@@ -68,11 +68,22 @@ function relTime(value: string | null): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
+const MIN_ITERS = 1000;
+const MAX_ITERS = 50000;
+// Rough training-time estimate (5090): ~1 min overhead + ~1 min / 5k iters.
+function trainMinutes(iters: number): number {
+  return Math.max(2, Math.round(1 + iters / 5000));
+}
+function presetForIters(iters: number): QualityKey | null {
+  return (Object.keys(QUALITY) as QualityKey[]).find((k) => QUALITY[k].iterations === iters) ?? null;
+}
+
 // ── page ──────────────────────────────────────────────────────────────────────
 export default function SplatLabPage() {
   const qc = useQueryClient();
   const [uploaded, setUploaded] = useState<SplatUploadResult | null>(null);
-  const [preset, setPreset] = useState<QualityKey>("standard");
+  const [iters, setIters] = useState<number>(QUALITY.standard.iterations);
+  const [showCustom, setShowCustom] = useState(false);
   const [toast, setToast] = useState<{ msg: string; bad?: boolean } | null>(null);
 
   const { data: status } = useQuery({
@@ -126,8 +137,24 @@ export default function SplatLabPage() {
       images_per_equirect: input.is_insv ? 8 : undefined,
       crop_bottom: input.is_insv ? 0.15 : undefined,
       num_frames_target: input.is_insv ? 75 : 300,
-      max_num_iterations: QUALITY[preset].iterations,
+      max_num_iterations: iters,
       insv_fov: input.is_insv ? 204 : undefined,
+    });
+  }
+
+  // Re-run a finished/failed scene with its own params (optionally at higher quality).
+  function rerun(job: SplatJob, multiplier = 1) {
+    if (activeJob) {
+      flash("A scene is already building — wait for it to finish.", true);
+      return;
+    }
+    const base = job.max_num_iterations || QUALITY.standard.iterations;
+    startMutation.mutate({
+      mode: "3d",
+      input_path: job.input_path,
+      output_dir: "outputs/3d",
+      capture_format: job.capture_format,
+      max_num_iterations: Math.min(MAX_ITERS, Math.round(base * multiplier)),
     });
   }
 
@@ -192,14 +219,19 @@ export default function SplatLabPage() {
             refreshing={transfersFetching}
           />
           <div className="mt-5 space-y-2">
-            <SectionLabel>Quality</SectionLabel>
+            <div className="flex items-center justify-between">
+              <SectionLabel>Quality</SectionLabel>
+              <button onClick={() => setShowCustom((v) => !v)} className="text-[11px] text-zinc-400 hover:text-cyan-200">
+                {showCustom ? "Hide custom" : "Customize"}
+              </button>
+            </div>
             <div className="grid grid-cols-3 gap-2">
               {(Object.keys(QUALITY) as QualityKey[]).map((k) => (
                 <button
                   key={k}
-                  onClick={() => setPreset(k)}
+                  onClick={() => setIters(QUALITY[k].iterations)}
                   className={`rounded-2xl border p-3 text-left transition-all ${
-                    preset === k
+                    presetForIters(iters) === k
                       ? "border-cyan-400/40 bg-cyan-400/10"
                       : "border-white/10 bg-white/[0.02] hover:border-cyan-500/20"
                   }`}
@@ -209,19 +241,59 @@ export default function SplatLabPage() {
                 </button>
               ))}
             </div>
+            {showCustom && (
+              <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-3">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-zinc-400">Training iterations</span>
+                  <span className="font-mono font-semibold text-cyan-200">{iters.toLocaleString()}</span>
+                </div>
+                <input
+                  type="range"
+                  min={MIN_ITERS}
+                  max={MAX_ITERS}
+                  step={1000}
+                  value={iters}
+                  onChange={(e) => setIters(Number(e.target.value))}
+                  className="mt-2 w-full accent-cyan-400"
+                />
+                <p className="mt-1 text-[11px] text-zinc-500">
+                  More iterations = sharper detail, longer build · est. ~{trainMinutes(iters)} min.
+                </p>
+              </div>
+            )}
           </div>
+
+          {uploaded && (
+            <div className="mt-4 rounded-2xl border border-cyan-500/20 bg-cyan-500/[0.06] p-3 text-xs">
+              <div className="flex items-center gap-2 text-cyan-100">
+                <CheckCircle2 className="h-4 w-4 shrink-0 text-cyan-300" />
+                <span className="truncate font-medium">{uploaded.name}</span>
+              </div>
+              <div className="mt-1.5 space-y-0.5 text-zinc-400">
+                <p>{uploaded.is_insv ? "360 footage — auto-unwrapped." : uploaded.detail}</p>
+                <p>
+                  Estimated build: <span className="text-zinc-200">~{trainMinutes(iters)} min</span> training
+                  {uploaded.kind === "file" ? " + a few min to find camera positions" : ""}.
+                </p>
+              </div>
+            </div>
+          )}
+
           <Button
             size="lg"
-            className="mt-5 w-full"
-            disabled={!uploaded || startMutation.isPending || !!activeJob}
+            className="mt-4 w-full"
+            disabled={!uploaded || startMutation.isPending || !!activeJob || (!!status && !engineReady)}
             onClick={() => uploaded && createFrom(uploaded)}
           >
             {startMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wand2 className="h-4 w-4" />}
-            {activeJob ? "A scene is already building…" : "Create 3D Scene"}
+            {!!status && !engineReady
+              ? "Engine warming up…"
+              : activeJob
+                ? "A scene is already building…"
+                : uploaded
+                  ? `Create 3D Scene · ~${trainMinutes(iters)} min`
+                  : "Create 3D Scene"}
           </Button>
-          {uploaded?.is_insv && (
-            <p className="mt-2 text-center text-xs text-cyan-200/80">360 footage detected — auto-unwrapped.</p>
-          )}
         </Card>
 
         {/* right: live status / viewer */}
@@ -244,7 +316,7 @@ export default function SplatLabPage() {
       </div>
 
       {/* gallery */}
-      <ResultsGallery jobs={completed} />
+      <ResultsGallery jobs={completed} onRerun={rerun} busy={!!activeJob} />
     </div>
   );
 }
@@ -444,7 +516,7 @@ function ActiveJobPanel({ job, onStop, stopping }: { job: SplatJob; onStop: () =
 }
 
 // ── results gallery ───────────────────────────────────────────────────────────
-function ResultsGallery({ jobs }: { jobs: SplatJob[] }) {
+function ResultsGallery({ jobs, onRerun, busy }: { jobs: SplatJob[]; onRerun: (job: SplatJob, mult?: number) => void; busy: boolean }) {
   const previewable = jobs.filter((j) => j.preview_available);
   const [featured, setFeatured] = useState<string | null>(null);
   const featuredJob = previewable.find((j) => j.job_id === featured) || previewable[0] || null;
@@ -477,14 +549,33 @@ function ResultsGallery({ jobs }: { jobs: SplatJob[] }) {
 
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {jobs.map((j) => (
-          <SceneCard key={j.job_id} job={j} active={j.job_id === featuredJob?.job_id} onFeature={() => setFeatured(j.job_id)} />
+          <SceneCard
+            key={j.job_id}
+            job={j}
+            active={j.job_id === featuredJob?.job_id}
+            onFeature={() => setFeatured(j.job_id)}
+            onRerun={onRerun}
+            busy={busy}
+          />
         ))}
       </div>
     </section>
   );
 }
 
-function SceneCard({ job, active, onFeature }: { job: SplatJob; active: boolean; onFeature: () => void }) {
+function SceneCard({
+  job,
+  active,
+  onFeature,
+  onRerun,
+  busy,
+}: {
+  job: SplatJob;
+  active: boolean;
+  onFeature: () => void;
+  onRerun: (job: SplatJob, mult?: number) => void;
+  busy: boolean;
+}) {
   return (
     <Card className={`p-3 transition-colors ${active ? "border-cyan-400/40" : "hover:border-white/20"}`}>
       <button onClick={onFeature} className="block w-full text-left">
@@ -495,6 +586,7 @@ function SceneCard({ job, active, onFeature }: { job: SplatJob; active: boolean;
         <div className="mt-1 flex items-center gap-2 text-[11px] text-zinc-500">
           <span>{relTime(job.completed_at)}</span>
           {job.capture_format === "equirectangular360" && <Badge>360</Badge>}
+          {job.max_num_iterations ? <span>{(job.max_num_iterations / 1000).toFixed(0)}k iters</span> : null}
           {job.pinned && <Pin className="h-3 w-3 text-cyan-300" />}
         </div>
       </button>
@@ -505,6 +597,14 @@ function SceneCard({ job, active, onFeature }: { job: SplatJob; active: boolean;
           </Button>
         </a>
         <DownloadMenu job={job} />
+      </div>
+      <div className="mt-1.5 flex items-center gap-2">
+        <Button size="sm" variant="ghost" className="flex-1 text-xs" disabled={busy} onClick={() => onRerun(job)} title="Re-run with the same settings">
+          <RefreshCw className="h-3.5 w-3.5" /> Re-run
+        </Button>
+        <Button size="sm" variant="ghost" className="flex-1 text-xs" disabled={busy} onClick={() => onRerun(job, 2)} title="Re-run at ~2x iterations">
+          ↑ Quality
+        </Button>
       </div>
     </Card>
   );
