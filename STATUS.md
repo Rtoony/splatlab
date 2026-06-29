@@ -55,11 +55,46 @@ Extract Splat Lab from the Nexus portal into its own standalone app at
       produced splat.ply(65M)+spz(4.3M)+web.ply(17.9M); **Redis GPU lock taken
       (holder lane=splat) during, released+cleared after**. Job visible in status,
       preview_available. (Smoke scene left in the gallery — RToony can delete.)
-- [ ] RISKY: swap portal `server/lib/gpu_arbiter.py` -> the Redis-backed version
-      (same API). Verify TRELLIS (three_d.py) still runs + now coordinates. Restart
-      portal (session-fresh check first).
-- [ ] Cutover splatlab frontend: /api/splat now hits splatlab's own backend (not
-      proxied). Verify E2E + cross-process coordination (splat + TRELLIS serialize).
+- [x] **Portal arbiter SWAPPED to Redis** (portal commit 5cdcb2c, pushed main).
+      Backed up old -> server/lib/gpu_arbiter.py.bak.inprocess.* (one-cp rollback).
+      Hardened per a 5-agent adversarial swarm (verdict fix-first): TTL 45->90s,
+      cancel-safe __aenter__/__aexit__ (no local-lock leak), socket_timeout 0.5,
+      broadened excepts. Re-verified: 2-proc mutual exclusion, fail-open, cancel-
+      mid-acquire releases local lock.
+      Post-swap gates ALL PASS: 87 vars (no stale-BW 0-var), REDIS_PASSWORD present,
+      /api/3d/queue 200 (TRELLIS alive), and COORDINATION ENGAGED — external Redis
+      lock flips the portal's gpu.locked to True (reads the shared lock, not per-proc).
+- [x] Frontend cutover: done (splatlab calls its own /api/splat). All three lanes
+      (splatlab-splat, portal-splat, portal-TRELLIS) now serialize on the 5090 via
+      the shared Redis lock. **The Phase-1->2 coordination gap is CLOSED.**
+
+## PHASE 2 COMPLETE (2026-06-29).
+## PHASE 3 COMPLETE (2026-06-29, portal commit 716f3be pushed). EXTRACTION DONE.
+- [x] splat.roonytoony.dev -> 307 splatlab (in auth_middleware, PRE-auth, so old
+      bookmarks skip the portal login wall). portal /splat + /splat/view -> client
+      redirect to splatlab (deep link preserved). Sidebar "Splat Lab" -> external.
+      Launch Bay: splat="moved", splatlab=the studio. Verified all; portal+splatlab
+      unaffected. Portal splat.py backend left DORMANT (still coordinated via the
+      shared Redis arbiter); deleting it is optional cleanup.
+
+## GUI backlog
+- [x] Capture confidence (commit 78cd649): Customize iterations slider + live time
+      estimate; preflight summary card; engine-ready gate on Create.
+- [x] Retry-with-params: Re-run + ↑Quality (2x) on scene cards (re-POST /train with
+      the job's params). Standard scenes faithful; 360 sub-params (images_per_equirect
+      /crop_bottom/insv_fov) not persisted on SplatJob meta so a 360 re-run uses
+      defaults — fine for standard, note for 360.
+- [ ] Real gallery thumbnails — DEFERRED (splat-transform .webp GPU rasterizer too
+      slow/finicky for a pipeline stage; ~2min+ and hung headless). Options: a
+      client-side canvas snapshot cached per scene, or a lighter offline render.
+- [ ] Minor cleanups: scene delete/pin buttons in splatlab gallery; delete portal
+      dormant splat.py + splat*.tsx; dedupe splat/splatlab Launch Bay cards; declare
+      redis in portal pyproject; delete splat_bf25300429 smoke scene.
+- [ ] optional cleanup: delete the portal's now-dormant splat.py + splat*.tsx;
+      declare `redis` in portal pyproject deps; dedupe the splat/splatlab Launch
+      Bay cards; delete the splat_bf25300429 smoke scene if unwanted.
+- [ ] Minor: declare `redis` in portal pyproject.toml deps (installed in venv now,
+      not yet in the manifest — matters only on a clean rebuild).
 - [ ] Phase 3: redirect splat.roonytoony.dev -> splatlab; remove the /splat page +
       nav entry from the portal (leave a redirect). Continue GUI backlog: capture-
       confidence (M3 preset sliders, M5 preflight validation), real gallery

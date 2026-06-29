@@ -22,6 +22,7 @@ import {
   Orbit,
   Pin,
   RefreshCw,
+  Trash2,
   Sparkles,
   Square,
   UploadCloud,
@@ -77,6 +78,11 @@ function trainMinutes(iters: number): number {
 function presetForIters(iters: number): QualityKey | null {
   return (Object.keys(QUALITY) as QualityKey[]).find((k) => QUALITY[k].iterations === iters) ?? null;
 }
+function sceneHue(id: string): number {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) % 360;
+  return h;
+}
 
 // ── page ──────────────────────────────────────────────────────────────────────
 export default function SplatLabPage() {
@@ -126,6 +132,22 @@ export default function SplatLabPage() {
   const stopMutation = useMutation({
     mutationFn: (id: string) => apiRequest(`/api/splat/jobs/${id}/stop`, { method: "POST" }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["status"] }),
+  });
+
+  const pinMutation = useMutation({
+    mutationFn: (job: SplatJob) =>
+      apiRequest(`/api/splat/jobs/${job.job_id}/${job.pinned ? "unpin" : "pin"}`, { method: "POST" }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["status"] }),
+    onError: (e) => flash(e instanceof Error ? e.message : "Pin failed", true),
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: (id: string) => apiRequest(`/api/splat/jobs/${id}`, { method: "DELETE" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["status"] });
+      flash("Scene deleted.");
+    },
+    onError: (e) => flash(e instanceof Error ? e.message : "Delete failed", true),
   });
 
   function createFrom(input: SplatUploadResult) {
@@ -316,7 +338,13 @@ export default function SplatLabPage() {
       </div>
 
       {/* gallery */}
-      <ResultsGallery jobs={completed} onRerun={rerun} busy={!!activeJob} />
+      <ResultsGallery
+        jobs={completed}
+        onRerun={rerun}
+        busy={!!activeJob}
+        onPin={(j) => pinMutation.mutate(j)}
+        onDelete={(id) => deleteMutation.mutate(id)}
+      />
     </div>
   );
 }
@@ -516,7 +544,19 @@ function ActiveJobPanel({ job, onStop, stopping }: { job: SplatJob; onStop: () =
 }
 
 // ── results gallery ───────────────────────────────────────────────────────────
-function ResultsGallery({ jobs, onRerun, busy }: { jobs: SplatJob[]; onRerun: (job: SplatJob, mult?: number) => void; busy: boolean }) {
+function ResultsGallery({
+  jobs,
+  onRerun,
+  busy,
+  onPin,
+  onDelete,
+}: {
+  jobs: SplatJob[];
+  onRerun: (job: SplatJob, mult?: number) => void;
+  busy: boolean;
+  onPin: (job: SplatJob) => void;
+  onDelete: (id: string) => void;
+}) {
   const previewable = jobs.filter((j) => j.preview_available);
   const [featured, setFeatured] = useState<string | null>(null);
   const featuredJob = previewable.find((j) => j.job_id === featured) || previewable[0] || null;
@@ -556,6 +596,8 @@ function ResultsGallery({ jobs, onRerun, busy }: { jobs: SplatJob[]; onRerun: (j
             onFeature={() => setFeatured(j.job_id)}
             onRerun={onRerun}
             busy={busy}
+            onPin={onPin}
+            onDelete={onDelete}
           />
         ))}
       </div>
@@ -569,27 +611,58 @@ function SceneCard({
   onFeature,
   onRerun,
   busy,
+  onPin,
+  onDelete,
 }: {
   job: SplatJob;
   active: boolean;
   onFeature: () => void;
   onRerun: (job: SplatJob, mult?: number) => void;
   busy: boolean;
+  onPin: (job: SplatJob) => void;
+  onDelete: (id: string) => void;
 }) {
+  const [confirmDel, setConfirmDel] = useState(false);
+  useEffect(() => {
+    if (!confirmDel) return;
+    const t = window.setTimeout(() => setConfirmDel(false), 3000);
+    return () => window.clearTimeout(t);
+  }, [confirmDel]);
+
   return (
-    <Card className={`p-3 transition-colors ${active ? "border-cyan-400/40" : "hover:border-white/20"}`}>
+    <Card className={`group relative p-3 transition-colors ${active ? "border-cyan-400/40" : "hover:border-white/20"}`}>
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          onPin(job);
+        }}
+        className={`absolute right-4 top-4 z-10 rounded-md bg-black/40 p-1 transition-opacity ${
+          job.pinned ? "text-cyan-300 opacity-100" : "text-zinc-400 opacity-0 hover:text-zinc-100 group-hover:opacity-100"
+        }`}
+        title={job.pinned ? "Unpin" : "Pin (protect from auto-cleanup)"}
+      >
+        <Pin className={`h-3.5 w-3.5 ${job.pinned ? "fill-current" : ""}`} />
+      </button>
+
       <button onClick={onFeature} className="block w-full text-left">
-        <div className="mb-2 flex aspect-video items-center justify-center rounded-xl border border-white/10 bg-gradient-to-br from-cyan-500/5 to-orange-500/5">
-          <Orbit className="h-7 w-7 text-cyan-300/50" />
+        <div
+          className="mb-2 flex aspect-video items-center justify-center rounded-xl border border-white/10"
+          style={{
+            // deterministic per-scene tint so cards are distinguishable (real
+            // splat thumbnails deferred — needs a preserveDrawingBuffer renderer)
+            background: `linear-gradient(135deg, hsl(${sceneHue(job.job_id)} 55% 13%), hsl(${(sceneHue(job.job_id) + 45) % 360} 50% 8%))`,
+          }}
+        >
+          <Orbit className="h-7 w-7" style={{ color: `hsl(${sceneHue(job.job_id)} 70% 62% / 0.55)` }} />
         </div>
         <p className="truncate text-sm font-medium text-zinc-100">{job.input_path.split("/").pop()}</p>
         <div className="mt-1 flex items-center gap-2 text-[11px] text-zinc-500">
           <span>{relTime(job.completed_at)}</span>
           {job.capture_format === "equirectangular360" && <Badge>360</Badge>}
           {job.max_num_iterations ? <span>{(job.max_num_iterations / 1000).toFixed(0)}k iters</span> : null}
-          {job.pinned && <Pin className="h-3 w-3 text-cyan-300" />}
         </div>
       </button>
+
       <div className="mt-2 flex items-center gap-2">
         <a href={`/view/${job.job_id}`} target="_blank" rel="noreferrer" className="flex-1">
           <Button size="sm" variant="outline" className="w-full">
@@ -604,6 +677,15 @@ function SceneCard({
         </Button>
         <Button size="sm" variant="ghost" className="flex-1 text-xs" disabled={busy} onClick={() => onRerun(job, 2)} title="Re-run at ~2x iterations">
           ↑ Quality
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          className={`text-xs ${confirmDel ? "text-red-300" : "text-zinc-500 hover:text-red-300"}`}
+          onClick={() => (confirmDel ? onDelete(job.job_id) : setConfirmDel(true))}
+          title="Delete scene"
+        >
+          <Trash2 className="h-3.5 w-3.5" /> {confirmDel ? "Sure?" : ""}
         </Button>
       </div>
     </Card>
