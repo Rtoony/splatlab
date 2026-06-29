@@ -40,8 +40,8 @@ GPU_ACQUIRE_TIMEOUT_SEC = 60
 
 LOCK_KEY = "nexus:gpu:heavy_lock"
 HOLDER_KEY = "nexus:gpu:heavy_holder"
-LOCK_TTL_MS = 45_000          # holder's lock auto-expires after this if not refreshed
-HEARTBEAT_SEC = 15.0          # refresh interval while holding
+LOCK_TTL_MS = 90_000          # holder's lock auto-expires after this if not refreshed
+HEARTBEAT_SEC = 15.0          # refresh interval while holding (TTL is 6x => wide margin)
 ACQUIRE_POLL_SEC = 0.5        # how often to retry acquiring a contended lock
 _CLIENT_RETRY_SEC = 30.0      # backoff before re-probing a down Redis
 
@@ -69,8 +69,8 @@ def _redis():
             port=int(os.environ.get("REDIS_PORT", "6379")),
             password=os.environ.get("REDIS_PASSWORD") or None,
             decode_responses=True,
-            socket_timeout=1.0,
-            socket_connect_timeout=1.0,
+            socket_timeout=0.5,
+            socket_connect_timeout=0.5,
         )
         c.ping()
         _client = c
@@ -91,37 +91,50 @@ class _CrossProcessLock:
 
     async def __aenter__(self) -> "_CrossProcessLock":
         await self._local.acquire()  # in-process serialization + fail-open fallback
-        token = f"{os.getpid()}:{uuid.uuid4().hex}"
-        r = _redis()
-        if r is None:
-            self._token = None  # local-only this round
-            return self
+        # Everything past here can await (to_thread SET, sleep) and thus be
+        # cancelled. Guard with BaseException so a CancelledError can never leak
+        # the local lock (which would deadlock this lane forever).
         try:
-            while True:
-                got = await asyncio.to_thread(r.set, LOCK_KEY, token, nx=True, px=LOCK_TTL_MS)
-                if got:
-                    break
-                await asyncio.sleep(ACQUIRE_POLL_SEC)
-            self._token = token
-            self._hb = asyncio.create_task(self._heartbeat(token))
-        except RedisError as e:
-            log.warning("gpu_arbiter: Redis acquire failed, holding local lock only: %s", e)
-            self._token = None
-        return self
+            token = f"{os.getpid()}:{uuid.uuid4().hex}"
+            r = _redis()
+            if r is None:
+                self._token = None  # local-only this round
+                return self
+            try:
+                while True:
+                    got = await asyncio.to_thread(r.set, LOCK_KEY, token, nx=True, px=LOCK_TTL_MS)
+                    if got:
+                        break
+                    await asyncio.sleep(ACQUIRE_POLL_SEC)
+                self._token = token
+                self._hb = asyncio.create_task(self._heartbeat(token))
+            except Exception as e:  # broadened: a bare OSError must not escape -> fail open
+                log.warning("gpu_arbiter: Redis acquire failed, holding local lock only: %s", e)
+                self._token = None
+            return self
+        except BaseException:
+            self._local.release()
+            raise
 
     async def __aexit__(self, *_exc: Any) -> None:
-        if self._hb is not None:
-            self._hb.cancel()
-            self._hb = None
-        token, self._token = self._token, None
-        if token is not None:
-            r = _redis()
-            if r is not None:
+        try:
+            hb, self._hb = self._hb, None
+            if hb is not None:
+                hb.cancel()
                 try:
-                    await asyncio.to_thread(r.eval, _RELEASE_LUA, 1, LOCK_KEY, token)
-                except RedisError:
+                    await hb
+                except asyncio.CancelledError:
                     pass
-        self._local.release()
+            token, self._token = self._token, None
+            if token is not None:
+                r = _redis()
+                if r is not None:
+                    try:
+                        await asyncio.to_thread(r.eval, _RELEASE_LUA, 1, LOCK_KEY, token)
+                    except Exception:
+                        pass
+        finally:
+            self._local.release()  # ALWAYS release, even if teardown above misbehaves
 
     async def _heartbeat(self, token: str) -> None:
         try:
