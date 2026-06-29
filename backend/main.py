@@ -1,0 +1,163 @@
+"""Splat Lab — standalone app backend.
+
+Phase 1 of carving Splat Lab out of the Nexus portal: this is its own service
+(own URL, own auth, own UI) but it REUSES the proven splat pipeline by streaming
+proxying /api/splat and /supersplat to the portal (127.0.0.1:3300). That keeps
+the in-process GPU arbiter (which serializes splat training with TRELLIS on the
+5090) intact — nothing about the working pipeline changes. Phase 2 will extract
+the backend behind a cross-process lock.
+
+Auth: log in with the same PORTAL_TOKEN; a signed cookie gates the app, and the
+portal bearer token is injected server-side on every proxied call (never sent to
+the browser).
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import os
+import time
+from pathlib import Path
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
+
+PORTAL_ORIGIN = os.environ.get("SPLATLAB_PORTAL_ORIGIN", "http://127.0.0.1:3300").rstrip("/")
+PORTAL_TOKEN = os.environ.get("PORTAL_TOKEN", "")
+COOKIE = "splatlab_session"
+MAX_AGE = 60 * 60 * 24 * 14  # 14 days
+DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+# Paths proxied to the portal's splat backend (everything else is the SPA).
+PROXY_PATHS = ("/api/", "/supersplat")
+
+app = FastAPI(title="Splat Lab")
+_client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0))
+
+
+# ── auth ────────────────────────────────────────────────────────────────────
+def _sign(ts: int) -> str:
+    mac = hmac.new(PORTAL_TOKEN.encode(), str(ts).encode(), hashlib.sha256).hexdigest()
+    return f"{ts}:{mac}"
+
+
+def _valid_cookie(value: str) -> bool:
+    if not value or ":" not in value or not PORTAL_TOKEN:
+        return False
+    ts_str, mac = value.rsplit(":", 1)
+    try:
+        if time.time() - int(ts_str) > MAX_AGE:
+            return False
+    except ValueError:
+        return False
+    expected = hmac.new(PORTAL_TOKEN.encode(), ts_str.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(mac, expected)
+
+
+def _authed(request: Request) -> bool:
+    if _valid_cookie(request.cookies.get(COOKIE, "")):
+        return True
+    auth = request.headers.get("authorization", "")
+    return bool(auth.startswith("Bearer ") and PORTAL_TOKEN and hmac.compare_digest(auth[7:], PORTAL_TOKEN))
+
+
+def _login_html(error: str = "") -> str:
+    msg = f'<p class="err">{error}</p>' if error else ""
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Splat Lab — Sign in</title><style>
+*{{box-sizing:border-box}}body{{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
+background:radial-gradient(circle at 30% 20%,rgba(34,211,238,.12),transparent 40%),#05070d;
+font-family:ui-sans-serif,system-ui,sans-serif;color:#e4e9f2}}
+.card{{width:340px;padding:32px;border:1px solid rgba(255,255,255,.1);border-radius:24px;
+background:rgba(10,16,28,.7);backdrop-filter:blur(8px)}}
+h1{{font-size:20px;margin:0 0 4px;letter-spacing:-.01em}}
+p.sub{{margin:0 0 20px;color:#8b97ad;font-size:13px}}
+input{{width:100%;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);
+background:rgba(255,255,255,.04);color:#e4e9f2;font-size:14px}}
+button{{width:100%;margin-top:12px;padding:10px;border:0;border-radius:12px;cursor:pointer;
+background:#22d3ee;color:#04121a;font-weight:700;font-size:14px}}
+.err{{color:#f87171;font-size:12px;margin:8px 0 0}}
+.brand{{display:flex;align-items:center;gap:8px;margin-bottom:14px;color:#22d3ee;
+font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.28em}}
+</style></head><body><form class="card" method="post" action="/login">
+<div class="brand">◆ Spatial Pipeline</div>
+<h1>Splat Lab</h1><p class="sub">Sign in with your portal token.</p>
+<input name="portal_token" type="password" placeholder="Portal token" autocomplete="current-password" autofocus required>
+<button type="submit">Enter</button>{msg}</form></body></html>"""
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True, "service": "splatlab", "portal_origin": PORTAL_ORIGIN, "token": bool(PORTAL_TOKEN)}
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    return _login_html()
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    form = await request.form()
+    token = (form.get("portal_token") or "").strip()
+    if not PORTAL_TOKEN or not hmac.compare_digest(token, PORTAL_TOKEN):
+        return HTMLResponse(_login_html("Invalid token."), status_code=401)
+    resp = RedirectResponse("/", status_code=303)
+    resp.set_cookie(COOKIE, _sign(int(time.time())), httponly=True, secure=True, samesite="lax", max_age=MAX_AGE, path="/")
+    return resp
+
+
+@app.get("/logout")
+async def logout():
+    resp = RedirectResponse("/login", status_code=303)
+    resp.delete_cookie(COOKIE, path="/")
+    return resp
+
+
+# ── streaming reverse-proxy to the portal splat backend ──────────────────────
+async def _proxy(request: Request, path: str) -> StreamingResponse:
+    url = httpx.URL(f"{PORTAL_ORIGIN}{path}", query=request.url.query.encode("utf-8"))
+    drop = {b"host", b"authorization", b"cookie", b"content-length"}
+    headers = [(k, v) for k, v in request.headers.raw if k.lower() not in drop]
+    headers.append((b"authorization", f"Bearer {PORTAL_TOKEN}".encode()))
+    upstream_req = _client.build_request(request.method, url, headers=headers, content=request.stream())
+    upstream = await _client.send(upstream_req, stream=True)
+    # aiter_raw + original headers keep content-encoding consistent.
+    return StreamingResponse(
+        upstream.aiter_raw(),
+        status_code=upstream.status_code,
+        headers=upstream.headers,
+        background=BackgroundTask(upstream.aclose),
+    )
+
+
+@app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_api(path: str, request: Request):
+    if not _authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return await _proxy(request, f"/api/{path}")
+
+
+@app.api_route("/supersplat/{path:path}", methods=["GET"])
+async def proxy_supersplat(path: str, request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    return await _proxy(request, f"/supersplat/{path}")
+
+
+# ── static SPA ───────────────────────────────────────────────────────────────
+if (DIST / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=str(DIST / "assets")), name="assets")
+
+
+@app.get("/{full_path:path}", response_class=HTMLResponse)
+async def spa(full_path: str, request: Request):
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
+    index = DIST / "index.html"
+    if index.is_file():
+        return FileResponse(str(index))
+    return HTMLResponse("<h1>Splat Lab</h1><p>Frontend not built yet.</p>", status_code=200)

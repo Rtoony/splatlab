@@ -1,0 +1,43 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap");
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: "Inter", ui-sans-serif, system-ui, sans-serif;
+  background:
+    radial-gradient(circle at 12% 8%, rgba(34, 211, 238, 0.1), transparent 36%),
+    radial-gradient(circle at 88% 6%, rgba(249, 115, 22, 0.08), transparent 30%),
+    #05070d;
+  color: #e6ebf4;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* subtle breathing for "checking" / in-progress dots */
+@keyframes nx-breath {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.nx-breath {
+  animation: nx-breath 2.4s ease-in-out infinite;
+}
+
+.display {
+  font-family: "Space Grotesk", "Inter", sans-serif;
+}
