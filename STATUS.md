@@ -84,12 +84,19 @@ Extract Splat Lab from the Nexus portal into its own standalone app at
       the job's params). Standard scenes faithful; 360 sub-params (images_per_equirect
       /crop_bottom/insv_fov) not persisted on SplatJob meta so a 360 re-run uses
       defaults — fine for standard, note for 360.
-- [ ] Real gallery thumbnails — DEFERRED (splat-transform .webp GPU rasterizer too
-      slow/finicky for a pipeline stage; ~2min+ and hung headless). Options: a
-      client-side canvas snapshot cached per scene, or a lighter offline render.
-- [ ] Minor cleanups: scene delete/pin buttons in splatlab gallery; delete portal
-      dormant splat.py + splat*.tsx; dedupe splat/splatlab Launch Bay cards; declare
-      redis in portal pyproject; delete splat_bf25300429 smoke scene.
+- [x] Scene pin + two-click delete on gallery cards (commit 477d2c8); per-scene
+      color tint so cards are distinguishable; 30k-iters badge.
+- [x] Cleanups: smoke scene splat_bf25300429 deleted; Launch Bay deduped (portal
+      commit ecc8e13: projects.py hides superseded "splat", canonical card ->
+      splatlab); redis declared in portal pyproject.
+- [ ] Real gallery thumbnails — STILL DEFERRED. Two dead-ends: splat-transform .webp
+      GPU rasterizer too slow/hung headless; a plain canvas.toDataURL() returns blank
+      without preserveDrawingBuffer. PATH: pass a custom THREE.WebGLRenderer with
+      {preserveDrawingBuffer:true} to the mkkellogg Viewer, capture after first
+      render, cache the dataURL per job_id in localStorage. Risks the shared viewer,
+      so left for a focused (non-autonomous) session.
+- [ ] Optional: delete portal dormant splat.py + splat*.tsx (harmless dead code,
+      cross-referenced — risky to remove unattended).
 - [ ] optional cleanup: delete the portal's now-dormant splat.py + splat*.tsx;
       declare `redis` in portal pyproject deps; dedupe the splat/splatlab Launch
       Bay cards; delete the splat_bf25300429 smoke scene if unwanted.
