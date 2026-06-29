@@ -1,39 +1,51 @@
 """Splat Lab — standalone app backend.
 
-Phase 1 of carving Splat Lab out of the Nexus portal: this is its own service
-(own URL, own auth, own UI) but it REUSES the proven splat pipeline by streaming
-proxying /api/splat and /supersplat to the portal (127.0.0.1:3300). That keeps
-the in-process GPU arbiter (which serializes splat training with TRELLIS on the
-5090) intact — nothing about the working pipeline changes. Phase 2 will extract
-the backend behind a cross-process lock.
+Phase 2 of carving Splat Lab out of the Nexus portal: this service now OWNS the
+splat pipeline (splat_route.py, ported from the portal) and coordinates the 5090
+with the portal's TRELLIS lane through a cross-process Redis lock (gpu_arbiter.py).
+/supersplat is still proxied to the portal (SuperSplat editor is mounted there).
 
-Auth: log in with the same PORTAL_TOKEN; a signed cookie gates the app, and the
-portal bearer token is injected server-side on every proxied call (never sent to
-the browser).
+Auth: log in with the same PORTAL_TOKEN; a signed cookie gates the app. The
+proxied calls inject the portal bearer server-side (never sent to the browser).
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import os
+import sys
 import time
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
+
+# Make the ported splat route + its local gpu_arbiter / operator_audit importable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import splat_route  # noqa: E402  (imports gpu_arbiter + operator_audit from this dir)
 
 PORTAL_ORIGIN = os.environ.get("SPLATLAB_PORTAL_ORIGIN", "http://127.0.0.1:3300").rstrip("/")
 PORTAL_TOKEN = os.environ.get("PORTAL_TOKEN", "")
 COOKIE = "splatlab_session"
 MAX_AGE = 60 * 60 * 24 * 14  # 14 days
 DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
-# Paths proxied to the portal's splat backend (everything else is the SPA).
-PROXY_PATHS = ("/api/", "/supersplat")
 
-app = FastAPI(title="Splat Lab")
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # Match the portal's splat startup hooks: rehydrate persisted jobs.
+    with contextlib.suppress(Exception):
+        splat_route.migrate_legacy_metas()
+    with contextlib.suppress(Exception):
+        splat_route.cleanup_orphan_jobs()
+    yield
+
+
+app = FastAPI(title="Splat Lab", lifespan=_lifespan)
 _client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0))
 
 
@@ -134,11 +146,13 @@ async def _proxy(request: Request, path: str) -> StreamingResponse:
     )
 
 
-@app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def proxy_api(path: str, request: Request):
+def require_auth(request: Request) -> None:
     if not _authed(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    return await _proxy(request, f"/api/{path}")
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+# /api/splat is now OWNED here (the ported pipeline), gated by splatlab auth.
+app.include_router(splat_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
 
 
 @app.api_route("/supersplat/{path:path}", methods=["GET"])
