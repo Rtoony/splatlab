@@ -27,6 +27,18 @@ export interface SplatJob {
   preview_spz_url?: string | null;
   preview_view_url?: string | null;
   preview_web_url?: string | null;
+  // Opt-in text-searchable "Language Field" — both flags optional so existing
+  // scenes (which never carry them) keep deserializing unchanged.
+  language_field?: boolean;
+  langfield_available?: boolean;
+}
+
+// Result of a Language Field text query: a server-rendered 3-view relevancy
+// heatmap strip (PNG) plus the normalized query and a readiness flag.
+export interface LangfieldQueryResult {
+  query: string;
+  heatmap_url: string;
+  ready: boolean;
 }
 
 export interface SplatGpuHolder {
@@ -51,6 +63,8 @@ export interface SplatStatusResponse {
     ffmpeg_available: boolean;
     insv_stitch_available: boolean;
     four_d_engine_ready: boolean;
+    // Whether the Language Field toolchain exists on this host (opt-in feature gate).
+    langfield_available?: boolean;
     [k: string]: unknown;
   };
   media_samples: Array<{ name: string; path: string; kind: "file" | "directory" }>;

@@ -31,13 +31,14 @@ import {
 } from "lucide-react";
 
 // ── pipeline metadata ────────────────────────────────────────────────────────
-const STAGE_ORDER = ["stitch", "process", "train", "export", "compress", "webopt"];
+const STAGE_ORDER = ["stitch", "process", "train", "langfield", "export", "compress", "webopt"];
 const STAGE_HUMAN: Record<string, string> = {
   stitch: "Unwrapping 360 footage",
   process: "Finding camera positions",
   glomap_sfm: "Re-solving with global SfM",
   mast3r_sfm: "Re-solving with MASt3R (pose-free)",
   train: "Building the 3D scene",
+  langfield: "Building the language field",
   export: "Finishing the scene",
   compress: "Compressing",
   webopt: "Preparing web viewer",
@@ -48,6 +49,7 @@ const STAGE_SHORT: Record<string, string> = {
   glomap_sfm: "Global SfM",
   mast3r_sfm: "MASt3R",
   train: "Train",
+  langfield: "Language field",
   export: "Export",
   compress: "Compress",
   webopt: "Web",
@@ -102,6 +104,8 @@ export default function SplatLabPage() {
   const [uploaded, setUploaded] = useState<SplatUploadResult | null>(null);
   const [iters, setIters] = useState<number>(QUALITY.standard.iterations);
   const [showCustom, setShowCustom] = useState(false);
+  // Opt-in: build a text-searchable Language Field alongside the scene.
+  const [languageField, setLanguageField] = useState(false);
   const [toast, setToast] = useState<{ msg: string; bad?: boolean } | null>(null);
   // Dismissed failed-job notice (by job_id) so a newer failure still shows.
   const [dismissedFailed, setDismissedFailed] = useState<string | null>(null);
@@ -130,6 +134,8 @@ export default function SplatLabPage() {
     )[0] ?? null;
   const gpu = status?.gpu;
   const engineReady = Boolean(status?.engines?.ns_train_available && status?.engines?.colmap_available);
+  // Whether the Language Field toolchain exists — gates the opt-in toggle.
+  const langfieldEngineAvailable = Boolean(status?.engines?.langfield_available);
 
   function flash(msg: string, bad = false) {
     setToast({ msg, bad });
@@ -183,6 +189,7 @@ export default function SplatLabPage() {
       num_frames_target: input.is_insv ? 75 : 300,
       max_num_iterations: iters,
       insv_fov: input.is_insv ? 204 : undefined,
+      language_field: languageField,
     });
   }
 
@@ -199,6 +206,7 @@ export default function SplatLabPage() {
       output_dir: "outputs/3d",
       capture_format: job.capture_format,
       max_num_iterations: Math.min(MAX_ITERS, Math.round(base * multiplier)),
+      language_field: Boolean(job.language_field),
     });
   }
 
@@ -216,6 +224,7 @@ export default function SplatLabPage() {
       capture_format: job.capture_format,
       max_num_iterations: job.max_num_iterations || QUALITY.standard.iterations,
       sfm_backend: "glomap",
+      language_field: Boolean(job.language_field),
     });
   }
   const glomapAvailable = Boolean(status?.engines?.glomap_available);
@@ -324,6 +333,35 @@ export default function SplatLabPage() {
               </div>
             )}
           </div>
+
+          {langfieldEngineAvailable && (
+            <button
+              type="button"
+              onClick={() => setLanguageField((v) => !v)}
+              className={`mt-3 flex w-full items-start gap-3 rounded-2xl border p-3 text-left transition-all ${
+                languageField
+                  ? "border-cyan-400/40 bg-cyan-400/10"
+                  : "border-white/10 bg-white/[0.02] hover:border-cyan-500/20"
+              }`}
+            >
+              <span
+                className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
+                  languageField ? "border-cyan-400 bg-cyan-400 text-[#04121a]" : "border-white/20 bg-white/5"
+                }`}
+              >
+                {languageField && <CheckCircle2 className="h-3.5 w-3.5" />}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="flex items-center gap-1.5 text-sm font-semibold text-white">
+                  <Sparkles className="h-3.5 w-3.5 text-cyan-200" /> Language search (text-searchable)
+                </span>
+                <span className="mt-0.5 block text-xs text-zinc-400">
+                  Build a language field so you can search the finished scene by typing what you’re looking for. Adds
+                  some build time.
+                </span>
+              </span>
+            </button>
+          )}
 
           {uploaded && (
             <div className="mt-4 rounded-2xl border border-cyan-500/20 bg-cyan-500/[0.06] p-3 text-xs">
@@ -814,6 +852,3 @@ function DownloadMenu({ job }: { job: SplatJob }) {
     </div>
   );
 }
-
-// keep lint happy about imported icons reserved for near-term use
-void Sparkles;

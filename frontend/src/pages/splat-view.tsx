@@ -1,10 +1,11 @@
-import { useMemo } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMemo, useState } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link, useRoute } from "wouter";
-import { apiRequest } from "@/lib/api";
-import type { SplatJob, SplatStatusResponse } from "@/lib/contracts";
+import { apiRequest, queryLangfield } from "@/lib/api";
+import type { LangfieldQueryResult, SplatJob, SplatStatusResponse } from "@/lib/contracts";
 import { SplatViewer } from "@/components/splat-viewer";
-import { ArrowLeft, Download, Loader2, Orbit } from "lucide-react";
+import { Button, Card, Input, SectionLabel } from "@/components/ui";
+import { ArrowLeft, Download, Loader2, Orbit, Search, Sparkles, X } from "lucide-react";
 
 export default function SplatViewPage() {
   const [, params] = useRoute("/view/:jobId");
@@ -70,7 +71,10 @@ export default function SplatViewPage() {
             </div>
           </Centered>
         ) : (
-          <SplatViewer url={viewUrl} format="ply" fill />
+          <>
+            <SplatViewer url={viewUrl} format="ply" fill />
+            {job.langfield_available && <LangfieldSearch jobId={job.job_id} />}
+          </>
         )}
       </main>
     </div>
@@ -79,4 +83,83 @@ export default function SplatViewPage() {
 
 function Centered({ children }: { children: React.ReactNode }) {
   return <div className="flex h-full items-center justify-center text-sm text-zinc-400">{children}</div>;
+}
+
+// Text-search panel for scenes that carry an opt-in Language Field. Floats over
+// the bottom of the viewer; a query renders a server-side relevancy heatmap strip.
+function LangfieldSearch({ jobId }: { jobId: string }) {
+  const [text, setText] = useState("");
+  const search = useMutation<LangfieldQueryResult, Error, string>({
+    mutationFn: (q: string) => queryLangfield(jobId, q),
+  });
+
+  function submit() {
+    const q = text.trim();
+    if (q) search.mutate(q);
+  }
+
+  return (
+    <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 flex justify-center p-3 sm:p-4">
+      <Card className="pointer-events-auto w-full max-w-lg border-white/12 bg-[#070b14]/85 p-3 backdrop-blur-md">
+        <div className="mb-2 flex items-center gap-1.5">
+          <Sparkles className="h-3.5 w-3.5 text-cyan-200" />
+          <SectionLabel>Search this scene</SectionLabel>
+        </div>
+        <form
+          className="flex items-center gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            submit();
+          }}
+        >
+          <Input
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder="Type what you’re looking for…"
+            autoComplete="off"
+          />
+          <Button type="submit" disabled={!text.trim() || search.isPending} className="shrink-0">
+            {search.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+            Search
+          </Button>
+        </form>
+
+        {search.isPending && (
+          <p className="mt-2 flex items-center gap-1.5 text-xs text-zinc-400">
+            <Loader2 className="h-3 w-3 animate-spin" /> Searching…
+          </p>
+        )}
+        {search.isError && (
+          <p className="mt-2 text-xs text-red-300">{search.error.message || "Search failed."}</p>
+        )}
+        {search.data && !search.isPending && (
+          <div className="mt-3 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <p className="truncate text-xs text-zinc-400">
+                Relevancy for <span className="text-zinc-200">“{search.data.query}”</span>
+                {!search.data.ready && " · still building…"}
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  setText("");
+                  search.reset();
+                }}
+                className="flex shrink-0 items-center gap-1 text-xs text-zinc-400 transition hover:text-zinc-100"
+              >
+                <X className="h-3.5 w-3.5" /> Clear
+              </button>
+            </div>
+            {search.data.heatmap_url && (
+              <img
+                src={search.data.heatmap_url}
+                alt={`Relevancy heatmap for "${search.data.query}"`}
+                className="w-full rounded-xl border border-white/10"
+              />
+            )}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
 }

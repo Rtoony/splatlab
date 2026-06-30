@@ -1,3 +1,5 @@
+import type { LangfieldQueryResult } from "@/lib/contracts";
+
 // Same-origin fetch helper. The splatlab backend proxies /api/* to the portal
 // splat API with the bearer injected, so the browser only ever sees same-origin.
 export async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
@@ -11,4 +13,14 @@ export async function apiRequest<T>(path: string, init?: RequestInit): Promise<T
     throw new Error(text || `HTTP ${res.status}`);
   }
   return (await res.json()) as T;
+}
+
+// Run a text query against a scene's opt-in Language Field. Returns a
+// server-rendered relevancy heatmap (PNG url) plus the normalized query.
+export function queryLangfield(jobId: string, text: string): Promise<LangfieldQueryResult> {
+  return apiRequest<LangfieldQueryResult>(`/api/splat/jobs/${jobId}/langfield/query`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
 }
