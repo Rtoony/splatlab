@@ -33,7 +33,6 @@ QUERIES = sys.argv[3].split("|") if len(sys.argv) > 3 else [
     "green bushes", "a window", "brick wall", "a lamp post",
 ]
 NEGATIVES = ["object", "things", "stuff", "texture", "surface"]
-CAM_VIEWS = [0, 38, 77]
 QW, QH = 640, 480
 
 # ── geometry (KEEP the spike load) ───────────────────────────────────────────────
@@ -45,6 +44,9 @@ opac = torch.sigmoid(m.opacities.detach()).squeeze(-1)
 sh = torch.cat([m.features_dc.detach()[:, None, :], m.features_rest.detach()], dim=1)
 cams = pipeline.datamanager.train_dataset.cameras.to(DEV)
 fullW, fullH = int(cams.width[0]), int(cams.height[0])
+# Adaptive representative views (don't hardcode indices — scenes vary in camera count).
+n_cams = int(cams.camera_to_worlds.shape[0])
+CAM_VIEWS = sorted({0, n_cams // 3, (2 * n_cams) // 3, n_cams - 1})[:3]
 
 d = np.load(OUT / "gauss_emb.npz")
 feat_n = torch.tensor(d["gauss_emb"], device=DEV).float()   # already L2-normed (zeros for unseen)

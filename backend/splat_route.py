@@ -118,6 +118,7 @@ MAST3R_VRAM_MB = 6_000
 # splat job. Pinned scripts live in backend/langfield/ (not the scratch ~/tools dir).
 LANGFIELD_DIR = Path(__file__).resolve().parent / "langfield"
 LANGFIELD_RUNNER = LANGFIELD_DIR / "run_langfield.sh"
+LANGFIELD_QUERY_RUNNER = LANGFIELD_DIR / "run_query.sh"
 LANGFIELD_QUERY_SCRIPT = LANGFIELD_DIR / "query_render_v2.py"
 LANGFIELD_ENV_PYTHON = Path.home() / "miniconda3" / "envs" / "langfield-spike" / "bin" / "python"
 SAM2_ENV_PYTHON = Path.home() / "miniconda3" / "envs" / "sam2" / "bin" / "python"
@@ -1267,6 +1268,56 @@ async def _run_train_stage(job: SplatJob, command: list[str]) -> int:
     return await _run_locked_stage(job, "train", command, TRAIN_VRAM_MB)
 
 
+def _langfield_clean_text(text: str) -> str:
+    """Sanitize a query into a SigLIP-safe + filename-safe string (word chars, spaces,
+    hyphens; collapsed; capped). The renderer writes q_<clean.replace(' ','_')>.png, so
+    the endpoint computes the heatmap URL deterministically."""
+    t = re.sub(r"[^\w\s-]+", " ", text).strip()
+    t = re.sub(r"\s+", " ", t)
+    return t[:80].strip() or "query"
+
+
+def _langfield_heatmap_name(clean_text: str) -> str:
+    return f"q_{clean_text.replace(' ', '_')}.png"
+
+
+async def _langfield_worker_query(config_path: str, lfdir: str, clean_text: str) -> bool:
+    """Try the warm worker (resident SigLIP + cached scene = sub-second). True iff it
+    rendered the heatmap; any error -> False so the caller falls back to the cold path."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=1.5)) as client:
+            resp = await client.post(
+                f"{LANGFIELD_WORKER_URL}/query",
+                json={"config": config_path, "lfdir": lfdir, "text": clean_text},
+            )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+async def _langfield_query_cold(scene_id: str, config_path: str, lfdir: str, clean_text: str) -> bool:
+    """Fallback when the worker is down: cold subprocess render under HEAVY_GPU_LOCK
+    (loads SigLIP + the pipeline, ~20-40s) so it serialises with train/TRELLIS and can
+    never OOM them. The lock releases the moment the render finishes."""
+    command = ["bash", str(LANGFIELD_QUERY_RUNNER), config_path, lfdir, clean_text]
+    async with gpu_arbiter.HEAVY_GPU_LOCK:
+        gpu_arbiter.set_holder("langfield", scene_id)
+        try:
+            ok, _msg = await gpu_arbiter.acquire_gpu(QUERY_VRAM_MB)
+            if not ok:
+                return False
+            proc = await asyncio.create_subprocess_exec(
+                *command, cwd=str(SPLAT_ROOT),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env=_subprocess_env(), start_new_session=True,
+            )
+            await proc.communicate()
+            return proc.returncode == 0
+        finally:
+            gpu_arbiter.clear_holder()
+
+
 def _maybe_escalate_sfm(
     job: SplatJob, process_index: int, registered: int, extracted: int, pct: str
 ) -> bool:
@@ -2052,6 +2103,44 @@ async def get_splat_preview_file(job_id: str, fmt: Literal["ply", "spz", "web"] 
     if not preview_file.is_file():
         raise HTTPException(status_code=404, detail="Preview file not generated yet")
     return FileResponse(str(preview_file), media_type="application/octet-stream", filename=f"{job_id}.{suffix}")
+
+
+@router.post("/jobs/{job_id}/langfield/query")
+async def langfield_query(job_id: str, payload: dict[str, Any]):
+    """Text-search a built language field -> a server-rendered relevancy heatmap.
+    Prefers the warm worker (sub-second); falls back to a cold subprocess under the
+    GPU lock. 404 if this scene has no built field. (Auth via the router mount.)"""
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    raw = str(payload.get("text", "")).strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty query")
+    clean = _langfield_clean_text(raw)
+    job_dir = _job_dir(job_id)
+    lfdir = job_dir / LANGFIELD_DIRNAME
+    if not (lfdir / "gauss_emb.npz").is_file():
+        raise HTTPException(status_code=404, detail="Language field not built for this scene")
+    config_path = _find_latest_config(job_dir)
+    if config_path is None:
+        raise HTTPException(status_code=409, detail="Scene checkpoint missing")
+    name = _langfield_heatmap_name(clean)
+    rendered = await _langfield_worker_query(str(config_path), str(lfdir), clean)
+    if not rendered:
+        rendered = await _langfield_query_cold(job_id, str(config_path), str(lfdir), clean)
+    if not rendered or not (lfdir / name).is_file():
+        raise HTTPException(status_code=500, detail="Language query render failed")
+    return {"query": clean, "heatmap_url": f"/api/splat/jobs/{job_id}/langfield/heatmap/{name}", "ready": True}
+
+
+@router.get("/jobs/{job_id}/langfield/heatmap/{name}")
+async def langfield_heatmap(job_id: str, name: str):
+    # name is constrained to the renderer's q_<safe>.png shape — no path traversal.
+    if not _safe_job_id(job_id) or not re.match(r"^q_[\w-]+\.png$", name):
+        raise HTTPException(status_code=404, detail="not found")
+    heat = _job_dir(job_id) / LANGFIELD_DIRNAME / name
+    if not heat.is_file():
+        raise HTTPException(status_code=404, detail="heatmap not rendered yet")
+    return FileResponse(str(heat), media_type="image/png")
 
 
 @router.post("/jobs/{job_id}/stop")
