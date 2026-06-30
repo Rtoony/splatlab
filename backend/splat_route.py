@@ -74,6 +74,29 @@ COLMAP_ENV_BIN = Path.home() / "miniconda3" / "envs" / "colmap" / "bin"
 # then hands the resulting sparse model to ns-process-data via --skip-colmap.
 # global_mapper (global SfM) registers far more frames on low-overlap captures.
 COLMAP4_BIN = Path.home() / "miniconda3" / "envs" / "colmap4" / "bin" / "colmap"
+# MASt3R-SfM rung (the strongest SfM escalation target). Deep-learning dense
+# matcher that solves poses where COLMAP/glomap fail entirely (it needs no
+# repeatable SIFT keypoints). It runs in its OWN persistent conda env
+# (mast3r-spike) with its own torch 2.10+cu128 build and a 2.6GB ViT-Large
+# checkpoint — kept apart from splatops so neither env's CUDA pins collide.
+# The runner emits an in-memory SparseGA scene as poses.npz/points3D.npz; a
+# converter then reproduces nerfstudio 1.1.5's EXACT colmap_to_json transform
+# convention (verified to 4.4e-16) to write transforms.json + images/ +
+# sparse_pc.ply directly — so the mast3r `process` stage produces a finished
+# Nerfstudio dataset and never invokes ns-process-data at all.
+MAST3R_ENV_PYTHON = Path.home() / "miniconda3" / "envs" / "mast3r-spike" / "bin" / "python"
+MAST3R_RUNNER = Path.home() / "tools" / "mast3r-spike" / "run_mast3r_sfm.py"
+MAST3R_CONVERTER = Path.home() / "tools" / "mast3r-spike" / "mast3r_to_nerfstudio.py"
+MAST3R_CHECKPOINT = (
+    Path.home()
+    / "tools"
+    / "mast3r-spike"
+    / "checkpoints"
+    / "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+)
+# swin-5-noncyclic gives a linear (not N^2) pair count — the validated default
+# for sequences; 'complete' is full N^2 for small sets.
+MAST3R_SCENE_GRAPH = "swin-5-noncyclic"
 # splat-transform (PlayCanvas, MIT) ships in the self-hosted SuperSplat
 # checkout. Used to compress the raw export into a .spz the in-page viewer
 # loads ~10x faster over the tunnel. Optional: a missing binary just skips
@@ -83,6 +106,9 @@ MAX_LOG_LINES = 400
 MAX_SAMPLE_MEDIA = 8
 MAX_LISTED_JOBS = 24
 TRAIN_VRAM_MB = 16_000
+# MASt3R-SfM ViT-Large inference peaks ~3.46 GB measured; reserve headroom so the
+# arbiter frees enough before the heavy step (it serialises against TRELLIS).
+MAST3R_VRAM_MB = 6_000
 KEEP_UNPINNED_COMPLETED = 10
 FAILED_RETENTION_HOURS = 24
 PREVIEW_DIRNAME = "_preview"
@@ -120,6 +146,28 @@ MIN_REGISTRATION_RATIO = 0.30
 # cameras; nerfstudio downscales from here as needed.
 STITCH_WIDTH = 5760
 STITCH_HEIGHT = 2880
+# AUTO-FALLBACK solver escalation. When the A1 registration gate trips on a
+# video/image-folder capture, the pipeline climbs this chain automatically
+# (zero clicks) instead of failing: it reroutes to the NEXT solver after the
+# current one that is AVAILABLE and not yet tried, rebuilds the SfM stage(s)
+# mid-run, and re-runs the gate. Ordered weakest -> strongest.
+#   - "colmap": the validated COLMAP 3.11.1 incremental path nerfstudio drives.
+#   - "glomap": COLMAP 4.x global SfM (global_mapper) — registers far more
+#     frames on low-overlap captures (proved 311/311 vs 2/311 incremental).
+#   - "mast3r": MASt3R-SfM (deep dense matcher) — the strongest rung; solves
+#     poses on captures with no repeatable SIFT features where both COLMAP
+#     paths register almost nothing (proved 39 frames on the backyard).
+# To add a rung later: append its name here AND add a branch in
+# _sfm_stage_commands + an availability key in SFM_SOLVER_AVAILABILITY. Nothing
+# in the escalation loop hardcodes the number of rungs.
+SFM_ESCALATION = ["colmap", "glomap", "mast3r"]
+# Per-solver availability key in _engine_availability(). A solver is only a
+# valid escalation target when its key is truthy. "colmap" is always present
+# (validated by _plan_3d_job up front), so it has no gating key.
+SFM_SOLVER_AVAILABILITY = {
+    "glomap": "glomap_available",
+    "mast3r": "mast3r_available",
+}
 _JOB_ID_RE = re.compile(r"^splat_[0-9a-f]{6,32}$")
 
 for directory in (DATA_DIR, UPLOADS_DIR, DEFAULT_3D_ROOT, OUTPUTS_DIR / "4d"):
@@ -165,6 +213,21 @@ class SplatJob:
     stage_commands: dict[str, list[str]] = field(default_factory=dict)
     stages_planned: list[str] = field(default_factory=list)
     log_lines: deque[str] = field(default_factory=lambda: deque(maxlen=MAX_LOG_LINES))
+    # AUTO-FALLBACK solver escalation state. sfm_tried records every SfM solver
+    # this job has already run (seeded with the starting sfm_backend) so the
+    # gate never re-runs the same solver and the chain terminates. reroute_count
+    # caps total reroutes at len(SFM_ESCALATION) as a belt-and-suspenders guard
+    # against any infinite loop. sfm_context carries the plan-time inputs the
+    # gate needs to rebuild SfM stage commands for a different solver mid-run;
+    # it is only populated for escalation-eligible jobs (video / image-folder,
+    # NOT equirect / pre-processed-dataset).
+    sfm_tried: set[str] = field(default_factory=set)
+    reroute_count: int = 0
+    sfm_context: dict[str, Any] | None = None
+    # The original train request, kept so the gate can rebuild SfM stage commands
+    # for a fallback solver mid-run (it needs num_frames_target / images-per-
+    # equirect / crop-bottom). Only set for escalation-eligible jobs.
+    sfm_req: SplatTrainRequest | None = None
 
 
 JOBS: dict[str, SplatJob] = {}
@@ -319,6 +382,25 @@ def _colmap4_path() -> str | None:
     return None
 
 
+def _mast3r_availability() -> dict:
+    """Locate the MASt3R-SfM rung: its env python, runner, converter, and the
+    2.6GB checkpoint. All four must exist for "mast3r" to be a valid escalation
+    target. Each path is independently overridable via an env var so the runner
+    can be relocated without a code change."""
+    python = os.environ.get("SPLAT_MAST3R_PYTHON", "").strip() or str(MAST3R_ENV_PYTHON)
+    runner = os.environ.get("SPLAT_MAST3R_RUNNER", "").strip() or str(MAST3R_RUNNER)
+    converter = os.environ.get("SPLAT_MAST3R_CONVERTER", "").strip() or str(MAST3R_CONVERTER)
+    checkpoint = os.environ.get("SPLAT_MAST3R_CHECKPOINT", "").strip() or str(MAST3R_CHECKPOINT)
+    available = all(Path(p).is_file() for p in (python, runner, converter, checkpoint))
+    return {
+        "mast3r_available": available,
+        "mast3r_python": python,
+        "mast3r_runner": runner,
+        "mast3r_converter": converter,
+        "mast3r_checkpoint": checkpoint,
+    }
+
+
 _V360_CACHE: bool | None = None
 
 
@@ -373,6 +455,10 @@ def _engine_availability() -> dict:
         # COLMAP 4.x global-SfM backend (opt-in via sfm_backend="glomap").
         "glomap_available": bool(colmap4),
         "glomap_path": colmap4,
+        # MASt3R-SfM rung (strongest escalation target): env python + runner +
+        # converter + 2.6GB checkpoint. Spread into the dict so the gate sees
+        # mast3r_available / mast3r_* alongside the COLMAP keys.
+        **_mast3r_availability(),
         "ffmpeg_available": bool(ffmpeg),
         "ffmpeg_path": ffmpeg,
         # Insta360 .insv auto-stitch needs ffmpeg's v360 filter.
@@ -609,6 +695,7 @@ def _glomap_sfm_command(
     colmap4: str,
     ffmpeg: str,
     job_dir: Path,
+    processed_dir: Path,
     process_input: Path,
     is_video: bool,
     num_frames_target: int,
@@ -670,7 +757,12 @@ def _glomap_sfm_command(
         f'set -euo pipefail; '
         # rm the sparse dir first so a stale sparse/0 from an aborted prior run
         # can't satisfy the final test -f and feed nerfstudio a partial model.
-        f'rm -rf "{sparse_dir}"; mkdir -p "{img_dir}" "{sparse_dir}"; '
+        # ALSO rm processed_dir: on a colmap->glomap auto-fallback reroute the
+        # earlier colmap `process` already populated it (transforms.json + images/
+        # + images_2/4/8); ns-process-data does NOT guarantee a clean overwrite, so
+        # the A1 registration gate could otherwise measure a stale colmap/glomap
+        # mix. Mirrors the mast3r path's clear. (Fresh glomap-start jobs: no-op.)
+        f'rm -rf "{sparse_dir}" "{processed_dir}"; mkdir -p "{img_dir}" "{sparse_dir}"; '
         f'{ingest}; '
         f'"{colmap4}" feature_extractor '
         f'--database_path "{db_path}" --image_path "{img_dir}" '
@@ -693,8 +785,231 @@ def _glomap_sfm_command(
     return ["bash", "-c", script]
 
 
-def _plan_3d_job(req: SplatTrainRequest, availability: dict, job_dir: Path, input_path: Path) -> tuple[list[str], dict[str, list[str]]]:
-    """Build the ordered stage list and per-stage commands for a 3D job.
+def _mast3r_image_dir(job_dir: Path) -> Path:
+    """Frames MASt3R-SfM runs ViT inference on. For video we extract frames here
+    first; for an image folder we copy the originals in. The converter reads
+    THIS same dir as --src-images so its --image-mode resized/fullres logic sees
+    identical basenames to the model's image names."""
+    return job_dir / "mast3r" / "images"
+
+
+def _mast3r_sfm_command(
+    availability: dict,
+    ffmpeg: str,
+    job_dir: Path,
+    processed_dir: Path,
+    process_input: Path,
+    is_video: bool,
+    num_frames_target: int,
+) -> list[str]:
+    """One self-contained `bash -c` command for the MASt3R-SfM rung.
+
+    Runs, in order:
+      0. (video only) ffmpeg extracts ~num_frames_target evenly-spaced frames
+         into mast3r/images/. (image input: originals copied in as-is.)
+      1. run_mast3r_sfm.py  -> mast3r/out/{poses.npz, points3D.npz, ...}
+         (ViT-Large dense matching on the GPU; the heavy step.)
+      2. mast3r_to_nerfstudio.py  -> writes transforms.json + images/ +
+         sparse_pc.ply DIRECTLY into <processed_dir>, reproducing nerfstudio
+         1.1.5's colmap_to_json convention (verified to 4.4e-16). There is NO
+         ns-process-data call: the converter output IS the finished dataset, so
+         the downstream `train` stage consumes processed_dir unchanged.
+
+    GPU NOTE (reviewer flag): like the colmap/glomap process stages, the MASt3R
+    ViT inference here runs OUTSIDE gpu_arbiter.HEAVY_GPU_LOCK — only the `train`
+    stage takes that lock. This matches existing SfM-stage behavior; the run is
+    short and modest (~3.46GB peak VRAM measured), but it is NOT serialised
+    against TRELLIS inference. Consistent with colmap/glomap, flagged for review.
+    """
+    img_dir = _mast3r_image_dir(job_dir)
+    run_out = job_dir / "mast3r" / "out"
+
+    if is_video:
+        # Identical frame-extraction approach to the glomap path: stride-sample
+        # ~num_frames_target evenly-spaced frames so MASt3R and the converter
+        # both see one directory of identical basenames.
+        extract = (
+            f'ffmpeg -y -i "{process_input}" '
+            f'-vf "select=not(mod(n\\,$STRIDE))" -vsync vfr '
+            f'-q:v 2 "{img_dir}/frame_%05d.jpg"'
+        )
+        prelude = (
+            f'FFPROBE="$(dirname "{ffmpeg}")/ffprobe"; '
+            f'[ -x "$FFPROBE" ] || FFPROBE=ffprobe; '
+            f'TOTAL="$("$FFPROBE" -v error -count_frames -select_streams v:0 '
+            f'-show_entries stream=nb_read_frames -of csv=p=0 "{process_input}" 2>/dev/null)"; '
+            f'case "$TOTAL" in ""|*[!0-9]*) TOTAL=0;; esac; '
+            f'if [ "$TOTAL" -gt {num_frames_target} ]; then '
+            f'STRIDE=$(( TOTAL / {num_frames_target} )); else STRIDE=1; fi; '
+        )
+        ingest = prelude + extract
+    else:
+        ingest = (
+            f'shopt -s nullglob nocaseglob; '
+            f'for f in "{process_input}"/*.jpg "{process_input}"/*.jpeg '
+            f'"{process_input}"/*.png "{process_input}"/*.webp '
+            f'"{process_input}"/*.bmp "{process_input}"/*.tif "{process_input}"/*.tiff; '
+            f'do cp -n "$f" "{img_dir}/"; done'
+        )
+
+    script = (
+        f'set -euo pipefail; '
+        # Clear stale run output + the destination dataset so a partial dataset
+        # from an aborted prior run can't satisfy the downstream check.
+        f'rm -rf "{run_out}" "{processed_dir}"; '
+        f'mkdir -p "{img_dir}" "{run_out}"; '
+        f'{ingest}; '
+        # ViT-Large dense matching -> in-memory SparseGA -> poses.npz/points3D.npz.
+        f'"{availability["mast3r_python"]}" "{availability["mast3r_runner"]}" '
+        f'--images "{img_dir}" --out "{run_out}" '
+        f'--ckpt "{availability["mast3r_checkpoint"]}" '
+        f'--scene-graph {MAST3R_SCENE_GRAPH}; '
+        # Reproduce nerfstudio's colmap_to_json convention -> processed_dir.
+        f'"{availability["mast3r_python"]}" "{availability["mast3r_converter"]}" '
+        f'--mast3r-out "{run_out}" --src-images "{img_dir}" '
+        f'--out "{processed_dir}" --image-mode resized; '
+        # Assert the converter produced a usable Nerfstudio dataset so the stage
+        # fails loud (rather than letting the A1 gate / train choke downstream).
+        f'test -f "{processed_dir}/transforms.json"'
+    )
+    return ["bash", "-c", script]
+
+
+def _sfm_stage_commands(
+    solver: str,
+    req: SplatTrainRequest,
+    availability: dict,
+    job_dir: Path,
+    processed_dir: Path,
+    process_input: Path,
+    subcommand: str,
+    is_equirect: bool,
+) -> dict[str, list[str]]:
+    """Build the SfM pre-stage(s) + `process` command(s) for ONE solver.
+
+    Returns an ordered {stage_name: command} dict — e.g. for "colmap" just
+    {"process": [...]}, for "glomap" {"glomap_sfm": [...], "process": [...]}.
+    This is the single source of truth for SfM command construction so the
+    AUTO-FALLBACK gate can rebuild the stages for a different solver mid-run,
+    exactly as the planner builds them up front. To add a rung (MASt3R), add an
+    `elif solver == "mast3r":` branch here that emits its own pre-stage(s) + a
+    `process` that consumes the model — no other call site changes.
+    """
+    if solver == "glomap":
+        # COLMAP 4.x global SfM: we drive feature_extractor + sequential
+        # matching + global_mapper ourselves into <job_dir>/colmap/sparse/0,
+        # then ns-process-data reads that model via --skip-colmap.
+        glomap_sfm = _glomap_sfm_command(
+            colmap4=availability["glomap_path"],
+            ffmpeg=availability["ffmpeg_path"],
+            job_dir=job_dir,
+            processed_dir=processed_dir,
+            process_input=process_input,
+            is_video=(subcommand == "video"),
+            num_frames_target=req.num_frames_target,
+        )
+        process_cmd = [
+            availability["ns_process_data_path"],
+            "images",
+            "--data",
+            str(_colmap_image_dir(job_dir)),
+            "--output-dir",
+            str(processed_dir),
+            "--skip-colmap",
+            # --colmap-model-path is resolved RELATIVE to --output-dir.
+            "--colmap-model-path",
+            os.path.relpath(job_dir / "colmap" / "sparse" / "0", processed_dir),
+            "--num-downscales",
+            "3",
+        ]
+        return {"glomap_sfm": glomap_sfm, "process": process_cmd}
+
+    if solver == "mast3r":
+        # MASt3R-SfM rung. The `mast3r_sfm` stage runs the runner (ViT inference
+        # -> poses.npz/points3D.npz) AND the converter, which writes a finished
+        # Nerfstudio dataset (transforms.json + images/ + sparse_pc.ply) DIRECTLY
+        # into processed_dir — reproducing nerfstudio 1.1.5's colmap_to_json
+        # convention (verified to 4.4e-16), with NO ns-process-data call. The
+        # `process` stage is therefore a no-op assert: it re-confirms the dataset
+        # exists, then the existing A1 registration gate (which counts frames in
+        # processed_dir/transforms.json vs processed_dir/images) validates the
+        # mast3r result exactly as it does for colmap/glomap. If mast3r ALSO
+        # under-registers, the chain is exhausted (no rung after it) and the gate
+        # fails with guidance.
+        mast3r_sfm = _mast3r_sfm_command(
+            availability=availability,
+            ffmpeg=availability["ffmpeg_path"],
+            job_dir=job_dir,
+            processed_dir=processed_dir,
+            process_input=process_input,
+            is_video=(subcommand == "video"),
+            num_frames_target=req.num_frames_target,
+        )
+        # Cheap, env-independent guard so the registration gate has a `process`
+        # stage to run and gate on (the real work already happened in mast3r_sfm).
+        process_cmd = ["test", "-f", str(processed_dir / "transforms.json")]
+        return {"mast3r_sfm": mast3r_sfm, "process": process_cmd}
+
+    # solver == "colmap" (default): the validated COLMAP 3.11.1 incremental
+    # path nerfstudio drives through ns-process-data — byte-for-byte the
+    # original command. Reaching here with anything else is a programming error.
+    if solver != "colmap":
+        raise ValueError(f"Unknown SfM solver: {solver}")
+    process_cmd = [
+        availability["ns_process_data_path"],
+        subcommand,
+        "--data",
+        str(process_input),
+        "--output-dir",
+        str(processed_dir),
+    ]
+    if subcommand == "video":
+        process_cmd.extend(["--num-frames-target", str(req.num_frames_target)])
+        # Sequential matching (loop closure) chains temporally-ordered frames
+        # far better than the default unordered-collection vocab_tree. Skip for
+        # equirect: each frame fans out into N perspective views, not a sequence.
+        if not is_equirect:
+            process_cmd.extend(["--matching-method", "sequential"])
+    if is_equirect:
+        process_cmd.extend(
+            [
+                "--camera-type",
+                "equirectangular",
+                "--images-per-equirect",
+                str(req.images_per_equirect),
+                "--crop-bottom",
+                str(req.crop_bottom),
+            ]
+        )
+    return {"process": process_cmd}
+
+
+def _next_sfm_solver(tried: set[str], availability: dict) -> str | None:
+    """The next solver in SFM_ESCALATION that is AVAILABLE and not yet tried.
+
+    Walks the whole chain from the start (not from a fixed index) so it works
+    regardless of which rung the job started on, and so an unavailable rung is
+    transparently skipped to the next available one. Returns None when the
+    chain is exhausted.
+    """
+    for candidate in SFM_ESCALATION:
+        if candidate in tried:
+            continue
+        avail_key = SFM_SOLVER_AVAILABILITY.get(candidate)
+        if avail_key is not None and not availability.get(avail_key):
+            continue
+        return candidate
+    return None
+
+
+def _plan_3d_job(
+    req: SplatTrainRequest, availability: dict, job_dir: Path, input_path: Path
+) -> tuple[list[str], dict[str, list[str]], dict[str, Any] | None]:
+    """Build the ordered stage list, per-stage commands, and escalation context.
+
+    The third return value (sfm_context) is non-None only for escalation-eligible
+    inputs (video / image-folder, not equirect / pre-processed dataset); it carries
+    the inputs the runner's A1 gate needs to rebuild SfM stages for a fallback solver.
 
     Inputs already containing a Nerfstudio dataset (transforms.json) skip the
     ns-process-data stage and train directly on the input.
@@ -719,6 +1034,10 @@ def _plan_3d_job(req: SplatTrainRequest, availability: dict, job_dir: Path, inpu
     stages: list[str] = []
     commands: dict[str, list[str]] = {}
     processed_dir = job_dir / "processed"
+    # Escalation context, populated only for escalation-eligible inputs below.
+    # A pre-processed dataset (transforms.json) or equirect job leaves it None,
+    # so the runner's gate never reroutes those.
+    sfm_context: dict[str, Any] | None = None
 
     # Raw Insta360 .insv: stitch dual-fisheye -> equirectangular MP4 first, then
     # treat the result as a 360 video. Forces equirectangular semantics
@@ -754,89 +1073,54 @@ def _plan_3d_job(req: SplatTrainRequest, availability: dict, job_dir: Path, inpu
                 detail=f"Unsupported input: {input_path}. Provide an image directory, a video file, a raw Insta360 .insv, or a processed Nerfstudio dataset.",
             )
 
-        # OPT-IN global-SfM rescue (COLMAP 4.x global_mapper). Only engages when
-        # the operator asked for it, the colmap4 binary is present, and the input
-        # is a plain video or image folder — NOT equirectangular (each 360 frame
-        # fans out into N perspective views, not one temporal sequence) and NOT a
-        # pre-processed dataset (handled above). On any miss we fall through to the
-        # byte-for-byte unchanged default COLMAP 3.11.1 path below.
-        use_glomap = (
-            req.sfm_backend == "glomap"
-            and availability.get("glomap_available")
-            and not is_equirect
-            and subcommand in ("video", "images")
-        )
-        if use_glomap:
-            # Stage 1: drive COLMAP 4.x ourselves (feature_extractor + sequential
-            # matching + global_mapper) -> <job_dir>/colmap/sparse/0/*.bin.
-            commands["glomap_sfm"] = _glomap_sfm_command(
-                colmap4=availability["glomap_path"],
-                ffmpeg=availability["ffmpeg_path"],
-                job_dir=job_dir,
-                process_input=process_input,
-                is_video=(subcommand == "video"),
-                num_frames_target=req.num_frames_target,
-            )
-            stages.append("glomap_sfm")
-            # Stage 2: ns-process-data copies+downscales the same frames COLMAP
-            # solved (--data = the colmap image dir, identical basenames) and
-            # builds transforms.json from our model via --skip-colmap. It still
-            # generates images_2/4/8 downscales (num-downscales). The A1
-            # registration gate on this `process` stage then applies as normal.
-            process_cmd = [
-                availability["ns_process_data_path"],
-                "images",
-                "--data",
-                str(_colmap_image_dir(job_dir)),
-                "--output-dir",
-                str(processed_dir),
-                "--skip-colmap",
-                # --colmap-model-path is resolved RELATIVE to --output-dir by
-                # ns-process-data, so pass the relative path (verified: an
-                # absolute path resolves under processed/<abs> and fails).
-                "--colmap-model-path",
-                os.path.relpath(job_dir / "colmap" / "sparse" / "0", processed_dir),
-                "--num-downscales",
-                "3",
-            ]
-            stages.append("process")
-            commands["process"] = process_cmd
-            train_data = processed_dir
-        else:
-            process_cmd = [
-                availability["ns_process_data_path"],
-                subcommand,
-                "--data",
-                str(process_input),
-                "--output-dir",
-                str(processed_dir),
-            ]
-            if subcommand == "video":
-                process_cmd.extend(["--num-frames-target", str(req.num_frames_target)])
-                # Video frames are temporally ordered, so sequential matching (with
-                # loop closure) chains them far more reliably than COLMAP's default
-                # vocab_tree, which is built for UNORDERED photo collections and
-                # collapses on a moving walkthrough. On a real backyard clip this
-                # took registration from 2/311 -> 343/477 (165k points). Skip it for
-                # equirect: each frame fans out into N perspective images that are
-                # not one temporal sequence, so the 360 path keeps the default matcher.
-                if not is_equirect:
-                    process_cmd.extend(["--matching-method", "sequential"])
-            if is_equirect:
-                process_cmd.extend(
-                    [
-                        "--camera-type",
-                        "equirectangular",
-                        "--images-per-equirect",
-                        str(req.images_per_equirect),
-                        "--crop-bottom",
-                        str(req.crop_bottom),
-                    ]
-                )
-            stages.append("process")
-            commands["process"] = process_cmd
-            train_data = processed_dir
+        # SfM solver selection + AUTO-FALLBACK eligibility. The escalation chain
+        # only engages for plain video / image-folder inputs — NOT equirectangular
+        # (each 360 frame fans out into N perspective views, not one temporal
+        # sequence) and NOT a pre-processed dataset (handled above). For those
+        # excluded cases we run the requested solver once with no reroute.
+        escalation_eligible = (not is_equirect) and subcommand in ("video", "images")
 
+        # Resolve the starting solver. The requested sfm_backend is honored when
+        # available; an opt-in glomap that isn't actually present silently falls
+        # back to colmap (byte-for-byte the original behavior). MASt3R etc. slot
+        # in here automatically via SFM_SOLVER_AVAILABILITY.
+        start_solver = req.sfm_backend
+        avail_key = SFM_SOLVER_AVAILABILITY.get(start_solver)
+        if avail_key is not None and not availability.get(avail_key):
+            start_solver = "colmap"
+
+        sfm_cmds = _sfm_stage_commands(
+            solver=start_solver,
+            req=req,
+            availability=availability,
+            job_dir=job_dir,
+            processed_dir=processed_dir,
+            process_input=process_input,
+            subcommand=subcommand,
+            is_equirect=is_equirect,
+        )
+        for stage_name, cmd in sfm_cmds.items():
+            stages.append(stage_name)
+            commands[stage_name] = cmd
+        train_data = processed_dir
+
+        if escalation_eligible:
+            # Stash the plan-time inputs the runner's gate needs to rebuild SfM
+            # stage commands for a different solver mid-run. Paths are stringified
+            # so the context is plain JSON-friendly data on the live job handle.
+            sfm_context = {
+                "start_solver": start_solver,
+                "processed_dir": str(processed_dir),
+                "process_input": str(process_input),
+                "subcommand": subcommand,
+                "is_equirect": is_equirect,
+            }
+        else:
+            sfm_context = None
+
+    # train_data may point at the input dataset (skip-process branch) or
+    # processed_dir; in the escalation case the gate re-runs `process` into the
+    # same processed_dir, so train_data stays valid across a reroute.
     commands["train"] = [
         availability["ns_train_path"],
         "splatfacto",
@@ -859,7 +1143,7 @@ def _plan_3d_job(req: SplatTrainRequest, availability: dict, job_dir: Path, inpu
         # webopt: lightweight .ply for the shareable web viewer. Best-effort,
         # runs after compress, failure never fails the job.
         stages.append("webopt")
-    return stages, commands
+    return stages, commands, sfm_context
 
 
 # ---------------------------------------------------------------------------
@@ -910,12 +1194,18 @@ async def _run_stage(job: SplatJob, stage: str, command: list[str]) -> int:
     return return_code
 
 
-async def _run_train_stage(job: SplatJob, command: list[str]) -> int:
-    """Run the train stage under the cross-route heavy-GPU lock."""
+async def _run_locked_stage(job: SplatJob, stage: str, command: list[str], vram_mb: int) -> int:
+    """Run a heavy-GPU stage under the cross-route lock (gpu_arbiter.HEAVY_GPU_LOCK).
+
+    Used by `train` and the MASt3R-SfM rung. MASt3R loads a 2.6 GB ViT-Large and
+    does dense matching on the GPU (~3.46 GB peak measured), so — unlike the light
+    COLMAP/GLOMAP SfM stages — it MUST serialise against the portal's TRELLIS lane
+    on the shared 5090, or a concurrent TRELLIS run can OOM (or be OOM'd by) it.
+    """
     if gpu_arbiter.HEAVY_GPU_LOCK.locked():
         holder = gpu_arbiter.holder_info()
         job.log_lines.append(
-            f"[train] Waiting for GPU — currently held by {holder.get('lane')} job {holder.get('job_id')}."
+            f"[{stage}] Waiting for GPU — currently held by {holder.get('lane')} job {holder.get('job_id')}."
         )
         _flush_log(job)
     async with gpu_arbiter.HEAVY_GPU_LOCK:
@@ -923,14 +1213,101 @@ async def _run_train_stage(job: SplatJob, command: list[str]) -> int:
             return -1
         gpu_arbiter.set_holder("splat", job.job_id)
         try:
-            ok, msg = await gpu_arbiter.acquire_gpu(TRAIN_VRAM_MB)
-            job.log_lines.append(f"[train] GPU arbiter: {msg}")
+            ok, msg = await gpu_arbiter.acquire_gpu(vram_mb)
+            job.log_lines.append(f"[{stage}] GPU arbiter: {msg}")
             if not ok:
                 _patch_meta(job.job_id, error_message=f"GPU acquire failed: {msg}")
                 return -1
-            return await _run_stage(job, "train", command)
+            return await _run_stage(job, stage, command)
         finally:
             gpu_arbiter.clear_holder()
+
+
+async def _run_train_stage(job: SplatJob, command: list[str]) -> int:
+    """Run the train stage under the cross-route heavy-GPU lock."""
+    return await _run_locked_stage(job, "train", command, TRAIN_VRAM_MB)
+
+
+def _maybe_escalate_sfm(
+    job: SplatJob, process_index: int, registered: int, extracted: int, pct: str
+) -> bool:
+    """AUTO-FALLBACK: reroute a low-registration job to the next solver, in place.
+
+    Returns True iff it set up a reroute (caller should `continue` so the loop
+    re-reads job.stages_planned). Returns False when the job is not eligible or
+    the solver chain is exhausted (caller should fail with guidance).
+
+    Infinite-loop safety, in order:
+      - only escalation-eligible jobs reroute (sfm_context is set => video /
+        image-folder; equirect / pre-processed-dataset leave it None);
+      - reroute_count is capped at len(SFM_ESCALATION);
+      - the chosen solver is added to job.sfm_tried BEFORE rerouting, and
+        _next_sfm_solver skips anything already tried — so no solver runs twice.
+    """
+    ctx = job.sfm_context
+    if ctx is None:
+        # Equirect / pre-processed dataset: not eligible. Caller fails as before.
+        return False
+    if job.reroute_count >= len(SFM_ESCALATION):
+        # Hard cap: even if availability lies, never reroute more than there are
+        # rungs in the chain.
+        return False
+
+    availability = _engine_availability()
+    next_solver = _next_sfm_solver(job.sfm_tried, availability)
+    if next_solver is None:
+        # Chain exhausted: every available solver after the current one is tried.
+        return False
+
+    job.log_lines.append(
+        f"[process] only {pct} registered ({registered}/{extracted}) — "
+        f"auto-retrying with {next_solver}…"
+    )
+
+    # Mark tried + count the reroute BEFORE mutating state, so any later failure
+    # can never re-pick this solver.
+    job.sfm_tried.add(next_solver)
+    job.reroute_count += 1
+
+    # Rebuild the SfM stage(s) + a fresh `process` for the new solver, using the
+    # same plan-time inputs (paths rehydrated from the stashed context).
+    if job.sfm_req is None:
+        # Defensive: sfm_context implies sfm_req was set at plan time. If somehow
+        # not, fail safe (no reroute) rather than crash mid-pipeline.
+        return False
+    new_cmds = _sfm_stage_commands(
+        solver=next_solver,
+        req=job.sfm_req,
+        availability=availability,
+        job_dir=Path(job.output_dir),
+        processed_dir=Path(ctx["processed_dir"]),
+        process_input=Path(ctx["process_input"]),
+        subcommand=ctx["subcommand"],
+        is_equirect=ctx["is_equirect"],
+    )
+
+    # Rename the new solver's `process` to a unique "reprocess<n>" so
+    # stages_planned never holds two identical "process" entries — duplicate names
+    # collide React keys on the stage rail AND green BOTH process bars when the
+    # reroute's process completes. The gate dispatches any "reprocess*" name
+    # exactly like "process" (same A1 registration check).
+    reprocess_name = f"reprocess{job.reroute_count}"
+    new_cmds = {
+        (reprocess_name if name == "process" else name): cmd
+        for name, cmd in new_cmds.items()
+    }
+
+    # Register the new commands (the SfM pre-stage + the uniquely-named reprocess;
+    # the stale already-run process/glomap_sfm entries stay behind us in the loop).
+    job.stage_commands.update(new_cmds)
+
+    # Inject the new solver's stages immediately AFTER the current process stage
+    # so they run next, ahead of the unchanged train/export/compress/webopt tail.
+    new_stage_names = list(new_cmds.keys())
+    insert_at = process_index + 1
+    job.stages_planned[insert_at:insert_at] = new_stage_names
+    _patch_meta(job.job_id, stages_planned=job.stages_planned)
+    return True
 
 
 async def _run_pipeline(job: SplatJob) -> None:
@@ -940,7 +1317,13 @@ async def _run_pipeline(job: SplatJob) -> None:
     error_message: str | None = None
 
     try:
-        for stage in job.stages_planned:
+        # Index-aware iteration: the AUTO-FALLBACK gate may insert a fallback
+        # solver's SfM stage(s) + a fresh `process` into job.stages_planned
+        # *immediately after the current process stage* and then `continue`.
+        # enumerate over the live list reflects in-place insertions, so the very
+        # next loop step picks up the injected stages ahead of the unchanged
+        # train/export/... tail. stage_index gives the gate the insert anchor.
+        for stage_index, stage in enumerate(job.stages_planned):
             if job.stop_requested:
                 break
 
@@ -977,6 +1360,13 @@ async def _run_pipeline(job: SplatJob) -> None:
                 return_code = await _run_stage(job, stage, command)
             elif stage == "train":
                 return_code = await _run_train_stage(job, job.stage_commands["train"])
+            elif stage == "mast3r_sfm":
+                # MASt3R-SfM ViT inference is heavy GPU work — run it under the
+                # shared lock so it serialises against the portal's TRELLIS lane.
+                # (The light COLMAP/GLOMAP SfM stages stay lockless via `else`.)
+                return_code = await _run_locked_stage(
+                    job, stage, job.stage_commands[stage], MAST3R_VRAM_MB
+                )
             elif stage == "compress":
                 # Best-effort: compress the exported .ply into a viewer-native
                 # .spz. A missing tool or non-zero exit is logged and skipped —
@@ -1018,14 +1408,17 @@ async def _run_pipeline(job: SplatJob) -> None:
                 completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
                 _patch_meta(job.job_id, stages_completed=[*completed, stage])
                 continue
-            elif stage == "process":
+            elif stage == "process" or stage.startswith("reprocess"):
                 # Registration-quality gate. The process (COLMAP/SfM) stage
                 # extracts frames and solves camera poses; only the registered
                 # frames land in transforms.json. A doomed capture registers
                 # almost nothing — training it just burns ~10 min of GPU on
                 # garbage. So: run process as normal, then check the ratio and
                 # FAIL FAST with guidance before the train stage if it's too low.
-                return_code = await _run_stage(job, stage, job.stage_commands["process"])
+                # A "reprocess<n>" stage is an auto-fallback solver's process step
+                # (uniquely named so it never collides with the original "process"
+                # on the stage rail); it runs through the exact same gate.
+                return_code = await _run_stage(job, stage, job.stage_commands[stage])
                 if job.stop_requested:
                     break
                 if return_code != 0:
@@ -1062,12 +1455,25 @@ async def _run_pipeline(job: SplatJob) -> None:
                         f"[process] registration: {registered}/{extracted} frames ({pct})."
                     )
                     if ratio < MIN_REGISTRATION_RATIO:
+                        # AUTO-FALLBACK: try to climb the solver chain (zero
+                        # clicks) before giving up. _maybe_escalate_sfm rebuilds
+                        # the next solver's SfM stage(s), mutates stages_planned
+                        # to inject them ahead of the remaining train/export/...,
+                        # and returns True iff a reroute was set up. Eligibility,
+                        # infinite-loop safety (sfm_tried + reroute cap), and the
+                        # equirect/dataset exclusion all live inside it.
+                        if _maybe_escalate_sfm(job, stage_index, registered, extracted, pct):
+                            # Loop re-reads job.stages_planned from the top, which
+                            # now begins with the new solver's pre-stage(s) + a
+                            # fresh `process`. The current low-reg run is dropped.
+                            continue
                         final_status = "failed"
+                        tried_label = ", ".join(sorted(job.sfm_tried)) or "colmap"
                         error_message = (
                             f"Only {registered} of {extracted} frames registered ({pct}). "
                             "The capture likely has low texture, motion blur, or not enough "
-                            "overlap. Recapture with slow, heavily-overlapping sweeps of a "
-                            "smaller area — or retry (global-SfM rescue is being added). "
+                            f"overlap. Auto-fallback tried {tried_label}; recapture with slow, "
+                            "heavily-overlapping sweeps of a smaller area. "
                             "Training was skipped to save GPU time."
                         )
                         job.log_lines.append(error_message)
@@ -1465,7 +1871,7 @@ async def start_splat_training(request: Request, req: SplatTrainRequest):
 
     job_id = f"splat_{secrets.token_hex(5)}"
     job_dir = _job_dir(job_id)
-    stages, commands = _plan_3d_job(req, availability, job_dir, input_path)
+    stages, commands, sfm_context = _plan_3d_job(req, availability, job_dir, input_path)
 
     job = SplatJob(
         job_id=job_id,
@@ -1473,6 +1879,13 @@ async def start_splat_training(request: Request, req: SplatTrainRequest):
         input_path=str(input_path),
         stages_planned=stages,
         stage_commands=commands,
+        # Seed sfm_tried with the solver this job is actually starting on (the
+        # planner may have downgraded an unavailable glomap request to colmap),
+        # not the raw requested backend — so the gate's "not yet tried" check is
+        # honest about what really ran. sfm_context carries the rebuild inputs.
+        sfm_tried={sfm_context["start_solver"]} if sfm_context else set(),
+        sfm_context=sfm_context,
+        sfm_req=req if sfm_context else None,
     )
 
     async with JOBS_LOCK:

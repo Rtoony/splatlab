@@ -35,6 +35,8 @@ const STAGE_ORDER = ["stitch", "process", "train", "export", "compress", "webopt
 const STAGE_HUMAN: Record<string, string> = {
   stitch: "Unwrapping 360 footage",
   process: "Finding camera positions",
+  glomap_sfm: "Re-solving with global SfM",
+  mast3r_sfm: "Re-solving with MASt3R (pose-free)",
   train: "Building the 3D scene",
   export: "Finishing the scene",
   compress: "Compressing",
@@ -43,11 +45,21 @@ const STAGE_HUMAN: Record<string, string> = {
 const STAGE_SHORT: Record<string, string> = {
   stitch: "Stitch",
   process: "Process",
+  glomap_sfm: "Global SfM",
+  mast3r_sfm: "MASt3R",
   train: "Train",
   export: "Export",
   compress: "Compress",
   webopt: "Web",
 };
+// An auto-fallback solver's process step is named "reprocess<n>" on the backend so
+// it never collides with the original "process" stage key — label it like Process.
+function stageShort(s: string): string {
+  return STAGE_SHORT[s] || (s.startsWith("reprocess") ? "Process" : s);
+}
+function stageHuman(s: string): string {
+  return STAGE_HUMAN[s] || (s.startsWith("reprocess") ? "Finding camera positions" : s);
+}
 const QUALITY = {
   draft: { label: "Draft", iterations: 7000, blurb: "~2 min" },
   standard: { label: "Standard", iterations: 30000, blurb: "~6 min" },
@@ -57,7 +69,7 @@ type QualityKey = keyof typeof QUALITY;
 
 function humanizeStage(job: SplatJob): string {
   if (job.status === "starting") return "Getting started…";
-  return job.stage ? STAGE_HUMAN[job.stage] || job.stage : "Working…";
+  return job.stage ? stageHuman(job.stage) : "Working…";
 }
 function relTime(value: string | null): string {
   if (!value) return "—";
@@ -564,7 +576,7 @@ function StageRail({ job }: { job: SplatJob }) {
                 isDone ? "text-emerald-300/80" : isCurrent ? "text-cyan-200" : "text-zinc-600"
               }`}
             >
-              {STAGE_SHORT[s] || s}
+              {stageShort(s)}
             </span>
           </div>
         );

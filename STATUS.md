@@ -133,9 +133,33 @@ Extract Splat Lab from the Nexus portal into its own standalone app at
       PROVEN end-to-end: global_mapper 311/311 on backyard (vs 2); nerfstudio 1.1.5
       reads the 4.x model → transforms.json 311 frames; 4.x renamed the GPU flags
       (SiftExtraction→FeatureExtraction.use_gpu, SiftMatching→FeatureMatching.use_gpu).
-- [ ] Phase B (pose-free MASt3R-SfM fallback) — PROVEN FEASIBLE on the 5090 (spike:
-      40 poses, 4.3GB VRAM, ~2min, CC-BY-NC-SA, curope optional so no custom-CUDA build).
-      NOT wired. Next: the transforms.json converter (NAVER's demo_glomap export is
-      undertested) + auto-reroute from the gate when global-SfM also fails.
-- [ ] Nice-to-have: make global-SfM the auto-fallback (gate detects low reg → auto
-      retry glomap → if still bad, MASt3R) for true zero-click "just works".
+- [x] **AUTO-FALLBACK (zero-click "just works")** — the A1 gate no longer just fails
+      on low reg: it climbs the solver chain `SFM_ESCALATION = [colmap, glomap, mast3r]`
+      automatically. `_maybe_escalate_sfm` rebuilds the next available solver's SfM
+      pre-stage + a uniquely-named `reprocess<n>` and injects them into the live
+      stages_planned ahead of train; the loop (enumerate over the live list) picks them
+      up next. Only fails the job with guidance once the chain is exhausted. Manual
+      "Retry with global SfM" button preserved; default COLMAP success path byte-for-byte
+      unchanged (verified: colmap planner emits only `['process']`, no `--skip-colmap`).
+      Loop-safety (no solver twice via sfm_tried; reroute cap = len(chain); equirect/
+      dataset excluded via sfm_context=None) — 22/22 unit checks PASS.
+- [x] **Phase B (pose-free MASt3R-SfM fallback) — WIRED & TESTED.** Terminal rung of the
+      chain. `mast3r_sfm` stage runs the runner (`~/tools/mast3r-spike/run_mast3r_sfm.py`,
+      ViT-Large dense matching → poses.npz/points3D.npz) then a DIRECT converter
+      (`mast3r_to_nerfstudio.py`) that reproduces nerfstudio 1.1.5's colmap_to_json
+      convention (proven identical to 4.4e-16) → writes transforms.json + images/ +
+      sparse_pc.ply straight into processed_dir (NO ns-process-data). END-TO-END TESTED:
+      39 backyard frames → 39/39 finite poses, 88.6s, 3.46GB peak → converter → full
+      ns-train splatfacto 100-iter smoke EXIT=0 (seeded from the MASt3R ply, random_init=
+      False). Coordinate gotcha handled (OpenCV c2w → OpenGL; world permute; applied_
+      transform on the cloud too). 4 path constants env-overridable; `mast3r_available`
+      True only if all 4 (env python + runner + converter + 2.6GB ckpt) exist —
+      VERIFIED live True. **DEP: conda env `mast3r-spike` + checkpoint (2.6GB) at
+      ~/tools/mast3r-spike/. CC-BY-NC-SA (non-commercial).**
+- Review fixes folded in before commit (3-issue adversarial pass): (#1, ship-blocker)
+  glomap `process` now `rm -rf processed_dir` so a colmap→glomap reroute can't measure
+  a stale colmap/glomap mix; (#4) `mast3r_sfm` runs under HEAVY_GPU_LOCK (6GB reserve)
+  so its ViT can't OOM the portal's TRELLIS lane (light colmap/glomap SfM stay lockless);
+  (#3) reroute process uniquely named `reprocess<n>` → no duplicate stage-rail key / no
+  false double-green. Review CONFIRMED safe: infinite-loop guards, mid-run list mutation,
+  no false-escalation of good captures, default path + manual button intact.
