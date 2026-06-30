@@ -114,3 +114,28 @@ Extract Splat Lab from the Nexus portal into its own standalone app at
 - Reuse PORTAL_TOKEN; pull via vault (nexus-svc-inject), never write to disk.
 - PROCESS MGMT: never broad-pkill `uvicorn backend.main:app` — many Nexus apps
   share that cmdline (nexus-vicinity :3404, etc.). Kill by exact port/cmdline only.
+
+## CAPTURE RELIABILITY — "every capture just works" (2026-06-30, commit e560c41)
+- [x] A1 registration GATE: splat_route.py — after `process`, ratio = registered
+      (transforms.json frames) / extracted (processed/images); < MIN_REGISTRATION_RATIO
+      (0.30) → fail fast pre-train with an actionable message (no GPU wasted).
+      Additive/reversible/parse-safe; default COLMAP path byte-for-byte unchanged.
+      Frontend: amber failure card surfaces the message + a "Retry with global SfM" button.
+      VERIFIED fires on backyard (2/311=0.6%), passes good jobs (128/128).
+- [x] A3 global-SfM rescue: opt-in `sfm_backend="glomap"` → glomap_sfm stage runs
+      COLMAP 4.x feature_extractor + sequential_matcher + global_mapper, then
+      ns-process-data --skip-colmap --colmap-model-path ../colmap/sparse/0 (RELATIVE).
+      **DEP: conda env `colmap4` = COLMAP 4.1.0 built from source (CUDA 12.8, sm_120,
+      -DCMAKE_CUDA_ARCHITECTURES=120). Binary: ~/miniconda3/envs/colmap4/bin/colmap.
+      ISOLATED — the working `colmap` (3.11.1) + `splatops` envs are untouched.**
+      Build needed 4 patches (CHOLMOD target, glog version macros, cuda_runtime.h
+      include, Eigen config-mode) — see workflow output if rebuilding.
+      PROVEN end-to-end: global_mapper 311/311 on backyard (vs 2); nerfstudio 1.1.5
+      reads the 4.x model → transforms.json 311 frames; 4.x renamed the GPU flags
+      (SiftExtraction→FeatureExtraction.use_gpu, SiftMatching→FeatureMatching.use_gpu).
+- [ ] Phase B (pose-free MASt3R-SfM fallback) — PROVEN FEASIBLE on the 5090 (spike:
+      40 poses, 4.3GB VRAM, ~2min, CC-BY-NC-SA, curope optional so no custom-CUDA build).
+      NOT wired. Next: the transforms.json converter (NAVER's demo_glomap export is
+      undertested) + auto-reroute from the gate when global-SfM also fails.
+- [ ] Nice-to-have: make global-SfM the auto-fallback (gate detects low reg → auto
+      retry glomap → if still bad, MASt3R) for true zero-click "just works".
