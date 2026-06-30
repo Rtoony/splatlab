@@ -1505,18 +1505,24 @@ async def _run_pipeline(job: SplatJob) -> None:
                 # wrapper runs the sam2 + langfield-spike passes back-to-back so TRELLIS
                 # can't wedge between them). A missing config or non-zero exit is logged
                 # and skipped — it NEVER fails the splat job; the splat is already done.
-                config_path = _find_latest_config(job_dir)
-                if config_path is None or not _langfield_available():
-                    job.log_lines.append("[langfield] skipped (no config or toolchain unavailable).")
-                else:
-                    lfdir = job_dir / LANGFIELD_DIRNAME
-                    lfdir.mkdir(parents=True, exist_ok=True)
-                    command = ["bash", str(LANGFIELD_RUNNER), str(config_path), str(lfdir)]
-                    rc = await _run_locked_stage(job, stage, command, LANGFIELD_VRAM_MB)
-                    if rc != 0:
-                        job.log_lines.append(
-                            "[langfield] build failed; the splat is unaffected (no language search for this scene)."
-                        )
+                # The whole body is wrapped so even an OSError (mkdir / config read /
+                # arbiter) is logged, not propagated — provably cannot flip the job to
+                # failed (one step beyond the compress/webopt best-effort precedent).
+                try:
+                    config_path = _find_latest_config(job_dir)
+                    if config_path is None or not _langfield_available():
+                        job.log_lines.append("[langfield] skipped (no config or toolchain unavailable).")
+                    else:
+                        lfdir = job_dir / LANGFIELD_DIRNAME
+                        lfdir.mkdir(parents=True, exist_ok=True)
+                        command = ["bash", str(LANGFIELD_RUNNER), str(config_path), str(lfdir)]
+                        rc = await _run_locked_stage(job, stage, command, LANGFIELD_VRAM_MB)
+                        if rc != 0:
+                            job.log_lines.append(
+                                "[langfield] build failed; the splat is unaffected (no language search for this scene)."
+                            )
+                except Exception as exc:  # noqa: BLE001 — best-effort: never fail the splat
+                    job.log_lines.append(f"[langfield] skipped (build error: {exc}); the splat is unaffected.")
                 completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
                 _patch_meta(job.job_id, stages_completed=[*completed, stage])
                 continue

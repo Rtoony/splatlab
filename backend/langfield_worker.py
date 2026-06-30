@@ -147,6 +147,10 @@ class Scene:
         self.config_path = config_path
         self.lfdir = lfdir
         self.last_used = time.monotonic()
+        # refcount of in-flight queries holding this scene; the idle-evictor must
+        # NOT free a scene that is mid-query (e.g. waiting on HEAVY_GPU_LOCK behind a
+        # long training run, which can exceed IDLE_EVICT_SEC).
+        self.in_use = 0
 
         config_p = Path(config_path)
         lf_p = Path(lfdir)
@@ -239,7 +243,7 @@ class WorkerState:
         dropped = []
         for key in list(self.scenes.keys()):
             sc = self.scenes[key]
-            if now - sc.last_used >= IDLE_EVICT_SEC:
+            if sc.in_use <= 0 and now - sc.last_used >= IDLE_EVICT_SEC:
                 self.scenes.pop(key)
                 sc.free()
                 dropped.append(key)
@@ -382,14 +386,21 @@ async def query(req: QueryReq) -> dict[str, Any]:
             STATE.insert_scene(sc)
         else:
             sc.touch()
+        sc.in_use += 1   # pin: the idle-evictor must not free us mid-query
 
-    views = req.views if req.views else _default_views(sc.n_cams)
-    # clamp/validate view indices against the resident camera count
-    views = [v for v in views if 0 <= int(v) < sc.n_cams] or _default_views(sc.n_cams)
+    try:
+        views = req.views if req.views else _default_views(sc.n_cams)
+        # clamp/validate view indices against the resident camera count
+        views = [v for v in views if 0 <= int(v) < sc.n_cams] or _default_views(sc.n_cams)
 
-    # ── render: heavy lock ONLY around the gsplat calls ──
-    scene_id = Path(req.lfdir).name or req.config
-    heatmap_name = await _render_locked(sc, req.text, views, scene_id)
+        # ── render: heavy lock ONLY around the gsplat calls ──
+        scene_id = Path(req.lfdir).name or req.config
+        sc.touch()   # refresh right before the (possibly long) lock wait behind train
+        heatmap_name = await _render_locked(sc, req.text, views, scene_id)
+    finally:
+        async with STATE.lock:
+            sc.in_use -= 1
+            sc.touch()
     return {"heatmap_name": heatmap_name, "ready": True}
 
 
