@@ -109,6 +109,22 @@ TRAIN_VRAM_MB = 16_000
 # MASt3R-SfM ViT-Large inference peaks ~3.46 GB measured; reserve headroom so the
 # arbiter frees enough before the heavy step (it serialises against TRELLIS).
 MAST3R_VRAM_MB = 6_000
+# ── Language Field (opt-in, additive) ────────────────────────────────────────────
+# Text-searchable splats: SAM 2.1 masks + SigLIP 2 region features lifted onto the
+# trained gaussians (training-free). ALL heavy work is SUBPROCESSED into the
+# langfield-spike / sam2 conda envs by absolute path — NOTHING is added to splatlab's
+# own venv (the proven MASt3R/colmap pattern). The build is a BEST-EFFORT post-train
+# stage (modelled on compress/webopt): a failure logs + continues, never fails the
+# splat job. Pinned scripts live in backend/langfield/ (not the scratch ~/tools dir).
+LANGFIELD_DIR = Path(__file__).resolve().parent / "langfield"
+LANGFIELD_RUNNER = LANGFIELD_DIR / "run_langfield.sh"
+LANGFIELD_QUERY_SCRIPT = LANGFIELD_DIR / "query_render_v2.py"
+LANGFIELD_ENV_PYTHON = Path.home() / "miniconda3" / "envs" / "langfield-spike" / "bin" / "python"
+SAM2_ENV_PYTHON = Path.home() / "miniconda3" / "envs" / "sam2" / "bin" / "python"
+LANGFIELD_DIRNAME = "_langfield"          # per-job artifact dir (sibling of _preview)
+LANGFIELD_VRAM_MB = 10_000                # SAM2.1 ~5GB + SigLIP2 ~2.3GB + gsplat render
+QUERY_VRAM_MB = 4_000                     # per-query render reserve (lock held ~ms)
+LANGFIELD_WORKER_URL = os.environ.get("SPLAT_LANGFIELD_WORKER_URL", "http://127.0.0.1:3417")
 KEEP_UNPINNED_COMPLETED = 10
 FAILED_RETENTION_HOURS = 24
 PREVIEW_DIRNAME = "_preview"
@@ -197,6 +213,10 @@ class SplatTrainRequest(BaseModel):
     # pre-processed dataset, not equirectangular — for now); otherwise it falls
     # back to the default path silently.
     sfm_backend: Literal["colmap", "glomap"] = "colmap"
+    # OPT-IN: build a text-searchable language field after training (SAM 2.1 +
+    # SigLIP 2, training-free lift). Default off → the pipeline is byte-identical.
+    # Best-effort: a build failure never fails the splat job.
+    language_field: bool = False
 
 
 @dataclass
@@ -401,6 +421,15 @@ def _mast3r_availability() -> dict:
     }
 
 
+def _langfield_available() -> bool:
+    """True iff the Language-Field toolchain is present: the build wrapper + both
+    conda-env pythons (langfield-spike = SigLIP+lift, sam2 = masks). The heavy deps
+    live in those envs; splatlab's own venv is never touched."""
+    lf_py = os.environ.get("SPLAT_LANGFIELD_PYTHON", "").strip() or str(LANGFIELD_ENV_PYTHON)
+    sam_py = os.environ.get("SPLAT_SAM2_PYTHON", "").strip() or str(SAM2_ENV_PYTHON)
+    return all(Path(p).is_file() for p in (LANGFIELD_RUNNER, lf_py, sam_py))
+
+
 _V360_CACHE: bool | None = None
 
 
@@ -459,6 +488,8 @@ def _engine_availability() -> dict:
         # converter + 2.6GB checkpoint. Spread into the dict so the gate sees
         # mast3r_available / mast3r_* alongside the COLMAP keys.
         **_mast3r_availability(),
+        # Language Field (opt-in): SAM 2.1 + SigLIP 2 toolchain present?
+        "langfield_available": _langfield_available(),
         "ffmpeg_available": bool(ffmpeg),
         "ffmpeg_path": ffmpeg,
         # Insta360 .insv auto-stitch needs ffmpeg's v360 filter.
@@ -643,6 +674,9 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
         # Lightweight copy for the shareable /splat/view page; fmt=web falls back
         # to the raw .ply server-side, so this is offered whenever a preview exists.
         "preview_web_url": f"/api/splat/jobs/{job_id}/preview/file?fmt=web" if preview_file.is_file() else None,
+        # Opt-in language field: a built per-gaussian feature sidecar exists -> the
+        # scene is text-searchable (the viewer shows the query UI when this is true).
+        "langfield_available": (output_dir / LANGFIELD_DIRNAME / "gauss_emb.npz").is_file(),
     }
 
 
@@ -1143,6 +1177,11 @@ def _plan_3d_job(
         # webopt: lightweight .ply for the shareable web viewer. Best-effort,
         # runs after compress, failure never fails the job.
         stages.append("webopt")
+    # OPT-IN language field, appended OUTSIDE the splat-transform guard (it needs
+    # only the nerfstudio checkpoint, not compress/webopt). Runs DEAD LAST; the
+    # runner builds its command from the job dir at stage time (like export).
+    if req.language_field and _langfield_available():
+        stages.append("langfield")
     return stages, commands, sfm_context
 
 
@@ -1405,6 +1444,28 @@ async def _run_pipeline(job: SplatJob) -> None:
                         job.log_lines.append("[webopt] web-optimized .ply failed; viewer falls back to the raw .ply.")
                 else:
                     job.log_lines.append("[webopt] skipped (tool or .ply unavailable).")
+                completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
+                _patch_meta(job.job_id, stages_completed=[*completed, stage])
+                continue
+            elif stage == "langfield":
+                # Best-effort OPT-IN: build the text-searchable language field (SAM 2.1
+                # masks + SigLIP 2 region features, training-free lift). Heavy GPU work,
+                # so it takes HEAVY_GPU_LOCK ONCE around the whole ~7-min build (the
+                # wrapper runs the sam2 + langfield-spike passes back-to-back so TRELLIS
+                # can't wedge between them). A missing config or non-zero exit is logged
+                # and skipped — it NEVER fails the splat job; the splat is already done.
+                config_path = _find_latest_config(job_dir)
+                if config_path is None or not _langfield_available():
+                    job.log_lines.append("[langfield] skipped (no config or toolchain unavailable).")
+                else:
+                    lfdir = job_dir / LANGFIELD_DIRNAME
+                    lfdir.mkdir(parents=True, exist_ok=True)
+                    command = ["bash", str(LANGFIELD_RUNNER), str(config_path), str(lfdir)]
+                    rc = await _run_locked_stage(job, stage, command, LANGFIELD_VRAM_MB)
+                    if rc != 0:
+                        job.log_lines.append(
+                            "[langfield] build failed; the splat is unaffected (no language search for this scene)."
+                        )
                 completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
                 _patch_meta(job.job_id, stages_completed=[*completed, stage])
                 continue
