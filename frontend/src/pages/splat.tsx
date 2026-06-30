@@ -646,14 +646,24 @@ function SceneCard({
 
       <button onClick={onFeature} className="block w-full text-left">
         <div
-          className="mb-2 flex aspect-video items-center justify-center rounded-xl border border-white/10"
+          className="relative mb-2 flex aspect-video items-center justify-center overflow-hidden rounded-xl border border-white/10"
           style={{
-            // deterministic per-scene tint so cards are distinguishable (real
-            // splat thumbnails deferred — needs a preserveDrawingBuffer renderer)
+            // per-scene tint shows through while the thumbnail loads / if missing
             background: `linear-gradient(135deg, hsl(${sceneHue(job.job_id)} 55% 13%), hsl(${(sceneHue(job.job_id) + 45) % 360} 50% 8%))`,
           }}
         >
-          <Orbit className="h-7 w-7" style={{ color: `hsl(${sceneHue(job.job_id)} 70% 62% / 0.55)` }} />
+          <Orbit className="absolute h-7 w-7" style={{ color: `hsl(${sceneHue(job.job_id)} 70% 62% / 0.55)` }} />
+          {job.preview_available && (
+            <img
+              src={`/api/splat/jobs/${job.job_id}/thumbnail`}
+              alt=""
+              loading="lazy"
+              className="relative h-full w-full object-cover"
+              onError={(e) => {
+                (e.currentTarget as HTMLImageElement).style.display = "none";
+              }}
+            />
+          )}
         </div>
         <p className="truncate text-sm font-medium text-zinc-100">{job.input_path.split("/").pop()}</p>
         <div className="mt-1 flex items-center gap-2 text-[11px] text-zinc-500">

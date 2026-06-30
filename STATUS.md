@@ -89,12 +89,13 @@ Extract Splat Lab from the Nexus portal into its own standalone app at
 - [x] Cleanups: smoke scene splat_bf25300429 deleted; Launch Bay deduped (portal
       commit ecc8e13: projects.py hides superseded "splat", canonical card ->
       splatlab); redis declared in portal pyproject.
-- [ ] Real gallery thumbnails — STILL DEFERRED. Two dead-ends: splat-transform .webp
-      GPU rasterizer too slow/hung headless; a plain canvas.toDataURL() returns blank
-      without preserveDrawingBuffer. PATH: pass a custom THREE.WebGLRenderer with
-      {preserveDrawingBuffer:true} to the mkkellogg Viewer, capture after first
-      render, cache the dataURL per job_id in localStorage. Risks the shared viewer,
-      so left for a focused (non-autonomous) session.
+- [x] Real gallery thumbnails — DONE (different approach than the deferred ones).
+      `backend/thumb.py`: a point-cloud projection of the splat's .ply, sampled by
+      SEEKING (CPU-only, ~50ms even on millions of points), colored by SH-DC, drawn
+      with Pillow, cached to _preview/thumb.webp. Endpoint GET /api/splat/jobs/{id}/
+      thumbnail (auth-gated, off-thread). SceneCard shows it with the per-scene
+      gradient+icon as the fallback (scenes without web.ply). Pillow added to venv +
+      requirements. (Avoided the GPU-rasterizer / preserveDrawingBuffer paths.)
 - [ ] Optional: delete portal dormant splat.py + splat*.tsx (harmless dead code,
       cross-referenced — risky to remove unattended).
 - [ ] optional cleanup: delete the portal's now-dormant splat.py + splat*.tsx;

@@ -10,6 +10,7 @@ proxied calls inject the portal bearer server-side (never sent to the browser).
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import hmac
@@ -27,6 +28,7 @@ from starlette.background import BackgroundTask
 # Make the ported splat route + its local gpu_arbiter / operator_audit importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import splat_route  # noqa: E402  (imports gpu_arbiter + operator_audit from this dir)
+import thumb as thumbgen  # noqa: E402  (scene thumbnail generator)
 
 PORTAL_ORIGIN = os.environ.get("SPLATLAB_PORTAL_ORIGIN", "http://127.0.0.1:3300").rstrip("/")
 PORTAL_TOKEN = os.environ.get("PORTAL_TOKEN", "")
@@ -153,6 +155,21 @@ def require_auth(request: Request) -> None:
 
 # /api/splat is now OWNED here (the ported pipeline), gated by splatlab auth.
 app.include_router(splat_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
+
+
+@app.get("/api/splat/jobs/{job_id}/thumbnail", dependencies=[Depends(require_auth)])
+async def splat_thumbnail(job_id: str):
+    if not splat_route._safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="not found")
+    meta = splat_route._read_meta(job_id)
+    output_dir = (
+        Path(meta["output_dir"]) if meta and meta.get("output_dir") else splat_route.DEFAULT_3D_ROOT / job_id
+    )
+    preview_dir = output_dir / splat_route.PREVIEW_DIRNAME
+    thumb = await asyncio.to_thread(thumbgen.get_or_make, preview_dir)
+    if thumb is None:
+        raise HTTPException(status_code=404, detail="thumbnail unavailable")
+    return FileResponse(str(thumb), media_type="image/webp")
 
 
 @app.api_route("/supersplat/{path:path}", methods=["GET"])
