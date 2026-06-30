@@ -91,6 +91,8 @@ export default function SplatLabPage() {
   const [iters, setIters] = useState<number>(QUALITY.standard.iterations);
   const [showCustom, setShowCustom] = useState(false);
   const [toast, setToast] = useState<{ msg: string; bad?: boolean } | null>(null);
+  // Dismissed failed-job notice (by job_id) so a newer failure still shows.
+  const [dismissedFailed, setDismissedFailed] = useState<string | null>(null);
 
   const { data: status } = useQuery({
     queryKey: ["status"],
@@ -106,6 +108,14 @@ export default function SplatLabPage() {
   const jobs = status?.jobs ?? [];
   const activeJob = jobs.find((j) => j.status === "running" || j.status === "starting") || null;
   const completed = jobs.filter((j) => j.status === "completed");
+  // Newest failed job (with a guidance message) so a doomed capture's
+  // "why it failed + what to do" surfaces in the Simple UI instead of
+  // vanishing silently. Sorted by completed_at (fallback created_at) desc.
+  const latestFailed = jobs
+    .filter((j) => j.status === "failed" && !!j.error_message)
+    .sort((a, b) =>
+      (b.completed_at ?? b.created_at).localeCompare(a.completed_at ?? a.created_at),
+    )[0] ?? null;
   const gpu = status?.gpu;
   const engineReady = Boolean(status?.engines?.ns_train_available && status?.engines?.colmap_available);
 
@@ -179,6 +189,24 @@ export default function SplatLabPage() {
       max_num_iterations: Math.min(MAX_ITERS, Math.round(base * multiplier)),
     });
   }
+
+  // Re-run a failed capture with COLMAP 4.x global SfM, which registers far more
+  // frames on the low-overlap captures incremental COLMAP gives up on.
+  function retryGlomap(job: SplatJob) {
+    if (activeJob) {
+      flash("A scene is already building — wait for it to finish.", true);
+      return;
+    }
+    startMutation.mutate({
+      mode: "3d",
+      input_path: job.input_path,
+      output_dir: "outputs/3d",
+      capture_format: job.capture_format,
+      max_num_iterations: job.max_num_iterations || QUALITY.standard.iterations,
+      sfm_backend: "glomap",
+    });
+  }
+  const glomapAvailable = Boolean(status?.engines?.glomap_available);
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
@@ -329,10 +357,43 @@ export default function SplatLabPage() {
           {activeJob ? (
             <ActiveJobPanel job={activeJob} onStop={() => stopMutation.mutate(activeJob.job_id)} stopping={stopMutation.isPending} />
           ) : (
-            <Card className="flex h-[200px] flex-col items-center justify-center p-6 text-center">
-              <Box className="mb-2 h-7 w-7 text-zinc-600" />
-              <p className="text-sm text-zinc-400">Your scene will build here. Pick a file and press Create.</p>
-            </Card>
+            <>
+              {latestFailed && dismissedFailed !== latestFailed.job_id && (
+                <Card className="relative border-amber-500/40 bg-amber-500/10 p-4">
+                  <button
+                    type="button"
+                    aria-label="Dismiss"
+                    onClick={() => setDismissedFailed(latestFailed.job_id)}
+                    className="absolute right-3 top-3 text-amber-300/70 transition hover:text-amber-200"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                  <div className="flex items-start gap-3 pr-6">
+                    <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-300" />
+                    <div className="space-y-1">
+                      <p className="text-sm font-semibold text-amber-100">
+                        Scene couldn’t be built — {latestFailed.input_path.split("/").pop()}
+                      </p>
+                      <p className="text-sm text-amber-200/90">{latestFailed.error_message}</p>
+                      {glomapAvailable && (
+                        <div className="pt-1.5">
+                          <Button size="sm" disabled={!!activeJob} onClick={() => retryGlomap(latestFailed)}>
+                            <RefreshCw className="h-3.5 w-3.5" /> Retry with global SfM
+                          </Button>
+                          <p className="mt-1 text-[11px] text-amber-200/60">
+                            Re-registers the same footage with a stronger solver — rescues most low-overlap captures.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </Card>
+              )}
+              <Card className="flex h-[200px] flex-col items-center justify-center p-6 text-center">
+                <Box className="mb-2 h-7 w-7 text-zinc-600" />
+                <p className="text-sm text-zinc-400">Your scene will build here. Pick a file and press Create.</p>
+              </Card>
+            </>
           )}
         </div>
       </div>
@@ -743,6 +804,4 @@ function DownloadMenu({ job }: { job: SplatJob }) {
 }
 
 // keep lint happy about imported icons reserved for near-term use
-void AlertTriangle;
 void Sparkles;
-void X;

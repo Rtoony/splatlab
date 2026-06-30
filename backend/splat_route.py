@@ -67,6 +67,13 @@ CONDA_ENV_BIN = Path.home() / "miniconda3" / "envs" / "splatops" / "bin"
 # gsplat kernel compilation. Must stay 3.11.x — colmap 4.x renamed CLI flags
 # nerfstudio 1.1.5 depends on.
 COLMAP_ENV_BIN = Path.home() / "miniconda3" / "envs" / "colmap" / "bin"
+# COLMAP 4.x lives in its OWN env (colmap4), kept apart from the 3.11.x env
+# above precisely because 4.x renamed CLI flags nerfstudio's incremental driver
+# depends on. We never let ns-process-data call this binary; the glomap backend
+# drives it directly (feature_extractor / sequential_matcher / global_mapper),
+# then hands the resulting sparse model to ns-process-data via --skip-colmap.
+# global_mapper (global SfM) registers far more frames on low-overlap captures.
+COLMAP4_BIN = Path.home() / "miniconda3" / "envs" / "colmap4" / "bin" / "colmap"
 # splat-transform (PlayCanvas, MIT) ships in the self-hosted SuperSplat
 # checkout. Used to compress the raw export into a .spz the in-page viewer
 # loads ~10x faster over the tunnel. Optional: a missing binary just skips
@@ -102,6 +109,13 @@ MAX_TRANSFER_ENTRIES = 60
 # plans, so uploads through splat.roonytoony.dev are limited by CF, not this —
 # the LAN origin (192.168.87.34:3300) has no such cap.
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+# Registration-quality gate: COLMAP/nerfstudio's "process" stage extracts N
+# frames but only registers the ones it can solve camera poses for. A capture
+# with low texture, motion blur, or thin overlap registers almost none — e.g.
+# the backyard job solved 2 of 311 (0.6%) and would have wasted ~10 min of GPU
+# training producing garbage. Below this ratio we fail FAST with guidance and
+# skip training. Tunable; raise to be stricter, lower to be more permissive.
+MIN_REGISTRATION_RATIO = 0.30
 # 5.7K equirectangular (2:1) — the native sphere resolution of X3/X4-class
 # cameras; nerfstudio downscales from here as needed.
 STITCH_WIDTH = 5760
@@ -125,6 +139,16 @@ class SplatTrainRequest(BaseModel):
     # Per-lens field of view for the ffmpeg v360 dual-fisheye -> equirectangular
     # stitch of raw Insta360 .insv. ~204 fits X2/X3; X4/X5 may want 206-210.
     insv_fov: float = Field(default=204.0, ge=160.0, le=280.0)
+    # Structure-from-Motion backend. "colmap" (default) is the validated COLMAP
+    # 3.11.1 incremental path nerfstudio drives via ns-process-data — unchanged.
+    # "glomap" is an OPT-IN rescue: COLMAP 4.x global SfM (global_mapper), which
+    # registers far more frames on hard captures (proved 311/311 on a backyard
+    # clip vs 2/311 for incremental). It runs feature_extractor + sequential
+    # matching + global_mapper itself, then hands the model to ns-process-data
+    # via --skip-colmap. Only applied to video / image-folder inputs (not a
+    # pre-processed dataset, not equirectangular — for now); otherwise it falls
+    # back to the default path silently.
+    sfm_backend: Literal["colmap", "glomap"] = "colmap"
 
 
 @dataclass
@@ -283,6 +307,18 @@ def _tool_path(binary: str, env_var: str) -> str | None:
     return shutil.which(binary)
 
 
+def _colmap4_path() -> str | None:
+    """Locate the COLMAP 4.x binary used by the opt-in glomap (global SfM)
+    backend. Deliberately NOT on the splatops/colmap-3.11 PATH so ns-process-data
+    never picks it up; we only invoke it directly. Override via SPLAT_COLMAP4_BIN."""
+    override = os.environ.get("SPLAT_COLMAP4_BIN", "").strip()
+    if override:
+        return override
+    if COLMAP4_BIN.is_file():
+        return str(COLMAP4_BIN)
+    return None
+
+
 _V360_CACHE: bool | None = None
 
 
@@ -323,6 +359,7 @@ def _engine_availability() -> dict:
     ns_process_data = _tool_path("ns-process-data", "SPLAT_NS_PROCESS_DATA_BIN")
     ns_export = _tool_path("ns-export", "SPLAT_NS_EXPORT_BIN")
     colmap = _tool_path("colmap", "SPLAT_COLMAP_BIN")
+    colmap4 = _colmap4_path()
     ffmpeg = _tool_path("ffmpeg", "SPLAT_FFMPEG_BIN")
     return {
         "ns_train_available": bool(ns_train),
@@ -333,6 +370,9 @@ def _engine_availability() -> dict:
         "ns_export_path": ns_export,
         "colmap_available": bool(colmap),
         "colmap_path": colmap,
+        # COLMAP 4.x global-SfM backend (opt-in via sfm_backend="glomap").
+        "glomap_available": bool(colmap4),
+        "glomap_path": colmap4,
         "ffmpeg_available": bool(ffmpeg),
         "ffmpeg_path": ffmpeg,
         # Insta360 .insv auto-stitch needs ffmpeg's v360 filter.
@@ -559,6 +599,100 @@ def _stitch_command(ffmpeg: str, src: Path, dst: Path, fov: float) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _colmap_image_dir(job_dir: Path) -> Path:
+    """Frames/photos COLMAP 4.x runs SfM on, also the --data ns-process-data
+    copies+downscales from (same basenames => model image names line up)."""
+    return job_dir / "colmap" / "images"
+
+
+def _glomap_sfm_command(
+    colmap4: str,
+    ffmpeg: str,
+    job_dir: Path,
+    process_input: Path,
+    is_video: bool,
+    num_frames_target: int,
+) -> list[str]:
+    """One self-contained shell command for the opt-in global-SfM backend.
+
+    Runs, in order, all writing under <job_dir>/colmap/:
+      0. (video only) ffmpeg extracts ~num_frames_target evenly-spaced frames
+         into colmap/images/ — so COLMAP and ns-process-data see identical
+         filenames. (image input: the frames are symlinked/copied in as-is.)
+      1. colmap feature_extractor  (single shared camera; SIFT on GPU)
+      2. colmap sequential_matcher (loop closure ON — same temporal-ordering
+         intent as the incremental path's --matching-method sequential)
+      3. colmap global_mapper      -> colmap/sparse/0/{cameras,images,points3D}.bin
+
+    Emitted as `bash -c` so the existing single-exec stage runner runs it
+    unchanged; failure of any step aborts the stage (set -e) and the A1
+    registration gate on the following `process` stage still applies.
+    """
+    img_dir = _colmap_image_dir(job_dir)
+    db_path = job_dir / "colmap" / "database.db"
+    sparse_dir = job_dir / "colmap" / "sparse"
+    model_dir = sparse_dir / "0"
+
+    if is_video:
+        # -vf fps drops the clip to ~num_frames_target frames over its length;
+        # COLMAP solves more frames than it can register, so over-sample lightly.
+        # We compute the fps from duration so the count tracks the request even
+        # for clips of unknown length: take every Nth frame via select.
+        extract = (
+            f'ffmpeg -y -i "{process_input}" '
+            f'-vf "select=not(mod(n\\,$STRIDE))" -vsync vfr '
+            f'-q:v 2 "{img_dir}/frame_%05d.jpg"'
+        )
+        # STRIDE = max(1, total_frames / target). Probe frame count with ffprobe;
+        # fall back to stride 1 (keep all) if probing fails.
+        prelude = (
+            f'FFPROBE="$(dirname "{ffmpeg}")/ffprobe"; '
+            f'[ -x "$FFPROBE" ] || FFPROBE=ffprobe; '
+            f'TOTAL="$("$FFPROBE" -v error -count_frames -select_streams v:0 '
+            f'-show_entries stream=nb_read_frames -of csv=p=0 "{process_input}" 2>/dev/null)"; '
+            f'case "$TOTAL" in ""|*[!0-9]*) TOTAL=0;; esac; '
+            f'if [ "$TOTAL" -gt {num_frames_target} ]; then '
+            f'STRIDE=$(( TOTAL / {num_frames_target} )); else STRIDE=1; fi; '
+        )
+        ingest = prelude + extract
+    else:
+        # Image folder: copy the source images in so COLMAP and ns-process-data
+        # share one directory of identical basenames.
+        ingest = (
+            f'shopt -s nullglob nocaseglob; '
+            f'for f in "{process_input}"/*.jpg "{process_input}"/*.jpeg '
+            f'"{process_input}"/*.png "{process_input}"/*.webp '
+            f'"{process_input}"/*.bmp "{process_input}"/*.tif "{process_input}"/*.tiff; '
+            f'do cp -n "$f" "{img_dir}/"; done'
+        )
+
+    script = (
+        f'set -euo pipefail; '
+        # rm the sparse dir first so a stale sparse/0 from an aborted prior run
+        # can't satisfy the final test -f and feed nerfstudio a partial model.
+        f'rm -rf "{sparse_dir}"; mkdir -p "{img_dir}" "{sparse_dir}"; '
+        f'{ingest}; '
+        f'"{colmap4}" feature_extractor '
+        f'--database_path "{db_path}" --image_path "{img_dir}" '
+        # COLMAP 4.x renamed the GPU toggle: SiftExtraction.use_gpu (3.x) ->
+        # FeatureExtraction.use_gpu (4.x). GPU is the default; we set it
+        # explicitly so a config change can't silently drop us to CPU.
+        f'--ImageReader.single_camera 1 --FeatureExtraction.use_gpu 1; '
+        f'"{colmap4}" sequential_matcher '
+        f'--database_path "{db_path}" '
+        # 4.x: SiftMatching.use_gpu -> FeatureMatching.use_gpu.
+        f'--SequentialMatching.loop_detection 1 --FeatureMatching.use_gpu 1; '
+        f'"{colmap4}" global_mapper '
+        f'--database_path "{db_path}" --image_path "{img_dir}" '
+        f'--output_path "{sparse_dir}"; '
+        # global_mapper writes its first reconstruction to sparse/0/ already;
+        # assert the expected model exists so the stage fails loud if SfM produced
+        # nothing (rather than letting ns-process-data choke downstream).
+        f'test -f "{model_dir}/cameras.bin"'
+    )
+    return ["bash", "-c", script]
+
+
 def _plan_3d_job(req: SplatTrainRequest, availability: dict, job_dir: Path, input_path: Path) -> tuple[list[str], dict[str, list[str]]]:
     """Build the ordered stage list and per-stage commands for a 3D job.
 
@@ -619,39 +753,89 @@ def _plan_3d_job(req: SplatTrainRequest, availability: dict, job_dir: Path, inpu
                 status_code=400,
                 detail=f"Unsupported input: {input_path}. Provide an image directory, a video file, a raw Insta360 .insv, or a processed Nerfstudio dataset.",
             )
-        process_cmd = [
-            availability["ns_process_data_path"],
-            subcommand,
-            "--data",
-            str(process_input),
-            "--output-dir",
-            str(processed_dir),
-        ]
-        if subcommand == "video":
-            process_cmd.extend(["--num-frames-target", str(req.num_frames_target)])
-            # Video frames are temporally ordered, so sequential matching (with
-            # loop closure) chains them far more reliably than COLMAP's default
-            # vocab_tree, which is built for UNORDERED photo collections and
-            # collapses on a moving walkthrough. On a real backyard clip this
-            # took registration from 2/311 -> 343/477 (165k points). Skip it for
-            # equirect: each frame fans out into N perspective images that are
-            # not one temporal sequence, so the 360 path keeps the default matcher.
-            if not is_equirect:
-                process_cmd.extend(["--matching-method", "sequential"])
-        if is_equirect:
-            process_cmd.extend(
-                [
-                    "--camera-type",
-                    "equirectangular",
-                    "--images-per-equirect",
-                    str(req.images_per_equirect),
-                    "--crop-bottom",
-                    str(req.crop_bottom),
-                ]
+
+        # OPT-IN global-SfM rescue (COLMAP 4.x global_mapper). Only engages when
+        # the operator asked for it, the colmap4 binary is present, and the input
+        # is a plain video or image folder — NOT equirectangular (each 360 frame
+        # fans out into N perspective views, not one temporal sequence) and NOT a
+        # pre-processed dataset (handled above). On any miss we fall through to the
+        # byte-for-byte unchanged default COLMAP 3.11.1 path below.
+        use_glomap = (
+            req.sfm_backend == "glomap"
+            and availability.get("glomap_available")
+            and not is_equirect
+            and subcommand in ("video", "images")
+        )
+        if use_glomap:
+            # Stage 1: drive COLMAP 4.x ourselves (feature_extractor + sequential
+            # matching + global_mapper) -> <job_dir>/colmap/sparse/0/*.bin.
+            commands["glomap_sfm"] = _glomap_sfm_command(
+                colmap4=availability["glomap_path"],
+                ffmpeg=availability["ffmpeg_path"],
+                job_dir=job_dir,
+                process_input=process_input,
+                is_video=(subcommand == "video"),
+                num_frames_target=req.num_frames_target,
             )
-        stages.append("process")
-        commands["process"] = process_cmd
-        train_data = processed_dir
+            stages.append("glomap_sfm")
+            # Stage 2: ns-process-data copies+downscales the same frames COLMAP
+            # solved (--data = the colmap image dir, identical basenames) and
+            # builds transforms.json from our model via --skip-colmap. It still
+            # generates images_2/4/8 downscales (num-downscales). The A1
+            # registration gate on this `process` stage then applies as normal.
+            process_cmd = [
+                availability["ns_process_data_path"],
+                "images",
+                "--data",
+                str(_colmap_image_dir(job_dir)),
+                "--output-dir",
+                str(processed_dir),
+                "--skip-colmap",
+                # --colmap-model-path is resolved RELATIVE to --output-dir by
+                # ns-process-data, so pass the relative path (verified: an
+                # absolute path resolves under processed/<abs> and fails).
+                "--colmap-model-path",
+                os.path.relpath(job_dir / "colmap" / "sparse" / "0", processed_dir),
+                "--num-downscales",
+                "3",
+            ]
+            stages.append("process")
+            commands["process"] = process_cmd
+            train_data = processed_dir
+        else:
+            process_cmd = [
+                availability["ns_process_data_path"],
+                subcommand,
+                "--data",
+                str(process_input),
+                "--output-dir",
+                str(processed_dir),
+            ]
+            if subcommand == "video":
+                process_cmd.extend(["--num-frames-target", str(req.num_frames_target)])
+                # Video frames are temporally ordered, so sequential matching (with
+                # loop closure) chains them far more reliably than COLMAP's default
+                # vocab_tree, which is built for UNORDERED photo collections and
+                # collapses on a moving walkthrough. On a real backyard clip this
+                # took registration from 2/311 -> 343/477 (165k points). Skip it for
+                # equirect: each frame fans out into N perspective images that are
+                # not one temporal sequence, so the 360 path keeps the default matcher.
+                if not is_equirect:
+                    process_cmd.extend(["--matching-method", "sequential"])
+            if is_equirect:
+                process_cmd.extend(
+                    [
+                        "--camera-type",
+                        "equirectangular",
+                        "--images-per-equirect",
+                        str(req.images_per_equirect),
+                        "--crop-bottom",
+                        str(req.crop_bottom),
+                    ]
+                )
+            stages.append("process")
+            commands["process"] = process_cmd
+            train_data = processed_dir
 
     commands["train"] = [
         availability["ns_train_path"],
@@ -831,6 +1015,74 @@ async def _run_pipeline(job: SplatJob) -> None:
                         job.log_lines.append("[webopt] web-optimized .ply failed; viewer falls back to the raw .ply.")
                 else:
                     job.log_lines.append("[webopt] skipped (tool or .ply unavailable).")
+                completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
+                _patch_meta(job.job_id, stages_completed=[*completed, stage])
+                continue
+            elif stage == "process":
+                # Registration-quality gate. The process (COLMAP/SfM) stage
+                # extracts frames and solves camera poses; only the registered
+                # frames land in transforms.json. A doomed capture registers
+                # almost nothing — training it just burns ~10 min of GPU on
+                # garbage. So: run process as normal, then check the ratio and
+                # FAIL FAST with guidance before the train stage if it's too low.
+                return_code = await _run_stage(job, stage, job.stage_commands["process"])
+                if job.stop_requested:
+                    break
+                if return_code != 0:
+                    final_status = "failed"
+                    if error_message is None:
+                        error_message = f"Stage '{stage}' exited with code {return_code}."
+                    job.log_lines.append(error_message)
+                    break
+
+                # Robustness: any parse/IO problem must NEVER abort a good job —
+                # on doubt we log a note and fall through to normal behavior.
+                processed_dir = job_dir / "processed"
+                registered: int | None = None
+                extracted: int | None = None
+                try:
+                    transforms = processed_dir / "transforms.json"
+                    with transforms.open() as fh:
+                        registered = len(json.load(fh).get("frames", []))
+                    images_dir = processed_dir / "images"
+                    extracted = sum(
+                        1
+                        for p in images_dir.iterdir()
+                        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+                    ) if images_dir.is_dir() else 0
+                except (OSError, ValueError, json.JSONDecodeError, KeyError) as exc:
+                    job.log_lines.append(
+                        f"[process] registration check skipped (could not read transforms/images: {exc})."
+                    )
+
+                if registered is not None and extracted:
+                    ratio = registered / extracted
+                    pct = f"{ratio * 100:.1f}%"
+                    job.log_lines.append(
+                        f"[process] registration: {registered}/{extracted} frames ({pct})."
+                    )
+                    if ratio < MIN_REGISTRATION_RATIO:
+                        final_status = "failed"
+                        error_message = (
+                            f"Only {registered} of {extracted} frames registered ({pct}). "
+                            "The capture likely has low texture, motion blur, or not enough "
+                            "overlap. Recapture with slow, heavily-overlapping sweeps of a "
+                            "smaller area — or retry (global-SfM rescue is being added). "
+                            "Training was skipped to save GPU time."
+                        )
+                        job.log_lines.append(error_message)
+                        _patch_meta(
+                            job.job_id,
+                            status=final_status,
+                            stage=None,
+                            error_message=error_message,
+                        )
+                        break
+                elif registered is not None and not extracted:
+                    job.log_lines.append(
+                        "[process] registration check skipped (no extracted images found)."
+                    )
+
                 completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
                 _patch_meta(job.job_id, stages_completed=[*completed, stage])
                 continue
