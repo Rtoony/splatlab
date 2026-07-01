@@ -2,22 +2,32 @@ import { useEffect, useRef, useState } from "react";
 
 // In-browser Gaussian-splat viewer (mkkellogg). Ported from the portal; renders
 // a .ply (raw or web-optimized) or .spz. `fill` makes it fill its parent.
+export type ViewerPoint = { point: [number, number, number]; radius: number };
+export type ViewerOverlay = { matches: ViewerPoint[]; active: number; label: string } | null;
+
 export function SplatViewer({
   url,
   format = "ply",
   fill = false,
   focus = null,
+  overlay = null,
+  onPickMatch,
 }: {
   url: string;
   format?: "ply" | "spz";
   fill?: boolean;
   // When set (from a language search hit), fly the camera to this 3D point.
-  focus?: { point: [number, number, number]; radius: number } | null;
+  focus?: ViewerPoint | null;
+  // When set, draw a highlight marker on each 3D match + a label on the active one.
+  overlay?: ViewerOverlay;
+  onPickMatch?: (i: number) => void;
 }) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const viewerRef = useRef<any>(null);
   const [error, setError] = useState<string | null>(null);
+  // Screen positions of each 3D match, updated every frame from the camera.
+  const [markers, setMarkers] = useState<{ x: number; y: number; front: boolean }[]>([]);
 
   useEffect(() => {
     let mounted = true;
@@ -93,6 +103,39 @@ export function SplatViewer({
     ctr.update();
   }, [focus]);
 
+  // Project each 3D match to screen every frame so the highlight markers + label
+  // track the camera as you orbit. Uses the camera's own THREE math (no `three` import).
+  useEffect(() => {
+    if (!overlay || overlay.matches.length === 0) {
+      setMarkers([]);
+      return;
+    }
+    let raf = 0;
+    const tick = () => {
+      const v = viewerRef.current;
+      const root = rootRef.current;
+      if (v && v.camera && root) {
+        const cam = v.camera;
+        const rect = root.getBoundingClientRect();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const Vec3: any = cam.position.constructor;
+        const fwd = new Vec3(0, 0, -1).applyQuaternion(cam.quaternion);
+        setMarkers(
+          overlay.matches.map((m) => {
+            const dir = new Vec3(m.point[0] - cam.position.x, m.point[1] - cam.position.y, m.point[2] - cam.position.z);
+            const front = dir.dot(fwd) > 0;
+            const p = new Vec3(m.point[0], m.point[1], m.point[2]);
+            p.project(cam);
+            return { x: (p.x * 0.5 + 0.5) * rect.width, y: (-p.y * 0.5 + 0.5) * rect.height, front };
+          }),
+        );
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [overlay]);
+
   return (
     <div
       className={
@@ -103,6 +146,31 @@ export function SplatViewer({
     >
       <div ref={rootRef} className="h-full w-full" />
       <ShortcutLegend />
+      {overlay &&
+        markers.map((mk, i) =>
+          mk.front ? (
+            <button
+              key={i}
+              type="button"
+              onClick={() => onPickMatch?.(i)}
+              style={{ left: `${mk.x}px`, top: `${mk.y}px` }}
+              title={`${overlay.label} — ${i + 1}/${overlay.matches.length}`}
+              className={`pointer-events-auto absolute z-20 -translate-x-1/2 -translate-y-1/2 rounded-full transition ${
+                i === overlay.active
+                  ? "h-6 w-6 border-2 border-cyan-300 bg-cyan-300/25 shadow-[0_0_14px_rgba(34,211,238,0.75)]"
+                  : "h-4 w-4 border-2 border-white/60 bg-white/10 hover:border-cyan-200 hover:bg-cyan-200/20"
+              }`}
+            />
+          ) : null,
+        )}
+      {overlay && markers[overlay.active]?.front && (
+        <div
+          style={{ left: `${markers[overlay.active].x}px`, top: `${markers[overlay.active].y - 20}px` }}
+          className="pointer-events-none absolute z-20 -translate-x-1/2 -translate-y-full whitespace-nowrap rounded-md bg-black/75 px-2 py-0.5 text-xs font-semibold text-cyan-100 shadow backdrop-blur-sm"
+        >
+          {overlay.label}
+        </div>
+      )}
       <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-4 py-3">
         <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-white/65">Drag to orbit. Scroll to zoom.</p>
       </div>

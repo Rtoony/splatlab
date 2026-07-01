@@ -35,13 +35,23 @@ export interface SplatJob {
 
 // Result of a Language Field text query: a server-rendered 3-view relevancy
 // heatmap strip (PNG) plus the normalized query and a readiness flag.
+export interface LangfieldMatch {
+  focus: [number, number, number];
+  radius: number;
+  score: number;
+  count: number;
+}
+
 export interface LangfieldQueryResult {
   query: string;
   heatmap_url: string;
   ready: boolean;
-  // 3D centroid of the match (viewer frame) + its spread, for "fly to" (worker path).
+  // 3D centroid of the primary match (viewer frame) + its spread, for "fly to".
   focus?: [number, number, number];
   radius?: number;
+  // Distinct clustered instances of the match (multiple references), for the
+  // clickable results + per-instance highlight overlay.
+  matches?: LangfieldMatch[];
 }
 
 export interface SplatGpuHolder {
