@@ -100,6 +100,12 @@ MAST3R_SCENE_GRAPH = "swin-5-noncyclic"
 # "Few Photos (AI poses)" caps the input count so the complete (all-pairs) scene-graph
 # stays cheap; 24 photos = 276 pairs. Above this a movie/large folder is evenly sampled.
 SPARSE_MAX_IMAGES = 24
+
+# TripoSplat generative lane ("Imagine a Splat"): one image -> a Z-up 3DGS .ply, no SfM.
+TRIPOSPLAT_DIR = Path.home() / "tools" / "triposplat-spike"
+TRIPOSPLAT_RUNNER = TRIPOSPLAT_DIR / "run_triposplat.sh"
+TRIPOSPLAT_CKPT = TRIPOSPLAT_DIR / "ckpts" / "diffusion_models" / "triposplat_fp16.safetensors"
+TRIPOSPLAT_VRAM_MB = 20_000  # model weights (~14GB) + working set; reserve generously
 # splat-transform (PlayCanvas, MIT) ships in the self-hosted SuperSplat
 # checkout. Used to compress the raw export into a .spz the in-page viewer
 # loads ~10x faster over the tunnel. Optional: a missing binary just skips
@@ -230,6 +236,9 @@ class SplatTrainRequest(BaseModel):
     # ordinary photos (2-12) yield a usable splat with no COLMAP. Requires the MASt3R
     # toolchain; only applies to image-folder / video inputs (not equirect / pre-processed).
     capture_mode: Literal["standard", "sparse"] = "standard"
+    # OPT-IN source. "capture" (default) = photos/video -> the normal pipeline. "generative-
+    # image" = "Imagine a Splat": a SINGLE image -> TripoSplat -> a 3DGS .ply, NO SfM/train.
+    source_type: Literal["capture", "generative-image"] = "capture"
 
 
 @dataclass
@@ -300,6 +309,7 @@ def _new_meta(job_id: str, req: SplatTrainRequest, input_path: Path, job_dir: Pa
         # the dense-seed MASt3R rung (the sole plan-time producer of a leading mast3r_sfm
         # stage), so a sparse request that didn't apply (equirect/dataset) isn't mis-badged.
         "capture_mode": "sparse" if (req.capture_mode == "sparse" and stages[:1] == ["mast3r_sfm"]) else "standard",
+        "source_type": req.source_type,
         "command": [],
         "created_at": _utc_now(),
         "started_at": None,
@@ -438,6 +448,14 @@ def _mast3r_availability() -> dict:
     }
 
 
+def _triposplat_availability() -> dict:
+    """Locate the TripoSplat generative lane: the 2-env runner + the fp16 checkpoint.
+    Both must exist for source_type='generative-image' to be offered."""
+    runner = os.environ.get("SPLAT_TRIPOSPLAT_RUNNER", "").strip() or str(TRIPOSPLAT_RUNNER)
+    available = Path(runner).is_file() and TRIPOSPLAT_CKPT.is_file()
+    return {"triposplat_available": available, "triposplat_runner": runner}
+
+
 def _langfield_available() -> bool:
     """True iff the Language-Field toolchain is present: the build wrapper + both
     conda-env pythons (langfield-spike = SigLIP+lift, sam2 = masks). The heavy deps
@@ -505,6 +523,8 @@ def _engine_availability() -> dict:
         # converter + 2.6GB checkpoint. Spread into the dict so the gate sees
         # mast3r_available / mast3r_* alongside the COLMAP keys.
         **_mast3r_availability(),
+        # TripoSplat generative lane (opt-in): one image -> 3DGS .ply.
+        **_triposplat_availability(),
         # Language Field (opt-in): SAM 2.1 + SigLIP 2 toolchain present?
         "langfield_available": _langfield_available(),
         "ffmpeg_available": bool(ffmpeg),
@@ -1146,6 +1166,20 @@ def _plan_3d_job(
     Inputs already containing a Nerfstudio dataset (transforms.json) skip the
     ns-process-data stage and train directly on the input.
     """
+    # ── Generative image-to-3D ("Imagine a Splat"): one image -> TripoSplat -> a Z-up
+    #    .ply. Skips the ENTIRE capture pipeline (no SfM, no ns-train, no capture tools),
+    #    then reuses compress/webopt to produce the viewer/download artifacts. ──
+    if req.source_type == "generative-image":
+        if not availability.get("triposplat_available"):
+            raise HTTPException(status_code=400, detail="TripoSplat toolchain is not available.")
+        preview_dir = _preview_dir_path(job_dir)
+        gen_cmd = ["bash", str(availability["triposplat_runner"]), str(input_path), str(preview_dir)]
+        stages = ["generate"]
+        commands = {"generate": gen_cmd}
+        if _splat_transform_path():
+            stages += ["compress", "webopt"]  # .spz + decimated web.ply from splat.ply
+        return stages, commands, None
+
     missing = [
         name
         for name, key in (
@@ -1612,6 +1646,12 @@ async def _run_pipeline(job: SplatJob) -> None:
                 return_code = await _run_stage(job, stage, command)
             elif stage == "train":
                 return_code = await _run_train_stage(job, job.stage_commands["train"])
+            elif stage == "generate":
+                # TripoSplat generative lane — heavy GPU (14B-ish weights + working set);
+                # take the shared lock so it serialises against train/MASt3R/TRELLIS.
+                return_code = await _run_locked_stage(
+                    job, stage, job.stage_commands[stage], TRIPOSPLAT_VRAM_MB
+                )
             elif stage == "mast3r_sfm":
                 # MASt3R-SfM ViT inference is heavy GPU work — run it under the
                 # shared lock so it serialises against the portal's TRELLIS lane.
