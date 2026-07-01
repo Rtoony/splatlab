@@ -31,6 +31,9 @@ export interface SplatJob {
   // scenes (which never carry them) keep deserializing unchanged.
   language_field?: boolean;
   langfield_available?: boolean;
+  // "sparse" when built via "Few Photos (AI poses)" (MASt3R dense-seed) — poses/geometry
+  // are partly AI-inferred, so the card badges it as such. Absent/"standard" otherwise.
+  capture_mode?: "standard" | "sparse";
   // Cheap per-scene stats for the gallery card (present once the scene is finished).
   stats?: {
     gaussians?: number;

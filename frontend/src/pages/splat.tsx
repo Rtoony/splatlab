@@ -828,6 +828,14 @@ function SceneCard({
               searchable
             </span>
           )}
+          {job.capture_mode === "sparse" && (
+            <span
+              title="Built from a few photos — camera poses + some geometry are AI-inferred, not measured."
+              className="absolute left-1 top-1 flex items-center gap-1 rounded bg-amber-400/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-200 backdrop-blur-sm"
+            >
+              <Camera className="h-3 w-3" /> AI poses
+            </span>
+          )}
         </div>
         <p className="truncate text-sm font-medium text-zinc-100">{job.input_path.split("/").pop()}</p>
         <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-zinc-500">

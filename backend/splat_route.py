@@ -97,6 +97,9 @@ MAST3R_CHECKPOINT = (
 # swin-5-noncyclic gives a linear (not N^2) pair count — the validated default
 # for sequences; 'complete' is full N^2 for small sets.
 MAST3R_SCENE_GRAPH = "swin-5-noncyclic"
+# "Few Photos (AI poses)" caps the input count so the complete (all-pairs) scene-graph
+# stays cheap; 24 photos = 276 pairs. Above this a movie/large folder is evenly sampled.
+SPARSE_MAX_IMAGES = 24
 # splat-transform (PlayCanvas, MIT) ships in the self-hosted SuperSplat
 # checkout. Used to compress the raw export into a .spz the in-page viewer
 # loads ~10x faster over the tunnel. Optional: a missing binary just skips
@@ -293,6 +296,10 @@ def _new_meta(job_id: str, req: SplatTrainRequest, input_path: Path, job_dir: Pa
         "output_dir": str(job_dir),
         "capture_format": req.capture_format,
         "max_num_iterations": req.max_num_iterations,
+        # Record the ACTUAL engaged capture mode: "sparse" only when the plan starts with
+        # the dense-seed MASt3R rung (the sole plan-time producer of a leading mast3r_sfm
+        # stage), so a sparse request that didn't apply (equirect/dataset) isn't mis-badged.
+        "capture_mode": "sparse" if (req.capture_mode == "sparse" and stages[:1] == ["mast3r_sfm"]) else "standard",
         "command": [],
         "created_at": _utc_now(),
         "started_at": None,
@@ -898,6 +905,7 @@ def _mast3r_sfm_command(
     num_frames_target: int,
     dense: bool = False,
     scene_graph: str = MAST3R_SCENE_GRAPH,
+    max_images: int = 0,
 ) -> list[str]:
     """One self-contained `bash -c` command for the MASt3R-SfM rung.
 
@@ -961,7 +969,8 @@ def _mast3r_sfm_command(
         f'"{availability["mast3r_python"]}" "{availability["mast3r_runner"]}" '
         f'--images "{img_dir}" --out "{run_out}" '
         f'--ckpt "{availability["mast3r_checkpoint"]}" '
-        f'--scene-graph {scene_graph}{" --dense" if dense else ""}; '
+        f'--scene-graph {scene_graph}{" --dense" if dense else ""}'
+        f'{f" --max-images {max_images}" if max_images else ""}; '
         # Reproduce nerfstudio's colmap_to_json convention -> processed_dir
         # (dense seed -> ply_file_path=dense_pc.ply when --seed dense).
         f'"{availability["mast3r_python"]}" "{availability["mast3r_converter"]}" '
@@ -1055,6 +1064,9 @@ def _sfm_stage_commands(
         # scene-graph (all image pairs — right for 2-12 photos, unlike swin windows).
         # The converter still writes a standard Nerfstudio dataset, so the `process`
         # assert + the A1 registration gate + the `train` stage are all unchanged.
+        # "Few Photos" caps the input at SPARSE_MAX_IMAGES (evenly sampled) so the
+        # complete (all-pairs) scene-graph stays O(cap^2) even if a movie or a big DSLR
+        # folder is fed in — a many-frame input degrades gracefully instead of hanging.
         mast3r_sfm = _mast3r_sfm_command(
             availability=availability,
             ffmpeg=availability["ffmpeg_path"],
@@ -1062,9 +1074,10 @@ def _sfm_stage_commands(
             processed_dir=processed_dir,
             process_input=process_input,
             is_video=(subcommand == "video"),
-            num_frames_target=req.num_frames_target,
+            num_frames_target=min(req.num_frames_target, SPARSE_MAX_IMAGES),
             dense=True,
             scene_graph="complete",
+            max_images=SPARSE_MAX_IMAGES,
         )
         process_cmd = ["test", "-f", str(processed_dir / "transforms.json")]
         return {"mast3r_sfm": mast3r_sfm, "process": process_cmd}
