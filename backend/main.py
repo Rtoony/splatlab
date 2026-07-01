@@ -165,6 +165,11 @@ async def splat_thumbnail(job_id: str):
     output_dir = (
         Path(meta["output_dir"]) if meta and meta.get("output_dir") else splat_route.DEFAULT_3D_ROOT / job_id
     )
+    # Prefer a REAL rendered hero view (scenes with a language field); fall back to the
+    # cheap CPU point-cloud thumbnail when there's no field / the worker is unavailable.
+    hero = await splat_route.ensure_hero_thumb(output_dir)
+    if hero is not None:
+        return FileResponse(str(hero), media_type="image/webp")
     preview_dir = output_dir / splat_route.PREVIEW_DIRNAME
     thumb = await asyncio.to_thread(thumbgen.get_or_make, preview_dir)
     if thumb is None:

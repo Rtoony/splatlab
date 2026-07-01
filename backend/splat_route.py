@@ -1364,6 +1364,34 @@ async def _langfield_worker_inventory(config_path: str, lfdir: str) -> dict | No
         return None
 
 
+async def ensure_hero_thumb(output_dir: Path) -> Path | None:
+    """A REAL rendered thumbnail for scenes with a language field: ask the warm worker
+    to render one clean hero view (cached at <lfdir>/hero.webp). Returns the path, or
+    None (no field / worker down / render failed) so the caller falls back to the cheap
+    CPU point-cloud thumbnail."""
+    lfdir = output_dir / LANGFIELD_DIRNAME
+    if not (lfdir / "gauss_emb.npz").is_file():
+        return None
+    hero = lfdir / "hero.webp"
+    if hero.is_file():
+        return hero
+    config_path = _find_latest_config(output_dir)
+    if config_path is None:
+        return None
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=1.5)) as client:
+            resp = await client.post(
+                f"{LANGFIELD_WORKER_URL}/hero",
+                json={"config": str(config_path), "lfdir": str(lfdir)},
+            )
+        if resp.status_code == 200 and hero.is_file():
+            return hero
+    except Exception:
+        pass
+    return None
+
+
 async def _langfield_query_cold(scene_id: str, config_path: str, lfdir: str, clean_text: str) -> bool:
     """Fallback when the worker is down: cold subprocess render under HEAVY_GPU_LOCK
     (loads SigLIP + the pipeline, ~20-40s) so it serialises with train/TRELLIS and can

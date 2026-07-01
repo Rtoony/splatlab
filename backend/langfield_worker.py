@@ -443,6 +443,19 @@ def _render_view_overlay(sc: Scene, rel3, ci: int):
     return (overlay.cpu().numpy() * 255).astype(np.uint8)
 
 
+def _render_hero_locked(sc: Scene, out_path: Path, long_side: int = 512) -> None:
+    """LOCKED (caller holds HEAVY_GPU_LOCK): render ONE clean RGB hero view (a
+    representative training camera) as a webp — a real splat image for the gallery
+    thumbnail, framed by the scene's own aspect (no heatmap)."""
+    ci = sc.n_cams // 2
+    w_px = long_side
+    h_px = max(1, int(round(long_side * sc.fullH / max(sc.fullW, 1))))
+    white = torch.ones(3, device=DEV)
+    out, alpha = sc.render(sc.sh, 3, ci, w_px, h_px)
+    rgb = (out[0, ..., :3] + (1 - alpha[0]) * white).clamp(0, 1)
+    Image.fromarray((rgb.cpu().numpy() * 255).astype(np.uint8)).save(out_path, "WEBP", quality=88)
+
+
 def _project_point(sc: Scene, focus, ci: int):
     """Project a world/.ply point into the ci-th camera's QWxQH image. Returns
     (u, v, depth, fx) or None if the point is behind the camera."""
@@ -517,6 +530,11 @@ class InventoryReq(BaseModel):
     config: str
     lfdir: str
     topn: int = 20
+
+
+class HeroReq(BaseModel):
+    config: str
+    lfdir: str
 
 
 app = FastAPI(title="Splat Lab Language Field — Warm Query Worker")
@@ -645,6 +663,48 @@ async def inventory(req: InventoryReq) -> dict[str, Any]:
     except Exception:  # pragma: no cover - cache write is best-effort
         pass
     return {"ready": True, "cached": False, "items": items}
+
+
+@app.post("/hero")
+async def hero(req: HeroReq) -> dict[str, Any]:
+    """Render a real RGB hero thumbnail for the scene, cached at <lfdir>/hero.webp.
+    Takes the heavy GPU lock only around the single render."""
+    if not (_HEAVY_OK and STATE.ready):
+        raise HTTPException(503, f"worker not ready (siglip loaded: {STATE.ready})")
+    lf_p = Path(req.lfdir)
+    if not (lf_p / "gauss_emb.npz").is_file():
+        raise HTTPException(404, f"gauss_emb.npz not found under lfdir {req.lfdir}")
+    if not Path(req.config).is_file():
+        raise HTTPException(404, f"config not found: {req.config}")
+
+    hero_path = lf_p / "hero.webp"
+    if hero_path.is_file():
+        return {"ready": True, "cached": True, "name": "hero.webp"}
+
+    async with STATE.lock:
+        sc = STATE.get_scene_cached(req.config)
+        if sc is None:
+            scene_id = lf_p.name or req.config
+            sc = await _build_scene_locked(req.config, req.lfdir, scene_id)
+            STATE.insert_scene(sc)
+        else:
+            sc.touch()
+        sc.in_use += 1
+
+    try:
+        scene_id = Path(req.lfdir).name or req.config
+        async with gpu_arbiter.HEAVY_GPU_LOCK:
+            gpu_arbiter.set_holder("langfield", scene_id)
+            try:
+                await gpu_arbiter.acquire_gpu(QUERY_VRAM_MB)
+                await asyncio.to_thread(_render_hero_locked, sc, hero_path)
+            finally:
+                gpu_arbiter.clear_holder()
+    finally:
+        async with STATE.lock:
+            sc.in_use -= 1
+            sc.touch()
+    return {"ready": True, "cached": False, "name": "hero.webp"}
 
 
 async def _build_scene_locked(config_path: str, lfdir: str, scene_id: str) -> Scene:
