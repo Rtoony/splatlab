@@ -262,22 +262,58 @@ def _compute_relevancy(state: WorkerState, sc: Scene, text: str):
     return rel[:, None].repeat(1, 3)
 
 
+def _cluster_extent(pts_np, c):
+    import numpy as np
+    return float(np.clip(np.quantile(np.linalg.norm(pts_np - c, axis=1), 0.75), 0.08, 1.5))
+
+
 def _relevancy_focus(sc, rel3):
-    """3D centroid + spread of the top-relevancy gaussians = the 'where' of the match,
-    in the .ply/viewer frame (sc.means are the exact exported-.ply coords). LOCKLESS,
-    cheap (tensor ops, no gsplat). Lets the viewer fly the camera to the found object."""
+    """Cluster the top-relevancy gaussians into DISTINCT 3D instances (multiple
+    references), in the .ply/viewer frame (sc.means == exported-.ply coords). LOCKLESS,
+    cheap. Returns the primary focus (back-compat) + a `matches` list the viewer uses to
+    show clickable results / highlight each instance. DBSCAN with a scale-adaptive eps."""
+    import numpy as np
+    from sklearn.cluster import DBSCAN
+
     rel = rel3[:, 0]
     n = rel.shape[0]
-    k = min(max(48, n // 200), n)                 # top ~0.5% (the strongest core)
+    # Wide-ish pool (lower threshold) so distinct instances are all represented, then
+    # keep only clusters with a genuine strong CORE — that separates real repeats from
+    # the diffuse tail.
+    k = min(4000, n)
     topv, topi = torch.topk(rel, k)
-    strong = topi[topv > 0.65]                    # only clearly-relevant gaussians
-    idx = strong if strong.numel() >= 16 else topi[: min(16, n)]
-    pts = sc.means[idx]
-    c = pts.mean(0)
-    # 70th-pct spread of the core, clamped so a diffuse match doesn't fling the
-    # camera to the moon (viewer scenes are ~unit-scaled).
-    r = float((pts - c).norm(dim=-1).quantile(0.70).clamp(0.08, 1.5))
-    return {"focus": [float(x) for x in c.tolist()], "radius": r, "hits": int(idx.numel())}
+    keep = topv > 0.42
+    idx = topi[keep] if int(keep.sum()) >= 30 else topi[: min(80, n)]
+    pts = sc.means[idx].cpu().numpy()
+    wts = rel[idx].cpu().numpy()
+
+    spread = float(np.linalg.norm(pts.std(0)) + 1e-6)
+    eps = float(np.clip(spread * 0.15, 0.05, 0.8))
+    labels = DBSCAN(eps=eps, min_samples=max(6, len(pts) // 60)).fit_predict(pts)
+
+    matches = []
+    for lab in set(labels.tolist()):
+        if lab == -1:
+            continue
+        m = labels == lab
+        if float(wts[m].max()) < 0.58:            # each instance needs a real strong core
+            continue
+        cp = pts[m]
+        c = cp.mean(0)
+        matches.append({
+            "focus": [float(x) for x in c],
+            "radius": _cluster_extent(cp, c),
+            "score": float(wts[m].sum()),
+            "count": int(m.sum()),
+        })
+    if not matches:                               # nothing distinct -> single centroid
+        c = pts.mean(0)
+        matches = [{"focus": [float(x) for x in c], "radius": _cluster_extent(pts, c),
+                    "score": float(wts.sum()), "count": len(pts)}]
+    matches.sort(key=lambda x: x["score"], reverse=True)
+    matches = matches[:6]
+    top = matches[0]
+    return {"focus": top["focus"], "radius": top["radius"], "matches": matches}
 
 
 def _render_strip_locked(sc: Scene, rel3, views: list[int], text: str) -> str:
