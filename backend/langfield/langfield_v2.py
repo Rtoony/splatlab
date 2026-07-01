@@ -9,7 +9,7 @@ Output: outputs_v2/gauss_emb.npz (per-gaussian 1152-D SigLIP feature, fp16).
 Geometry + cameras + the get_viewmat convention are loaded from the SAME nerfstudio
 pipeline (co-framed; pose-correct — proven in the spike).
 """
-import sys, json
+import os, sys, json
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +29,7 @@ from gsplat import rasterization                              # noqa: E402
 from transformers import AutoModel, AutoProcessor             # noqa: E402
 
 DEV = "cuda"
-DEPTH_TOL = 0.07          # relative front-surface tolerance (occlusion gate)
+DEPTH_TOL = float(os.environ.get("LANGFIELD_DEPTH_TOL", "0.07"))  # front-surface occlusion tolerance; raise for dense scenes
 SIGLIP_CKPT = "google/siglip2-so400m-patch16-384"
 EMB_BATCH = 64
 
@@ -165,7 +165,8 @@ frac_seen = seen.float().mean().item()
 frac_w = (Wsum.squeeze(-1) > 0).float().mean().item()
 print(f"[lift] seen={frac_seen:.1%}  got-feature={frac_w:.1%}", flush=True)
 assert gid.max() < N, "gaussian_ids out of range — packed indexing broken"
-assert frac_seen > 0.5, f"only {frac_seen:.1%} gaussians seen — occlusion gate too tight (raise DEPTH_TOL)"
+_SEEN_MIN = float(os.environ.get("LANGFIELD_SEEN_MIN", "0.5"))
+assert frac_seen > _SEEN_MIN, f"only {frac_seen:.1%} gaussians seen — occlusion gate too tight (raise DEPTH_TOL)"
 assert frac_w > 0.5, f"only {frac_w:.1%} gaussians got a mask — PASS A handoff / res mismatch"
 
 np.savez_compressed(OUT / "gauss_emb.npz",
