@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link, useRoute } from "wouter";
 import { apiRequest, fetchLangfieldInventory, queryLangfield } from "@/lib/api";
@@ -10,7 +10,7 @@ import type {
 } from "@/lib/contracts";
 import { SplatViewer, type ViewerHighlight, type ViewerOverlay } from "@/components/splat-viewer";
 import { Button, Card, Input, SectionLabel } from "@/components/ui";
-import { ArrowLeft, ChevronDown, ChevronUp, Download, Eye, EyeOff, Layers, Loader2, Orbit, Search, Sparkles, X } from "lucide-react";
+import { ArrowLeft, ChevronDown, ChevronUp, Crosshair, Download, Eye, EyeOff, Layers, Loader2, Orbit, Search, Sparkles, X } from "lucide-react";
 
 // Distinct colors handed out to toggled inventory objects (stable per item index).
 const HL_PALETTE = ["#22d3ee", "#f59e0b", "#a78bfa", "#34d399", "#f472b6", "#60a5fa", "#fb7185", "#facc15", "#4ade80", "#c084fc"];
@@ -40,12 +40,12 @@ export default function SplatViewPage() {
 
   const matches = result?.matches ?? [];
   const activeMatch = matches[activeIdx];
-  // Memoized so the viewer's fly / projection effects only re-run when the target or
-  // overlay actually changes (not on every render).
-  const focus = useMemo<FocusTarget | null>(
-    () => (activeMatch ? { point: activeMatch.focus, radius: activeMatch.radius } : null),
-    [activeMatch],
-  );
+  // Camera fly target — set by a search hit OR a legend "zoom to". Flying recenters the
+  // orbit pivot on the object and frames it by its extent (see splat-viewer).
+  const [flyTarget, setFlyTarget] = useState<FocusTarget | null>(null);
+  useEffect(() => {
+    if (activeMatch) setFlyTarget({ point: activeMatch.focus, radius: activeMatch.radius });
+  }, [activeMatch]);
   const overlay = useMemo<ViewerOverlay>(
     () =>
       highlightOn && matches.length && result
@@ -129,7 +129,7 @@ export default function SplatViewPage() {
           </Centered>
         ) : (
           <>
-            <SplatViewer url={viewUrl} format="ply" fill focus={focus} overlay={overlay} highlights={highlights} onPickMatch={setActiveIdx} />
+            <SplatViewer url={viewUrl} format="ply" fill focus={flyTarget} overlay={overlay} highlights={highlights} onPickMatch={setActiveIdx} />
             {job.langfield_available && (invItems.length > 0 || invLoading) && (
               <InventoryLegend
                 items={invItems}
@@ -143,6 +143,7 @@ export default function SplatViewPage() {
                     return next;
                   })
                 }
+                onZoom={(it) => setFlyTarget({ point: it.focus, radius: it.radius })}
                 onClear={() => setActiveLabels(new Set())}
               />
             )}
@@ -181,6 +182,7 @@ function InventoryLegend({
   active,
   colorFor,
   onToggle,
+  onZoom,
   onClear,
 }: {
   items: LangfieldInventoryItem[];
@@ -188,6 +190,7 @@ function InventoryLegend({
   active: Set<string>;
   colorFor: (label: string) => string;
   onToggle: (label: string) => void;
+  onZoom: (it: LangfieldInventoryItem) => void;
   onClear: () => void;
 }) {
   const [open, setOpen] = useState(true);
@@ -221,26 +224,42 @@ function InventoryLegend({
                   const on = active.has(it.label);
                   const color = colorFor(it.label);
                   return (
-                    <button
+                    <div
                       key={it.label}
-                      type="button"
-                      onClick={() => onToggle(it.label)}
-                      title={`${(it.presence * 100).toFixed(1)}% of scene · reliability ${it.reliability.toFixed(2)} · ${it.matches.length} spot(s)`}
-                      className={`flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left transition ${on ? "bg-white/10" : "hover:bg-white/5"}`}
+                      className={`flex w-full items-center gap-1 rounded-md pl-1.5 pr-0.5 transition ${on ? "bg-white/10" : "hover:bg-white/5"}`}
                     >
-                      <span
-                        className="h-3 w-3 shrink-0 rounded-full border-2"
-                        style={{ borderColor: color, backgroundColor: on ? color : "transparent", boxShadow: on ? `0 0 8px ${color}` : "none" }}
-                      />
-                      <span className={`w-20 shrink-0 truncate text-xs ${on ? "text-zinc-100" : "text-zinc-300"}`}>{it.label}</span>
-                      <span className="relative h-1.5 flex-1 overflow-hidden rounded-full bg-white/10">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const wasOn = on;
+                          onToggle(it.label);
+                          if (!wasOn) onZoom(it); // activating -> also fly there
+                        }}
+                        title={`${(it.presence * 100).toFixed(1)}% of scene · reliability ${it.reliability.toFixed(2)} · ${it.count ?? 0} gaussians`}
+                        className="flex min-w-0 flex-1 items-center gap-2 py-1 text-left"
+                      >
                         <span
-                          className="absolute inset-y-0 left-0 rounded-full"
-                          style={{ width: `${(it.presence / maxP) * 100}%`, backgroundColor: color, opacity: on ? 1 : 0.55 }}
+                          className="h-3 w-3 shrink-0 rounded-full border-2"
+                          style={{ borderColor: color, backgroundColor: on ? color : "transparent", boxShadow: on ? `0 0 8px ${color}` : "none" }}
                         />
-                      </span>
-                      <span className="w-7 shrink-0 text-right text-[10px] tabular-nums text-zinc-500">{(it.presence * 100).toFixed(0)}%</span>
-                    </button>
+                        <span className={`w-[68px] shrink-0 truncate text-xs ${on ? "text-zinc-100" : "text-zinc-300"}`}>{it.label}</span>
+                        <span className="relative h-1.5 flex-1 overflow-hidden rounded-full bg-white/10">
+                          <span
+                            className="absolute inset-y-0 left-0 rounded-full"
+                            style={{ width: `${(it.presence / maxP) * 100}%`, backgroundColor: color, opacity: on ? 1 : 0.55 }}
+                          />
+                        </span>
+                        <span className="w-7 shrink-0 text-right text-[10px] tabular-nums text-zinc-500">{(it.presence * 100).toFixed(0)}%</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onZoom(it)}
+                        title="Zoom to & center on this"
+                        className="shrink-0 rounded p-0.5 text-zinc-500 transition hover:bg-white/10 hover:text-cyan-200"
+                      >
+                        <Crosshair className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   );
                 })}
               </div>

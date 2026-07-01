@@ -54,7 +54,7 @@ NEGATIVES = ["object", "things", "stuff", "texture", "surface"]
 # Curated open-vocabulary noun list for the "what's in this scene" inventory. We score
 # each word's per-gaussian relevancy against the scene, rank by presence, and keep the
 # top-N. Bump INVENTORY_VERSION when this list or the scoring changes (invalidates cache).
-INVENTORY_VERSION = 4
+INVENTORY_VERSION = 7
 VOCAB = [
     # furniture / indoor
     "chair", "table", "desk", "sofa", "couch", "bed", "stool", "bench", "shelf",
@@ -99,6 +99,7 @@ VOCAB = [
     "sock", "belt", "tie", "scarf", "mask", "helmet", "backpack", "notebook", "folder",
     "envelope", "card", "dice", "chess piece", "domino", "marble", "token", "whistle",
 ]
+VOCAB = list(dict.fromkeys(VOCAB))   # de-dupe (a few words appear in >1 group)
 QW, QH = 640, 480
 THUMB = 224                    # per-match result thumbnail side (square, px)
 QUERY_VRAM_MB = 4000            # headroom we ask acquire_gpu() to guarantee per render
@@ -399,6 +400,16 @@ def _scene_inventory(state: "WorkerState", sc: Scene, topn: int = 20) -> list[di
     emb = state._text_emb(VOCAB)                        # [V,1152]
     neg = state.neg_p                                   # [K,1152]
     sim_neg = feat_n @ neg.T                            # [N,K] — same for every word
+
+    # Scene solid-core center + radius (opacity-weighted). The sharp, well-reconstructed
+    # SUBJECT (a toy on a table) sits here with opaque, tight gaussians; peripheral
+    # floaters are low-opacity and far. Used to reward the clearly-rendered subject over
+    # diffuse background surfaces in the ranking.
+    op = sc.opac                                        # [N] in [0,1]
+    wnorm = op / (op.sum() + 1e-9)
+    core = (sc.means * wnorm[:, None]).sum(0)           # [3]
+    core_r = float(torch.sqrt((((sc.means - core) ** 2).sum(1) * wnorm).sum()) + 1e-6)
+
     scored = []
     for i, word in enumerate(VOCAB):
         sim_pos = feat_n @ emb[i]                       # [N]
@@ -406,42 +417,57 @@ def _scene_inventory(state: "WorkerState", sc: Scene, topn: int = 20) -> list[di
         for k in range(neg.shape[0]):
             pair = torch.stack([sim_pos, sim_neg[:, k]], dim=-1)
             rel = torch.minimum(rel, torch.softmax(pair * 10.0, dim=-1)[:, 0])
-        # unseen gaussians (zero feature) sit at exactly 0.5, so >0.55 counts only
-        # gaussians that genuinely match this word.
+        # unseen gaussians (zero feature) sit at exactly 0.5, so >0.55 counts a genuine match.
         strong = rel > 0.55
         cnt = int(strong.sum())
-        pres = cnt / max(n, 1)
-        reliab = float(torch.topk(rel, min(200, n)).values.mean())
-        # SMART rank: a small-but-salient object (a set of keys) should make the list even
-        # though its area share is tiny. Gate on genuine confidence + a real (non-trivial)
-        # cluster of matching gaussians, then score by CONFIDENCE, only gently boosted by
-        # coverage (sqrt) — so big surfaces still lead but distinctive small things surface.
-        if reliab < 0.53 or cnt < 12:
+        if cnt < 12:
             continue
-        score = reliab * (0.55 + min(pres, 1.0) ** 0.5)
-        scored.append((word, pres, reliab, score, rel, strong))
+        reliab = float(torch.topk(rel, min(200, n)).values.mean())
+        if reliab < 0.53:
+            continue
+        pres = cnt / max(n, 1)
+        # RENDER-QUALITY / subject boost. A clearly-rendered object is SOLID (opaque),
+        # CENTRAL (near the sharp core), and COMPACT (tight gaussians — a real localized
+        # thing, not a diffuse match smeared across the scene). Each damps the diffuse
+        # low-opacity background so the in-focus subject rises.
+        om = sc.means[strong]
+        solidity = float(op[strong].mean())
+        centrality = float(torch.exp(-torch.linalg.norm(om.mean(0) - core) / core_r))
+        spread = float(torch.linalg.norm(om.std(0)))
+        compactness = float(np.exp(-spread / (core_r + 1e-6)))
+        quality = (0.35 + 0.65 * solidity) * (0.45 + 0.75 * centrality) * (0.4 + 0.6 * compactness)
+        # confidence-led, gently coverage-boosted, subject-weighted: a small sharp subject
+        # outranks a big diffuse background surface.
+        score = reliab * (0.55 + pres ** 0.5) * quality
+        scored.append((word, pres, reliab, score, strong))
     scored.sort(key=lambda x: x[3], reverse=True)       # rank by smart score
+
     items = []
-    for word, pres, reliab, score, rel, strong in scored[:topn]:
-        focus = _relevancy_focus(sc, rel[:, None].repeat(1, 3))
-        # AREA highlight: a spread of the object's OWN matching gaussians (not one
-        # centroid), so the viewer lights up the whole region — "tile" paints the floor.
+    for word, pres, reliab, score, strong in scored[:topn]:
         idx = torch.nonzero(strong, as_tuple=False).squeeze(-1)
-        if int(idx.numel()) > 200:
-            perm = torch.randperm(int(idx.numel()), device=idx.device)[:200]
-            sel = idx[perm]
-        else:
-            sel = idx
-        pts = sc.means[sel].detach().cpu().numpy() if int(sel.numel()) else np.zeros((0, 3))
+        om = sc.means[idx]
+        # robust center + extent: trim the scattered outlier tail so a spurious few
+        # gaussians don't inflate the object or muddy the area wash / zoom framing.
+        c0 = om.mean(0)
+        d = torch.linalg.norm(om - c0, dim=1)
+        keep = d <= torch.quantile(d, 0.85)
+        if int(keep.sum()) >= 8:
+            idx, om = idx[keep], om[keep]
+        center = om.mean(0)
+        extent = max(float(torch.quantile(torch.linalg.norm(om - center, dim=1), 0.9)), 0.08)
+        # AREA highlight + zoom framing use the object's own gaussians (sampled).
+        sel = idx if int(idx.numel()) <= 200 else idx[torch.randperm(int(idx.numel()), device=idx.device)[:200]]
+        pts = sc.means[sel].detach().cpu().numpy()
         items.append({
             "label": word,
             "presence": round(pres, 4),
             "reliability": round(reliab, 3),
-            "focus": focus["focus"],
-            "radius": focus["radius"],
+            "focus": [float(x) for x in center],     # whole-object center (zoom pivot)
+            "radius": round(extent, 3),              # whole-object extent (zoom framing)
+            "count": int(idx.numel()),
             "points": [[float(x) for x in p] for p in pts],
-            "matches": [{k: m[k] for k in ("focus", "radius", "score", "count")}
-                        for m in focus["matches"]],
+            "matches": [{"focus": [float(x) for x in center], "radius": round(extent, 3),
+                         "score": float(score), "count": int(idx.numel())}],
         })
     return items
 

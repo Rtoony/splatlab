@@ -95,11 +95,13 @@ export function SplatViewer({
     const v = viewerRef.current;
     if (!focus || !v || !v.camera || !v.controls) return;
     const [fx, fy, fz] = focus.point;
-    // Stand back far enough to see the match IN CONTEXT (its surroundings), not a
-    // tight close-up. Bump FLY_ZOOM / FLY_MIN up for more room, down for tighter.
+    // Stand back to frame the target by its extent: small item -> close, large space ->
+    // zoom-to-extents. FLY_MAX caps big legend objects (a floor) so we don't fly outside
+    // the scene. (Search matches are small, so their feel is unchanged.)
     const FLY_ZOOM = 8;
     const FLY_MIN = 1.8;
-    const dist = Math.max(focus.radius * FLY_ZOOM, FLY_MIN);
+    const FLY_MAX = 16;
+    const dist = Math.min(Math.max(focus.radius * FLY_ZOOM, FLY_MIN), FLY_MAX);
     const cam = v.camera;
     const ctr = v.controls;
     let dx = cam.position.x - fx;
