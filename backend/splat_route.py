@@ -60,7 +60,12 @@ DEFAULT_3D_ROOT = OUTPUTS_DIR / "3d"
 # this is the path for splatting large captures from a remote device. The
 # /transfers endpoint lists splat-ready inputs found here; the operator picks
 # one and /train consumes its absolute path directly (no browser upload).
-TRANSFERS_DIR = Path.home() / "transfers"
+# Scoped to a per-app subfolder (~/transfers/splatlab) so Splat Lab only sees ITS
+# own drop folder, not the whole shared transfers tree. Override via env if needed.
+TRANSFERS_DIR = Path(
+    os.environ.get("SPLAT_TRANSFERS_DIR", "").strip() or str(Path.home() / "transfers" / "splatlab")
+)
+TRANSFERS_DIR.mkdir(parents=True, exist_ok=True)
 CONDA_ENV_BIN = Path.home() / "miniconda3" / "envs" / "splatops" / "bin"
 # COLMAP lives in its own env: conda-forge colmap pins a cudatoolkit that
 # conflicts with the nvcc 12.8 the splatops env needs for sm_120 (RTX 5090)
@@ -597,6 +602,10 @@ def _classify_transfer(path: Path) -> tuple[str, str] | None:
             return "video", f"Video · {_human_size(path.stat().st_size)}"
         if ext in ARCHIVE_EXTENSIONS:
             return "zip", f"Photo zip · {_human_size(path.stat().st_size)}"
+        # A single image can't be photogrammetry-captured, but it IS a valid input for
+        # the generative "Imagine a Splat" lane — surface it so it's pickable there.
+        if ext in IMAGE_EXTENSIONS:
+            return "image", f"Single image · Imagine a Splat · {_human_size(path.stat().st_size)}"
         return None
     if path.is_dir():
         if (path / "transforms.json").is_file():

@@ -297,15 +297,18 @@ export default function SplatLabPage() {
           <TransfersPicker
             entries={transfers?.entries ?? []}
             selectedPath={uploaded?.path ?? null}
-            onSelect={(e) =>
+            onSelect={(e) => {
+              // A single image can only go through the generative lane; sync the toggle
+              // to the picked input so "Imagine a Splat" turns on/off automatically.
+              setGenerativeMode(e.kind === "image");
               setUploaded({
                 path: e.path,
                 name: e.name,
                 kind: e.kind === "images" || e.kind === "dataset" ? "directory" : "file",
                 is_insv: e.is_insv,
                 detail: `From Transfers · ${e.detail}`,
-              })
-            }
+              });
+            }}
             onRefresh={() => refetchTransfers()}
             refreshing={transfersFetching}
           />

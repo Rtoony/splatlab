@@ -135,7 +135,7 @@ export interface SplatUploadResult {
 export interface SplatTransferEntry {
   name: string;
   path: string;
-  kind: "video" | "insv" | "zip" | "images" | "dataset";
+  kind: "video" | "insv" | "zip" | "images" | "image" | "dataset";
   is_insv: boolean;
   size_bytes: number;
   detail: string;
