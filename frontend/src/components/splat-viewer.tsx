@@ -30,9 +30,12 @@ export function SplatViewer({
         if (!mounted || !rootRef.current) return;
         viewer = new GaussianSplats3D.Viewer({
           rootElement: rootRef.current,
-          cameraUp: [0, -1, -0.6],
-          initialCameraPosition: [-1, -4, 6],
-          initialCameraLookAt: [0, 2, 0],
+          // Nerfstudio splatfacto scenes come out Z-up (verified: avg camera-up
+          // ≈ [0,0,1] on every scene). The old [0,-1,-0.6] was a wrong tilted up
+          // that rendered scenes upside-down. Z-up + a front-elevated start frame.
+          cameraUp: [0, 0, 1],
+          initialCameraPosition: [0, -3, 1.4],
+          initialCameraLookAt: [0, 0, 0.2],
           // The page isn't cross-origin-isolated (no COOP/COEP headers), so
           // SharedArrayBuffer is disabled in the browser. The sort worker defaults
           // to it and hangs forever on "Processing splats…". Use the non-shared-
