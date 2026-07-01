@@ -31,6 +31,13 @@ export interface SplatJob {
   // scenes (which never carry them) keep deserializing unchanged.
   language_field?: boolean;
   langfield_available?: boolean;
+  // Cheap per-scene stats for the gallery card (present once the scene is finished).
+  stats?: {
+    gaussians?: number;
+    width?: number;
+    height?: number;
+    images?: number;
+  } | null;
 }
 
 // Result of a Language Field text query: a server-rendered 3-view relevancy

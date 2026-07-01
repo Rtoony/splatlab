@@ -647,6 +647,55 @@ def _splat_transform_path() -> str | None:
     return shutil.which("splat-transform")
 
 
+STATS_VERSION = 1
+
+
+def _ply_vertex_count(ply_path: Path) -> int | None:
+    """Gaussian count = the .ply vertex count, from the header only (cheap)."""
+    try:
+        with ply_path.open("rb") as f:
+            hdr = b""
+            while b"end_header" not in hdr and len(hdr) < 8192:
+                chunk = f.read(512)
+                if not chunk:
+                    break
+                hdr += chunk
+        m = re.search(rb"element vertex (\d+)", hdr)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+def _scene_stats(job_id: str, output_dir: Path, meta: dict[str, Any]) -> dict[str, Any] | None:
+    """Cheap per-scene stats (gaussian count, source resolution, image count) for the
+    gallery card. Computed once from the finished artifacts, then cached in meta.json."""
+    cached = meta.get("stats")
+    if isinstance(cached, dict) and cached.get("v") == STATS_VERSION:
+        return cached
+    splat = _preview_file_path(output_dir)
+    if not splat.is_file():
+        return None  # scene not finished — compute on a later poll
+    stats: dict[str, Any] = {"v": STATS_VERSION}
+    gc = _ply_vertex_count(splat)
+    if gc:
+        stats["gaussians"] = gc
+    for cand in output_dir.rglob("transforms.json"):
+        try:
+            d = json.loads(cand.read_text())
+            if "w" in d and "h" in d:
+                stats["width"], stats["height"] = int(d["w"]), int(d["h"])
+            if isinstance(d.get("frames"), list):
+                stats["images"] = len(d["frames"])
+        except Exception:
+            pass
+        break
+    try:
+        _patch_meta(job_id, stats=stats)
+    except Exception:
+        pass
+    return stats
+
+
 def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
     job_id = meta["job_id"]
     output_dir = Path(meta["output_dir"])
@@ -678,6 +727,8 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
         # Opt-in language field: a built per-gaussian feature sidecar exists -> the
         # scene is text-searchable (the viewer shows the query UI when this is true).
         "langfield_available": (output_dir / LANGFIELD_DIRNAME / "gauss_emb.npz").is_file(),
+        # Cheap per-scene stats for the gallery card (gaussian count, resolution, images).
+        "stats": _scene_stats(job_id, output_dir, meta),
     }
 
 

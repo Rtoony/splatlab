@@ -98,6 +98,13 @@ function sceneHue(id: string): number {
   return h;
 }
 
+// Compact count: 1284773 -> "1.3M", 608501 -> "609k".
+function fmtCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
+  return String(n);
+}
+
 // ── page ──────────────────────────────────────────────────────────────────────
 export default function SplatLabPage() {
   const qc = useQueryClient();
@@ -775,12 +782,24 @@ function SceneCard({
               }}
             />
           )}
+          {job.stats?.gaussians ? (
+            <span className="absolute bottom-1 left-1 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-cyan-100 backdrop-blur-sm">
+              {fmtCount(job.stats.gaussians)} splats
+            </span>
+          ) : null}
+          {job.langfield_available && (
+            <span className="absolute bottom-1 right-1 rounded bg-cyan-400/20 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-200 backdrop-blur-sm">
+              searchable
+            </span>
+          )}
         </div>
         <p className="truncate text-sm font-medium text-zinc-100">{job.input_path.split("/").pop()}</p>
-        <div className="mt-1 flex items-center gap-2 text-[11px] text-zinc-500">
+        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-zinc-500">
           <span>{relTime(job.completed_at)}</span>
           {job.capture_format === "equirectangular360" && <Badge>360</Badge>}
           {job.max_num_iterations ? <span>{(job.max_num_iterations / 1000).toFixed(0)}k iters</span> : null}
+          {job.stats?.width && job.stats?.height ? <span>{job.stats.width}×{job.stats.height}</span> : null}
+          {job.stats?.images ? <span>{job.stats.images} imgs</span> : null}
         </div>
       </button>
 
