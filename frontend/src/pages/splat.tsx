@@ -116,6 +116,8 @@ export default function SplatLabPage() {
   const [languageField, setLanguageField] = useState(false);
   // Opt-in: "Few Photos (AI poses)" — MASt3R dense-seed sparse-view mode (InstantSplat).
   const [sparseMode, setSparseMode] = useState(false);
+  // Opt-in: "Imagine a Splat" — TripoSplat single-image generative lane.
+  const [generativeMode, setGenerativeMode] = useState(false);
   const [toast, setToast] = useState<{ msg: string; bad?: boolean } | null>(null);
   // Dismissed failed-job notice (by job_id) so a newer failure still shows.
   const [dismissedFailed, setDismissedFailed] = useState<string | null>(null);
@@ -148,6 +150,8 @@ export default function SplatLabPage() {
   const langfieldEngineAvailable = Boolean(status?.engines?.langfield_available);
   // Whether the MASt3R toolchain exists — gates the "Few Photos (AI poses)" mode.
   const mast3rEngineAvailable = Boolean(status?.engines?.mast3r_available);
+  // Whether the TripoSplat toolchain exists — gates the "Imagine a Splat" mode.
+  const triposplatEngineAvailable = Boolean(status?.engines?.triposplat_available);
 
   function flash(msg: string, bad = false) {
     setToast({ msg, bad });
@@ -204,6 +208,8 @@ export default function SplatLabPage() {
       language_field: languageField,
       // "Few Photos (AI poses)": dense-seed MASt3R sparse-view path (no COLMAP).
       capture_mode: sparseMode && !input.is_insv ? "sparse" : undefined,
+      // "Imagine a Splat": single-image generative lane (skips SfM/train entirely).
+      source_type: generativeMode && !input.is_insv ? "generative-image" : undefined,
     });
   }
 
@@ -401,6 +407,35 @@ export default function SplatLabPage() {
                 <span className="mt-0.5 block text-xs text-zinc-400">
                   Only a handful of shots (2–12)? Skip COLMAP — MASt3R infers camera poses + a dense AI depth prior so
                   a few photos still make a splat. Geometry in unseen/untextured areas is AI-inferred, not measured.
+                </span>
+              </span>
+            </button>
+          )}
+
+          {triposplatEngineAvailable && (
+            <button
+              type="button"
+              onClick={() => setGenerativeMode((v) => !v)}
+              className={`mt-3 flex w-full items-start gap-3 rounded-2xl border p-3 text-left transition-all ${
+                generativeMode
+                  ? "border-fuchsia-400/40 bg-fuchsia-400/10"
+                  : "border-white/10 bg-white/[0.02] hover:border-fuchsia-500/20"
+              }`}
+            >
+              <span
+                className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
+                  generativeMode ? "border-fuchsia-400 bg-fuchsia-400 text-[#04121a]" : "border-white/20 bg-white/5"
+                }`}
+              >
+                {generativeMode && <CheckCircle2 className="h-3.5 w-3.5" />}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="flex items-center gap-1.5 text-sm font-semibold text-white">
+                  <Wand2 className="h-3.5 w-3.5 text-fuchsia-200" /> Imagine a Splat (1 image)
+                </span>
+                <span className="mt-0.5 block text-xs text-zinc-400">
+                  Just ONE picture — TripoSplat generates a full 3D object in ~10s (no capture needed). The back and
+                  sides you didn't photograph are invented by the model, not real.
                 </span>
               </span>
             </button>
@@ -828,14 +863,21 @@ function SceneCard({
               searchable
             </span>
           )}
-          {job.capture_mode === "sparse" && (
+          {job.source_type === "generative-image" ? (
+            <span
+              title="Generated from a single image — the back and sides are invented by the model, not photographed."
+              className="absolute left-1 top-1 flex items-center gap-1 rounded bg-fuchsia-400/20 px-1.5 py-0.5 text-[10px] font-semibold text-fuchsia-200 backdrop-blur-sm"
+            >
+              <Wand2 className="h-3 w-3" /> Generated
+            </span>
+          ) : job.capture_mode === "sparse" ? (
             <span
               title="Built from a few photos — camera poses + some geometry are AI-inferred, not measured."
               className="absolute left-1 top-1 flex items-center gap-1 rounded bg-amber-400/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-200 backdrop-blur-sm"
             >
               <Camera className="h-3 w-3" /> AI poses
             </span>
-          )}
+          ) : null}
         </div>
         <p className="truncate text-sm font-medium text-zinc-100">{job.input_path.split("/").pop()}</p>
         <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-zinc-500">

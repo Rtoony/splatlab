@@ -34,6 +34,9 @@ export interface SplatJob {
   // "sparse" when built via "Few Photos (AI poses)" (MASt3R dense-seed) — poses/geometry
   // are partly AI-inferred, so the card badges it as such. Absent/"standard" otherwise.
   capture_mode?: "standard" | "sparse";
+  // "generative-image" when built from a SINGLE image via TripoSplat ("Imagine a Splat")
+  // — the whole object is generated; the card badges it "Generated".
+  source_type?: "capture" | "generative-image";
   // Cheap per-scene stats for the gallery card (present once the scene is finished).
   stats?: {
     gaussians?: number;
