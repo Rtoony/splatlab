@@ -1,11 +1,19 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link, useRoute } from "wouter";
-import { apiRequest, queryLangfield } from "@/lib/api";
-import type { LangfieldQueryResult, SplatJob, SplatStatusResponse } from "@/lib/contracts";
-import { SplatViewer, type ViewerOverlay } from "@/components/splat-viewer";
+import { apiRequest, fetchLangfieldInventory, queryLangfield } from "@/lib/api";
+import type {
+  LangfieldInventoryItem,
+  LangfieldQueryResult,
+  SplatJob,
+  SplatStatusResponse,
+} from "@/lib/contracts";
+import { SplatViewer, type ViewerHighlight, type ViewerOverlay } from "@/components/splat-viewer";
 import { Button, Card, Input, SectionLabel } from "@/components/ui";
-import { ArrowLeft, Download, Eye, EyeOff, Loader2, Orbit, Search, Sparkles, X } from "lucide-react";
+import { ArrowLeft, ChevronDown, ChevronUp, Download, Eye, EyeOff, Layers, Loader2, Orbit, Search, Sparkles, X } from "lucide-react";
+
+// Distinct colors handed out to toggled inventory objects (stable per item index).
+const HL_PALETTE = ["#22d3ee", "#f59e0b", "#a78bfa", "#34d399", "#f472b6", "#60a5fa", "#fb7185", "#facc15", "#4ade80", "#c084fc"];
 
 export default function SplatViewPage() {
   const [, params] = useRoute("/view/:jobId");
@@ -44,6 +52,28 @@ export default function SplatViewPage() {
         ? { matches: matches.map((m) => ({ point: m.focus, radius: m.radius })), active: activeIdx, label: result.query }
         : null,
     [highlightOn, matches, activeIdx, result],
+  );
+
+  // Scene object inventory (top-N auto-detected objects) + which ones are toggled on.
+  const { data: inventory, isLoading: invLoading } = useQuery({
+    queryKey: ["inventory", jobId],
+    queryFn: () => fetchLangfieldInventory(jobId),
+    enabled: Boolean(jobId && job?.langfield_available),
+    staleTime: Infinity,
+    retry: false,
+  });
+  const invItems = inventory?.items ?? [];
+  const [activeLabels, setActiveLabels] = useState<Set<string>>(new Set());
+  const colorFor = (label: string) => HL_PALETTE[Math.max(0, invItems.findIndex((i) => i.label === label)) % HL_PALETTE.length];
+
+  // Each toggled-on inventory object becomes a colored highlight group (all its instances).
+  const highlights = useMemo<ViewerHighlight[]>(
+    () =>
+      invItems
+        .filter((it) => activeLabels.has(it.label))
+        .map((it) => ({ label: it.label, color: colorFor(it.label), points: it.matches.map((m) => m.focus) })),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [invItems, activeLabels],
   );
 
   return (
@@ -94,7 +124,23 @@ export default function SplatViewPage() {
           </Centered>
         ) : (
           <>
-            <SplatViewer url={viewUrl} format="ply" fill focus={focus} overlay={overlay} onPickMatch={setActiveIdx} />
+            <SplatViewer url={viewUrl} format="ply" fill focus={focus} overlay={overlay} highlights={highlights} onPickMatch={setActiveIdx} />
+            {job.langfield_available && (invItems.length > 0 || invLoading) && (
+              <InventoryLegend
+                items={invItems}
+                loading={invLoading}
+                active={activeLabels}
+                colorFor={colorFor}
+                onToggle={(label) =>
+                  setActiveLabels((prev) => {
+                    const next = new Set(prev);
+                    next.has(label) ? next.delete(label) : next.add(label);
+                    return next;
+                  })
+                }
+                onClear={() => setActiveLabels(new Set())}
+              />
+            )}
             {job.langfield_available && (
               <LangfieldSearch
                 jobId={job.job_id}
@@ -119,6 +165,94 @@ export default function SplatViewPage() {
 
 function Centered({ children }: { children: React.ReactNode }) {
   return <div className="flex h-full items-center justify-center text-sm text-zinc-400">{children}</div>;
+}
+
+// Left-side "what's in this scene" legend: the top-N auto-detected objects with a
+// presence bar; toggle any (multiple at once) to highlight + label all their instances
+// on screen in a distinct color. Collapsible so it can get out of the way.
+function InventoryLegend({
+  items,
+  loading,
+  active,
+  colorFor,
+  onToggle,
+  onClear,
+}: {
+  items: LangfieldInventoryItem[];
+  loading: boolean;
+  active: Set<string>;
+  colorFor: (label: string) => string;
+  onToggle: (label: string) => void;
+  onClear: () => void;
+}) {
+  const [open, setOpen] = useState(true);
+  const maxP = Math.max(...items.map((i) => i.presence), 0.0001);
+  return (
+    <div className="pointer-events-none absolute left-3 top-3 z-20 w-56">
+      <Card className="pointer-events-auto border-white/12 bg-[#070b14]/85 p-2 backdrop-blur-md">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="flex w-full items-center justify-between gap-2 px-1 py-0.5 text-left"
+        >
+          <span className="flex items-center gap-1.5">
+            <Layers className="h-3.5 w-3.5 text-cyan-200" />
+            <SectionLabel>In this scene</SectionLabel>
+          </span>
+          <span className="flex items-center gap-1 text-[11px] text-zinc-500">
+            {active.size > 0 && <span className="text-cyan-300">{active.size} on</span>}
+            {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+          </span>
+        </button>
+        {open &&
+          (loading ? (
+            <p className="flex items-center gap-1.5 px-1 py-2 text-xs text-zinc-400">
+              <Loader2 className="h-3 w-3 animate-spin" /> detecting objects…
+            </p>
+          ) : (
+            <div className="mt-1.5">
+              <div className="max-h-[52vh] space-y-0.5 overflow-y-auto pr-1">
+                {items.map((it) => {
+                  const on = active.has(it.label);
+                  const color = colorFor(it.label);
+                  return (
+                    <button
+                      key={it.label}
+                      type="button"
+                      onClick={() => onToggle(it.label)}
+                      title={`${(it.presence * 100).toFixed(1)}% of scene · reliability ${it.reliability.toFixed(2)} · ${it.matches.length} spot(s)`}
+                      className={`flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left transition ${on ? "bg-white/10" : "hover:bg-white/5"}`}
+                    >
+                      <span
+                        className="h-3 w-3 shrink-0 rounded-full border-2"
+                        style={{ borderColor: color, backgroundColor: on ? color : "transparent", boxShadow: on ? `0 0 8px ${color}` : "none" }}
+                      />
+                      <span className={`w-20 shrink-0 truncate text-xs ${on ? "text-zinc-100" : "text-zinc-300"}`}>{it.label}</span>
+                      <span className="relative h-1.5 flex-1 overflow-hidden rounded-full bg-white/10">
+                        <span
+                          className="absolute inset-y-0 left-0 rounded-full"
+                          style={{ width: `${(it.presence / maxP) * 100}%`, backgroundColor: color, opacity: on ? 1 : 0.55 }}
+                        />
+                      </span>
+                      <span className="w-7 shrink-0 text-right text-[10px] tabular-nums text-zinc-500">{(it.presence * 100).toFixed(0)}%</span>
+                    </button>
+                  );
+                })}
+              </div>
+              {active.size > 0 && (
+                <button
+                  type="button"
+                  onClick={onClear}
+                  className="mt-1 flex w-full items-center justify-center gap-1 rounded-md py-1 text-[11px] text-zinc-400 transition hover:bg-white/5 hover:text-zinc-200"
+                >
+                  <X className="h-3 w-3" /> clear highlights
+                </button>
+              )}
+            </div>
+          ))}
+      </Card>
+    </div>
+  );
 }
 
 // The 3D point (viewer frame) + spread the viewer should fly to on a search hit.

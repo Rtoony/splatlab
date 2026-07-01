@@ -4,6 +4,8 @@ import { useEffect, useRef, useState } from "react";
 // a .ply (raw or web-optimized) or .spz. `fill` makes it fill its parent.
 export type ViewerPoint = { point: [number, number, number]; radius: number };
 export type ViewerOverlay = { matches: ViewerPoint[]; active: number; label: string } | null;
+// A named, colored group of 3D points to highlight+label all at once (inventory legend).
+export type ViewerHighlight = { label: string; color: string; points: [number, number, number][] };
 
 export function SplatViewer({
   url,
@@ -11,6 +13,7 @@ export function SplatViewer({
   fill = false,
   focus = null,
   overlay = null,
+  highlights = [],
   onPickMatch,
 }: {
   url: string;
@@ -20,6 +23,8 @@ export function SplatViewer({
   focus?: ViewerPoint | null;
   // When set, draw a highlight marker on each 3D match + a label on the active one.
   overlay?: ViewerOverlay;
+  // Multiple colored object groups highlighted + labeled simultaneously (legend toggles).
+  highlights?: ViewerHighlight[];
   onPickMatch?: (i: number) => void;
 }) {
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -28,6 +33,8 @@ export function SplatViewer({
   const [error, setError] = useState<string | null>(null);
   // Screen positions of each 3D match, updated every frame from the camera.
   const [markers, setMarkers] = useState<{ x: number; y: number; front: boolean }[]>([]);
+  // Screen positions of each highlight group's points (colored legend highlights).
+  const [hlMarkers, setHlMarkers] = useState<{ label: string; color: string; pts: { x: number; y: number; front: boolean }[] }[]>([]);
 
   useEffect(() => {
     let mounted = true;
@@ -140,6 +147,43 @@ export function SplatViewer({
     return () => cancelAnimationFrame(raf);
   }, [overlay]);
 
+  // Project every highlight group's 3D points to screen each frame (legend toggles).
+  // Separate from the search overlay so both can be shown at once without interfering.
+  useEffect(() => {
+    if (!highlights || highlights.length === 0) {
+      setHlMarkers([]);
+      return;
+    }
+    let raf = 0;
+    const tick = () => {
+      const v = viewerRef.current;
+      const root = rootRef.current;
+      if (v && v.camera && root) {
+        const cam = v.camera;
+        const rect = root.getBoundingClientRect();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const Vec3: any = cam.position.constructor;
+        const fwd = new Vec3(0, 0, -1).applyQuaternion(cam.quaternion);
+        setHlMarkers(
+          highlights.map((h) => ({
+            label: h.label,
+            color: h.color,
+            pts: h.points.map((pt) => {
+              const dir = new Vec3(pt[0] - cam.position.x, pt[1] - cam.position.y, pt[2] - cam.position.z);
+              const front = dir.dot(fwd) > 0;
+              const p = new Vec3(pt[0], pt[1], pt[2]);
+              p.project(cam);
+              return { x: (p.x * 0.5 + 0.5) * rect.width, y: (-p.y * 0.5 + 0.5) * rect.height, front };
+            }),
+          })),
+        );
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [highlights]);
+
   return (
     <div
       className={
@@ -175,6 +219,32 @@ export function SplatViewer({
           {overlay.label}
         </div>
       )}
+      {/* Legend highlights: colored dots on every instance of each toggled object,
+          plus one label per object at its first on-screen instance. */}
+      {hlMarkers.map((h, gi) => (
+        <div key={gi}>
+          {h.pts.map((pt, pi) =>
+            pt.front ? (
+              <div
+                key={pi}
+                style={{ left: `${pt.x}px`, top: `${pt.y}px`, backgroundColor: `${h.color}40`, borderColor: h.color, boxShadow: `0 0 10px ${h.color}` }}
+                className="pointer-events-none absolute z-20 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2"
+              />
+            ) : null,
+          )}
+          {(() => {
+            const lead = h.pts.find((p) => p.front);
+            return lead ? (
+              <div
+                style={{ left: `${lead.x}px`, top: `${lead.y - 14}px`, color: h.color, borderColor: `${h.color}80` }}
+                className="pointer-events-none absolute z-20 -translate-x-1/2 -translate-y-full whitespace-nowrap rounded-md border bg-black/80 px-1.5 py-0.5 text-[11px] font-bold shadow backdrop-blur-sm"
+              >
+                {h.label}
+              </div>
+            ) : null;
+          })()}
+        </div>
+      ))}
       <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-4 py-3">
         <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-white/65">Drag to orbit. Scroll to zoom.</p>
       </div>

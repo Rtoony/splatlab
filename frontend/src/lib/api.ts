@@ -1,4 +1,4 @@
-import type { LangfieldQueryResult } from "@/lib/contracts";
+import type { LangfieldInventoryResult, LangfieldQueryResult } from "@/lib/contracts";
 
 // Same-origin fetch helper. The splatlab backend proxies /api/* to the portal
 // splat API with the bearer injected, so the browser only ever sees same-origin.
@@ -23,4 +23,10 @@ export function queryLangfield(jobId: string, text: string): Promise<LangfieldQu
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text }),
   });
+}
+
+// Fetch a scene's auto-detected object inventory (top-N by presence) for the
+// toggle-to-highlight legend. Warm-worker only; 503 -> caller hides the legend.
+export function fetchLangfieldInventory(jobId: string): Promise<LangfieldInventoryResult> {
+  return apiRequest<LangfieldInventoryResult>(`/api/splat/jobs/${jobId}/langfield/inventory`);
 }

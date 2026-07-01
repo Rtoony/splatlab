@@ -58,6 +58,23 @@ export interface LangfieldQueryResult {
   matches?: LangfieldMatch[];
 }
 
+// One auto-detected object in a scene's inventory: a label, how much of the scene it
+// occupies (presence 0..1), a peak-confidence reliability (0..1), and its clustered
+// instances (for the toggle-to-highlight legend).
+export interface LangfieldInventoryItem {
+  label: string;
+  presence: number;
+  reliability: number;
+  focus: [number, number, number];
+  radius: number;
+  matches: LangfieldMatch[];
+}
+
+export interface LangfieldInventoryResult {
+  job_id: string;
+  items: LangfieldInventoryItem[];
+}
+
 export interface SplatGpuHolder {
   lane: string | null;
   job_id: string | null;
