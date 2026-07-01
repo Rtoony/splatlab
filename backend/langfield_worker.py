@@ -24,6 +24,7 @@ min so a long training run can reclaim the card.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -49,6 +50,45 @@ log = logging.getLogger("langfield_worker")
 DEV = "cuda"
 SIGLIP_CKPT = "google/siglip2-so400m-patch16-384"
 NEGATIVES = ["object", "things", "stuff", "texture", "surface"]
+
+# Curated open-vocabulary noun list for the "what's in this scene" inventory. We score
+# each word's per-gaussian relevancy against the scene, rank by presence, and keep the
+# top-N. Bump INVENTORY_VERSION when this list or the scoring changes (invalidates cache).
+INVENTORY_VERSION = 3
+VOCAB = [
+    # furniture / indoor
+    "chair", "table", "desk", "sofa", "couch", "bed", "stool", "bench", "shelf",
+    "bookshelf", "cabinet", "drawer", "counter", "countertop", "wardrobe", "dresser",
+    # kitchen / dining
+    "refrigerator", "oven", "stove", "microwave", "sink", "faucet", "toaster", "kettle",
+    "pan", "pot", "bowl", "plate", "cup", "mug", "glass", "bottle", "jar", "can",
+    "knife", "fork", "spoon", "cutting board", "dish", "napkin", "tray",
+    # decor / small objects
+    "lamp", "light", "candle", "vase", "painting", "picture frame", "mirror", "clock",
+    "book", "magazine", "box", "basket", "bag", "pillow", "cushion", "blanket", "rug",
+    "curtain", "toy", "doll", "lego", "ball", "camera", "phone", "remote", "speaker",
+    # electronics
+    "television", "monitor", "computer", "laptop", "keyboard", "mouse",
+    # plants / nature
+    "plant", "potted plant", "flower", "leaf", "tree", "bush",
+    "grass", "moss", "branch", "trunk", "log", "stump", "vine", "fern",
+    # food
+    "fruit", "apple", "banana", "orange", "bread", "food", "vegetable",
+    # outdoor / structural
+    "building", "house", "roof", "wall", "brick wall", "window", "door", "gate",
+    "fence", "stairs", "railing", "pillar", "column", "floor", "ceiling", "ground",
+    "path", "sidewalk", "road", "gravel", "pavement",
+    # outdoor objects
+    "car", "bicycle", "wheel", "bench seat", "statue", "sculpture", "fountain",
+    "pot", "planter", "umbrella", "sign", "pole", "lamp post", "trash can", "ladder",
+    "bucket", "hose", "rope", "flag", "tent",
+    # materials / surfaces
+    "wood", "metal", "glass surface", "stone", "concrete", "fabric", "tile", "carpet",
+    # scene elements
+    "sky", "cloud", "water", "pond", "shadow", "reflection", "person",
+    # musical / misc
+    "piano", "guitar", "instrument",
+]
 QW, QH = 640, 480
 THUMB = 224                    # per-match result thumbnail side (square, px)
 QUERY_VRAM_MB = 4000            # headroom we ask acquire_gpu() to guarantee per render
@@ -337,6 +377,48 @@ def _best_view_for(sc, focus) -> int:
     return int(np.argmax(score))
 
 
+def _scene_inventory(state: "WorkerState", sc: Scene, topn: int = 20) -> list[dict]:
+    """Open-vocabulary "what's in this scene" inventory. Scores every VOCAB word's
+    per-gaussian relevancy against the scene, ranks by PRESENCE (share of gaussians the
+    object occupies), and returns the top-N with presence + reliability (peak confidence)
+    + clustered instances (for the toggle-to-highlight legend). LOCKLESS — cheap matmuls
+    only, no gsplat render. sim_neg is word-independent so it's computed once."""
+    import numpy as np
+    feat_n = sc.feat_n                                  # [N,1152] L2-normed
+    n = int(feat_n.shape[0])
+    emb = state._text_emb(VOCAB)                        # [V,1152]
+    neg = state.neg_p                                   # [K,1152]
+    sim_neg = feat_n @ neg.T                            # [N,K] — same for every word
+    scored = []
+    for i, word in enumerate(VOCAB):
+        sim_pos = feat_n @ emb[i]                       # [N]
+        rel = torch.ones_like(sim_pos)
+        for k in range(neg.shape[0]):
+            pair = torch.stack([sim_pos, sim_neg[:, k]], dim=-1)
+            rel = torch.minimum(rel, torch.softmax(pair * 10.0, dim=-1)[:, 0])
+        # unseen gaussians (zero feature) sit at exactly 0.5, so >0.55 counts only
+        # gaussians that genuinely match this word.
+        pres = float((rel > 0.55).sum()) / max(n, 1)
+        if pres < 0.0008:                               # essentially absent -> skip
+            continue
+        reliab = float(torch.topk(rel, min(200, n)).values.mean())
+        scored.append((word, pres, reliab, rel))
+    scored.sort(key=lambda x: x[1], reverse=True)       # rank by presence
+    items = []
+    for word, pres, reliab, rel in scored[:topn]:
+        focus = _relevancy_focus(sc, rel[:, None].repeat(1, 3))
+        items.append({
+            "label": word,
+            "presence": round(pres, 4),
+            "reliability": round(reliab, 3),
+            "focus": focus["focus"],
+            "radius": focus["radius"],
+            "matches": [{k: m[k] for k in ("focus", "radius", "score", "count")}
+                        for m in focus["matches"]],
+        })
+    return items
+
+
 def _render_view_overlay(sc: Scene, rel3, ci: int):
     """LOCKED (caller holds HEAVY_GPU_LOCK): render one camera view as an RGB base with
     the relevancy heatmap composited over it. Overlay math VERBATIM from query_render_v2.
@@ -431,6 +513,12 @@ class QueryReq(BaseModel):
     views: list[int] | None = None
 
 
+class InventoryReq(BaseModel):
+    config: str
+    lfdir: str
+    topn: int = 20
+
+
 app = FastAPI(title="Splat Lab Language Field — Warm Query Worker")
 
 
@@ -511,6 +599,52 @@ async def query(req: QueryReq) -> dict[str, Any]:
             sc.in_use -= 1
             sc.touch()
     return {"heatmap_name": heatmap_name, "ready": True, **focus}
+
+
+@app.post("/inventory")
+async def inventory(req: InventoryReq) -> dict[str, Any]:
+    """Top-N "what's in this scene" object inventory (open-vocab), cached per scene in
+    <lfdir>/inventory.json. Cheap (no gsplat render), so it runs LOCKLESS."""
+    if not (_HEAVY_OK and STATE.ready):
+        raise HTTPException(503, f"worker not ready (siglip loaded: {STATE.ready})")
+
+    lf_p = Path(req.lfdir)
+    if not (lf_p / "gauss_emb.npz").is_file():
+        raise HTTPException(404, f"gauss_emb.npz not found under lfdir {req.lfdir}")
+    if not Path(req.config).is_file():
+        raise HTTPException(404, f"config not found: {req.config}")
+
+    cache = lf_p / "inventory.json"
+    if cache.is_file():
+        try:
+            data = json.loads(cache.read_text())
+            if data.get("version") == INVENTORY_VERSION and data.get("items"):
+                return {"ready": True, "cached": True, "items": data["items"]}
+        except Exception:  # pragma: no cover - stale/corrupt cache: recompute
+            pass
+
+    async with STATE.lock:
+        sc = STATE.get_scene_cached(req.config)
+        if sc is None:
+            scene_id = lf_p.name or req.config
+            sc = await _build_scene_locked(req.config, req.lfdir, scene_id)
+            STATE.insert_scene(sc)
+        else:
+            sc.touch()
+        sc.in_use += 1   # pin against idle-evict while scoring
+
+    try:
+        items = await asyncio.to_thread(_scene_inventory, STATE, sc, req.topn)
+    finally:
+        async with STATE.lock:
+            sc.in_use -= 1
+            sc.touch()
+
+    try:
+        cache.write_text(json.dumps({"version": INVENTORY_VERSION, "items": items}))
+    except Exception:  # pragma: no cover - cache write is best-effort
+        pass
+    return {"ready": True, "cached": False, "items": items}
 
 
 async def _build_scene_locked(config_path: str, lfdir: str, scene_id: str) -> Scene:

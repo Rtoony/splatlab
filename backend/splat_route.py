@@ -1297,6 +1297,22 @@ async def _langfield_worker_query(config_path: str, lfdir: str, clean_text: str)
         return None
 
 
+async def _langfield_worker_inventory(config_path: str, lfdir: str) -> dict | None:
+    """Ask the warm worker for the scene's top-N object inventory (cached per scene).
+    Returns the worker JSON on success, else None (no cold fallback — inventory is a
+    warm-worker-only convenience)."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=1.5)) as client:
+            resp = await client.post(
+                f"{LANGFIELD_WORKER_URL}/inventory",
+                json={"config": config_path, "lfdir": lfdir},
+            )
+        return resp.json() if resp.status_code == 200 else None
+    except Exception:
+        return None
+
+
 async def _langfield_query_cold(scene_id: str, config_path: str, lfdir: str, clean_text: str) -> bool:
     """Fallback when the worker is down: cold subprocess render under HEAVY_GPU_LOCK
     (loads SigLIP + the pipeline, ~20-40s) so it serialises with train/TRELLIS and can
@@ -2149,6 +2165,26 @@ async def langfield_query(job_id: str, payload: dict[str, Any]):
         "ready": True,
         **focus,
     }
+
+
+@router.get("/jobs/{job_id}/langfield/inventory")
+async def langfield_inventory(job_id: str):
+    """Top-N objects auto-detected in this scene (open-vocab), for the toggle-to-highlight
+    legend. Warm-worker only + cached per scene; 404 if no field, 503 if the worker is
+    down (the UI just hides the legend). (Auth via the router mount.)"""
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    job_dir = _job_dir(job_id)
+    lfdir = job_dir / LANGFIELD_DIRNAME
+    if not (lfdir / "gauss_emb.npz").is_file():
+        raise HTTPException(status_code=404, detail="Language field not built for this scene")
+    config_path = _find_latest_config(job_dir)
+    if config_path is None:
+        raise HTTPException(status_code=409, detail="Scene checkpoint missing")
+    result = await _langfield_worker_inventory(str(config_path), str(lfdir))
+    if result is None:
+        raise HTTPException(status_code=503, detail="Inventory worker unavailable")
+    return {"job_id": job_id, "items": result.get("items", [])}
 
 
 @router.get("/jobs/{job_id}/langfield/heatmap/{name}")
