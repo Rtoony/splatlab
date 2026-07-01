@@ -2136,7 +2136,8 @@ async def langfield_query(job_id: str, payload: dict[str, Any]):
     if worker_result is not None:
         rendered = True
         # 3D centroid(s) of the match(es), for the viewer to fly to / highlight
-        # (worker path only). `matches` = distinct clustered instances.
+        # (worker path only). `matches` = distinct clustered instances; each carries a
+        # `thumb` filename the UI turns into a served heatmap URL (same job, same route).
         focus = {k: worker_result[k] for k in ("focus", "radius", "matches") if k in worker_result}
     else:
         rendered = await _langfield_query_cold(job_id, str(config_path), str(lfdir), clean)

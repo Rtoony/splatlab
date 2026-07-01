@@ -40,6 +40,10 @@ export interface LangfieldMatch {
   radius: number;
   score: number;
   count: number;
+  // Per-instance result thumbnail FILENAME (rendered from the camera that best frames
+  // this match, cropped to the object); served via the same heatmap route for this job.
+  // Absent on cold/legacy responses.
+  thumb?: string;
 }
 
 export interface LangfieldQueryResult {

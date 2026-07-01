@@ -50,6 +50,7 @@ DEV = "cuda"
 SIGLIP_CKPT = "google/siglip2-so400m-patch16-384"
 NEGATIVES = ["object", "things", "stuff", "texture", "surface"]
 QW, QH = 640, 480
+THUMB = 224                    # per-match result thumbnail side (square, px)
 QUERY_VRAM_MB = 4000            # headroom we ask acquire_gpu() to guarantee per render
 SCENE_CACHE_MAX = int(os.environ.get("SPLAT_LANGFIELD_SCENE_CACHE", "2"))  # LRU size (1-2)
 IDLE_EVICT_SEC = float(os.environ.get("SPLAT_LANGFIELD_IDLE_SEC", str(10 * 60)))  # ~10 min
@@ -312,44 +313,101 @@ def _relevancy_focus(sc, rel3):
                     "score": float(wts.sum()), "count": len(pts)}]
     matches.sort(key=lambda x: x["score"], reverse=True)
     matches = matches[:6]
+    # pick the training camera that best FRAMES each instance, so its result
+    # thumbnail actually looks at that object (not a fixed default view).
+    for m in matches:
+        m["view"] = _best_view_for(sc, m["focus"])
     top = matches[0]
     return {"focus": top["focus"], "radius": top["radius"], "matches": matches}
 
 
-def _render_strip_locked(sc: Scene, rel3, views: list[int], text: str) -> str:
-    """LOCKED (caller holds HEAVY_GPU_LOCK): the gsplat rasterizations + overlay
-    composite. Overlay math is VERBATIM from query_render_v2.py. Saves
-    <lfdir>/q_<safe>.png and returns the filename."""
+def _best_view_for(sc, focus) -> int:
+    """Index of the training camera that best frames `focus` (viewer/.ply coords):
+    the one whose forward axis points most directly at it (in front + centered),
+    lightly preferring a closer camera on ties. LOCKLESS (reads the cams tensor)."""
+    import numpy as np
+    c2w = sc.cams.camera_to_worlds.detach().cpu().numpy()   # [N,3,4]
+    pos = c2w[:, :3, 3]
+    fwd = -c2w[:, :3, 2]                                     # nerfstudio: camera looks down -Z
+    fwd = fwd / (np.linalg.norm(fwd, axis=1, keepdims=True) + 1e-9)
+    d = np.asarray(focus, dtype=np.float64)[None, :] - pos
+    dist = np.linalg.norm(d, axis=1) + 1e-9
+    cos = (d / dist[:, None] * fwd).sum(1)                   # centered-ness; >0 = in front
+    score = cos - 0.03 * (dist / (dist.max() + 1e-9))       # tie-break toward closer
+    return int(np.argmax(score))
+
+
+def _render_view_overlay(sc: Scene, rel3, ci: int):
+    """LOCKED (caller holds HEAVY_GPU_LOCK): render one camera view as an RGB base with
+    the relevancy heatmap composited over it. Overlay math VERBATIM from query_render_v2.
+    Returns an HxWx3 uint8 array."""
     turbo = cm.get_cmap("turbo")
     white = torch.ones(3, device=DEV)
+    out, alpha = sc.render(sc.sh, 3, ci, QW, QH)
+    rgb = (out[0, ..., :3] + (1 - alpha[0]) * white).clamp(0, 1)
+    relmap, alpha = sc.render(rel3, None, ci, QW, QH)
+    a = alpha[0, ..., 0]
+    R = relmap[0, ..., 0] / (a + 1e-6)
+    valid = a > 0.5
+    if valid.sum() > 100:
+        lo = torch.quantile(R[valid], 0.85)
+        hi = torch.quantile(R[valid], 0.99)
+    else:
+        lo, hi = R.min(), R.max()
+    Rn = ((R - lo) / (hi - lo + 1e-6)).clamp(0, 1) * valid
+    heat = torch.tensor(turbo(Rn.cpu().numpy())[..., :3], device=DEV, dtype=torch.float32)
+    w = (0.75 * Rn)[..., None]
+    overlay = (rgb * (1 - w) + heat * w).clamp(0, 1)
+    return (overlay.cpu().numpy() * 255).astype(np.uint8)
 
-    # RGB base tiles (cached per view within this call — verbatim from cold path)
-    rgb_cache: dict[int, Any] = {}
-    for ci in views:
-        out, alpha = sc.render(sc.sh, 3, ci, QW, QH)
-        rgb_cache[ci] = (out[0, ..., :3] + (1 - alpha[0]) * white).clamp(0, 1)
 
-    tiles = []
-    for ci in views:
-        relmap, alpha = sc.render(rel3, None, ci, QW, QH)
-        a = alpha[0, ..., 0]
-        R = relmap[0, ..., 0] / (a + 1e-6)
-        valid = a > 0.5
-        if valid.sum() > 100:
-            lo = torch.quantile(R[valid], 0.85)
-            hi = torch.quantile(R[valid], 0.99)
-        else:
-            lo, hi = R.min(), R.max()
-        Rn = ((R - lo) / (hi - lo + 1e-6)).clamp(0, 1) * valid
-        heat = torch.tensor(turbo(Rn.cpu().numpy())[..., :3], device=DEV, dtype=torch.float32)
-        w = (0.75 * Rn)[..., None]
-        overlay = (rgb_cache[ci] * (1 - w) + heat * w).clamp(0, 1)
-        tiles.append((overlay.cpu().numpy() * 255).astype(np.uint8))
+def _project_point(sc: Scene, focus, ci: int):
+    """Project a world/.ply point into the ci-th camera's QWxQH image. Returns
+    (u, v, depth, fx) or None if the point is behind the camera."""
+    viewmat = get_viewmat(sc.cams.camera_to_worlds[ci:ci + 1])[0]        # world->cam [4,4]
+    K = sc.cams.get_intrinsics_matrices()[ci:ci + 1].clone().to(DEV)[0]  # [3,3]
+    K[0, :] *= (QW / sc.fullW)
+    K[1, :] *= (QH / sc.fullH)
+    f = torch.tensor([float(focus[0]), float(focus[1]), float(focus[2]), 1.0],
+                     device=DEV, dtype=viewmat.dtype)
+    pc = viewmat @ f
+    z = float(pc[2])
+    if z <= 1e-3:
+        return None
+    u = float(K[0, 0] * pc[0] / pc[2] + K[0, 2])
+    v = float(K[1, 1] * pc[1] / pc[2] + K[1, 2])
+    return u, v, z, float(K[0, 0])
 
+
+def _render_match_thumbs_locked(sc: Scene, rel3, matches: list[dict], text: str) -> list[str]:
+    """LOCKED: one result thumbnail per match, each rendered from the camera that best
+    frames it (match['view']) and cropped to the object. The primary match is saved as
+    q_<safe>.png (so the app's heatmap_url + existence check resolve), the rest as
+    q_<safe>_<i>.png. Returns the filenames aligned to `matches`."""
     safe = _safe_name(text)
-    out_path = Path(sc.lfdir) / f"q_{safe}.png"
-    Image.fromarray(np.concatenate(tiles, 1)).save(out_path)
-    return out_path.name
+    overlays: dict[int, Any] = {}     # cache per camera — matches often share a view
+    names: list[str] = []
+    for i, m in enumerate(matches):
+        ci = int(m.get("view", 0))
+        ci = ci if 0 <= ci < sc.n_cams else 0
+        if ci not in overlays:
+            overlays[ci] = _render_view_overlay(sc, rel3, ci)
+        img = overlays[ci]
+        H, W = img.shape[:2]
+        crop = img
+        proj = _project_point(sc, m["focus"], ci)
+        if proj is not None:
+            u, v, z, fx = proj
+            s = float(np.clip(fx * 2.4 * float(m["radius"]) / z, 150.0, float(min(W, H))))
+            x0 = int(np.clip(u - s / 2, 0, W - 1)); x1 = int(np.clip(u + s / 2, 1, W))
+            y0 = int(np.clip(v - s / 2, 0, H - 1)); y1 = int(np.clip(v + s / 2, 1, H))
+            if x1 - x0 >= 24 and y1 - y0 >= 24:
+                crop = img[y0:y1, x0:x1]
+        name = f"q_{safe}.png" if i == 0 else f"q_{safe}_{i}.png"
+        Image.fromarray(crop).resize((THUMB, THUMB)).save(Path(sc.lfdir) / name)
+        m["thumb"] = name
+        names.append(name)
+    return names
 
 
 def _safe_name(text: str) -> str:
@@ -443,14 +501,11 @@ async def query(req: QueryReq) -> dict[str, Any]:
         sc.in_use += 1   # pin: the idle-evictor must not free us mid-query
 
     try:
-        views = req.views if req.views else _default_views(sc.n_cams)
-        # clamp/validate view indices against the resident camera count
-        views = [v for v in views if 0 <= int(v) < sc.n_cams] or _default_views(sc.n_cams)
-
-        # ── render: heavy lock ONLY around the gsplat calls ──
+        # ── render: heavy lock ONLY around the gsplat calls. Views are now chosen
+        #    per-match (best camera for each instance), so req.views is unused. ──
         scene_id = Path(req.lfdir).name or req.config
         sc.touch()   # refresh right before the (possibly long) lock wait behind train
-        heatmap_name, focus = await _render_locked(sc, req.text, views, scene_id)
+        heatmap_name, focus = await _render_locked(sc, req.text, scene_id)
     finally:
         async with STATE.lock:
             sc.in_use -= 1
@@ -470,23 +525,25 @@ async def _build_scene_locked(config_path: str, lfdir: str, scene_id: str) -> Sc
     return sc
 
 
-async def _render_locked(sc: Scene, text: str, views: list[int], scene_id: str) -> str:
+async def _render_locked(sc: Scene, text: str, scene_id: str) -> str:
     """The text-encode + per-gaussian cosine relevancy run LOCKLESS; the heavy GPU
     lock is taken ONLY around the gsplat rasterizations (the part that contends for
     VRAM with training/TRELLIS). A query thus WAITS behind a heavy lane and never
-    preempts/OOMs it.
+    preempts/OOMs it. Renders one result thumbnail per clustered match (each framed
+    by its best camera); the primary is q_<safe>.png. Returns (primary_name, focus).
     """
-    # LOCKLESS: SigLIP text-encode + per-gaussian relevancy + the 3D match centroid
+    # LOCKLESS: SigLIP text-encode + per-gaussian relevancy + the 3D match centroids
     rel3 = await asyncio.to_thread(_compute_relevancy, STATE, sc, text)
     focus = await asyncio.to_thread(_relevancy_focus, sc, rel3)
 
-    # LOCKED: gsplat render + overlay composite
+    # LOCKED: gsplat render + overlay composite (per-match thumbnails)
     async with gpu_arbiter.HEAVY_GPU_LOCK:
         gpu_arbiter.set_holder("langfield", scene_id)
         try:
             await gpu_arbiter.acquire_gpu(QUERY_VRAM_MB)
-            name = await asyncio.to_thread(_render_strip_locked, sc, rel3, views, text)
-            return name, focus
+            names = await asyncio.to_thread(
+                _render_match_thumbs_locked, sc, rel3, focus["matches"], text)
+            return names[0], focus   # names[0] == q_<safe>.png (primary, back-compat)
         finally:
             gpu_arbiter.clear_holder()
 

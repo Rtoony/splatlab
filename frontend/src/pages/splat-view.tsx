@@ -231,33 +231,43 @@ function LangfieldSearch({
                 <X className="h-3.5 w-3.5" /> Clear
               </button>
             </div>
-            {matches.length > 1 && (
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-[11px] text-zinc-500">jump to:</span>
-                {matches.map((m, i) => (
-                  <button
-                    key={i}
-                    type="button"
-                    onClick={() => onPick(i)}
-                    title={`Instance ${i + 1} · ${m.count} gaussians`}
-                    className={`h-6 w-6 rounded-full text-xs font-bold transition ${
-                      i === activeIdx
-                        ? "bg-cyan-400 text-black shadow-[0_0_10px_rgba(34,211,238,0.7)]"
-                        : "bg-white/10 text-zinc-200 hover:bg-white/20"
-                    }`}
-                  >
-                    {i + 1}
-                  </button>
-                ))}
+            {/* Clickable per-instance result thumbnails (each framed on that match).
+                Click = fly to + emphasize it. Falls back to the stitched heatmap on
+                cold/legacy responses that carry no per-match thumbnails. */}
+            {matches.some((m) => m.thumb) ? (
+              <div className="flex gap-2 overflow-x-auto pb-1">
+                {matches.map((m, i) =>
+                  m.thumb ? (
+                    <button
+                      key={i}
+                      type="button"
+                      onClick={() => onPick(i)}
+                      title={`Instance ${i + 1} · ${m.count} gaussians`}
+                      className={`relative shrink-0 overflow-hidden rounded-lg border-2 transition ${
+                        i === activeIdx
+                          ? "border-cyan-400 shadow-[0_0_12px_rgba(34,211,238,0.6)]"
+                          : "border-white/10 hover:border-white/40"
+                      }`}
+                    >
+                      <img
+                        src={`/api/splat/jobs/${jobId}/langfield/heatmap/${m.thumb}`}
+                        alt={`Match ${i + 1}`}
+                        className="h-20 w-20 object-cover"
+                      />
+                      <span className="absolute left-1 top-1 rounded bg-black/70 px-1.5 text-[10px] font-bold text-white">
+                        {i + 1}
+                      </span>
+                    </button>
+                  ) : null,
+                )}
               </div>
-            )}
-            {result.heatmap_url && (
+            ) : result.heatmap_url ? (
               <img
                 src={result.heatmap_url}
                 alt={`Relevancy heatmap for "${result.query}"`}
                 className="w-full rounded-xl border border-white/10"
               />
-            )}
+            ) : null}
           </div>
         )}
       </Card>
