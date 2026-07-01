@@ -167,7 +167,7 @@ print(f"[lift] seen={frac_seen:.1%}  got-feature={frac_w:.1%}", flush=True)
 assert gid.max() < N, "gaussian_ids out of range — packed indexing broken"
 _SEEN_MIN = float(os.environ.get("LANGFIELD_SEEN_MIN", "0.5"))
 assert frac_seen > _SEEN_MIN, f"only {frac_seen:.1%} gaussians seen — occlusion gate too tight (raise DEPTH_TOL)"
-assert frac_w > 0.5, f"only {frac_w:.1%} gaussians got a mask — PASS A handoff / res mismatch"
+assert frac_w > _SEEN_MIN, f"only {frac_w:.1%} gaussians got a mask — PASS A handoff / res mismatch"
 
 np.savez_compressed(OUT / "gauss_emb.npz",
          gauss_emb=gauss_emb.half().cpu().numpy(),
