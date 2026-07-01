@@ -102,6 +102,7 @@ export function SplatViewer({
       }
     >
       <div ref={rootRef} className="h-full w-full" />
+      <ShortcutLegend />
       <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-4 py-3">
         <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-white/65">Drag to orbit. Scroll to zoom.</p>
       </div>
@@ -110,6 +111,19 @@ export function SplatViewer({
           {error}
         </div>
       )}
+    </div>
+  );
+}
+
+// Floating shortcut reference — no background, tucked top-right, non-interactive.
+function ShortcutLegend() {
+  const k = "text-white/75";
+  return (
+    <div className="pointer-events-none absolute right-3 top-3 z-10 select-none text-right font-mono text-[10px] leading-[1.55] text-white/40">
+      <div><span className={k}>drag</span> orbit · <span className={k}>scroll</span> zoom</div>
+      <div><span className={k}>W A S D</span> pan · <span className={k}>← →</span> roll</div>
+      <div><span className={k}>F</span>/<span className={k}>G</span> focal · <span className={k}>=</span>/<span className={k}>−</span> scale</div>
+      <div><span className={k}>I</span> info · <span className={k}>C</span> cursor · <span className={k}>P</span> points · <span className={k}>O</span> ortho</div>
     </div>
   );
 }
