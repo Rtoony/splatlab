@@ -149,8 +149,17 @@ for v in range(n_frames):
         print(f"  view {v}: {int(valid.sum())} gaussian-mask hits | seen so far {int(seen.sum())}", flush=True)
 
 # ── finalize ─────────────────────────────────────────────────────────────────────
-gauss_emb = F.normalize(Facc / (Wsum + 1e-15), dim=-1)
-gauss_emb[~seen] = 0.0
+# Chunked, IN-PLACE normalize. 30k-iter scenes carry ~1.5-2M gaussians; the naive
+# `F.normalize(Facc / Wsum)` allocates several full [N,1152] temporaries at once and
+# OOMs a 32GB card. Divide in place, then L2-normalize row-chunks in place, so peak
+# VRAM stays ~one Facc + one chunk instead of ~3x Facc.
+Facc.div_(Wsum + 1e-15)
+_NORM_CHUNK = 200_000
+for _s in range(0, N, _NORM_CHUNK):
+    _e = min(_s + _NORM_CHUNK, N)
+    Facc[_s:_e] = F.normalize(Facc[_s:_e], dim=-1)
+Facc[~seen] = 0.0
+gauss_emb = Facc
 
 frac_seen = seen.float().mean().item()
 frac_w = (Wsum.squeeze(-1) > 0).float().mean().item()
