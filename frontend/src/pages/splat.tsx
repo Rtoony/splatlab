@@ -13,6 +13,7 @@ import { SplatViewer } from "@/components/splat-viewer";
 import {
   AlertTriangle,
   Box,
+  Camera,
   CheckCircle2,
   ChevronDown,
   Cpu,
@@ -113,6 +114,8 @@ export default function SplatLabPage() {
   const [showCustom, setShowCustom] = useState(false);
   // Opt-in: build a text-searchable Language Field alongside the scene.
   const [languageField, setLanguageField] = useState(false);
+  // Opt-in: "Few Photos (AI poses)" — MASt3R dense-seed sparse-view mode (InstantSplat).
+  const [sparseMode, setSparseMode] = useState(false);
   const [toast, setToast] = useState<{ msg: string; bad?: boolean } | null>(null);
   // Dismissed failed-job notice (by job_id) so a newer failure still shows.
   const [dismissedFailed, setDismissedFailed] = useState<string | null>(null);
@@ -143,6 +146,8 @@ export default function SplatLabPage() {
   const engineReady = Boolean(status?.engines?.ns_train_available && status?.engines?.colmap_available);
   // Whether the Language Field toolchain exists — gates the opt-in toggle.
   const langfieldEngineAvailable = Boolean(status?.engines?.langfield_available);
+  // Whether the MASt3R toolchain exists — gates the "Few Photos (AI poses)" mode.
+  const mast3rEngineAvailable = Boolean(status?.engines?.mast3r_available);
 
   function flash(msg: string, bad = false) {
     setToast({ msg, bad });
@@ -197,6 +202,8 @@ export default function SplatLabPage() {
       max_num_iterations: iters,
       insv_fov: input.is_insv ? 204 : undefined,
       language_field: languageField,
+      // "Few Photos (AI poses)": dense-seed MASt3R sparse-view path (no COLMAP).
+      capture_mode: sparseMode && !input.is_insv ? "sparse" : undefined,
     });
   }
 
@@ -365,6 +372,35 @@ export default function SplatLabPage() {
                 <span className="mt-0.5 block text-xs text-zinc-400">
                   Build a language field so you can search the finished scene by typing what you’re looking for. Adds
                   some build time.
+                </span>
+              </span>
+            </button>
+          )}
+
+          {mast3rEngineAvailable && (
+            <button
+              type="button"
+              onClick={() => setSparseMode((v) => !v)}
+              className={`mt-3 flex w-full items-start gap-3 rounded-2xl border p-3 text-left transition-all ${
+                sparseMode
+                  ? "border-amber-400/40 bg-amber-400/10"
+                  : "border-white/10 bg-white/[0.02] hover:border-amber-500/20"
+              }`}
+            >
+              <span
+                className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
+                  sparseMode ? "border-amber-400 bg-amber-400 text-[#04121a]" : "border-white/20 bg-white/5"
+                }`}
+              >
+                {sparseMode && <CheckCircle2 className="h-3.5 w-3.5" />}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="flex items-center gap-1.5 text-sm font-semibold text-white">
+                  <Camera className="h-3.5 w-3.5 text-amber-200" /> Few Photos (AI poses)
+                </span>
+                <span className="mt-0.5 block text-xs text-zinc-400">
+                  Only a handful of shots (2–12)? Skip COLMAP — MASt3R infers camera poses + a dense AI depth prior so
+                  a few photos still make a splat. Geometry in unseen/untextured areas is AI-inferred, not measured.
                 </span>
               </span>
             </button>
