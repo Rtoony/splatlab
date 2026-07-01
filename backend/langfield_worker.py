@@ -54,7 +54,7 @@ NEGATIVES = ["object", "things", "stuff", "texture", "surface"]
 # Curated open-vocabulary noun list for the "what's in this scene" inventory. We score
 # each word's per-gaussian relevancy against the scene, rank by presence, and keep the
 # top-N. Bump INVENTORY_VERSION when this list or the scoring changes (invalidates cache).
-INVENTORY_VERSION = 3
+INVENTORY_VERSION = 4
 VOCAB = [
     # furniture / indoor
     "chair", "table", "desk", "sofa", "couch", "bed", "stool", "bench", "shelf",
@@ -88,6 +88,16 @@ VOCAB = [
     "sky", "cloud", "water", "pond", "shadow", "reflection", "person",
     # musical / misc
     "piano", "guitar", "instrument",
+    # small but distinctive handheld objects — surfaced by the smart ranking even at
+    # low presence (a set of keys is tiny but salient).
+    "keys", "keychain", "wallet", "watch", "ring", "coin", "pen", "pencil", "marker",
+    "scissors", "cable", "charger", "headphones", "earbuds", "glasses", "sunglasses",
+    "controller", "figurine", "trophy", "medal", "brush", "comb", "razor", "toothbrush",
+    "spray bottle", "tube", "tin", "flashlight", "lighter", "matchbox", "usb drive",
+    "battery", "lightbulb", "screwdriver", "hammer", "wrench", "pliers", "tape",
+    "stapler", "calculator", "wallet", "purse", "hat", "cap", "shoe", "boot", "glove",
+    "sock", "belt", "tie", "scarf", "mask", "helmet", "backpack", "notebook", "folder",
+    "envelope", "card", "dice", "chess piece", "domino", "marble", "token", "whistle",
 ]
 QW, QH = 640, 480
 THUMB = 224                    # per-match result thumbnail side (square, px)
@@ -398,21 +408,38 @@ def _scene_inventory(state: "WorkerState", sc: Scene, topn: int = 20) -> list[di
             rel = torch.minimum(rel, torch.softmax(pair * 10.0, dim=-1)[:, 0])
         # unseen gaussians (zero feature) sit at exactly 0.5, so >0.55 counts only
         # gaussians that genuinely match this word.
-        pres = float((rel > 0.55).sum()) / max(n, 1)
-        if pres < 0.0008:                               # essentially absent -> skip
-            continue
+        strong = rel > 0.55
+        cnt = int(strong.sum())
+        pres = cnt / max(n, 1)
         reliab = float(torch.topk(rel, min(200, n)).values.mean())
-        scored.append((word, pres, reliab, rel))
-    scored.sort(key=lambda x: x[1], reverse=True)       # rank by presence
+        # SMART rank: a small-but-salient object (a set of keys) should make the list even
+        # though its area share is tiny. Gate on genuine confidence + a real (non-trivial)
+        # cluster of matching gaussians, then score by CONFIDENCE, only gently boosted by
+        # coverage (sqrt) — so big surfaces still lead but distinctive small things surface.
+        if reliab < 0.53 or cnt < 12:
+            continue
+        score = reliab * (0.55 + min(pres, 1.0) ** 0.5)
+        scored.append((word, pres, reliab, score, rel, strong))
+    scored.sort(key=lambda x: x[3], reverse=True)       # rank by smart score
     items = []
-    for word, pres, reliab, rel in scored[:topn]:
+    for word, pres, reliab, score, rel, strong in scored[:topn]:
         focus = _relevancy_focus(sc, rel[:, None].repeat(1, 3))
+        # AREA highlight: a spread of the object's OWN matching gaussians (not one
+        # centroid), so the viewer lights up the whole region — "tile" paints the floor.
+        idx = torch.nonzero(strong, as_tuple=False).squeeze(-1)
+        if int(idx.numel()) > 200:
+            perm = torch.randperm(int(idx.numel()), device=idx.device)[:200]
+            sel = idx[perm]
+        else:
+            sel = idx
+        pts = sc.means[sel].detach().cpu().numpy() if int(sel.numel()) else np.zeros((0, 3))
         items.append({
             "label": word,
             "presence": round(pres, 4),
             "reliability": round(reliab, 3),
             "focus": focus["focus"],
             "radius": focus["radius"],
+            "points": [[float(x) for x in p] for p in pts],
             "matches": [{k: m[k] for k in ("focus", "radius", "score", "count")}
                         for m in focus["matches"]],
         })
@@ -529,7 +556,7 @@ class QueryReq(BaseModel):
 class InventoryReq(BaseModel):
     config: str
     lfdir: str
-    topn: int = 20
+    topn: int = 50
 
 
 class HeroReq(BaseModel):

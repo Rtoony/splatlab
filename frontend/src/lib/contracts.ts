@@ -74,6 +74,8 @@ export interface LangfieldInventoryItem {
   reliability: number;
   focus: [number, number, number];
   radius: number;
+  // A spread of the object's own matching gaussians, for an AREA highlight (not a pin).
+  points: [number, number, number][];
   matches: LangfieldMatch[];
 }
 

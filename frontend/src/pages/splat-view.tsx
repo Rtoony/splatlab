@@ -71,7 +71,12 @@ export default function SplatViewPage() {
     () =>
       invItems
         .filter((it) => activeLabels.has(it.label))
-        .map((it) => ({ label: it.label, color: colorFor(it.label), points: it.matches.map((m) => m.focus) })),
+        // area highlight: the object's own gaussian spread (fallback to instance centroids)
+        .map((it) => ({
+          label: it.label,
+          color: colorFor(it.label),
+          points: it.points?.length ? it.points : it.matches.map((m) => m.focus),
+        })),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [invItems, activeLabels],
   );

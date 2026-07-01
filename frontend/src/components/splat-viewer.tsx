@@ -219,32 +219,32 @@ export function SplatViewer({
           {overlay.label}
         </div>
       )}
-      {/* Legend highlights: colored dots on every instance of each toggled object,
-          plus one label per object at its first on-screen instance. */}
-      {hlMarkers.map((h, gi) => (
-        <div key={gi}>
-          {h.pts.map((pt, pi) =>
-            pt.front ? (
+      {/* Legend highlights: a soft AREA wash — many translucent screen-blended dots over
+          the object's own gaussians build up into a colored region — + one label at the
+          region's centroid. "tile" paints the whole floor, not a pin. */}
+      {hlMarkers.map((h, gi) => {
+        const front = h.pts.filter((p) => p.front);
+        if (!front.length) return null;
+        const cx = front.reduce((s, p) => s + p.x, 0) / front.length;
+        const cy = front.reduce((s, p) => s + p.y, 0) / front.length;
+        return (
+          <div key={gi}>
+            {front.map((pt, pi) => (
               <div
                 key={pi}
-                style={{ left: `${pt.x}px`, top: `${pt.y}px`, backgroundColor: `${h.color}40`, borderColor: h.color, boxShadow: `0 0 10px ${h.color}` }}
-                className="pointer-events-none absolute z-20 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2"
+                style={{ left: `${pt.x}px`, top: `${pt.y}px`, backgroundColor: `${h.color}4d`, mixBlendMode: "screen" }}
+                className="pointer-events-none absolute z-20 h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full"
               />
-            ) : null,
-          )}
-          {(() => {
-            const lead = h.pts.find((p) => p.front);
-            return lead ? (
-              <div
-                style={{ left: `${lead.x}px`, top: `${lead.y - 14}px`, color: h.color, borderColor: `${h.color}80` }}
-                className="pointer-events-none absolute z-20 -translate-x-1/2 -translate-y-full whitespace-nowrap rounded-md border bg-black/80 px-1.5 py-0.5 text-[11px] font-bold shadow backdrop-blur-sm"
-              >
-                {h.label}
-              </div>
-            ) : null;
-          })()}
-        </div>
-      ))}
+            ))}
+            <div
+              style={{ left: `${cx}px`, top: `${cy}px`, color: h.color, borderColor: `${h.color}80` }}
+              className="pointer-events-none absolute z-30 -translate-x-1/2 -translate-y-1/2 whitespace-nowrap rounded-md border bg-black/80 px-1.5 py-0.5 text-[11px] font-bold shadow backdrop-blur-sm"
+            >
+              {h.label}
+            </div>
+          </div>
+        );
+      })}
       <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-4 py-3">
         <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-white/65">Drag to orbit. Scroll to zoom.</p>
       </div>
