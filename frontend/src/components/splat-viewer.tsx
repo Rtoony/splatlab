@@ -33,6 +33,11 @@ export function SplatViewer({
           cameraUp: [0, -1, -0.6],
           initialCameraPosition: [-1, -4, 6],
           initialCameraLookAt: [0, 2, 0],
+          // The page isn't cross-origin-isolated (no COOP/COEP headers), so
+          // SharedArrayBuffer is disabled in the browser. The sort worker defaults
+          // to it and hangs forever on "Processing splats…". Use the non-shared-
+          // memory path — slightly slower sort, but it actually works.
+          sharedMemoryForWorkers: false,
         });
         await viewer.addSplatScene(url, {
           showLoadingUI: true,
