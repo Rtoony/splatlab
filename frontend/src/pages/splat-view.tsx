@@ -126,6 +126,10 @@ function LangfieldSearch({ jobId, onFocus }: { jobId: string; onFocus: (f: Focus
             onChange={(e) => setText(e.target.value)}
             placeholder="Type what you’re looking for…"
             autoComplete="off"
+            // The mkkellogg viewer listens for WASD/etc. on window (bubble phase),
+            // which hijacks typing. Stop key events from reaching it while typing.
+            onKeyDown={(e) => e.stopPropagation()}
+            onKeyUp={(e) => e.stopPropagation()}
           />
           <Button type="submit" disabled={!text.trim() || search.isPending} className="shrink-0">
             {search.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
