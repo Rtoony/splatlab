@@ -1281,9 +1281,10 @@ def _langfield_heatmap_name(clean_text: str) -> str:
     return f"q_{clean_text.replace(' ', '_')}.png"
 
 
-async def _langfield_worker_query(config_path: str, lfdir: str, clean_text: str) -> bool:
-    """Try the warm worker (resident SigLIP + cached scene = sub-second). True iff it
-    rendered the heatmap; any error -> False so the caller falls back to the cold path."""
+async def _langfield_worker_query(config_path: str, lfdir: str, clean_text: str) -> dict | None:
+    """Try the warm worker (resident SigLIP + cached scene = sub-second). Returns the
+    worker's JSON (incl. the 3D match `focus`/`radius`) on success, else None so the
+    caller falls back to the cold path."""
     import httpx
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=1.5)) as client:
@@ -1291,9 +1292,9 @@ async def _langfield_worker_query(config_path: str, lfdir: str, clean_text: str)
                 f"{LANGFIELD_WORKER_URL}/query",
                 json={"config": config_path, "lfdir": lfdir, "text": clean_text},
             )
-        return resp.status_code == 200
+        return resp.json() if resp.status_code == 200 else None
     except Exception:
-        return False
+        return None
 
 
 async def _langfield_query_cold(scene_id: str, config_path: str, lfdir: str, clean_text: str) -> bool:
@@ -2130,12 +2131,22 @@ async def langfield_query(job_id: str, payload: dict[str, Any]):
     if config_path is None:
         raise HTTPException(status_code=409, detail="Scene checkpoint missing")
     name = _langfield_heatmap_name(clean)
-    rendered = await _langfield_worker_query(str(config_path), str(lfdir), clean)
-    if not rendered:
+    worker_result = await _langfield_worker_query(str(config_path), str(lfdir), clean)
+    focus: dict[str, Any] = {}
+    if worker_result is not None:
+        rendered = True
+        # 3D centroid of the match, for the viewer to fly to (worker path only).
+        focus = {k: worker_result[k] for k in ("focus", "radius") if k in worker_result}
+    else:
         rendered = await _langfield_query_cold(job_id, str(config_path), str(lfdir), clean)
     if not rendered or not (lfdir / name).is_file():
         raise HTTPException(status_code=500, detail="Language query render failed")
-    return {"query": clean, "heatmap_url": f"/api/splat/jobs/{job_id}/langfield/heatmap/{name}", "ready": True}
+    return {
+        "query": clean,
+        "heatmap_url": f"/api/splat/jobs/{job_id}/langfield/heatmap/{name}",
+        "ready": True,
+        **focus,
+    }
 
 
 @router.get("/jobs/{job_id}/langfield/heatmap/{name}")

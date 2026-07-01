@@ -23,6 +23,8 @@ export default function SplatViewPage() {
   );
   const viewUrl = job?.preview_web_url ?? job?.preview_view_url ?? null;
   const title = job ? job.input_path?.split("/").pop() || job.job_id : jobId;
+  // Where the viewer should fly on a search hit (set from a query's 3D focus).
+  const [focus, setFocus] = useState<FocusTarget | null>(null);
 
   return (
     <div className="flex h-screen flex-col bg-[#05070d] text-zinc-100">
@@ -72,8 +74,8 @@ export default function SplatViewPage() {
           </Centered>
         ) : (
           <>
-            <SplatViewer url={viewUrl} format="ply" fill />
-            {job.langfield_available && <LangfieldSearch jobId={job.job_id} />}
+            <SplatViewer url={viewUrl} format="ply" fill focus={focus} />
+            {job.langfield_available && <LangfieldSearch jobId={job.job_id} onFocus={setFocus} />}
           </>
         )}
       </main>
@@ -85,12 +87,19 @@ function Centered({ children }: { children: React.ReactNode }) {
   return <div className="flex h-full items-center justify-center text-sm text-zinc-400">{children}</div>;
 }
 
+// The 3D point (viewer frame) + spread the viewer should fly to on a search hit.
+export type FocusTarget = { point: [number, number, number]; radius: number };
+
 // Text-search panel for scenes that carry an opt-in Language Field. Floats over
-// the bottom of the viewer; a query renders a server-side relevancy heatmap strip.
-function LangfieldSearch({ jobId }: { jobId: string }) {
+// the bottom of the viewer; a query renders a server-side relevancy heatmap strip
+// AND flies the 3D view to the match (via onFocus).
+function LangfieldSearch({ jobId, onFocus }: { jobId: string; onFocus: (f: FocusTarget) => void }) {
   const [text, setText] = useState("");
   const search = useMutation<LangfieldQueryResult, Error, string>({
     mutationFn: (q: string) => queryLangfield(jobId, q),
+    onSuccess: (r) => {
+      if (r.focus) onFocus({ point: r.focus, radius: r.radius ?? 0.3 });
+    },
   });
 
   function submit() {

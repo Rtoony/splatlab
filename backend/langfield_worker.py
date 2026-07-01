@@ -262,6 +262,24 @@ def _compute_relevancy(state: WorkerState, sc: Scene, text: str):
     return rel[:, None].repeat(1, 3)
 
 
+def _relevancy_focus(sc, rel3):
+    """3D centroid + spread of the top-relevancy gaussians = the 'where' of the match,
+    in the .ply/viewer frame (sc.means are the exact exported-.ply coords). LOCKLESS,
+    cheap (tensor ops, no gsplat). Lets the viewer fly the camera to the found object."""
+    rel = rel3[:, 0]
+    n = rel.shape[0]
+    k = min(max(48, n // 200), n)                 # top ~0.5% (the strongest core)
+    topv, topi = torch.topk(rel, k)
+    strong = topi[topv > 0.65]                    # only clearly-relevant gaussians
+    idx = strong if strong.numel() >= 16 else topi[: min(16, n)]
+    pts = sc.means[idx]
+    c = pts.mean(0)
+    # 70th-pct spread of the core, clamped so a diffuse match doesn't fling the
+    # camera to the moon (viewer scenes are ~unit-scaled).
+    r = float((pts - c).norm(dim=-1).quantile(0.70).clamp(0.08, 1.5))
+    return {"focus": [float(x) for x in c.tolist()], "radius": r, "hits": int(idx.numel())}
+
+
 def _render_strip_locked(sc: Scene, rel3, views: list[int], text: str) -> str:
     """LOCKED (caller holds HEAVY_GPU_LOCK): the gsplat rasterizations + overlay
     composite. Overlay math is VERBATIM from query_render_v2.py. Saves
@@ -396,12 +414,12 @@ async def query(req: QueryReq) -> dict[str, Any]:
         # ── render: heavy lock ONLY around the gsplat calls ──
         scene_id = Path(req.lfdir).name or req.config
         sc.touch()   # refresh right before the (possibly long) lock wait behind train
-        heatmap_name = await _render_locked(sc, req.text, views, scene_id)
+        heatmap_name, focus = await _render_locked(sc, req.text, views, scene_id)
     finally:
         async with STATE.lock:
             sc.in_use -= 1
             sc.touch()
-    return {"heatmap_name": heatmap_name, "ready": True}
+    return {"heatmap_name": heatmap_name, "ready": True, **focus}
 
 
 async def _build_scene_locked(config_path: str, lfdir: str, scene_id: str) -> Scene:
@@ -422,15 +440,17 @@ async def _render_locked(sc: Scene, text: str, views: list[int], scene_id: str) 
     VRAM with training/TRELLIS). A query thus WAITS behind a heavy lane and never
     preempts/OOMs it.
     """
-    # LOCKLESS: SigLIP text-encode + per-gaussian relevancy
+    # LOCKLESS: SigLIP text-encode + per-gaussian relevancy + the 3D match centroid
     rel3 = await asyncio.to_thread(_compute_relevancy, STATE, sc, text)
+    focus = await asyncio.to_thread(_relevancy_focus, sc, rel3)
 
     # LOCKED: gsplat render + overlay composite
     async with gpu_arbiter.HEAVY_GPU_LOCK:
         gpu_arbiter.set_holder("langfield", scene_id)
         try:
             await gpu_arbiter.acquire_gpu(QUERY_VRAM_MB)
-            return await asyncio.to_thread(_render_strip_locked, sc, rel3, views, text)
+            name = await asyncio.to_thread(_render_strip_locked, sc, rel3, views, text)
+            return name, focus
         finally:
             gpu_arbiter.clear_holder()
 

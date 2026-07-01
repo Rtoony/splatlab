@@ -39,6 +39,9 @@ export interface LangfieldQueryResult {
   query: string;
   heatmap_url: string;
   ready: boolean;
+  // 3D centroid of the match (viewer frame) + its spread, for "fly to" (worker path).
+  focus?: [number, number, number];
+  radius?: number;
 }
 
 export interface SplatGpuHolder {

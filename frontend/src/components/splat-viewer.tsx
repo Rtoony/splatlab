@@ -6,12 +6,17 @@ export function SplatViewer({
   url,
   format = "ply",
   fill = false,
+  focus = null,
 }: {
   url: string;
   format?: "ply" | "spz";
   fill?: boolean;
+  // When set (from a language search hit), fly the camera to this 3D point.
+  focus?: { point: [number, number, number]; radius: number } | null;
 }) {
   const rootRef = useRef<HTMLDivElement | null>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const viewerRef = useRef<any>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -52,6 +57,7 @@ export function SplatViewer({
           return;
         }
         viewer.start();
+        viewerRef.current = viewer;
       } catch (cause) {
         if (!mounted) return;
         setError(cause instanceof Error ? cause.message : "Could not load splat preview.");
@@ -61,9 +67,31 @@ export function SplatViewer({
     void boot();
     return () => {
       mounted = false;
+      viewerRef.current = null;
       if (viewer) void viewer.dispose();
     };
   }, [url, format]);
+
+  // Fly the camera to a search hit: recenter on the 3D point, keeping the current
+  // viewing angle, pulled back to frame the match (radius-scaled distance).
+  useEffect(() => {
+    const v = viewerRef.current;
+    if (!focus || !v || !v.camera || !v.controls) return;
+    const [fx, fy, fz] = focus.point;
+    const dist = Math.max(focus.radius * 3.5, 0.7);
+    const cam = v.camera;
+    const ctr = v.controls;
+    let dx = cam.position.x - fx;
+    let dy = cam.position.y - fy;
+    let dz = cam.position.z - fz;
+    let len = Math.hypot(dx, dy, dz);
+    if (len < 1e-3) {
+      dx = 0; dy = -1; dz = 0.6; len = Math.hypot(dx, dy, dz);
+    }
+    ctr.target.set(fx, fy, fz);
+    cam.position.set(fx + (dx / len) * dist, fy + (dy / len) * dist, fz + (dz / len) * dist);
+    ctr.update();
+  }, [focus]);
 
   return (
     <div
