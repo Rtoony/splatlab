@@ -88,7 +88,11 @@ export function SplatViewer({
     const v = viewerRef.current;
     if (!focus || !v || !v.camera || !v.controls) return;
     const [fx, fy, fz] = focus.point;
-    const dist = Math.max(focus.radius * 3.5, 0.7);
+    // Stand back far enough to see the match IN CONTEXT (its surroundings), not a
+    // tight close-up. Bump FLY_ZOOM / FLY_MIN up for more room, down for tighter.
+    const FLY_ZOOM = 8;
+    const FLY_MIN = 1.8;
+    const dist = Math.max(focus.radius * FLY_ZOOM, FLY_MIN);
     const cam = v.camera;
     const ctr = v.controls;
     let dx = cam.position.x - fx;
