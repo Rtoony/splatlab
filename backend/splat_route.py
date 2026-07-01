@@ -184,6 +184,9 @@ SFM_ESCALATION = ["colmap", "glomap", "mast3r"]
 SFM_SOLVER_AVAILABILITY = {
     "glomap": "glomap_available",
     "mast3r": "mast3r_available",
+    # InstantSplat sparse-view rung: same MASt3R toolchain, dense-seed + low-iter path.
+    # NOT in SFM_ESCALATION (it's a user-selected capture mode, not an auto-fallback rung).
+    "mast3r-sparse": "mast3r_available",
 }
 _JOB_ID_RE = re.compile(r"^splat_[0-9a-f]{6,32}$")
 
@@ -218,6 +221,12 @@ class SplatTrainRequest(BaseModel):
     # SigLIP 2, training-free lift). Default off → the pipeline is byte-identical.
     # Best-effort: a build failure never fails the splat job.
     language_field: bool = False
+    # OPT-IN capture mode. "standard" (default) → the pipeline is byte-identical.
+    # "sparse" = InstantSplat "Few Photos (AI poses)": force the MASt3R rung with a
+    # DENSE pointmap seed + complete scene-graph + low iterations, so a handful of
+    # ordinary photos (2-12) yield a usable splat with no COLMAP. Requires the MASt3R
+    # toolchain; only applies to image-folder / video inputs (not equirect / pre-processed).
+    capture_mode: Literal["standard", "sparse"] = "standard"
 
 
 @dataclass
@@ -887,6 +896,8 @@ def _mast3r_sfm_command(
     process_input: Path,
     is_video: bool,
     num_frames_target: int,
+    dense: bool = False,
+    scene_graph: str = MAST3R_SCENE_GRAPH,
 ) -> list[str]:
     """One self-contained `bash -c` command for the MASt3R-SfM rung.
 
@@ -945,15 +956,17 @@ def _mast3r_sfm_command(
         f'rm -rf "{run_out}" "{processed_dir}"; '
         f'mkdir -p "{img_dir}" "{run_out}"; '
         f'{ingest}; '
-        # ViT-Large dense matching -> in-memory SparseGA -> poses.npz/points3D.npz.
+        # ViT-Large dense matching -> in-memory SparseGA -> poses.npz/points3D.npz
+        # (+ dense3D.npz when --dense, for the InstantSplat sparse-view seed).
         f'"{availability["mast3r_python"]}" "{availability["mast3r_runner"]}" '
         f'--images "{img_dir}" --out "{run_out}" '
         f'--ckpt "{availability["mast3r_checkpoint"]}" '
-        f'--scene-graph {MAST3R_SCENE_GRAPH}; '
-        # Reproduce nerfstudio's colmap_to_json convention -> processed_dir.
+        f'--scene-graph {scene_graph}{" --dense" if dense else ""}; '
+        # Reproduce nerfstudio's colmap_to_json convention -> processed_dir
+        # (dense seed -> ply_file_path=dense_pc.ply when --seed dense).
         f'"{availability["mast3r_python"]}" "{availability["mast3r_converter"]}" '
         f'--mast3r-out "{run_out}" --src-images "{img_dir}" '
-        f'--out "{processed_dir}" --image-mode resized; '
+        f'--out "{processed_dir}" --image-mode resized{" --seed dense" if dense else ""}; '
         # Assert the converter produced a usable Nerfstudio dataset so the stage
         # fails loud (rather than letting the A1 gate / train choke downstream).
         f'test -f "{processed_dir}/transforms.json"'
@@ -1033,6 +1046,26 @@ def _sfm_stage_commands(
         )
         # Cheap, env-independent guard so the registration gate has a `process`
         # stage to run and gate on (the real work already happened in mast3r_sfm).
+        process_cmd = ["test", "-f", str(processed_dir / "transforms.json")]
+        return {"mast3r_sfm": mast3r_sfm, "process": process_cmd}
+
+    if solver == "mast3r-sparse":
+        # InstantSplat "Few Photos (AI poses)" rung: identical to the mast3r rung but
+        # with a DENSE pointmap seed (ply_file_path=dense_pc.ply) + the `complete`
+        # scene-graph (all image pairs — right for 2-12 photos, unlike swin windows).
+        # The converter still writes a standard Nerfstudio dataset, so the `process`
+        # assert + the A1 registration gate + the `train` stage are all unchanged.
+        mast3r_sfm = _mast3r_sfm_command(
+            availability=availability,
+            ffmpeg=availability["ffmpeg_path"],
+            job_dir=job_dir,
+            processed_dir=processed_dir,
+            process_input=process_input,
+            is_video=(subcommand == "video"),
+            num_frames_target=req.num_frames_target,
+            dense=True,
+            scene_graph="complete",
+        )
         process_cmd = ["test", "-f", str(processed_dir / "transforms.json")]
         return {"mast3r_sfm": mast3r_sfm, "process": process_cmd}
 
@@ -1146,6 +1179,7 @@ def _plan_3d_job(
         is_video = input_path.suffix.lower() in VIDEO_EXTENSIONS
         is_equirect = req.capture_format == "equirectangular360"
 
+    sparse_mode = False  # set True below when the InstantSplat few-photos rung engages
     if not is_insv and input_path.is_dir() and (input_path / "transforms.json").is_file():
         train_data = input_path
     else:
@@ -1174,6 +1208,19 @@ def _plan_3d_job(
         avail_key = SFM_SOLVER_AVAILABILITY.get(start_solver)
         if avail_key is not None and not availability.get(avail_key):
             start_solver = "colmap"
+
+        # InstantSplat "Few Photos (AI poses)": override to the dense-seed MASt3R rung.
+        # A handful of photos won't COLMAP, so there is NO auto-fallback (escalation off);
+        # if MASt3R isn't available the request degrades to the standard path silently.
+        sparse_mode = (
+            req.capture_mode == "sparse"
+            and subcommand in ("video", "images")
+            and not is_equirect
+            and bool(availability.get("mast3r_available"))
+        )
+        if sparse_mode:
+            start_solver = "mast3r-sparse"
+            escalation_eligible = False
 
         sfm_cmds = _sfm_stage_commands(
             solver=start_solver,
@@ -1207,6 +1254,12 @@ def _plan_3d_job(
     # train_data may point at the input dataset (skip-process branch) or
     # processed_dir; in the escalation case the gate re-runs `process` into the
     # same processed_dir, so train_data stays valid across a reroute.
+    # Sparse-view (few photos) trains at LOW iterations — the geometry is already
+    # seeded by the dense MASt3R cloud and few images overfit fast; 30k just bakes in
+    # artifacts. Cap the default; an explicit lower request is still honored.
+    train_iters = req.max_num_iterations
+    if sparse_mode and train_iters > 8000:
+        train_iters = 7000
     commands["train"] = [
         availability["ns_train_path"],
         "splatfacto",
@@ -1215,7 +1268,7 @@ def _plan_3d_job(
         "--output-dir",
         str(job_dir),
         "--max-num-iterations",
-        str(req.max_num_iterations),
+        str(train_iters),
         "--viewer.quit-on-train-completion",
         "True",
     ]
@@ -1726,9 +1779,11 @@ async def _run_pipeline(job: SplatJob) -> None:
             final_status = "stopped"
             job.log_lines.append("Pipeline stopped by operator request.")
     except Exception as exc:  # noqa: BLE001 — surface anything to the job log
+        import traceback
         final_status = "failed"
         error_message = f"Pipeline crashed: {exc}"
         job.log_lines.append(error_message)
+        job.log_lines.append("[traceback] " + traceback.format_exc().replace("\n", " | "))
     finally:
         meta = _patch_meta(
             job.job_id,

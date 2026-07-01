@@ -232,7 +232,9 @@ async def acquire_gpu(needed_mb: int) -> tuple[bool, str]:
     if status.get("vram_free_mb", 0) >= needed_mb:
         return True, f"sufficient headroom ({status['vram_free_mb']} MB free)"
     resident = [s for s in status.get("services", []) if s.get("resident")]
-    resident.sort(key=lambda s: (s.get("priority", 99), -s.get("idle_sec", 0) or 0))
+    # NB: `or 0` INSIDE the negation — a service can report idle_sec=None, and
+    # `-None` crashes the whole acquire path (bad operand type for unary -).
+    resident.sort(key=lambda s: (s.get("priority", 99), -(s.get("idle_sec") or 0)))
     evicted: list[str] = []
     deadline = time.monotonic() + GPU_ACQUIRE_TIMEOUT_SEC
     for svc in resident:
