@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/api";
+import { setSplatlabFeedbackContext } from "@/lib/feedback-context";
 import type {
   SplatJob,
   SplatStatusResponse,
@@ -152,6 +153,33 @@ export default function SplatLabPage() {
   const mast3rEngineAvailable = Boolean(status?.engines?.mast3r_available);
   // Whether the TripoSplat toolchain exists — gates the "Imagine a Splat" mode.
   const triposplatEngineAvailable = Boolean(status?.engines?.triposplat_available);
+
+  useEffect(() => {
+    setSplatlabFeedbackContext({
+      page: "splatlab-gallery",
+      active_job_id: activeJob?.job_id ?? null,
+      active_job_status: activeJob?.status ?? null,
+      active_job_stage: activeJob?.stage ?? null,
+      completed_count: completed.length,
+      failed_count: jobs.filter((j) => j.status === "failed").length,
+      selected_upload: uploaded
+        ? {
+            name: uploaded.name,
+            kind: uploaded.kind,
+            is_insv: uploaded.is_insv,
+          }
+        : null,
+      settings: {
+        iterations: iters,
+        language_field: languageField,
+        sparse_mode: sparseMode,
+        generative_mode: generativeMode,
+      },
+      gpu_lane: gpu?.lane ?? null,
+      gpu_locked: Boolean(gpu?.locked),
+    });
+    return () => setSplatlabFeedbackContext(null);
+  }, [activeJob, completed.length, generativeMode, gpu?.lane, gpu?.locked, iters, jobs, languageField, sparseMode, uploaded]);
 
   function flash(msg: string, bad = false) {
     setToast({ msg, bad });

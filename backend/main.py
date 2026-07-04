@@ -28,6 +28,7 @@ from starlette.background import BackgroundTask
 # Make the ported splat route + its local gpu_arbiter / operator_audit importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import splat_route  # noqa: E402  (imports gpu_arbiter + operator_audit from this dir)
+import feedback  # noqa: E402  (small SQLite-backed in-app feedback loop)
 import thumb as thumbgen  # noqa: E402  (scene thumbnail generator)
 
 PORTAL_ORIGIN = os.environ.get("SPLATLAB_PORTAL_ORIGIN", "http://127.0.0.1:3300").rstrip("/")
@@ -44,6 +45,8 @@ async def _lifespan(_app: FastAPI):
         splat_route.migrate_legacy_metas()
     with contextlib.suppress(Exception):
         splat_route.cleanup_orphan_jobs()
+    with contextlib.suppress(Exception):
+        feedback.init_db()
     yield
 
 
@@ -155,6 +158,9 @@ def require_auth(request: Request) -> None:
 
 # /api/splat is now OWNED here (the ported pipeline), gated by splatlab auth.
 app.include_router(splat_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
+
+# Feedback is Splatlab-native runtime data, also gated by the same signed cookie.
+app.include_router(feedback.router, dependencies=[Depends(require_auth)])
 
 
 @app.get("/api/splat/jobs/{job_id}/thumbnail", dependencies=[Depends(require_auth)])

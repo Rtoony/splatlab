@@ -91,6 +91,29 @@ export interface LangfieldInventoryResult {
   items: LangfieldInventoryItem[];
 }
 
+export interface SplatCameraPose {
+  index: number;
+  image_name: string;
+  file_path: string;
+  position: [number, number, number];
+  forward: [number, number, number];
+  up: [number, number, number];
+  right: [number, number, number];
+  fov_y_degrees?: number | null;
+}
+
+export interface SplatCamerasResponse {
+  job_id: string;
+  count: number;
+  total: number;
+  sampled: boolean;
+  frame: "viewer" | "source";
+  source: "dataparser_transforms" | "transforms_json";
+  display_scale: number;
+  image_size: { width: number | null; height: number | null };
+  cameras: SplatCameraPose[];
+}
+
 export interface SplatGpuHolder {
   lane: string | null;
   job_id: string | null;

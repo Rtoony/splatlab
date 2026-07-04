@@ -1,16 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link, useRoute } from "wouter";
-import { apiRequest, fetchLangfieldInventory, queryLangfield } from "@/lib/api";
+import { apiRequest, fetchLangfieldInventory, fetchSplatCameras, queryLangfield } from "@/lib/api";
+import { setSplatlabFeedbackContext } from "@/lib/feedback-context";
 import type {
   LangfieldInventoryItem,
   LangfieldQueryResult,
+  SplatCameraPose,
   SplatJob,
   SplatStatusResponse,
 } from "@/lib/contracts";
-import { SplatViewer, type ViewerHighlight, type ViewerOverlay } from "@/components/splat-viewer";
+import { SplatViewer, type ViewerCameraNodeTarget, type ViewerCameraViewTarget, type ViewerHighlight, type ViewerOverlay } from "@/components/splat-viewer";
 import { Button, Card, Input, SectionLabel } from "@/components/ui";
-import { ArrowLeft, ChevronDown, ChevronUp, Crosshair, Download, Eye, EyeOff, Layers, Loader2, Orbit, Search, Sparkles, X } from "lucide-react";
+import { ArrowLeft, Camera, ChevronDown, ChevronUp, Crosshair, Download, Eye, EyeOff, Layers, Loader2, Orbit, RotateCcw, Search, SlidersHorizontal, Sparkles, X } from "lucide-react";
 
 // Distinct colors handed out to toggled inventory objects (stable per item index).
 const HL_PALETTE = ["#22d3ee", "#f59e0b", "#a78bfa", "#34d399", "#f472b6", "#60a5fa", "#fb7185", "#facc15", "#4ade80", "#c084fc"];
@@ -31,12 +33,87 @@ export default function SplatViewPage() {
   );
   const viewUrl = job?.preview_web_url ?? job?.preview_view_url ?? null;
   const title = job ? job.input_path?.split("/").pop() || job.job_id : jobId;
+  const [cameraOverlayOn, setCameraOverlayOn] = useState(false);
+  const [inventoryOpen, setInventoryOpen] = useState(false);
+  const [cameraShotsOpen, setCameraShotsOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [shortcutLegendOpen, setShortcutLegendOpen] = useState(false);
+  const [resetViewToken, setResetViewToken] = useState(0);
+
+  const { data: cameras, isFetching: camerasLoading, error: camerasError } = useQuery({
+    queryKey: ["cameras", jobId],
+    queryFn: () => fetchSplatCameras(jobId),
+    enabled: cameraOverlayOn && Boolean(jobId && viewUrl),
+    staleTime: Infinity,
+    retry: false,
+  });
+  const cameraOverlay = useMemo(
+    () =>
+      cameraOverlayOn && cameras
+        ? { cameras: cameras.cameras, displayScale: cameras.display_scale, frame: cameras.frame }
+        : null,
+    [cameraOverlayOn, cameras],
+  );
+  const [selectedCameraIndex, setSelectedCameraIndex] = useState<number | null>(null);
+  const [cameraViewTarget, setCameraViewTarget] = useState<ViewerCameraViewTarget>(null);
+  const [cameraNodeTarget, setCameraNodeTarget] = useState<ViewerCameraNodeTarget>(null);
+
+  function zoomToCamera(camera: SplatCameraPose) {
+    setCameraOverlayOn(true);
+    setCameraShotsOpen(true);
+    setSelectedCameraIndex(camera.index);
+    setFlyTarget(null);
+    setCameraViewTarget(null);
+    setCameraNodeTarget((prev) => ({
+      camera,
+      token: (prev?.token ?? 0) + 1,
+      distance: Math.max((cameras?.display_scale ?? 0.08) * 4, 0.24),
+    }));
+  }
+
+  function viewFromCamera(camera: SplatCameraPose) {
+    setCameraOverlayOn(true);
+    setCameraShotsOpen(true);
+    setSelectedCameraIndex(camera.index);
+    setFlyTarget(null);
+    setCameraNodeTarget(null);
+    setCameraViewTarget((prev) => ({
+      camera,
+      token: (prev?.token ?? 0) + 1,
+      distance: Math.max((cameras?.display_scale ?? 0.08) * 14, 1.1),
+    }));
+  }
+
+  function resetToDefaultView() {
+    setCameraOverlayOn(false);
+    setInventoryOpen(false);
+    setCameraShotsOpen(false);
+    setSearchOpen(false);
+    setActiveLabels(new Set());
+    setResult(null);
+    setActiveIdx(0);
+    setHighlightOn(false);
+    setShortcutLegendOpen(false);
+    setSelectedCameraIndex(null);
+    setCameraViewTarget(null);
+    setCameraNodeTarget(null);
+    setFlyTarget(null);
+    setResetViewToken((token) => token + 1);
+  }
+
+  function enableAdvancedView() {
+    setCameraOverlayOn(true);
+    setInventoryOpen(true);
+    setCameraShotsOpen(true);
+    setSearchOpen(true);
+    setShortcutLegendOpen(true);
+  }
 
   // Search-result navigation: the matched instances, which one is active (flown-to
   // + emphasized), and whether the highlight/label overlay is shown.
   const [result, setResult] = useState<LangfieldQueryResult | null>(null);
   const [activeIdx, setActiveIdx] = useState(0);
-  const [highlightOn, setHighlightOn] = useState(true);
+  const [highlightOn, setHighlightOn] = useState(false);
 
   const matches = result?.matches ?? [];
   const activeMatch = matches[activeIdx];
@@ -81,6 +158,31 @@ export default function SplatViewPage() {
     [invItems, activeLabels],
   );
 
+  useEffect(() => {
+    setSplatlabFeedbackContext({
+      page: "splat-viewer",
+      job_id: job?.job_id ?? jobId,
+      job_status: job?.status ?? null,
+      job_stage: job?.stage ?? null,
+      preview_available: Boolean(job?.preview_available),
+      language_field_available: Boolean(job?.langfield_available),
+      active_search: result?.query ?? null,
+      active_match_index: result ? activeIdx : null,
+      visible_inventory_labels: Array.from(activeLabels),
+      capture_cameras_visible: cameraOverlayOn,
+      capture_camera_count: cameras?.count ?? null,
+      capture_camera_frame: cameras?.frame ?? null,
+      camera_shots_panel_open: cameraShotsOpen,
+      inventory_panel_open: inventoryOpen,
+      search_panel_open: searchOpen,
+      shortcut_legend_open: shortcutLegendOpen,
+      selected_capture_camera_index: selectedCameraIndex,
+      selected_capture_camera_name: cameras?.cameras.find((camera) => camera.index === selectedCameraIndex)?.image_name ?? null,
+      camera_node_zoom_active: Boolean(cameraNodeTarget),
+    });
+    return () => setSplatlabFeedbackContext(null);
+  }, [activeIdx, activeLabels, cameraNodeTarget, cameraOverlayOn, cameraShotsOpen, cameras, inventoryOpen, job, jobId, result, searchOpen, selectedCameraIndex, shortcutLegendOpen]);
+
   return (
     <div className="flex h-screen flex-col bg-[#05070d] text-zinc-100">
       <header className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
@@ -94,15 +196,41 @@ export default function SplatViewPage() {
             <span className="truncate text-sm font-semibold">{title}</span>
           </div>
         </div>
-        {job?.preview_file_url && (
-          <a
-            href={job.preview_file_url}
-            download={`${jobId}.ply`}
-            className="flex shrink-0 items-center gap-1.5 rounded-full border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-semibold text-zinc-200 hover:bg-white/10"
-          >
-            <Download className="h-3.5 w-3.5" /> Full-quality .ply
-          </a>
-        )}
+        <div className="flex shrink-0 items-center gap-2">
+          {job && viewUrl && (
+            <>
+              <Button type="button" variant="outline" size="sm" onClick={resetToDefaultView} title="Reset camera and collapse viewer extras">
+                <RotateCcw className="h-3.5 w-3.5" /> Reset
+              </Button>
+              <Button type="button" variant="outline" size="sm" onClick={enableAdvancedView} title="Open advanced search, scene, and camera tools">
+                <SlidersHorizontal className="h-3.5 w-3.5" /> Advanced
+              </Button>
+              <Button
+                type="button"
+                variant={cameraOverlayOn ? "primary" : "outline"}
+                size="sm"
+                onClick={() => {
+                  setCameraOverlayOn((v) => !v);
+                  setCameraShotsOpen((v) => (!cameraOverlayOn ? true : v));
+                }}
+                title={camerasError ? "Camera poses are unavailable for this scene" : "Toggle capture camera locations"}
+                className={cameraOverlayOn ? "bg-amber-300 text-zinc-950 hover:bg-amber-200" : ""}
+              >
+                {camerasLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Camera className="h-3.5 w-3.5" />}
+                {cameraOverlayOn && cameras ? `${cameras.count}/${cameras.total} cameras` : "Cameras"}
+              </Button>
+            </>
+          )}
+          {job?.preview_file_url && (
+            <a
+              href={job.preview_file_url}
+              download={`${jobId}.ply`}
+              className="flex shrink-0 items-center gap-1.5 rounded-full border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-semibold text-zinc-200 hover:bg-white/10"
+            >
+              <Download className="h-3.5 w-3.5" /> Full-quality .ply
+            </a>
+          )}
+        </div>
       </header>
       <main className="relative flex-1 overflow-hidden">
         {isLoading && !job ? (
@@ -129,12 +257,45 @@ export default function SplatViewPage() {
           </Centered>
         ) : (
           <>
-            <SplatViewer url={viewUrl} format="ply" fill focus={flyTarget} overlay={overlay} highlights={highlights} onPickMatch={setActiveIdx} />
+            <SplatViewer
+              url={viewUrl}
+              format="ply"
+              fill
+              focus={flyTarget}
+              overlay={overlay}
+              highlights={highlights}
+              cameraOverlay={cameraOverlay}
+              viewCamera={cameraViewTarget}
+              cameraNodeTarget={cameraNodeTarget}
+              resetViewToken={resetViewToken}
+              showShortcutLegend={shortcutLegendOpen}
+              onPickMatch={setActiveIdx}
+              onPickCamera={zoomToCamera}
+            />
+            {cameraOverlayOn && camerasError && (
+              <div className="pointer-events-none absolute right-3 top-20 z-30 max-w-xs rounded-xl border border-amber-300/25 bg-black/70 px-3 py-2 text-xs text-amber-100 shadow backdrop-blur-md">
+                Camera poses are unavailable for this scene. Generated single-image splats and unfinished captures usually do not have SfM cameras.
+              </div>
+            )}
+            {cameraOverlayOn && cameras && (
+              <CameraShotsLegend
+                cameras={cameras.cameras}
+                total={cameras.total}
+                sampled={cameras.sampled}
+                activeIndex={selectedCameraIndex}
+                open={cameraShotsOpen}
+                onOpenChange={setCameraShotsOpen}
+                onZoom={zoomToCamera}
+                onView={viewFromCamera}
+              />
+            )}
             {job.langfield_available && (invItems.length > 0 || invLoading) && (
               <InventoryLegend
                 items={invItems}
                 loading={invLoading}
                 active={activeLabels}
+                open={inventoryOpen}
+                onOpenChange={setInventoryOpen}
                 colorFor={colorFor}
                 onToggle={(label) =>
                   setActiveLabels((prev) => {
@@ -153,6 +314,8 @@ export default function SplatViewPage() {
                 result={result}
                 activeIdx={activeIdx}
                 highlightOn={highlightOn}
+                open={searchOpen}
+                onOpenChange={setSearchOpen}
                 onResult={(r) => {
                   setResult(r);
                   setActiveIdx(0);
@@ -180,6 +343,8 @@ function InventoryLegend({
   items,
   loading,
   active,
+  open,
+  onOpenChange,
   colorFor,
   onToggle,
   onZoom,
@@ -188,19 +353,20 @@ function InventoryLegend({
   items: LangfieldInventoryItem[];
   loading: boolean;
   active: Set<string>;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
   colorFor: (label: string) => string;
   onToggle: (label: string) => void;
   onZoom: (it: LangfieldInventoryItem) => void;
   onClear: () => void;
 }) {
-  const [open, setOpen] = useState(true);
   const maxP = Math.max(...items.map((i) => i.presence), 0.0001);
   return (
     <div className="pointer-events-none absolute left-3 top-3 z-20 w-56">
       <Card className="pointer-events-auto border-white/12 bg-[#070b14]/85 p-2 backdrop-blur-md">
         <button
           type="button"
-          onClick={() => setOpen((v) => !v)}
+          onClick={() => onOpenChange(!open)}
           className="flex w-full items-center justify-between gap-2 px-1 py-0.5 text-left"
         >
           <span className="flex items-center gap-1.5">
@@ -279,6 +445,96 @@ function InventoryLegend({
   );
 }
 
+function CameraShotsLegend({
+  cameras,
+  total,
+  sampled,
+  activeIndex,
+  open,
+  onOpenChange,
+  onZoom,
+  onView,
+}: {
+  cameras: SplatCameraPose[];
+  total: number;
+  sampled: boolean;
+  activeIndex: number | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onZoom: (camera: SplatCameraPose) => void;
+  onView: (camera: SplatCameraPose) => void;
+}) {
+  return (
+    <div className="pointer-events-none absolute right-3 top-20 z-20 w-[21rem] max-w-[calc(100vw-1.5rem)]">
+      <Card className="pointer-events-auto border-amber-300/20 bg-[#100d08]/85 p-2 backdrop-blur-md">
+        <button
+          type="button"
+          onClick={() => onOpenChange(!open)}
+          className="flex w-full items-center justify-between gap-2 px-1 py-0.5 text-left"
+        >
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Camera className="h-3.5 w-3.5 shrink-0 text-amber-200" />
+            <SectionLabel className="text-amber-100/75">Camera shots</SectionLabel>
+          </span>
+          <span className="flex items-center gap-1 text-[11px] text-amber-100/60">
+            {cameras.length}/{total}
+            {sampled && <span>sampled</span>}
+            {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+          </span>
+        </button>
+        {open && (
+          <div className="mt-1.5">
+            <p className="px-1 pb-1 text-[11px] leading-snug text-amber-100/55">
+              Names come from the original source images. Crosshair zooms tight behind the camera node; View uses the capture pose and FOV.
+            </p>
+            <div className="max-h-[48vh] space-y-0.5 overflow-y-auto pr-1">
+              {cameras.map((camera) => {
+                const active = camera.index === activeIndex;
+                return (
+                  <div
+                    key={camera.index}
+                    className={`grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-1 rounded-md px-1 py-0.5 transition ${
+                      active ? "bg-amber-300/15 ring-1 ring-amber-300/25" : "hover:bg-white/5"
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => onView(camera)}
+                      title={camera.file_path || camera.image_name}
+                      className="min-w-0 py-1 text-left"
+                    >
+                      <span className={`block truncate text-xs font-semibold ${active ? "text-amber-100" : "text-zinc-200"}`}>
+                        {camera.image_name || `camera-${camera.index + 1}`}
+                      </span>
+                      <span className="block text-[10px] text-zinc-500">#{camera.index + 1}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onZoom(camera)}
+                      title="Zoom tight to this camera node"
+                      className="rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[11px] font-semibold text-zinc-300 transition hover:border-cyan-300/40 hover:text-cyan-100"
+                    >
+                      <Crosshair className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onView(camera)}
+                      title="View from this original camera pose"
+                      className="rounded-md border border-amber-300/20 bg-amber-300/10 px-2 py-1 text-[11px] font-semibold text-amber-100 transition hover:bg-amber-300/20"
+                    >
+                      <Eye className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
 // The 3D point (viewer frame) + spread the viewer should fly to on a search hit.
 export type FocusTarget = { point: [number, number, number]; radius: number };
 
@@ -292,6 +548,8 @@ function LangfieldSearch({
   result,
   activeIdx,
   highlightOn,
+  open,
+  onOpenChange,
   onResult,
   onPick,
   onToggleHighlight,
@@ -301,6 +559,8 @@ function LangfieldSearch({
   result: LangfieldQueryResult | null;
   activeIdx: number;
   highlightOn: boolean;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
   onResult: (r: LangfieldQueryResult) => void;
   onPick: (i: number) => void;
   onToggleHighlight: () => void;
@@ -319,6 +579,20 @@ function LangfieldSearch({
 
   const matches = result?.matches ?? [];
 
+  if (!open) {
+    return (
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex justify-center p-3 sm:p-4">
+        <button
+          type="button"
+          onClick={() => onOpenChange(true)}
+          className="pointer-events-auto flex items-center gap-2 rounded-full border border-cyan-300/20 bg-[#070b14]/80 px-3 py-2 text-xs font-bold uppercase tracking-[0.18em] text-cyan-100 shadow backdrop-blur-md transition hover:border-cyan-200/50 hover:bg-[#0a1724]"
+        >
+          <Sparkles className="h-3.5 w-3.5" /> Search this scene
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex justify-center p-3 sm:p-4">
       <Card className="pointer-events-auto w-full max-w-lg border-white/12 bg-[#070b14]/85 p-3 backdrop-blur-md">
@@ -327,16 +601,26 @@ function LangfieldSearch({
             <Sparkles className="h-3.5 w-3.5 text-cyan-200" />
             <SectionLabel>Search this scene</SectionLabel>
           </div>
-          <button
-            type="button"
-            onClick={onToggleHighlight}
-            title={highlightOn ? "Hide highlights & labels" : "Show highlights & labels"}
-            className={`flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold transition ${
-              highlightOn ? "bg-cyan-400/15 text-cyan-200" : "bg-white/5 text-zinc-400 hover:text-zinc-200"
-            }`}
-          >
-            {highlightOn ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />} highlights
-          </button>
+          <div className="flex shrink-0 items-center gap-1">
+            <button
+              type="button"
+              onClick={onToggleHighlight}
+              title={highlightOn ? "Hide highlights & labels" : "Show highlights & labels"}
+              className={`flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold transition ${
+                highlightOn ? "bg-cyan-400/15 text-cyan-200" : "bg-white/5 text-zinc-400 hover:text-zinc-200"
+              }`}
+            >
+              {highlightOn ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />} highlights
+            </button>
+            <button
+              type="button"
+              onClick={() => onOpenChange(false)}
+              title="Collapse search"
+              className="rounded-full p-1 text-zinc-500 transition hover:bg-white/10 hover:text-zinc-200"
+            >
+              <ChevronDown className="h-3.5 w-3.5" />
+            </button>
+          </div>
         </div>
         <form
           className="flex items-center gap-2"

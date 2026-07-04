@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import os
 import re
 import secrets
@@ -780,6 +781,97 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
 def _find_latest_config(output_dir: Path) -> Path | None:
     candidates = sorted(output_dir.rglob("config.yml"), key=lambda path: path.stat().st_mtime, reverse=True)
     return candidates[0] if candidates else None
+
+
+def _find_scene_transforms(output_dir: Path) -> Path | None:
+    preferred = output_dir / "processed" / "transforms.json"
+    if preferred.is_file():
+        return preferred
+    candidates = sorted(output_dir.rglob("transforms.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else None
+
+
+def _find_dataparser_transforms(output_dir: Path) -> Path | None:
+    candidates = sorted(output_dir.rglob("dataparser_transforms.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else None
+
+
+def _mat3x4_apply(mat: list[list[float]], pose: list[list[float]]) -> list[list[float]]:
+    """Apply Nerfstudio's saved dataparser 3x4 transform to a camera-to-world pose."""
+    out: list[list[float]] = []
+    for r in range(3):
+        row: list[float] = []
+        for c in range(4):
+            value = mat[r][3] if c == 3 else 0.0
+            for k in range(3):
+                value += mat[r][k] * pose[k][c]
+            row.append(float(value))
+        out.append(row)
+    return out
+
+
+def _mat4_from_3x4(mat: list[list[float]]) -> list[list[float]]:
+    return [[float(mat[r][c]) for c in range(4)] for r in range(3)] + [[0.0, 0.0, 0.0, 1.0]]
+
+
+def _mat4_multiply(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
+    return [[sum(a[r][k] * b[k][c] for k in range(4)) for c in range(4)] for r in range(4)]
+
+
+def _mat4_inverse_affine(mat: list[list[float]]) -> list[list[float]]:
+    a, b, c = mat[0][0], mat[0][1], mat[0][2]
+    d, e, f = mat[1][0], mat[1][1], mat[1][2]
+    g, h, i = mat[2][0], mat[2][1], mat[2][2]
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    if abs(det) < 1e-12:
+        raise ValueError("applied_transform is not invertible")
+    inv_det = 1.0 / det
+    inv3 = [
+        [(e * i - f * h) * inv_det, (c * h - b * i) * inv_det, (b * f - c * e) * inv_det],
+        [(f * g - d * i) * inv_det, (a * i - c * g) * inv_det, (c * d - a * f) * inv_det],
+        [(d * h - e * g) * inv_det, (b * g - a * h) * inv_det, (a * e - b * d) * inv_det],
+    ]
+    t = [mat[0][3], mat[1][3], mat[2][3]]
+    inv_t = [-sum(inv3[r][k] * t[k] for k in range(3)) for r in range(3)]
+    return [inv3[0] + [inv_t[0]], inv3[1] + [inv_t[1]], inv3[2] + [inv_t[2]], [0.0, 0.0, 0.0, 1.0]]
+
+
+def _compose_saved_pose_transform(
+    dataparser_transform: list[list[float]], applied_transform: Any | None
+) -> list[list[float]]:
+    """Return saved-transforms.json pose -> trained/viewer-frame transform.
+
+    Nerfstudio saves dataparser_transforms.json as original-data -> output frame.
+    The frame transform_matrix entries in processed/transforms.json are already in
+    the saved dataset frame, so undo the dataset applied_transform before applying
+    the saved dataparser transform. Without this, camera paths get drawn on the
+    wrong up axis.
+    """
+    mat = _mat4_from_3x4(dataparser_transform)
+    if isinstance(applied_transform, list) and len(applied_transform) == 3:
+        applied = _mat4_from_3x4([[float(applied_transform[r][c]) for c in range(4)] for r in range(3)])
+        mat = _mat4_multiply(mat, _mat4_inverse_affine(applied))
+    return [mat[0], mat[1], mat[2]]
+
+
+def _vec_norm(v: list[float]) -> list[float]:
+    mag = sum(x * x for x in v) ** 0.5
+    if mag <= 1e-12:
+        return [0.0, 0.0, 0.0]
+    return [float(x / mag) for x in v]
+
+
+def _vec_distance(a: list[float], b: list[float]) -> float:
+    return sum((a[i] - b[i]) ** 2 for i in range(3)) ** 0.5
+
+
+def _camera_display_scale(positions: list[list[float]]) -> float:
+    if len(positions) < 2:
+        return 0.08
+    mins = [min(p[i] for p in positions) for i in range(3)]
+    maxs = [max(p[i] for p in positions) for i in range(3)]
+    diag = _vec_distance(mins, maxs)
+    return max(0.025, min(diag * 0.035, 0.18))
 
 
 def _export_command(ns_export: str, config_path: Path, output_dir: Path) -> list[str]:
@@ -2298,6 +2390,107 @@ async def generate_splat_preview(request: Request, job_id: str):
         "job_id": job_id,
         "preview_file_path": str(preview_file),
         "preview_file_url": f"/api/splat/jobs/{job_id}/preview/file",
+    }
+
+
+@router.get("/jobs/{job_id}/cameras")
+async def get_splat_cameras(job_id: str, limit: int = 500):
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+
+    output_dir = Path(meta["output_dir"])
+    transforms_path = _find_scene_transforms(output_dir)
+    if transforms_path is None:
+        raise HTTPException(status_code=404, detail="No capture camera transforms found for this scene")
+
+    try:
+        transforms = json.loads(transforms_path.read_text())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read camera transforms: {exc}") from exc
+
+    frames = transforms.get("frames")
+    if not isinstance(frames, list) or not frames:
+        raise HTTPException(status_code=404, detail="No capture cameras found for this scene")
+
+    dataparser_path = _find_dataparser_transforms(output_dir)
+    dataparser_transform: list[list[float]] | None = None
+    dataparser_scale = 1.0
+    if dataparser_path is not None:
+        try:
+            dataparser = json.loads(dataparser_path.read_text())
+            raw_transform = dataparser.get("transform")
+            if isinstance(raw_transform, list) and len(raw_transform) == 3:
+                raw_dataparser_transform = [[float(raw_transform[r][c]) for c in range(4)] for r in range(3)]
+                dataparser_transform = _compose_saved_pose_transform(raw_dataparser_transform, transforms.get("applied_transform"))
+                dataparser_scale = float(dataparser.get("scale", 1.0))
+        except Exception:
+            dataparser_transform = None
+            dataparser_scale = 1.0
+
+    limit = max(1, min(int(limit or 500), 1000))
+    step = max(1, (len(frames) + limit - 1) // limit)
+    cameras: list[dict[str, Any]] = []
+    positions: list[list[float]] = []
+
+    for index, frame in enumerate(frames):
+        if index % step != 0 or not isinstance(frame, dict):
+            continue
+        raw_pose = frame.get("transform_matrix")
+        if not isinstance(raw_pose, list) or len(raw_pose) < 3:
+            continue
+        try:
+            pose = [[float(raw_pose[r][c]) for c in range(4)] for r in range(3)]
+        except Exception:
+            continue
+
+        if dataparser_transform is not None:
+            pose = _mat3x4_apply(dataparser_transform, pose)
+            for r in range(3):
+                pose[r][3] *= dataparser_scale
+
+        position = [float(pose[0][3]), float(pose[1][3]), float(pose[2][3])]
+        right = _vec_norm([pose[0][0], pose[1][0], pose[2][0]])
+        up = _vec_norm([pose[0][1], pose[1][1], pose[2][1]])
+        forward = _vec_norm([-pose[0][2], -pose[1][2], -pose[2][2]])
+        positions.append(position)
+        file_path = str(frame.get("file_path") or "")
+        frame_height = frame.get("h", transforms.get("h"))
+        frame_fy = frame.get("fl_y", transforms.get("fl_y"))
+        fov_y_degrees = None
+        if isinstance(frame_height, int | float) and isinstance(frame_fy, int | float) and frame_fy > 0:
+            fov_y_degrees = math.degrees(2.0 * math.atan(float(frame_height) / (2.0 * float(frame_fy))))
+        cameras.append({
+            "index": index,
+            "image_name": Path(file_path).name if file_path else f"camera-{index + 1}",
+            "file_path": file_path,
+            "position": position,
+            "forward": forward,
+            "up": up,
+            "right": right,
+            "fov_y_degrees": fov_y_degrees,
+        })
+
+    if not cameras:
+        raise HTTPException(status_code=404, detail="No valid capture cameras found for this scene")
+
+    width = transforms.get("w")
+    height = transforms.get("h")
+    return {
+        "job_id": job_id,
+        "count": len(cameras),
+        "total": len(frames),
+        "sampled": step > 1,
+        "frame": "viewer" if dataparser_transform is not None else "source",
+        "source": "dataparser_transforms" if dataparser_transform is not None else "transforms_json",
+        "display_scale": _camera_display_scale(positions),
+        "image_size": {
+            "width": int(width) if isinstance(width, int | float) else None,
+            "height": int(height) if isinstance(height, int | float) else None,
+        },
+        "cameras": cameras,
     }
 
 
