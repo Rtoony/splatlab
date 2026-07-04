@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
+import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
@@ -52,11 +54,44 @@ _REFRESH_LUA = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call(
 _client = None
 _client_down_at = 0.0
 _holder: dict[str, Any] = {"lane": None, "job_id": None, "since": None}
+# XC-1: edge-trigger so the Redis-degrade transition pages ONCE per outage (not on
+# every 30s re-probe). Reset to False on a successful reconnect so recovery re-arms.
+_degraded_alerted = False
+
+
+def _notify_degraded(detail: str) -> None:
+    """XC-1: best-effort WARN that cross-process GPU arbitration has degraded to an
+    in-process lock (Redis unavailable). MUST NEVER raise or block the arbiter -
+    fail-open is the whole contract of this module; the log.warning above is the
+    durable receipt if this send is dropped. Fire-and-forget via nexus-notify; if it
+    is missing or errors we swallow it. (Delivery during a locked-vault boot also
+    depends on the nexus-notify hardcoded-ntfy floor - see finding NOTIFY-1.)"""
+    try:
+        notify = os.path.expanduser("~/bin/nexus-notify")
+        if not (os.path.isfile(notify) and os.access(notify, os.X_OK)):
+            notify = shutil.which("nexus-notify")
+        if not notify:
+            return
+        msg = (
+            "GPU arbiter DEGRADED: Redis unavailable -> in-process lock only. "
+            "Cross-lane 5090 serialization (splat / TRELLIS / langfield) is DISABLED; "
+            "two concurrent heavy GPU jobs can now co-run and OOM/corrupt. Detail: "
+            + detail
+        )
+        subprocess.Popen(
+            [notify, "--source=gpu-arbiter", "--severity=warn", "--quiet", msg],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except Exception:  # noqa: BLE001 - notify is best-effort; never break the lock
+        pass
 
 
 def _redis():
     """Return a live Redis client, or None (then everything fails open)."""
-    global _client, _client_down_at
+    global _client, _client_down_at, _degraded_alerted
     if _redislib is None:
         return None
     if _client is not None:
@@ -74,10 +109,14 @@ def _redis():
         )
         c.ping()
         _client = c
+        _degraded_alerted = False  # XC-1: recovered - re-arm the degrade alert
         return c
     except Exception as e:  # noqa: BLE001 - any failure => fail open
         _client_down_at = time.monotonic()
         log.warning("gpu_arbiter: Redis unavailable, using in-process lock only: %s", e)
+        if not _degraded_alerted:  # XC-1: page the transition to in-process-lock-only ONCE
+            _notify_degraded(str(e))
+            _degraded_alerted = True
         return None
 
 
