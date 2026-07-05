@@ -144,7 +144,7 @@ except Exception as _e:  # pragma: no cover - lets py_compile / ast.parse pass a
     eval_setup = get_viewmat = rasterization = None  # type: ignore
     AutoModel = AutoProcessor = cm = Image = None  # type: ignore
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 
 
@@ -558,6 +558,29 @@ def _render_match_thumbs_locked(sc: Scene, rel3, matches: list[dict], text: str)
     return names
 
 
+def quantize_relevancy(rel):
+    """uint8-quantize a per-gaussian relevancy vector over [rel_min, rel_max].
+
+    Pure numpy with a LOCAL import (the module-level ``np`` is None when the heavy
+    deps are absent — same guard pattern as ``_cluster_extent``), so tests exercise
+    the exact wire quantization without torch. Returns (payload, rel_min, rel_max);
+    the client dequantizes with ``rel_min + q/255 * (rel_max - rel_min)``. A
+    constant vector quantizes to all zeros with rel_min == rel_max, so the client
+    dequantizes back to the constant; an empty vector yields (b"", 0.0, 0.0).
+    """
+    import numpy as np
+    rel = np.asarray(rel, dtype=np.float32).reshape(-1)
+    if rel.size == 0:
+        return b"", 0.0, 0.0
+    rmin = float(rel.min())
+    rmax = float(rel.max())
+    span = rmax - rmin
+    if span <= 0.0:
+        return bytes(rel.size), rmin, rmax
+    q = np.round((rel - rmin) / span * 255.0).astype(np.uint8)
+    return q.tobytes(), rmin, rmax
+
+
 def _safe_name(text: str) -> str:
     """text.replace(' ','_') then sanitize to [\\w-] (drop everything else)."""
     s = text.replace(" ", "_")
@@ -583,6 +606,12 @@ class InventoryReq(BaseModel):
     config: str
     lfdir: str
     topn: int = 50
+
+
+class RelevancyReq(BaseModel):
+    config: str
+    lfdir: str
+    text: str
 
 
 class HeroReq(BaseModel):
@@ -670,6 +699,60 @@ async def query(req: QueryReq) -> dict[str, Any]:
             sc.in_use -= 1
             sc.touch()
     return {"heatmap_name": heatmap_name, "ready": True, **focus}
+
+
+@app.post("/relevancy")
+async def relevancy(req: RelevancyReq) -> Response:
+    """Raw per-gaussian relevancy for the CLIENT-SIDE heatmap. ENTIRELY LOCKLESS:
+    SigLIP text-encode + cosine relevancy + 3D match clustering only — no gsplat
+    render, no PNG, so it never takes HEAVY_GPU_LOCK (a first-touch scene build
+    still serializes via _build_scene_locked, same as every route). Body = the
+    uint8-quantized [N] vector in gauss_emb.npz row order (== the exported
+    splat.ply row order); X-Count/X-Min/X-Max carry the dequantization params
+    (rel = min + q/255*(max-min)) and X-Matches the clustered instances JSON
+    (same shape as /query's matches, minus the rendered thumbs)."""
+    if not (_HEAVY_OK and STATE.ready):
+        raise HTTPException(503, f"worker not ready (siglip loaded: {STATE.ready})")
+
+    lf_p = Path(req.lfdir)
+    if not (lf_p / "gauss_emb.npz").is_file():
+        raise HTTPException(404, f"gauss_emb.npz not found under lfdir {req.lfdir}")
+    if not Path(req.config).is_file():
+        raise HTTPException(404, f"config not found: {req.config}")
+
+    async with STATE.lock:
+        sc = STATE.get_scene_cached(req.config)
+        if sc is None:
+            scene_id = lf_p.name or req.config
+            sc = await _build_scene_locked(req.config, req.lfdir, scene_id)
+            STATE.insert_scene(sc)
+        else:
+            sc.touch()
+        sc.in_use += 1   # pin against idle-evict while computing
+
+    try:
+        def _compute():
+            rel3 = _compute_relevancy(STATE, sc, req.text)
+            focus = _relevancy_focus(sc, rel3)
+            payload, rmin, rmax = quantize_relevancy(rel3[:, 0].detach().cpu().numpy())
+            return payload, rmin, rmax, focus
+
+        payload, rmin, rmax, focus = await asyncio.to_thread(_compute)
+    finally:
+        async with STATE.lock:
+            sc.in_use -= 1
+            sc.touch()
+
+    return Response(
+        content=payload,
+        media_type="application/octet-stream",
+        headers={
+            "X-Count": str(len(payload)),
+            "X-Min": repr(rmin),
+            "X-Max": repr(rmax),
+            "X-Matches": json.dumps(focus, separators=(",", ":")),
+        },
+    )
 
 
 @app.post("/inventory")
