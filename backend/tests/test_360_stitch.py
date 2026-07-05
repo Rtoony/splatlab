@@ -531,6 +531,25 @@ def test_escalation_matrix(tried, is_equirect, expected):
     assert splat_route._next_sfm_solver(set(tried), ALL_AVAILABLE, is_equirect=is_equirect) == expected
 
 
+def test_seed_sfm_tried_escalation_eligible_uses_start_solver():
+    ctx = {"start_solver": "glomap", "processed_dir": "/x", "process_input": "/y",
+           "subcommand": "video", "is_equirect": False}
+    assert splat_route._seed_sfm_tried(ctx, ["process", "train"]) == {"glomap"}
+
+
+def test_seed_sfm_tried_sparse_job_seeds_mast3r_sparse():
+    # capture_mode="sparse" -> escalation_eligible=False -> sfm_context is None,
+    # but the job still starts on a real solver — must not be left empty (the
+    # bug: an empty set made the exhaustion message fall back to "colmap").
+    assert splat_route._seed_sfm_tried(None, ["mast3r_sfm", "train", "export"]) == {"mast3r-sparse"}
+
+
+def test_seed_sfm_tried_pre_processed_dataset_seeds_empty():
+    # A dataset input (transforms.json already present) skips SfM entirely —
+    # no solver ran, so an empty set is the honest answer (not "colmap").
+    assert splat_route._seed_sfm_tried(None, ["train", "export"]) == set()
+
+
 def test_maybe_escalate_reroutes_equirect_to_glomap_only(monkeypatch, tmp_path):
     monkeypatch.setattr(splat_route, "DEFAULT_3D_ROOT", tmp_path)
     monkeypatch.setattr(splat_route, "_engine_availability", lambda: ALL_AVAILABLE)

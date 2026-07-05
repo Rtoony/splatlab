@@ -1807,6 +1807,26 @@ def _sfm_stage_commands(
     return {"process": process_cmd}
 
 
+def _seed_sfm_tried(sfm_context: dict[str, Any] | None, stages: list[str]) -> set[str]:
+    """The initial job.sfm_tried set, honest about the solver a job actually
+    started on — used both by the escalation gate's "not yet tried" check and
+    by exhaustion error messages ("Auto-fallback tried {tried_label}").
+
+    Escalation-eligible jobs (sfm_context is set) seed with the planner's
+    start_solver. Sparse ("Few Photos") jobs are NOT escalation-eligible —
+    sfm_context is deliberately None for them — but they still start on a real
+    solver (mast3r-sparse), detected the same way _new_meta detects a
+    genuinely-engaged sparse plan (stages[:1] == ["mast3r_sfm"]). Leaving this
+    empty for sparse jobs made a failed job's error message fall back to a
+    hardcoded "colmap" default even though COLMAP never ran.
+    """
+    if sfm_context:
+        return {sfm_context["start_solver"]}
+    if stages[:1] == ["mast3r_sfm"]:
+        return {"mast3r-sparse"}
+    return set()
+
+
 def _next_sfm_solver(tried: set[str], availability: dict, is_equirect: bool = False) -> str | None:
     """The next solver in SFM_ESCALATION that is AVAILABLE and not yet tried.
 
@@ -3074,11 +3094,9 @@ async def start_splat_training(request: Request, req: SplatTrainRequest):
         input_path=str(input_path),
         stages_planned=stages,
         stage_commands=commands,
-        # Seed sfm_tried with the solver this job is actually starting on (the
-        # planner may have downgraded an unavailable glomap request to colmap),
-        # not the raw requested backend — so the gate's "not yet tried" check is
-        # honest about what really ran. sfm_context carries the rebuild inputs.
-        sfm_tried={sfm_context["start_solver"]} if sfm_context else set(),
+        # Seed sfm_tried with the solver this job is actually starting on — see
+        # _seed_sfm_tried for why sparse jobs need special handling too.
+        sfm_tried=_seed_sfm_tried(sfm_context, stages),
         sfm_context=sfm_context,
         sfm_req=req if sfm_context else None,
     )
