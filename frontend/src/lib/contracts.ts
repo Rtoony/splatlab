@@ -37,6 +37,16 @@ export interface SplatJob {
   // scenes (which never carry them) keep deserializing unchanged.
   language_field?: boolean;
   langfield_available?: boolean;
+  // Persisted SfM/frame-density params (backend already returns these via the
+  // meta spread; declared here so "Promote to full build" can read a scene's
+  // own settings instead of falling back to request defaults that could
+  // contradict how the scene was actually built).
+  num_frames_target?: number;
+  sfm_backend?: "colmap" | "glomap";
+  // Test Flight trim window. Non-null trim_duration_s marks a scene as a
+  // trimmed proof build (see the gallery card's "Promote to full build" action).
+  trim_start_s?: number | null;
+  trim_duration_s?: number | null;
   // Survey-lane scale calibration: meters per scene unit (nerfstudio scenes are
   // non-metric). Set from the viewer's measure tool; absent/null = uncalibrated.
   meters_per_unit?: number | null;

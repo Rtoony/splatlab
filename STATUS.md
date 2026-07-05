@@ -438,4 +438,59 @@ no `stages_failed` record. Left untouched per the brief ("Do NOT touch the compr
 stages... just note in your report"). Same `_record_stage_failure` helper would cover them
 if/when someone picks that up.
 
+## §1E "Promote to full build" SHIPPED (2026-07-05, Sonnet 5 swarm session, from the handoff pack)
+Fixes the F2 "hybrid" trap: on a completed Test Flight (trimmed) scene, the old **Re-run**
+button silently dropped the trim (job.input_path is always the original full .insv — trim is
+stitch-time only, never re-sent) but kept the flight's draft `max_num_iterations` and fell back
+to the request default `sfm_backend="colmap"` — a multi-hour run at draft quality on the doomed
+84-min COLMAP rung, neither a test nor a full build.
+
+- `frontend/src/lib/contracts.ts`: exposed `num_frames_target`, `sfm_backend`, `trim_start_s`,
+  `trim_duration_s` on `SplatJob` (backend already returned them via the meta spread; the type
+  just didn't declare them).
+- `frontend/src/pages/splat.tsx`: new `promoteToFullBuild(job)` — same insv input, trim omitted
+  (full clip), `num_frames_target: 300` (the backend's §1D′ duration-aware rule overrides this
+  for insv jobs once deployed), `sfm_backend: job.sfm_backend ?? "glomap"` (the rung the flight
+  actually proved — every flight requests glomap directly, so the persisted value is reliable;
+  no reroute history needs to be exposed), iterations from the **currently selected quality
+  preset** (`iters`), `language_field` from the current toggle (not the flight's stored value).
+  On scene cards where `trim_duration_s != null`, this one button replaces BOTH Re-run and
+  ↑Quality — both call the same old `rerun()` and both inherit the identical hybrid bug on a
+  trimmed scene, so leaving ↑Quality in place would leave the trap under a different label.
+- `rerun()`/`retryGlomap()` (non-flight jobs) now also forward the scene's persisted
+  `num_frames_target` (both) and `sfm_backend` (rerun only — retryGlomap's whole point is to
+  override it to glomap) instead of leaving them unset and falling back to request defaults
+  that could silently contradict how the scene was actually built.
+
+**Verification:**
+```
+$ npx tsc --noEmit    (frontend/)
+43 errors — byte-identical to the pre-existing baseline (splat-viewer.tsx/feedback.tsx/
+feedback-api.ts/splat-view.tsx); zero in contracts.ts or splat.tsx.
+
+$ npm run build       (frontend/)
+✓ built in 2.31s — clean.
+```
+No component-test runner exists in this repo (no vitest/jest configured), so the gate's
+"manual dispatch meta.json diff" path was done **without creating a live job** (no visible
+gallery row, no audit event, no meta.json write) — imported `splat_route` directly and ran the
+exact JSON.stringify(body) shape `promoteToFullBuild()` sends through `SplatTrainRequest` ->
+`_plan_3d_job` -> `_new_meta`, using the real `VID_20260514_064632_first90s.insv` for duration:
+```
+1. SplatTrainRequest validated OK:
+   trim_start_s=None trim_duration_s=None sfm_backend='glomap' num_frames_target=300
+2. _plan_3d_job stages: ['stitch', 'glomap_sfm', 'process', 'train', 'export', 'compress', 'webopt']
+   stitch argv: [...'-i', '.../VID_20260514_064632_first90s.insv', '-filter_complex', ...]
+   (no -ss/-t in the argv — full clip, trim correctly dropped)
+3. _new_meta persisted fields (would-be meta.json):
+   num_frames_target = 300 / sfm_backend = 'glomap' / trim_start_s = None / trim_duration_s = None
+OK: promoted payload validates, drops the trim, keeps glomap, no job/meta.json written.
+```
+Confirms: trim dropped, glomap rung kept (not colmap), stages plan correctly — proves the
+exact defect (F2) is fixed without spending GPU time or creating visible state.
+
+Deploy: frontend-only, `npm run build` already run above — **no service restart needed**.
+
+Committed locally (not pushed): see git log.
+
 Committed locally (not pushed): see git log for the Problem/Fix/Verification/Risk message.

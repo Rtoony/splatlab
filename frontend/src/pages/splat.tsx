@@ -257,6 +257,10 @@ export default function SplatLabPage() {
   }
 
   // Re-run a finished/failed scene with its own params (optionally at higher quality).
+  // Forwards the scene's OWN persisted num_frames_target/sfm_backend rather than
+  // leaving them unset — an unset sfm_backend falls back to the request default
+  // ("colmap"), which would silently contradict a scene that was actually built
+  // on glomap (the same "hybrid" trap Promote to full build exists to fix).
   function rerun(job: SplatJob, multiplier = 1) {
     if (activeJob) {
       flash("A scene is already building — wait for it to finish.", true);
@@ -268,6 +272,8 @@ export default function SplatLabPage() {
       input_path: job.input_path,
       output_dir: "outputs/3d",
       capture_format: job.capture_format,
+      num_frames_target: job.num_frames_target,
+      sfm_backend: job.sfm_backend,
       max_num_iterations: Math.min(MAX_ITERS, Math.round(base * multiplier)),
       language_field: Boolean(job.language_field),
     });
@@ -285,9 +291,37 @@ export default function SplatLabPage() {
       input_path: job.input_path,
       output_dir: "outputs/3d",
       capture_format: job.capture_format,
+      num_frames_target: job.num_frames_target,
       max_num_iterations: job.max_num_iterations || QUALITY.standard.iterations,
       sfm_backend: "glomap",
       language_field: Boolean(job.language_field),
+    });
+  }
+
+  // Promote a Test Flight (trimmed) proof scene to a full build: same insv
+  // input with the trim dropped (full clip), num_frames_target reset to the
+  // full-run default (the backend's duration-aware 3fps rule takes over from
+  // here — see PLAN.md §1D′), the SfM rung the flight actually proved works
+  // (persisted sfm_backend — glomap for every flight, so this never re-enters
+  // the ~84min doomed COLMAP rung), and the CURRENTLY selected quality preset
+  // instead of the flight's draft iteration cap.
+  function promoteToFullBuild(job: SplatJob) {
+    if (activeJob) {
+      flash("A scene is already building — wait for it to finish.", true);
+      return;
+    }
+    startMutation.mutate({
+      mode: "3d",
+      input_path: job.input_path,
+      output_dir: "outputs/3d",
+      capture_format: job.capture_format,
+      images_per_equirect: job.capture_format === "equirectangular360" ? 8 : undefined,
+      crop_bottom: job.capture_format === "equirectangular360" ? 0.15 : undefined,
+      insv_fov: job.capture_format === "equirectangular360" ? 204 : undefined,
+      num_frames_target: 300,
+      max_num_iterations: iters,
+      sfm_backend: job.sfm_backend ?? "glomap",
+      language_field: languageField,
     });
   }
   const glomapAvailable = Boolean(status?.engines?.glomap_available);
@@ -605,6 +639,7 @@ export default function SplatLabPage() {
       <ResultsGallery
         jobs={completed}
         onRerun={rerun}
+        onPromote={promoteToFullBuild}
         busy={!!activeJob}
         onPin={(j) => pinMutation.mutate(j)}
         onDelete={(id) => deleteMutation.mutate(id)}
@@ -811,12 +846,14 @@ function ActiveJobPanel({ job, onStop, stopping }: { job: SplatJob; onStop: () =
 function ResultsGallery({
   jobs,
   onRerun,
+  onPromote,
   busy,
   onPin,
   onDelete,
 }: {
   jobs: SplatJob[];
   onRerun: (job: SplatJob, mult?: number) => void;
+  onPromote: (job: SplatJob) => void;
   busy: boolean;
   onPin: (job: SplatJob) => void;
   onDelete: (id: string) => void;
@@ -859,6 +896,7 @@ function ResultsGallery({
             active={j.job_id === featuredJob?.job_id}
             onFeature={() => setFeatured(j.job_id)}
             onRerun={onRerun}
+            onPromote={onPromote}
             busy={busy}
             onPin={onPin}
             onDelete={onDelete}
@@ -874,6 +912,7 @@ function SceneCard({
   active,
   onFeature,
   onRerun,
+  onPromote,
   busy,
   onPin,
   onDelete,
@@ -882,6 +921,7 @@ function SceneCard({
   active: boolean;
   onFeature: () => void;
   onRerun: (job: SplatJob, mult?: number) => void;
+  onPromote: (job: SplatJob) => void;
   busy: boolean;
   onPin: (job: SplatJob) => void;
   onDelete: (id: string) => void;
@@ -985,12 +1025,31 @@ function SceneCard({
         <DownloadMenu job={job} />
       </div>
       <div className="mt-1.5 flex items-center gap-2">
-        <Button size="sm" variant="ghost" className="flex-1 text-xs" disabled={busy} onClick={() => onRerun(job)} title="Re-run with the same settings">
-          <RefreshCw className="h-3.5 w-3.5" /> Re-run
-        </Button>
-        <Button size="sm" variant="ghost" className="flex-1 text-xs" disabled={busy} onClick={() => onRerun(job, 2)} title="Re-run at ~2x iterations">
-          ↑ Quality
-        </Button>
+        {job.trim_duration_s != null ? (
+          // A Test Flight proof scene: Re-run/↑Quality would silently drop the
+          // trim and inherit the flight's draft settings (the F2 "hybrid" trap —
+          // full clip + draft iters + whatever sfm_backend the request defaults
+          // to). Promote to full build is the one correct next action here.
+          <Button
+            size="sm"
+            variant="ghost"
+            className="flex-1 border border-emerald-400/30 text-xs text-emerald-200 hover:bg-emerald-400/10"
+            disabled={busy}
+            onClick={() => onPromote(job)}
+            title="Build the full clip at full quality, using the settings this proof validated"
+          >
+            <Rocket className="h-3.5 w-3.5" /> Promote to full build
+          </Button>
+        ) : (
+          <>
+            <Button size="sm" variant="ghost" className="flex-1 text-xs" disabled={busy} onClick={() => onRerun(job)} title="Re-run with the same settings">
+              <RefreshCw className="h-3.5 w-3.5" /> Re-run
+            </Button>
+            <Button size="sm" variant="ghost" className="flex-1 text-xs" disabled={busy} onClick={() => onRerun(job, 2)} title="Re-run at ~2x iterations">
+              ↑ Quality
+            </Button>
+          </>
+        )}
         <Button
           size="sm"
           variant="ghost"
