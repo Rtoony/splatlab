@@ -1026,6 +1026,37 @@ def _stitched_path(job_dir: Path) -> Path:
     return job_dir / "stitched" / "equirect.mp4"
 
 
+def _stitch_cpu_leash() -> list[str]:
+    """argv prefix bounding the stitch's CPU footprint (taskset + nice).
+
+    2026-07-04 hard reset: firmware logged a FATAL CrashLog (BERT) the instant
+    the stitch's all-core x264 encode launched — an idle→full-package power
+    step with the 5090 still in its post-train power state. Confining the
+    encode to half the cores makes that step smaller and gentler, and keeps
+    the box responsive during stitches. taskset and nice both exec through,
+    so job.pid still lands on ffmpeg and stop/kill semantics are unchanged.
+
+    SPLAT_STITCH_CPUS: max CPUs for the stitch (default: half the cores,
+    floor 4). 0 disables the leash entirely.
+    """
+    raw = os.environ.get("SPLAT_STITCH_CPUS", "").strip()
+    default = max(4, (os.cpu_count() or 8) // 2)
+    try:
+        count = int(raw) if raw else default
+    except ValueError:
+        count = default
+    if count <= 0:
+        return []
+    prefix: list[str] = []
+    taskset = shutil.which("taskset")
+    if taskset:
+        prefix += [taskset, "-c", f"0-{count - 1}"]
+    nice = shutil.which("nice")
+    if nice:
+        prefix += [nice, "-n", "10"]
+    return prefix
+
+
 def _stitch_command(ffmpeg: str, src: Path, dst: Path, fov: float, dual_stream: bool = False) -> list[str]:
     """ffmpeg v360: Insta360 dual-fisheye -> equirectangular MP4 (open-source,
     no SDK). Seams are visible at the lens boundary but splatfacto tolerates
@@ -1040,19 +1071,23 @@ def _stitch_command(ffmpeg: str, src: Path, dst: Path, fov: float, dual_stream: 
     equirect (proved: COLMAP registered 2/624 on splat_ec1b984ffb). So hstack
     the two streams into one side-by-side dual-fisheye first, THEN v360 it —
     validated on the real X4 capture (two clean circles -> coherent pano).
+
+    Both paths run under _stitch_cpu_leash() — the all-core x264 launch is
+    the proven trigger of the 07-04 hardware reset.
     """
     v360 = (
         f"v360=input=dfisheye:output=e:ih_fov={fov}:iv_fov={fov}"
         f":w={STITCH_WIDTH}:h={STITCH_HEIGHT}:interp=lanczos"
     )
+    leash = _stitch_cpu_leash()
     if dual_stream:
         filter_complex = f"[0:v:0][0:v:1]hstack=inputs=2[d];[d]{v360}[eq]"
         return [
-            ffmpeg, "-y", "-i", str(src),
+            *leash, ffmpeg, "-y", "-i", str(src),
             "-filter_complex", filter_complex, "-map", "[eq]",
             "-c:v", "libx264", "-crf", "18", "-an", str(dst),
         ]
-    return [ffmpeg, "-y", "-i", str(src), "-vf", v360, "-c:v", "libx264", "-crf", "18", "-an", str(dst)]
+    return [*leash, ffmpeg, "-y", "-i", str(src), "-vf", v360, "-c:v", "libx264", "-crf", "18", "-an", str(dst)]
 
 
 def _equirect_frame_corruption(rows: list[list[int]]) -> tuple[str, int] | None:

@@ -220,3 +220,28 @@ parked, replaced by survey/scale/benchmark design — see reports dir).
   have SAM2.1 + the sam2 env on disk.
 - UI guidance follow-up: 360 upload card should say "hold the camera OVERHEAD
   on a stick — if you're visible anywhere but straight down, the scan fails".
+
+## CRASH POST-MORTEM + CPU LEASH (2026-07-04 evening)
+- 17:36:53 splat_98095cb055 (office selfie clip) COMPLETED end-to-end: hstack
+  stitch + glomap escalation -> trained, 1.92M gaussians, artifacts in
+  _preview/ (splat.ply 454MB, web.ply 78MB). Quality UNVETTED — selfie data;
+  eyeball in the viewer before judging. thumb.webp is 0 bytes (crash cut it).
+- 17:37:22 the REAL acceptance run (May-14 pool walkthrough, 1.65GB) started as
+  splat_fdac9edaab; the PC HARD-RESET within seconds of its stitch launching.
+  Forensics: NOT VRAM/GPU (vram 31%, 56C, xid 0, gpu-watch clean at 17:35:37),
+  NOT mains power (UPS event log silent), NOT kernel (no oops/pstore; journal
+  tail lost). Firmware BERT record = CPER severity FATAL, section GUID
+  81212A96-09ED-4996-9471-8D729C8E69ED (Firmware Error Record Reference /
+  Intel CrashLog) -> CPU-domain hardware fatal error at the instant the
+  all-core x264 encode launched (idle->250W package step; RAPL PL1=PL2=250W;
+  ASUS ROG MAXIMUS Z890 HERO BIOS 3002, 285K ucode 0x121). The orphaned job
+  was auto-marked failed on restart ("portal restarted while job was active").
+- MITIGATION 1 (this commit): `_stitch_cpu_leash()` — taskset to half the
+  cores (floor 4) + nice 10 on BOTH stitch paths. SPLAT_STITCH_CPUS overrides;
+  0 disables. taskset/nice exec through -> job.pid still ffmpeg. 131 tests pass.
+- MITIGATION 2 (system level): RAPL power-limit guard staged as
+  ~/scripts/aipc-cpu-power-guard.sh (dry-run default; --apply caps PL1/PL2 +
+  installs a persistent boot unit). BIOS checklist in the crash report.
+- GATE: re-dispatch the pool-walkthrough acceptance run ONLY after the power
+  guard is applied (app leash alone shrinks the transient but the fault is
+  hardware-marginal).

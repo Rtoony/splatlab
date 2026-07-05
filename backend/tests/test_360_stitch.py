@@ -91,7 +91,8 @@ SINGLE_PROBE = {"streams": 1, "width": 5760, "height": 2880, "dims": [(5760, 288
 # ---------------------------------------------------------------------------
 
 
-def test_stitch_command_single_stream_is_legacy_form():
+def test_stitch_command_single_stream_is_legacy_form(monkeypatch):
+    monkeypatch.setenv("SPLAT_STITCH_CPUS", "0")  # leash off -> byte-for-byte legacy argv
     cmd = splat_route._stitch_command("/bin/ffmpeg", Path("/in/a.insv"), Path("/out/eq.mp4"), 204.0)
     assert cmd == [
         "/bin/ffmpeg", "-y", "-i", "/in/a.insv",
@@ -101,7 +102,8 @@ def test_stitch_command_single_stream_is_legacy_form():
     ]
 
 
-def test_stitch_command_dual_stream_hstacks_both_lenses():
+def test_stitch_command_dual_stream_hstacks_both_lenses(monkeypatch):
+    monkeypatch.setenv("SPLAT_STITCH_CPUS", "0")
     cmd = splat_route._stitch_command(
         "/bin/ffmpeg", Path("/in/a.insv"), Path("/out/eq.mp4"), 204.0, dual_stream=True
     )
@@ -113,6 +115,53 @@ def test_stitch_command_dual_stream_hstacks_both_lenses():
         "-map", "[eq]",
         "-c:v", "libx264", "-crf", "18", "-an", "/out/eq.mp4",
     ]
+
+
+# ---------------------------------------------------------------------------
+# CPU leash (2026-07-04 crash guard): the all-core x264 launch is the proven
+# trigger of a firmware-fatal hardware reset — the stitch must never again
+# slam every core at once.
+# ---------------------------------------------------------------------------
+
+
+def test_stitch_cpu_leash_default_caps_to_half_cores(monkeypatch):
+    monkeypatch.delenv("SPLAT_STITCH_CPUS", raising=False)
+    cmd = splat_route._stitch_command("/bin/ffmpeg", Path("/in/a.insv"), Path("/out/eq.mp4"), 204.0)
+    i = cmd.index("/bin/ffmpeg")
+    assert i > 0, "leash prefix missing — stitch would launch all-core"
+    prefix = cmd[:i]
+    import os as _os
+    expected = max(4, (_os.cpu_count() or 8) // 2)
+    assert f"0-{expected - 1}" in prefix  # taskset CPU list
+    assert "-n" in prefix and "10" in prefix  # nice
+    # ffmpeg argv after the prefix is the untouched legacy form
+    assert cmd[i:] == [
+        "/bin/ffmpeg", "-y", "-i", "/in/a.insv",
+        "-vf",
+        "v360=input=dfisheye:output=e:ih_fov=204.0:iv_fov=204.0:w=5760:h=2880:interp=lanczos",
+        "-c:v", "libx264", "-crf", "18", "-an", "/out/eq.mp4",
+    ]
+
+
+def test_stitch_cpu_leash_env_override(monkeypatch):
+    monkeypatch.setenv("SPLAT_STITCH_CPUS", "4")
+    prefix = splat_route._stitch_cpu_leash()
+    assert "0-3" in prefix
+
+
+def test_stitch_cpu_leash_bad_env_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("SPLAT_STITCH_CPUS", "banana")
+    prefix = splat_route._stitch_cpu_leash()
+    assert prefix, "bad env value must not disable the leash"
+
+
+def test_stitch_cpu_leash_applies_to_dual_stream_too(monkeypatch):
+    monkeypatch.setenv("SPLAT_STITCH_CPUS", "4")
+    cmd = splat_route._stitch_command(
+        "/bin/ffmpeg", Path("/in/a.insv"), Path("/out/eq.mp4"), 204.0, dual_stream=True
+    )
+    assert cmd.index("/bin/ffmpeg") > 0
+    assert "0-3" in cmd[: cmd.index("/bin/ffmpeg")]
 
 
 @pytest.mark.parametrize(
