@@ -3,8 +3,9 @@ import { useQuery } from "@tanstack/react-query";
 import { Link } from "wouter";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { dyno, RgbaArray, readRgbaArray, SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
+import { dyno, RgbaArray, SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
 import { apiRequest } from "@/lib/api";
+import { buildHeatmapModifier, fetchRelevancy, packRelevancyRgba } from "@/lib/spark-heatmap";
 import type { SplatJob, SplatStatusResponse } from "@/lib/contracts";
 import { Button, Card, SectionLabel } from "@/components/ui";
 import { ArrowLeft, Box, Compass, Crosshair, Flame, Gauge, Loader2, RotateCcw, Search, Sun } from "lucide-react";
@@ -347,39 +348,15 @@ function SparkViewport({ url, job }: { url: string; job: SplatJob }) {
     if (!job || !mesh || !heatmapEnabled || !spotlightEnabled || !spotlightThresholdDyno || !text) return;
     setQueryBusy(true);
     setQueryError(null);
-    const started = performance.now();
     try {
-      const res = await fetch(`/api/splat/jobs/${job.job_id}/langfield/relevancy`, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
-      if (res.status === 401) {
-        window.location.href = "/login";
-        return;
-      }
-      if (!res.ok) {
-        const detail = await res.text().catch(() => res.statusText);
-        throw new Error(`${res.status}: ${detail.slice(0, 300)}`);
-      }
-      const bytes = new Uint8Array(await res.arrayBuffer());
+      const result = await fetchRelevancy(job.job_id, text);
       const numSplats = mesh.packedSplats?.numSplats ?? mesh.numSplats ?? 0;
-      if (bytes.length !== numSplats) {
+      if (result.bytes.length !== numSplats) {
         throw new Error(
-          `relevancy rows (${bytes.length.toLocaleString()}) != loaded splats (${numSplats.toLocaleString()}) — scene not loaded as langweb?`,
+          `relevancy rows (${result.bytes.length.toLocaleString()}) != loaded splats (${numSplats.toLocaleString()}) — scene not loaded as langweb?`,
         );
       }
-      const rgba = new Uint8Array(numSplats * 4);
-      for (let i = 0; i < numSplats; i += 1) {
-        const b = bytes[i];
-        const o = i * 4;
-        rgba[o] = b;
-        rgba[o + 1] = b;
-        rgba[o + 2] = b;
-        rgba[o + 3] = 255;
-      }
-      const scalarArray = new RgbaArray({ array: rgba, count: numSplats });
+      const scalarArray = new RgbaArray({ array: packRelevancyRgba(result.bytes), count: numSplats });
       mesh.worldModifier = buildHeatmapModifier({
         scalarArray,
         heatmapEnabled,
@@ -390,23 +367,11 @@ function SparkViewport({ url, job }: { url: string; job: SplatJob }) {
       setRealScalarLive(true);
       setHeatmapOn(true);
       heatmapEnabled.value = true;
-      const relMin = res.headers.get("X-Min");
-      const relMax = res.headers.get("X-Max");
-      let matchCount: number | null = null;
-      const matchesHeader = res.headers.get("X-Matches");
-      if (matchesHeader) {
-        try {
-          const parsed = JSON.parse(matchesHeader);
-          if (Array.isArray(parsed)) matchCount = parsed.length;
-        } catch {
-          matchCount = null;
-        }
-      }
-      const ms = Math.round(performance.now() - started);
+      mesh.updateVersion();
       setQueryStatus(
-        `"${text}" · ${bytes.length.toLocaleString()} rows · rel ${relMin ?? "?"}–${relMax ?? "?"}` +
-          (matchCount !== null ? ` · ${matchCount} instance${matchCount === 1 ? "" : "s"}` : "") +
-          ` · ${ms}ms`,
+        `"${text}" · ${result.bytes.length.toLocaleString()} rows · rel ${result.relMin ?? "?"}–${result.relMax ?? "?"}` +
+          (result.matchCount !== null ? ` · ${result.matchCount} instance${result.matchCount === 1 ? "" : "s"}` : "") +
+          ` · ${result.ms}ms`,
       );
     } catch (cause) {
       setQueryError(cause instanceof Error ? cause.message : "Relevancy request failed.");
@@ -563,52 +528,6 @@ function buildFakeScalarArray(numSplats: number): Uint8Array {
     array[o + 3] = 255;
   }
   return array;
-}
-
-// GPU worldModifier: reads the fake per-splat scalar back out of the RgbaArray texture
-// (Spark's splat-painter example mechanism — readRgbaArray keyed by splat index),
-// tints rgb through a 5-stop viridis-ish ramp, and fades opacity below a threshold.
-function buildHeatmapModifier({
-  scalarArray,
-  heatmapEnabled,
-  spotlightEnabled,
-  spotlightThreshold,
-}: {
-  scalarArray: RgbaArray;
-  heatmapEnabled: ReturnType<typeof dyno.dynoBool>;
-  spotlightEnabled: ReturnType<typeof dyno.dynoBool>;
-  spotlightThreshold: ReturnType<typeof dyno.dynoFloat>;
-}) {
-  return dyno.dynoBlock({ gsplat: dyno.Gsplat }, { gsplat: dyno.Gsplat }, ({ gsplat }) => {
-    if (!gsplat) throw new Error("heatmap modifier: no gsplat input");
-    const { rgb, opacity, index } = dyno.splitGsplat(gsplat).outputs;
-    const raw = readRgbaArray(scalarArray.dyno, index);
-    // NOTE: dyno's own .d.ts types `swizzle`'s single-component selector incorrectly
-    // (a template-literal type that never matches a bare "x"/"w"), so single-component
-    // reads go through `split(...).outputs.x` instead — same result, correctly typed.
-    const t = dyno.split(raw).outputs.x;
-
-    const stop0 = dyno.dynoVec3(new THREE.Vector3(0.267, 0.005, 0.329));
-    const stop1 = dyno.dynoVec3(new THREE.Vector3(0.229, 0.322, 0.545));
-    const stop2 = dyno.dynoVec3(new THREE.Vector3(0.128, 0.567, 0.551));
-    const stop3 = dyno.dynoVec3(new THREE.Vector3(0.369, 0.789, 0.383));
-    const stop4 = dyno.dynoVec3(new THREE.Vector3(0.993, 0.906, 0.144));
-    let ramp = dyno.mix(stop0, stop1, dyno.smoothstep(dyno.dynoFloat(0.0), dyno.dynoFloat(0.25), t));
-    ramp = dyno.mix(ramp, stop2, dyno.smoothstep(dyno.dynoFloat(0.25), dyno.dynoFloat(0.5), t));
-    ramp = dyno.mix(ramp, stop3, dyno.smoothstep(dyno.dynoFloat(0.5), dyno.dynoFloat(0.75), t));
-    ramp = dyno.mix(ramp, stop4, dyno.smoothstep(dyno.dynoFloat(0.75), dyno.dynoFloat(1.0), t));
-
-    const heatmapMask = dyno.float(heatmapEnabled);
-    const tintedRgb = dyno.mix(rgb, ramp, heatmapMask);
-
-    const belowThreshold = dyno.lessThan(t, spotlightThreshold);
-    const spotlightActive = dyno.and(spotlightEnabled, belowThreshold);
-    const dimmedOpacity = dyno.mul(opacity, dyno.dynoFloat(0.04));
-    const newOpacity = dyno.select(spotlightActive, dimmedOpacity, opacity);
-
-    const outGsplat = dyno.combineGsplat({ gsplat, rgb: tintedRgb, opacity: newOpacity });
-    return { gsplat: outGsplat };
-  });
 }
 
 function easeInOutCubic(t: number): number {

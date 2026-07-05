@@ -31,6 +31,9 @@ export interface SplatJob {
   // scenes (which never carry them) keep deserializing unchanged.
   language_field?: boolean;
   langfield_available?: boolean;
+  // Survey-lane scale calibration: meters per scene unit (nerfstudio scenes are
+  // non-metric). Set from the viewer's measure tool; absent/null = uncalibrated.
+  meters_per_unit?: number | null;
   // "sparse" when built via "Few Photos (AI poses)" (MASt3R dense-seed) — poses/geometry
   // are partly AI-inferred, so the card badges it as such. Absent/"standard" otherwise.
   capture_mode?: "standard" | "sparse";

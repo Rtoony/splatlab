@@ -12,7 +12,8 @@ import type {
 } from "@/lib/contracts";
 import { SplatViewer, type ViewerCameraNodeTarget, type ViewerCameraViewTarget, type ViewerHighlight, type ViewerOverlay } from "@/components/splat-viewer";
 import { Button, Card, Input, SectionLabel } from "@/components/ui";
-import { ArrowLeft, Camera, ChevronDown, ChevronUp, Crosshair, Download, Eye, EyeOff, Layers, Loader2, Orbit, RotateCcw, Search, SlidersHorizontal, Sparkles, X } from "lucide-react";
+import { ArrowLeft, Camera, ChevronDown, ChevronUp, Compass, Crosshair, Download, Eye, EyeOff, Layers, Loader2, Orbit, RotateCcw, Search, SlidersHorizontal, Sparkles, X } from "lucide-react";
+import { SparkSceneViewer } from "@/components/spark-scene-viewer";
 
 // Distinct colors handed out to toggled inventory objects (stable per item index).
 const HL_PALETTE = ["#22d3ee", "#f59e0b", "#a78bfa", "#34d399", "#f472b6", "#60a5fa", "#fb7185", "#facc15", "#4ade80", "#c084fc"];
@@ -39,6 +40,16 @@ export default function SplatViewPage() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [shortcutLegendOpen, setShortcutLegendOpen] = useState(false);
   const [resetViewToken, setResetViewToken] = useState(0);
+  // Wave-2 Spark cutover, opt-in: the beta viewer carries the real language
+  // heatmap + measure/scale tools; the classic viewer keeps overlays/search
+  // fly-to until the full 2.4 port. Sticky per browser.
+  const [sparkBeta, setSparkBeta] = useState(() => localStorage.getItem("splatlab.sparkBeta") === "1");
+  function toggleSparkBeta() {
+    setSparkBeta((v) => {
+      localStorage.setItem("splatlab.sparkBeta", v ? "0" : "1");
+      return !v;
+    });
+  }
 
   const { data: cameras, isFetching: camerasLoading, error: camerasError } = useQuery({
     queryKey: ["cameras", jobId],
@@ -198,6 +209,18 @@ export default function SplatViewPage() {
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {job && viewUrl && (
+            <Button
+              type="button"
+              variant={sparkBeta ? "primary" : "outline"}
+              size="sm"
+              onClick={toggleSparkBeta}
+              title="Spark beta viewer: real language heatmap on the splats + measure/scale tools"
+              className={sparkBeta ? "bg-cyan-300 text-zinc-950 hover:bg-cyan-200" : ""}
+            >
+              <Compass className="h-3.5 w-3.5" /> {sparkBeta ? "Spark beta ON" : "Spark beta"}
+            </Button>
+          )}
+          {job && viewUrl && !sparkBeta && (
             <>
               <Button type="button" variant="outline" size="sm" onClick={resetToDefaultView} title="Reset camera and collapse viewer extras">
                 <RotateCcw className="h-3.5 w-3.5" /> Reset
@@ -266,6 +289,8 @@ export default function SplatViewPage() {
               </p>
             </div>
           </Centered>
+        ) : sparkBeta ? (
+          <SparkSceneViewer key={job.job_id} job={job} />
         ) : (
           <>
             <SplatViewer

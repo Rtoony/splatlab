@@ -3307,6 +3307,32 @@ async def pin_splat_job(job_id: str):
     return {"ok": True, "job_id": job_id, "pinned": True}
 
 
+@router.post("/jobs/{job_id}/scale")
+async def set_splat_scale(job_id: str, payload: dict[str, Any]):
+    """Survey-lane scale calibration: METERS PER SCENE UNIT, set by measuring a
+    reference of known real-world length in the viewer. nerfstudio scenes are
+    non-metric (poses auto-normalized to a unit box), so this stored factor is
+    the only bridge from scene units to real distances — measure/DXF/LandXML
+    all hang off it. Body {"meters_per_unit": <float>} sets; null clears.
+    Reaches clients via the **meta spread in _job_payload."""
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    raw = payload.get("meters_per_unit")
+    if raw is None:
+        meta = _patch_meta(job_id, meters_per_unit=None)
+    else:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="meters_per_unit must be a number")
+        if not (math.isfinite(value) and 0.0 < value < 1e6):
+            raise HTTPException(status_code=400, detail="meters_per_unit must be finite and > 0")
+        meta = _patch_meta(job_id, meters_per_unit=value)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    return {"ok": True, "job_id": job_id, "meters_per_unit": meta.get("meters_per_unit")}
+
+
 @router.post("/jobs/{job_id}/unpin")
 async def unpin_splat_job(job_id: str):
     meta = _patch_meta(job_id, pinned=False) if _safe_job_id(job_id) else None

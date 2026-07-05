@@ -284,3 +284,26 @@ parked, replaced by survey/scale/benchmark design — see reports dir).
   takes effect next portal restart (deferred — another session is deploying
   portal). splat_75ebbcddde meta hand-restored to running; its pipeline never
   actually stopped.
+
+## SURVEY v1 SLICE + SPARK BETA ON THE VIEW PAGE (2026-07-04 night)
+- **Scale calibration shipped end-to-end**: POST /jobs/{id}/scale stores
+  meters_per_unit in meta (validated, null clears; 9 tests). Viewer measure
+  tool: Spark raycast two-point pick -> markers+line -> scene units ->
+  calibrate with known length (m/ft/in) -> real units everywhere after.
+  LIVE RECEIPT (Garden): 0.5235 units = 1.524m = 5.00ft; meta shows
+  meters_per_unit=2.9113 (NB: test calibration with a made-up 5ft reference —
+  clear via {"meters_per_unit": null} or recalibrate on a real reference).
+- **Spark beta viewer on /view/:jobId** (spark-scene-viewer.tsx, opt-in header
+  toggle, sticky localStorage): real language heatmap + spotlight + measure.
+  Classic viewer untouched/default; overlays/search-flyto stay classic until
+  the full 2.4 cutover. Shared machinery extracted to lib/spark-heatmap.ts
+  (spike page refactored onto it — one implementation).
+- ezdxf 1.4.4 installed in backend/.venv (survey exports dep, per DESIGN.md).
+- ⚠️ **LESSON (cost us the first acceptance run): `systemctl --user restart
+  splatlab` SIGTERMs the WHOLE cgroup — start_new_session does NOT protect
+  job subprocesses from systemd (KillMode=control-group). splat_75ebbcddde
+  died mid-mapper ("Stage 'process' exited with code -15"). RULE: never
+  restart splatlab.service with a job in flight. BACKLOG: job resume-on-start
+  (rehydrate running meta + stage checkpoints) — codev candidate.
+- Acceptance run RE-DISPATCHED: **splat_192e4223fb** (same params,
+  language_field=true); leash verified (taskset 0-11, nice 10).
