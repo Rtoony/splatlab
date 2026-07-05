@@ -621,3 +621,41 @@ all of this — Phase 3.2 should port its logic into `_plan_3d_job`/new pipeline
 not re-derive it.
 
 Committed (script + this STATUS.md, NOT the gitignored output/log): see git log.
+
+## Photo-capture reliability + survey polish pass (2026-07-05, RToony's call)
+RToony deprioritized the 360-video segmentation work (Phase 3.2 on hold) in favor of
+the photo/standard-capture path — "smaller, quicker, easier for a small site." Two
+review agents audited the escalation chain and survey/measurement tools; RToony picked
+the two quick fixes to land now (DXF export, escalation UX polish, and the two
+dimension-bug fixes below are deferred/already-fixed — see below):
+
+- **fix(splat) 4e1e4f3**: compress/webopt now use the existing `_record_stage_failure`
+  helper (previously langfield-only) — a failed .spz/web.ply/langweb build is no longer
+  indistinguishable from a success in job meta. 7 new tests.
+- **test(scale) 0e01afe**: `test_scale_rejects_garbage[nan/inf]` — root cause was
+  httpx's own request encoder refusing NaN/Infinity (RFC 8259 compliant), not the
+  endpoint (which was always correct). Fixed by sending raw bytes for those two cases.
+  **Full backend suite now 183/183 green — first fully-green run this program.**
+- **fix(splat) a8662b4**: sparse ("Few Photos") jobs seeded `sfm_tried` as an empty set
+  (not escalation-eligible), so a failed sparse job's error message fell back to
+  claiming "Auto-fallback tried colmap" even though it ran mast3r-sparse and never
+  touched COLMAP — directly misleading for the small-site/few-photos use case.
+  Extracted `_seed_sfm_tried()`, 3 new tests.
+- **fix(survey) 2ce5692**: scale calibration UI (`spark-scene-viewer.tsx`) — (1)
+  `calibDim` no longer silently falls back to "the last dimension in the list" when
+  nothing is explicitly picked (bit a user who deletes their calibration target); (2)
+  recalibrating now requires a two-click confirm (same idiom as scene delete) since
+  meters_per_unit is one scalar shared by every dimension's displayed length. Live-
+  verified on the Garden scene (see commit for the verification detail — the browser
+  automation tool's synthetic clicks didn't register on this specific button, a tool
+  quirk; a real dispatched click confirmed both fixes end-to-end).
+
+**Deferred (not started, real findings on record for later)**:
+- DXF/LandXML export: `ezdxf` is installed and the scale endpoint's own docstring
+  claims "measure/DXF/LandXML all hang off it," but no export code exists at all —
+  dimensions are 100% client-side sessionStorage with no save/export path. Biggest
+  gap for the civil-survey use case; real feature work, not a quick fix.
+- Escalation UX polish: `sfm_tried`/`reroute_count` never reach the frontend (the
+  "Retry with global SfM" button doesn't know if that solver was already exhausted);
+  reroute reasons only appear in scrolling logs, not the stage rail; exhaustion
+  guidance text is video-flavored regardless of actual capture type (photo vs video).
