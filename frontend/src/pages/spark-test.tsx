@@ -415,17 +415,23 @@ function SparkViewport({ url, job }: { url: string; job: SplatJob }) {
     }
   }
 
+  // Spark only re-runs the splat generator when the mesh version bumps —
+  // mutating a dyno uniform alone leaves the last generated frame on screen
+  // (proven live: spotlight toggle was a visual no-op until updateVersion()).
   function onHeatmapToggle(next: boolean) {
     setHeatmapOn(next);
     if (heatmapEnabledRef.current) heatmapEnabledRef.current.value = next;
+    meshRef.current?.updateVersion();
   }
   function onSpotlightToggle(next: boolean) {
     setSpotlightOn(next);
     if (spotlightEnabledRef.current) spotlightEnabledRef.current.value = next;
+    meshRef.current?.updateVersion();
   }
   function onThresholdChange(next: number) {
     setSpotlightThreshold(next);
     if (spotlightThresholdRef.current) spotlightThresholdRef.current.value = next;
+    meshRef.current?.updateVersion();
   }
 
   return (

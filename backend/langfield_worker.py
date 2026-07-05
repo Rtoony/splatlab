@@ -225,6 +225,25 @@ class Scene:
         d = np.load(lf_p / "gauss_emb.npz")
         self.feat_n = torch.tensor(d["gauss_emb"], device=DEV).float()
 
+        # ply->ckpt row map for the CLIENT-SIDE heatmap: gauss_emb rows follow the
+        # checkpoint, but the client renders the exported ply and ns-export FILTERS
+        # gaussians (Garden: 4,778 dropped -> off-by-thousands mistint). Kept on
+        # CPU as numpy; None -> /relevancy serves ckpt order and the client's
+        # row-count guard fails loud instead of mistinting.
+        try:
+            # lazy import: keeps the no-heavy-deps import path clean; sys.path
+            # insert because the worker isn't launched with backend/ as a root
+            import sys as _sys
+            _here = str(Path(__file__).resolve().parent)
+            if _here not in _sys.path:
+                _sys.path.insert(0, _here)
+            import langfield_align
+            self.ply_map = langfield_align.load_or_build_map(
+                lf_p, self.means.detach().cpu().numpy())
+        except Exception:
+            log.exception("ply->ckpt align errored; relevancy stays in ckpt order")
+            self.ply_map = None
+
         self.render = _make_render(
             self.means, self.quats, self.scales, self.opac,
             self.cams, self.fullW, self.fullH)
@@ -707,8 +726,11 @@ async def relevancy(req: RelevancyReq) -> Response:
     SigLIP text-encode + cosine relevancy + 3D match clustering only — no gsplat
     render, no PNG, so it never takes HEAVY_GPU_LOCK (a first-touch scene build
     still serializes via _build_scene_locked, same as every route). Body = the
-    uint8-quantized [N] vector in gauss_emb.npz row order (== the exported
-    splat.ply row order); X-Count/X-Min/X-Max carry the dequantization params
+    uint8-quantized [N] vector in EXPORTED-PLY row order when the scene's
+    ply->ckpt map exists (langfield_align; ns-export filters gaussians, so raw
+    gauss_emb/ckpt order does NOT match the ply), else raw gauss_emb order —
+    the client must verify N == its loaded splat count either way.
+    X-Count/X-Min/X-Max carry the dequantization params
     (rel = min + q/255*(max-min)) and X-Matches the clustered instances JSON
     (same shape as /query's matches, minus the rendered thumbs)."""
     if not (_HEAVY_OK and STATE.ready):
@@ -734,7 +756,13 @@ async def relevancy(req: RelevancyReq) -> Response:
         def _compute():
             rel3 = _compute_relevancy(STATE, sc, req.text)
             focus = _relevancy_focus(sc, rel3)
-            payload, rmin, rmax = quantize_relevancy(rel3[:, 0].detach().cpu().numpy())
+            rel_np = rel3[:, 0].detach().cpu().numpy()
+            ply_map = getattr(sc, "ply_map", None)
+            if ply_map is not None:
+                # reorder/filter to exported-ply row order BEFORE quantizing so
+                # X-Min/X-Max describe exactly the rows the client receives
+                rel_np = rel_np[ply_map]
+            payload, rmin, rmax = quantize_relevancy(rel_np)
             return payload, rmin, rmax, focus
 
         payload, rmin, rmax, focus = await asyncio.to_thread(_compute)

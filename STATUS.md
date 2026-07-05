@@ -257,3 +257,30 @@ parked, replaced by survey/scale/benchmark design — see reports dir).
   fake proof. Langfield scenes load fmt=langweb (index alignment with gauss_emb);
   FAIL-LOUD on any rows≠splats mismatch. End-to-end test unblocks the moment
   splat_75ebbcddde's langfield lands.
+
+## WAVE 2.1-2.3 PROVEN END-TO-END ON REAL DATA (2026-07-04 evening)
+- **Index mismatch ROOT-CAUSED + FIXED**: gauss_emb rows follow the CHECKPOINT,
+  but ns-export FILTERS gaussians (Garden: 1,326,611 ckpt -> 1,321,833 ply;
+  4,778 dropped) — so even langweb order could never match raw gauss_emb.
+  Fix = `backend/langfield_align.py`: byte-exact float32 xyz hash map
+  (ply row -> ckpt row), built+cached lazily per scene by the worker
+  (`_langfield/ply_index_map.npy`), applied to /relevancy BEFORE quantization.
+  Receipt: X-Count 1326611 -> 1321833 after fix; worker log "ply->ckpt map
+  ready"; 100% of ply rows matched. Legacy scenes fixed retroactively, no
+  retrain. 137 backend tests pass (6 new).
+- **Live browser receipt (Garden, real GPU)**: "flower vase" -> 1,321,833 rows,
+  420ms warm -> REAL per-splat heatmap tint on the Spark viewer + spotlight
+  fade of low-relevancy splats. Spark verdict = PASS (Z-up correct, 1.3M splats
+  crisp; fps unmeasurable headless — rAF throttled in background windows).
+- **Spark gotcha (proven live)**: mutating a dyno uniform does NOT re-run the
+  generator — spotlight/threshold flips were visual no-ops until
+  `mesh.updateVersion()` after each uniform write.
+- Garden langweb.ply backfilled (86MB vs 328MB raw fallback; 0.8s). TODO:
+  backfill the other 5 mip360 langfield scenes the same one-liner way.
+- **Portal clobber bug FIXED (portal commit 87632b6, NOT yet restarted)**: the
+  portal's dormant splat.py ran cleanup_orphan_jobs() on every deploy and
+  marked LIVE splatlab jobs failed ("portal restarted while job was active" at
+  18:21:24 = portal ActiveEnterTimestamp, receipt). Startup hook removed;
+  takes effect next portal restart (deferred — another session is deploying
+  portal). splat_75ebbcddde meta hand-restored to running; its pipeline never
+  actually stopped.
