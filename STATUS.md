@@ -536,9 +536,16 @@ confirmed unchanged since the langfield commit). 5 new tests, 0 regressions:
   proves this ships with zero behavior change for the already-correct lane)
 - probe failure leaves the client's value alone (no crash, no guess)
 
-Deploy: backend change — needs `splatlab-safe-restart` before it's live (not yet deployed
-this session; no job was running at last 0b check, but deploy happens right before Phase
-3.1 dispatch to bundle it with one restart rather than two).
+Deploy: **DEPLOYED 2026-07-05 11:34 PDT** via `splatlab-safe-restart` (RToony's go-ahead,
+post-Phase-3.1). First attempt showed healthz `token:false` (should be `true`) —
+`nexus-svc-inject` had written 0 vars. Root cause: systemd user manager's global
+`BW_SESSION` (`systemctl --user show-environment`) was STALE relative to the current
+valid session in `/dev/shm/nexus_session` (confirmed: `bw` rejected it, prompted for
+the master password) — this is the known `gotcha_stale_systemd_bw_session.md` pattern
+("wrote 0 vars" is its exact signature). Fix: `systemctl --user set-environment
+BW_SESSION=<value from /dev/shm/nexus_session>`, then re-ran `splatlab-safe-restart`.
+Second attempt: `nexus-svc-inject: wrote 36 vars`, healthz `token:true`, service active.
+§1D′ is now genuinely live for every new insv/equirect dispatch.
 
 Committed locally (not pushed): see git log.
 
