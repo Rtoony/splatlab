@@ -5,6 +5,7 @@ import { FeedbackWidget } from "@/components/feedback-widget";
 const SplatLabPage = lazy(() => import("@/pages/splat"));
 const SplatViewPage = lazy(() => import("@/pages/splat-view"));
 const FeedbackPage = lazy(() => import("@/pages/feedback"));
+const SparkTestPage = lazy(() => import("@/pages/spark-test"));
 
 function Loading() {
   return (
@@ -24,6 +25,9 @@ export default function App() {
           </Route>
           <Route path="/view/:jobId">
             <SplatViewPage />
+          </Route>
+          <Route path="/spark-test">
+            <SparkTestPage />
           </Route>
           <Route path="/">
             <SplatLabPage />

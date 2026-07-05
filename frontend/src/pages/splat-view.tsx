@@ -230,6 +230,17 @@ export default function SplatViewPage() {
               <Download className="h-3.5 w-3.5" /> Full-quality .ply
             </a>
           )}
+          {job?.preview_file_url && (
+            <a
+              href={`/supersplat/?load=${encodeURIComponent(job.preview_file_url)}&filename=${encodeURIComponent(`${jobId}.ply`)}`}
+              target="_blank"
+              rel="noreferrer"
+              title="Open this scene in the SuperSplat editor (select, crop, transform, export)"
+              className="flex shrink-0 items-center gap-1.5 rounded-full border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-semibold text-zinc-200 hover:bg-white/10"
+            >
+              <Sparkles className="h-3.5 w-3.5" /> Edit in SuperSplat
+            </a>
+          )}
         </div>
       </header>
       <main className="relative flex-1 overflow-hidden">
