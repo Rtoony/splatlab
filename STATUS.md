@@ -245,3 +245,15 @@ parked, replaced by survey/scale/benchmark design — see reports dir).
 - GATE: re-dispatch the pool-walkthrough acceptance run ONLY after the power
   guard is applied (app leash alone shrinks the transient but the fault is
   hardware-marginal).
+
+## WAVE 2 START — acceptance run + Spark real-relevancy wiring (2026-07-04 late)
+- Power guard APPLIED by RToony (RAPL PL1=125W/PL2=177W verified; boot unit enabled).
+- Acceptance run DISPATCHED: `splat_75ebbcddde` (May-14 pool walkthrough,
+  language_field=true — langfield stage queued last, will be the FIRST langfield
+  scene on disk). Leash receipt in job.log: `taskset -c 0-11 nice -n 10 ffmpeg`;
+  package 75C under load; the crash scenario now runs safely.
+- spark-test upgraded (Wave 2.3 wiring): real language query → POST
+  /langfield/relevancy → uint8 vector → RgbaArray → the SAME dyno modifier as the
+  fake proof. Langfield scenes load fmt=langweb (index alignment with gauss_emb);
+  FAIL-LOUD on any rows≠splats mismatch. End-to-end test unblocks the moment
+  splat_75ebbcddde's langfield lands.

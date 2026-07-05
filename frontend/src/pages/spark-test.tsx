@@ -7,7 +7,7 @@ import { dyno, RgbaArray, readRgbaArray, SparkRenderer, SplatFileType, SplatMesh
 import { apiRequest } from "@/lib/api";
 import type { SplatJob, SplatStatusResponse } from "@/lib/contracts";
 import { Button, Card, SectionLabel } from "@/components/ui";
-import { ArrowLeft, Box, Compass, Crosshair, Flame, Gauge, Loader2, RotateCcw, Sun } from "lucide-react";
+import { ArrowLeft, Box, Compass, Crosshair, Flame, Gauge, Loader2, RotateCcw, Search, Sun } from "lucide-react";
 
 // SPIKE PAGE — proves the Spark (sparkjs.dev) viewer mechanism ahead of a possible
 // migration off @mkkellogg/gaussian-splats-3d (see splat-viewer.tsx). Standalone route;
@@ -44,7 +44,12 @@ export default function SparkTestPage() {
   }, [scenes, jobId]);
 
   const job = scenes.find((s) => s.job_id === jobId) ?? null;
-  const url = job ? `/api/splat/jobs/${job.job_id}/preview/file?fmt=web` : null;
+  // Langfield scenes load the full-count langweb variant so splat index i ==
+  // gauss_emb row i == relevancy byte i. web.ply is decimated + REORDERED by
+  // splat-transform, so its indices can never be zipped onto relevancy data.
+  const url = job
+    ? `/api/splat/jobs/${job.job_id}/preview/file?fmt=${job.langfield_available ? "langweb" : "web"}`
+    : null;
 
   return (
     <div className="flex h-screen flex-col bg-[#05070d] text-zinc-100">
@@ -77,7 +82,7 @@ export default function SparkTestPage() {
       </header>
       <main className="relative flex-1 overflow-hidden">
         {url && job ? (
-          <SparkViewport key={job.job_id} url={url} />
+          <SparkViewport key={job.job_id} url={url} job={job} />
         ) : (
           <div className="flex h-full items-center justify-center text-sm text-zinc-500">
             No previewable scene available yet.
@@ -94,7 +99,7 @@ function sceneLabel(job: SplatJob): string {
   return gaussians ? `${name} (${gaussians.toLocaleString()} splats)` : name;
 }
 
-function SparkViewport({ url }: { url: string }) {
+function SparkViewport({ url, job }: { url: string; job: SplatJob }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
@@ -115,6 +120,11 @@ function SparkViewport({ url }: { url: string }) {
   const [spotlightOn, setSpotlightOn] = useState(false);
   const [spotlightThreshold, setSpotlightThreshold] = useState(0.4);
   const [pivotMode, setPivotMode] = useState<PivotMode>("none");
+  const [query, setQuery] = useState("");
+  const [queryBusy, setQueryBusy] = useState(false);
+  const [queryStatus, setQueryStatus] = useState<string | null>(null);
+  const [queryError, setQueryError] = useState<string | null>(null);
+  const [realScalarLive, setRealScalarLive] = useState(false);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -125,6 +135,9 @@ function SparkViewport({ url }: { url: string }) {
     setReady(false);
     setSplatCount(null);
     setPivotMode("none");
+    setQueryStatus(null);
+    setQueryError(null);
+    setRealScalarLive(false);
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 1000);
@@ -321,6 +334,87 @@ function SparkViewport({ url }: { url: string }) {
     tweenCancelRef.current = animateCameraTo(camera, controls, targetPosition, up, pivot);
   }
 
+  // Real relevancy → the SAME modifier mechanism the fake proof uses, fed by the
+  // uint8 vector from /langfield/relevancy (row i == langweb splat i). Refuses to
+  // apply on any row/splat count mismatch — a silent misalignment would tint the
+  // wrong splats, which is worse than an error.
+  async function runRealQuery() {
+    const mesh = meshRef.current;
+    const heatmapEnabled = heatmapEnabledRef.current;
+    const spotlightEnabled = spotlightEnabledRef.current;
+    const spotlightThresholdDyno = spotlightThresholdRef.current;
+    const text = query.trim();
+    if (!job || !mesh || !heatmapEnabled || !spotlightEnabled || !spotlightThresholdDyno || !text) return;
+    setQueryBusy(true);
+    setQueryError(null);
+    const started = performance.now();
+    try {
+      const res = await fetch(`/api/splat/jobs/${job.job_id}/langfield/relevancy`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (res.status === 401) {
+        window.location.href = "/login";
+        return;
+      }
+      if (!res.ok) {
+        const detail = await res.text().catch(() => res.statusText);
+        throw new Error(`${res.status}: ${detail.slice(0, 300)}`);
+      }
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      const numSplats = mesh.packedSplats?.numSplats ?? mesh.numSplats ?? 0;
+      if (bytes.length !== numSplats) {
+        throw new Error(
+          `relevancy rows (${bytes.length.toLocaleString()}) != loaded splats (${numSplats.toLocaleString()}) — scene not loaded as langweb?`,
+        );
+      }
+      const rgba = new Uint8Array(numSplats * 4);
+      for (let i = 0; i < numSplats; i += 1) {
+        const b = bytes[i];
+        const o = i * 4;
+        rgba[o] = b;
+        rgba[o + 1] = b;
+        rgba[o + 2] = b;
+        rgba[o + 3] = 255;
+      }
+      const scalarArray = new RgbaArray({ array: rgba, count: numSplats });
+      mesh.worldModifier = buildHeatmapModifier({
+        scalarArray,
+        heatmapEnabled,
+        spotlightEnabled,
+        spotlightThreshold: spotlightThresholdDyno,
+      });
+      mesh.updateGenerator();
+      setRealScalarLive(true);
+      setHeatmapOn(true);
+      heatmapEnabled.value = true;
+      const relMin = res.headers.get("X-Min");
+      const relMax = res.headers.get("X-Max");
+      let matchCount: number | null = null;
+      const matchesHeader = res.headers.get("X-Matches");
+      if (matchesHeader) {
+        try {
+          const parsed = JSON.parse(matchesHeader);
+          if (Array.isArray(parsed)) matchCount = parsed.length;
+        } catch {
+          matchCount = null;
+        }
+      }
+      const ms = Math.round(performance.now() - started);
+      setQueryStatus(
+        `"${text}" · ${bytes.length.toLocaleString()} rows · rel ${relMin ?? "?"}–${relMax ?? "?"}` +
+          (matchCount !== null ? ` · ${matchCount} instance${matchCount === 1 ? "" : "s"}` : "") +
+          ` · ${ms}ms`,
+      );
+    } catch (cause) {
+      setQueryError(cause instanceof Error ? cause.message : "Relevancy request failed.");
+    } finally {
+      setQueryBusy(false);
+    }
+  }
+
   function onHeatmapToggle(next: boolean) {
     setHeatmapOn(next);
     if (heatmapEnabledRef.current) heatmapEnabledRef.current.value = next;
@@ -383,10 +477,42 @@ function SparkViewport({ url }: { url: string }) {
         </div>
 
         <div className="h-px bg-white/10" />
-        <SectionLabel>Heatmap mechanism proof (fake data)</SectionLabel>
+        <SectionLabel>Language heatmap (real relevancy)</SectionLabel>
+        {job?.langfield_available ? (
+          <>
+            <form
+              className="flex items-center gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                void runRealQuery();
+              }}
+            >
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder='Try "chair", "trash can"…'
+                className="w-full rounded border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-cyan-400/50 focus:outline-none"
+              />
+              <Button type="submit" size="sm" disabled={queryBusy || !query.trim()}>
+                {queryBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Search className="h-3.5 w-3.5" />}
+              </Button>
+            </form>
+            {queryStatus && <p className="text-[10px] leading-snug text-emerald-300/90">{queryStatus}</p>}
+            {queryError && <p className="text-[10px] leading-snug text-rose-300/90">{queryError}</p>}
+          </>
+        ) : (
+          <p className="text-[10px] leading-snug text-zinc-500">
+            This scene has no language field — run a job with the language field enabled
+            to drive the heatmap with real relevancy. The fake-scalar proof below still works.
+          </p>
+        )}
+
+        <div className="h-px bg-white/10" />
+        <SectionLabel>{realScalarLive ? "Heatmap (REAL relevancy live)" : "Heatmap mechanism proof (fake data)"}</SectionLabel>
         <label className="flex items-center gap-2">
           <input type="checkbox" checked={heatmapOn} onChange={(e) => onHeatmapToggle(e.target.checked)} />
-          <Flame className="h-3.5 w-3.5 text-orange-300" /> Tint by fake per-splat scalar
+          <Flame className="h-3.5 w-3.5 text-orange-300" />{" "}
+          {realScalarLive ? "Tint by query relevancy" : "Tint by fake per-splat scalar"}
         </label>
         <label className="flex items-center gap-2">
           <input type="checkbox" checked={spotlightOn} onChange={(e) => onSpotlightToggle(e.target.checked)} />
@@ -405,8 +531,9 @@ function SparkViewport({ url }: { url: string }) {
           <span className="w-9 shrink-0 text-right text-zinc-400">{spotlightThreshold.toFixed(2)}</span>
         </div>
         <p className="text-[10px] leading-snug text-zinc-500">
-          Scalar is fake (sin-of-index, not a real relevancy score) — this only proves the
-          per-splat-index → texture → shader wiring for the future language-field heatmap.
+          {realScalarLive
+            ? "Tint + spotlight now read the real per-splat relevancy for the last query (turbo-style ramp: purple = low, yellow = high)."
+            : "Scalar is fake (sin-of-index, not a real relevancy score) — this only proves the per-splat-index → texture → shader wiring for the language-field heatmap."}
         </p>
       </Card>
     </div>
