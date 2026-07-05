@@ -687,6 +687,64 @@ def test_plan_insv_trim_unknown_duration_falls_back_to_start_zero(monkeypatch):
     assert cmd[cmd.index("-t") + 1] == "45.000"
 
 
+# ---------------------------------------------------------------------------
+# §1D′: duration-aware num_frames_target (the 3fps density rule, server-side)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_insv_full_run_computes_duration_aware_num_frames_target(monkeypatch):
+    # No trim at all — a "full build" request. The UI can only ever hardcode a
+    # flat guess for num_frames_target; this must override it from the ACTUAL
+    # clip duration at the proven 3fps density (80s * 3 = 240, well under the
+    # 500 crop-count cap for images_per_equirect=8).
+    monkeypatch.setattr(splat_route, "_probe_video_duration", lambda ffprobe, src: 80.0)
+    req = _req(input_path="cap.insv", num_frames_target=75)  # the UI's old flat guess
+    _plan(req, "/in/cap.insv", monkeypatch, probe=DUAL_PROBE)
+    assert req.num_frames_target == 240
+
+
+def test_plan_insv_full_run_caps_num_frames_target_at_crop_guard(monkeypatch):
+    # A long clip: 3fps would want 900 frames (300s * 3), but images_per_equirect=8
+    # means 900*8=7200 perspective images — the /train endpoint's crop-count guard
+    # rejects anything over 4000, so the computed value must self-cap at 500
+    # (4000 // 8), never produce a request the endpoint would then reject.
+    monkeypatch.setattr(splat_route, "_probe_video_duration", lambda ffprobe, src: 300.0)
+    req = _req(input_path="cap.insv")
+    _plan(req, "/in/cap.insv", monkeypatch, probe=DUAL_PROBE)
+    assert req.num_frames_target == 500
+    assert req.num_frames_target * req.images_per_equirect <= 4000
+
+
+def test_plan_insv_num_frames_target_cap_scales_with_images_per_equirect(monkeypatch):
+    # 14-crop mode halves the frame budget: 4000 // 14 = 285.
+    monkeypatch.setattr(splat_route, "_probe_video_duration", lambda ffprobe, src: 200.0)
+    req = _req(input_path="cap.insv", images_per_equirect=14)
+    _plan(req, "/in/cap.insv", monkeypatch, probe=DUAL_PROBE)
+    assert req.num_frames_target == 285
+
+
+def test_plan_insv_trim_num_frames_target_matches_test_flight_client_value(monkeypatch):
+    # Test Flight already computes num_frames_target = 3fps * trim_duration_s
+    # client-side (30s -> 90 frames, splat.tsx createFrom()). The server-side
+    # rule must derive the SAME number from the same (post-trim) window, so
+    # shipping this is a no-op for Test Flight and a real fix only for full runs.
+    monkeypatch.setattr(splat_route, "_probe_video_duration", lambda ffprobe, src: 106.7)
+    req = _req(input_path="cap.insv", trim_duration_s=30.0, num_frames_target=90)
+    _plan(req, "/in/cap.insv", monkeypatch, probe=DUAL_PROBE)
+    assert req.num_frames_target == 90
+
+
+def test_plan_insv_full_run_probe_failure_leaves_client_value(monkeypatch):
+    # No trim, and the duration probe itself fails (no ffprobe / unreadable
+    # container): there's no real window to compute density from, so fall back
+    # to whatever the client sent rather than guessing — mirrors the layout
+    # probe's own fail-open policy elsewhere in this module.
+    monkeypatch.setattr(splat_route, "_probe_video_duration", lambda ffprobe, src: None)
+    req = _req(input_path="cap.insv", num_frames_target=75)
+    _plan(req, "/in/cap.insv", monkeypatch, probe=DUAL_PROBE)
+    assert req.num_frames_target == 75
+
+
 def test_plan_non_insv_trim_rejected_loud(monkeypatch):
     req = _req(input_path="clip.mp4", trim_duration_s=45.0)
     with pytest.raises(HTTPException) as exc:

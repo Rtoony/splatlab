@@ -493,4 +493,53 @@ Deploy: frontend-only, `npm run build` already run above — **no service restar
 
 Committed locally (not pushed): see git log.
 
+## §1D′ duration-aware num_frames_target SHIPPED (2026-07-05, Sonnet 5 swarm session)
+The pipeline's only proven-good 360 config is ~3.0fps equirect frame density
+(splat_9da9dff4b2 @1.76fps: 599 posed, ZERO points vs splat_5177f8d99a @3.0fps: 1078/1080
+registered, 105k points — same window, both directions confirmed). Test Flight already
+computes `num_frames_target = 3 * trim_duration_s` client-side, but a full (non-flight)
+insv run has no way to know the real clip duration — the UI can only hardcode a flat
+guess (75), which is 0.7fps on a 106s clip and hits the exact same 0-point cliff on
+anything longer than ~25s.
+
+**Fix** (`backend/splat_route.py`, `_plan_3d_job`'s `is_insv` branch):
+- Duration is now always probed (not just when a trim is requested) — `full_duration`.
+- After trim resolution: `density_window_s = trim_duration if trim_duration is not None
+  else full_duration`. When known and > 0: `req.num_frames_target =
+  min(ceil(3.0 * density_window_s), 4000 // req.images_per_equirect)` — overrides
+  whatever the client sent, self-capped so it can never trip the `/train` endpoint's
+  existing `perspective_images > 4000` guard (backend/splat_route.py:3020, unchanged).
+  Probe failure (no ffprobe / unreadable container) leaves the client's value alone
+  rather than guessing — mirrors the layout-probe's existing fail-open policy.
+- Test Flight is a **no-op** under this rule: same 3fps formula, same (trim) window,
+  same result the client already sends (30s -> 90, matches exactly) — only full runs
+  change behavior.
+- `_new_meta` runs AFTER `_plan_3d_job` in the `/train` handler, so meta.json now shows
+  the REAL computed value, not the raw client request — also fixes the SfM-escalation
+  gate's rebuild path (`sfm_req`), which is captured after the override and so reroutes
+  to a fallback solver using the correct density too.
+
+**Verification:**
+```
+$ ~/.local/bin/pytest backend/tests/test_360_stitch.py -q
+64 passed in 0.56s   (56 baseline + 5 new §1D′ cases + 3 already added post-langfield fix)
+
+$ ~/.local/bin/pytest backend/tests/ -q
+2 failed, 174 passed, 4 warnings in 2.16s
+```
+The 2 failures are the same PRE-EXISTING `test_scale_calibration.py` nan/inf cases (unrelated,
+confirmed unchanged since the langfield commit). 5 new tests, 0 regressions:
+- full run computes duration-aware target (80s -> 240, no cap needed)
+- crop-count cap engages on a long clip (300s -> would be 900, capped to 500)
+- cap scales with images_per_equirect (14-crop: 4000//14=285)
+- Test Flight trim produces the SAME value the client already computes (30s -> 90 —
+  proves this ships with zero behavior change for the already-correct lane)
+- probe failure leaves the client's value alone (no crash, no guess)
+
+Deploy: backend change — needs `splatlab-safe-restart` before it's live (not yet deployed
+this session; no job was running at last 0b check, but deploy happens right before Phase
+3.1 dispatch to bundle it with one restart rather than two).
+
+Committed locally (not pushed): see git log.
+
 Committed locally (not pushed): see git log for the Problem/Fix/Verification/Risk message.

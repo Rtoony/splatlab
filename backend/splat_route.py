@@ -1944,8 +1944,9 @@ def _plan_3d_job(
         # the window, trim is a no-op (drop it entirely).
         trim_start = req.trim_start_s
         trim_duration = req.trim_duration_s
+        full_duration = _probe_video_duration(ffprobe, input_path) if ffprobe else None
         if trim_start is not None or trim_duration is not None:
-            duration = _probe_video_duration(ffprobe, input_path) if ffprobe else None
+            duration = full_duration
             if duration is not None and trim_start is not None and trim_start >= duration:
                 raise HTTPException(
                     status_code=400,
@@ -1957,6 +1958,28 @@ def _plan_3d_job(
                     trim_duration = None  # window >= clip: trim is a no-op
                 elif trim_start is None:
                     trim_start = max(0.0, ((duration or 0.0) - trim_duration) / 2)
+
+        # Frame-density rule (the pipeline's ONLY proven-good 360 config —
+        # empirically confirmed both directions on the same window:
+        # splat_9da9dff4b2 @1.76fps -> 599 cameras posed, ZERO 3D points;
+        # splat_5177f8d99a @3.0fps, same clip -> 1078/1080 registered, 105k
+        # points). Test Flight already sends a correct 3fps-derived value
+        # client-side, but a full (non-flight) insv run has no way to know
+        # the clip's actual duration, so the UI can only ever hardcode a
+        # flat guess — wrong for anything but one specific clip length.
+        # Compute it here from the REAL (post-trim) window instead of
+        # trusting the client, capped so num_frames_target * images_per_equirect
+        # never exceeds the crop-count guard the /train endpoint enforces.
+        # A trimmed request lands on the exact same number the client already
+        # computed (same rule, same window), so this is a no-op override for
+        # Test Flight and a real fix for full runs. Probe failure (no ffprobe,
+        # unreadable container) leaves num_frames_target as the client sent it
+        # rather than guessing — mirrors the layout-probe's own fail-open policy.
+        density_window_s = trim_duration if trim_duration is not None else full_duration
+        if density_window_s is not None and density_window_s > 0:
+            cap = 4000 // req.images_per_equirect
+            req.num_frames_target = min(math.ceil(3.0 * density_window_s), cap)
+
         stitched = _stitched_path(job_dir)
         commands["stitch"] = _stitch_command(
             availability["ffmpeg_path"], input_path, stitched, req.insv_fov,
