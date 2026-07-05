@@ -163,6 +163,13 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
   const [calibUnit, setCalibUnit] = useState<"m" | "ft" | "in">("ft");
   const [savingScale, setSavingScale] = useState(false);
   const [scaleError, setScaleError] = useState<string | null>(null);
+  const [recalibrateArmed, setRecalibrateArmed] = useState(false);
+
+  useEffect(() => {
+    if (!recalibrateArmed) return;
+    const t = window.setTimeout(() => setRecalibrateArmed(false), 3000);
+    return () => window.clearTimeout(t);
+  }, [recalibrateArmed]);
 
   useEffect(() => {
     measureArmRef.current = measureArm;
@@ -200,7 +207,10 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
 
   function deleteDim(id: number) {
     syncDims(dimsRef.current.filter((d) => d.id !== id));
-    if (calibDimId === id) setCalibDimId(null);
+    if (calibDimId === id) {
+      setCalibDimId(null);
+      setRecalibrateArmed(false);
+    }
   }
 
   // ---- overlay (multi-query heatmap) -------------------------------------
@@ -488,8 +498,22 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
 
   // ---- scale calibration --------------------------------------------------
   async function saveScale() {
-    const dim = dimsRef.current.find((d) => d.id === calibDimId) ?? dimsRef.current[dimsRef.current.length - 1];
-    if (!dim) return;
+    // meters_per_unit is ONE scalar shared by every dimension in the scene
+    // (line ~1124: `len * metersPerUnit` on each label) — recalibrating
+    // silently changes every previously-placed dimension's displayed
+    // real-world length. Require a second click, same two-step confirm
+    // idiom as scene delete (splat.tsx confirmDel), instead of overwriting
+    // an existing calibration with no warning.
+    if (metersPerUnit !== null && !recalibrateArmed) {
+      setRecalibrateArmed(true);
+      return;
+    }
+    setRecalibrateArmed(false);
+    const dim = dimsRef.current.find((d) => d.id === calibDimId);
+    if (!dim) {
+      setScaleError("Pick a dimension and enter its real length.");
+      return;
+    }
     const sceneDist = dimLength(dim);
     const len = Number(calibLen);
     if (!Number.isFinite(len) || len <= 0 || sceneDist <= 0) {
@@ -813,7 +837,12 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url]);
 
-  const calibDim = dims.find((d) => d.id === calibDimId) ?? dims[dims.length - 1] ?? null;
+  // No fallback to "the last dimension" here: calibDimId is only ever set by an
+  // explicit click on a dimension (line ~1122) or cleared by deleteDim() when its
+  // target is removed. Silently re-targeting calibration onto whatever happens
+  // to be last in the list, with no prompt, let a user recalibrate against the
+  // wrong reference without noticing.
+  const calibDim = dims.find((d) => d.id === calibDimId) ?? null;
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-black/70">
@@ -1119,7 +1148,10 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
                 type="button"
                 className="min-w-0 flex-1 truncate text-left hover:text-cyan-200"
                 title="Use this dimension for scale calibration"
-                onClick={() => setCalibDimId(d.id)}
+                onClick={() => {
+                  setCalibDimId(d.id);
+                  setRecalibrateArmed(false);
+                }}
               >
                 #{i + 1} · {len.toFixed(3)} u{metersPerUnit ? ` = ${formatReal(len * metersPerUnit)}` : ""}
               </button>
@@ -1151,8 +1183,15 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
                 <option value="in">in</option>
                 <option value="m">m</option>
               </select>
-              <Button type="button" size="sm" onClick={() => void saveScale()} disabled={savingScale || !calibDim}>
-                {savingScale ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Set scale"}
+              <Button
+                type="button"
+                size="sm"
+                variant={recalibrateArmed ? "primary" : "outline"}
+                onClick={() => void saveScale()}
+                disabled={savingScale || !calibDim}
+                title={recalibrateArmed ? "This replaces the scale every dimension's length is shown in — click again to confirm" : undefined}
+              >
+                {savingScale ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : recalibrateArmed ? "Sure? (replaces all)" : "Set scale"}
               </Button>
             </div>
             {scaleError && <p className="text-[10px] leading-snug text-rose-300/90">{scaleError}</p>}
