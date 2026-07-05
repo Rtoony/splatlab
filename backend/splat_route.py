@@ -365,9 +365,10 @@ def _new_meta(job_id: str, req: SplatTrainRequest, input_path: Path, job_dir: Pa
         "stage": None,
         "stages_planned": stages,
         "stages_completed": [],
-        # Parallel to stages_completed: best-effort/optional stages (langfield)
-        # that ran but failed land here too, so a failed optional stage stays
-        # distinguishable from a genuinely successful one. See _record_stage_failure.
+        # Parallel to stages_completed: best-effort/optional stages (compress,
+        # webopt, webopt-langweb, langfield) that ran but failed land here too,
+        # so a failed optional stage stays distinguishable from a genuinely
+        # successful one. See _record_stage_failure.
         "stages_failed": [],
         "input_path": str(input_path),
         "output_dir": str(job_dir),
@@ -440,9 +441,10 @@ def _record_stage_failure(job_id: str, stage: str, reason: str) -> None:
     """Append a {stage, reason} record to meta['stages_failed'] — parallel to,
     never instead of, stages_completed.
 
-    For a best-effort/optional stage (currently: langfield) a non-zero exit or
-    a caught exception must NEVER flip the job to "failed" — the splat itself
-    already succeeded independent of it. But before this helper existed, the
+    For a best-effort/optional stage (compress, webopt, webopt-langweb,
+    langfield) a non-zero exit or a caught exception must NEVER flip the job
+    to "failed" — the splat itself already succeeded independent of it. But
+    before this helper existed, the
     only bookkeeping was appending the stage name to stages_completed
     unconditionally, which made a failed optional stage indistinguishable from
     a successful one in job meta / the API payload / the frontend. This is the
@@ -2490,6 +2492,7 @@ async def _run_pipeline(job: SplatJob) -> None:
                     rc = await _run_stage(job, stage, command)
                     if rc != 0:
                         job.log_lines.append("[compress] .spz compression failed; keeping raw .ply preview.")
+                        _record_stage_failure(job.job_id, stage, f"exit code {rc}")
                 else:
                     job.log_lines.append("[compress] skipped (tool or .ply unavailable).")
                 completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
@@ -2515,6 +2518,7 @@ async def _run_pipeline(job: SplatJob) -> None:
                     rc = await _run_stage(job, stage, command)
                     if rc != 0:
                         job.log_lines.append("[webopt] web-optimized .ply failed; viewer falls back to the raw .ply.")
+                        _record_stage_failure(job.job_id, stage, f"exit code {rc}")
                     # langweb: full-count SH-stripped copy for the CLIENT-SIDE language
                     # heatmap. No --decimate, so its row order matches gauss_emb.npz
                     # (probe-verified — see _langweb_command). Built only for jobs that
@@ -2533,6 +2537,7 @@ async def _run_pipeline(job: SplatJob) -> None:
                             job.log_lines.append(
                                 "[webopt] langweb .ply failed; the client heatmap falls back to the raw .ply."
                             )
+                            _record_stage_failure(job.job_id, "webopt-langweb", f"exit code {rc}")
                 else:
                     job.log_lines.append("[webopt] skipped (tool or .ply unavailable).")
                 completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
