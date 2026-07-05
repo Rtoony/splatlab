@@ -307,3 +307,26 @@ parked, replaced by survey/scale/benchmark design — see reports dir).
   (rehydrate running meta + stage checkpoints) — codev candidate.
 - Acceptance run RE-DISPATCHED: **splat_192e4223fb** (same params,
   language_field=true); leash verified (taskset 0-11, nice 10).
+
+## OVERLAY v2 + DIMENSIONS (2026-07-04 late night, all browser-verified on Garden)
+- **Multi-query language overlay**: up to 4 simultaneous searches, one color
+  each (editable via color picker), packed into ONE RgbaArray (R/G/B/A
+  channels) + mode-baked dyno modifier in lib/spark-heatmap.ts
+  (buildOverlayModifier). Modes: Highlight (natural + colored matches),
+  Isolate (only matches visible), Spotlight (colored + rest dimmed), Ramp
+  (single-query scientific ramp: viridis/turbo/magma/grayscale). Live legend
+  (bottom-right) tracks queries/colors/mode/threshold; per-query enable
+  toggles + shared match-threshold slider are live uniforms (updateVersion).
+  Receipts: "ball"@0.91 highlight = just the ball yellow on natural scene;
+  isolate = table floats alone; 2-query legend (ball/wooden table).
+  NOTE: relevancy bytes are PER-QUERY min-max normalized -> threshold is
+  relative (default 0.75); absolute calibration = future work.
+- **Dimensions**: unlimited two-point dimensions; draggable endpoints
+  (pointer-capture, orbit paused during drag); floating midpoint labels
+  (imperative DOM, projected per frame); list with per-dim delete + clear-all;
+  sessionStorage persistence per scene; calibration binds to a selected
+  dimension. Receipt: patio dim "3.039 m · 9.97 ft" label live.
+- **Embedding-paint designed** (RToony's idea): sidecar override model
+  (never mutate gauss_emb), query-select/sphere/brush rungs, worker apply +
+  CRUD -> ~/reports/splatlab-embedding-paint-design-2026-07-04/DESIGN.md.
+  P1 unblocked by today's langfield_align work.

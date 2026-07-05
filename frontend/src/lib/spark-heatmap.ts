@@ -115,3 +115,144 @@ export async function fetchRelevancy(jobId: string, text: string): Promise<Relev
     ms: Math.round(performance.now() - started),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Multi-query overlay: up to 4 simultaneous text queries live in ONE RgbaArray
+// (R/G/B/A = query 0..3 relevancy), composited by a mode-baked modifier.
+// Structural knobs (mode, ramp, colors, channel count) are BAKED — rebuild the
+// modifier + updateGenerator() on change (cheap, ms). Only the threshold and
+// per-channel enables are live uniforms (updateVersion() after writes).
+// ---------------------------------------------------------------------------
+
+export type OverlayMode = "tint" | "highlight" | "isolate" | "spotlight";
+
+export const RAMPS: Record<string, [number, number, number][]> = {
+  viridis: [
+    [0.267, 0.005, 0.329],
+    [0.229, 0.322, 0.545],
+    [0.128, 0.567, 0.551],
+    [0.369, 0.789, 0.383],
+    [0.993, 0.906, 0.144],
+  ],
+  turbo: [
+    [0.19, 0.072, 0.232],
+    [0.155, 0.736, 0.925],
+    [0.646, 0.99, 0.235],
+    [0.987, 0.537, 0.129],
+    [0.48, 0.016, 0.011],
+  ],
+  magma: [
+    [0.001, 0.0, 0.014],
+    [0.316, 0.071, 0.485],
+    [0.716, 0.215, 0.475],
+    [0.986, 0.535, 0.382],
+    [0.987, 0.991, 0.75],
+  ],
+  grayscale: [
+    [0.05, 0.05, 0.05],
+    [0.29, 0.29, 0.29],
+    [0.53, 0.53, 0.53],
+    [0.76, 0.76, 0.76],
+    [1.0, 1.0, 1.0],
+  ],
+};
+
+export function rampCssGradient(ramp: string): string {
+  const stops = RAMPS[ramp] ?? RAMPS.viridis;
+  const css = stops
+    .map((s, i) => `rgb(${Math.round(s[0] * 255)},${Math.round(s[1] * 255)},${Math.round(s[2] * 255)}) ${(i / (stops.length - 1)) * 100}%`)
+    .join(", ");
+  return `linear-gradient(90deg, ${css})`;
+}
+
+// Pack up to 4 per-splat relevancy vectors into one RGBA texture buffer.
+export function packChannelsRgba(channels: Uint8Array[], numSplats: number): Uint8Array {
+  const rgba = new Uint8Array(numSplats * 4);
+  for (let c = 0; c < Math.min(channels.length, 4); c += 1) {
+    const src = channels[c];
+    for (let i = 0; i < numSplats; i += 1) rgba[i * 4 + c] = src[i];
+  }
+  return rgba;
+}
+
+export function buildOverlayModifier({
+  scalarArray,
+  channelCount,
+  channelColors,
+  channelEnabled,
+  mode,
+  ramp,
+  threshold,
+}: {
+  scalarArray: RgbaArray;
+  channelCount: number;
+  channelColors: [number, number, number][]; // baked per channel
+  channelEnabled: ReturnType<typeof dyno.dynoBool>[]; // live uniforms
+  mode: OverlayMode; // baked
+  ramp: string; // baked; used by "tint" (single-query ramp view)
+  threshold: ReturnType<typeof dyno.dynoFloat>; // live uniform
+}) {
+  return dyno.dynoBlock({ gsplat: dyno.Gsplat }, { gsplat: dyno.Gsplat }, ({ gsplat }) => {
+    if (!gsplat) throw new Error("overlay modifier: no gsplat input");
+    const { rgb, opacity, index } = dyno.splitGsplat(gsplat).outputs;
+    const texel = dyno.split(readRgbaArray(scalarArray.dyno, index)).outputs;
+    const chans = [texel.x, texel.y, texel.z, texel.w].slice(0, Math.max(1, channelCount));
+
+    if (mode === "tint") {
+      // Single-query scientific view: full ramp over the whole scene.
+      const stops = (RAMPS[ramp] ?? RAMPS.viridis).map((s) =>
+        dyno.dynoVec3(new THREE.Vector3(s[0], s[1], s[2])),
+      );
+      const t = chans[0];
+      // widen to mix()'s DynoVal type so the loop reassignment type-checks
+      let col = dyno.mix(stops[0], stops[0], dyno.dynoFloat(0));
+      for (let i = 1; i < stops.length; i += 1) {
+        col = dyno.mix(
+          col,
+          stops[i],
+          dyno.smoothstep(dyno.dynoFloat((i - 1) / (stops.length - 1)), dyno.dynoFloat(i / (stops.length - 1)), t),
+        );
+      }
+      const on = dyno.float(channelEnabled[0]);
+      return { gsplat: dyno.combineGsplat({ gsplat, rgb: dyno.mix(rgb, col, on) }) };
+    }
+
+    // Multi-query modes: a splat "matches" channel i when that channel is
+    // enabled AND its relevancy exceeds the threshold. The winning channel is
+    // the highest-relevancy match (select-chain, later-higher wins).
+    // Initializers go through no-op select()s so the accumulators carry
+    // select's widened DynoVal types (reassignment stays type-compatible).
+    const never = dyno.dynoBool(false);
+    let bestT = dyno.select(never, dyno.dynoFloat(-1), dyno.dynoFloat(-1));
+    let bestColor = dyno.select(never, rgb, rgb);
+    let anyMatch = dyno.select(never, dyno.dynoFloat(0), dyno.dynoFloat(0));
+    for (let i = 0; i < chans.length; i += 1) {
+      const above = dyno.and(channelEnabled[i], dyno.lessThan(threshold, chans[i]));
+      const wins = dyno.and(above, dyno.lessThan(bestT, chans[i]));
+      const color = dyno.dynoVec3(new THREE.Vector3(...(channelColors[i] ?? [1, 1, 0])));
+      bestT = dyno.select(wins, chans[i], bestT);
+      bestColor = dyno.select(wins, color, bestColor);
+      anyMatch = dyno.select(above, dyno.dynoFloat(1), anyMatch);
+    }
+    const isMatch = dyno.lessThan(dyno.dynoFloat(0.5), anyMatch);
+
+    if (mode === "highlight") {
+      // Natural scene; matches blend strongly toward their query color.
+      const tinted = dyno.mix(rgb, bestColor, dyno.dynoFloat(0.8));
+      const outRgb = dyno.select(isMatch, tinted, rgb);
+      return { gsplat: dyno.combineGsplat({ gsplat, rgb: outRgb }) };
+    }
+    if (mode === "isolate") {
+      // Only matches visible (natural color); everything else vanishes.
+      const hidden = dyno.mul(opacity, dyno.dynoFloat(0.015));
+      const outOpacity = dyno.select(isMatch, opacity, hidden);
+      return { gsplat: dyno.combineGsplat({ gsplat, opacity: outOpacity }) };
+    }
+    // spotlight: matches tinted + full opacity; the rest natural but dimmed.
+    const tinted = dyno.mix(rgb, bestColor, dyno.dynoFloat(0.65));
+    const outRgb = dyno.select(isMatch, tinted, rgb);
+    const dimmed = dyno.mul(opacity, dyno.dynoFloat(0.06));
+    const outOpacity = dyno.select(isMatch, opacity, dimmed);
+    return { gsplat: dyno.combineGsplat({ gsplat, rgb: outRgb, opacity: outOpacity }) };
+  });
+}
