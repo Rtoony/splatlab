@@ -24,6 +24,7 @@ import {
   Orbit,
   Pin,
   RefreshCw,
+  Rocket,
   Trash2,
   Sparkles,
   Square,
@@ -115,6 +116,9 @@ export default function SplatLabPage() {
   const [showCustom, setShowCustom] = useState(false);
   // Opt-in: build a text-searchable Language Field alongside the scene.
   const [languageField, setLanguageField] = useState(false);
+  // Opt-in: "Test Flight" — trim a centered window from a big .insv and run the
+  // full pipeline fast (glomap-first, draft iters) to prove capture + settings.
+  const [testFlight, setTestFlight] = useState(false);
   // Opt-in: "Few Photos (AI poses)" — MASt3R dense-seed sparse-view mode (InstantSplat).
   const [sparseMode, setSparseMode] = useState(false);
   // Opt-in: "Imagine a Splat" — TripoSplat single-image generative lane.
@@ -174,12 +178,13 @@ export default function SplatLabPage() {
         language_field: languageField,
         sparse_mode: sparseMode,
         generative_mode: generativeMode,
+        test_flight: testFlight,
       },
       gpu_lane: gpu?.lane ?? null,
       gpu_locked: Boolean(gpu?.locked),
     });
     return () => setSplatlabFeedbackContext(null);
-  }, [activeJob, completed.length, generativeMode, gpu?.lane, gpu?.locked, iters, jobs, languageField, sparseMode, uploaded]);
+  }, [activeJob, completed.length, generativeMode, gpu?.lane, gpu?.locked, iters, jobs, languageField, sparseMode, testFlight, uploaded]);
 
   function flash(msg: string, bad = false) {
     setToast({ msg, bad });
@@ -223,6 +228,12 @@ export default function SplatLabPage() {
   });
 
   function createFrom(input: SplatUploadResult) {
+    // Test Flight (insv only): centered 30s trim window at the PROVEN ~3fps
+    // equirect frame density (90 frames; 1.76fps triangulated ZERO points on
+    // splat_9da9dff4b2, 3fps gave 99.8% reg + 105k points on the same window)
+    // + glomap-first (skips the COLMAP rung that burned 84 min on 07-04) +
+    // draft iterations + no language field. ~20 min proof of capture/settings.
+    const flight = testFlight && input.is_insv;
     startMutation.mutate({
       mode: "3d",
       input_path: input.path,
@@ -230,10 +241,14 @@ export default function SplatLabPage() {
       capture_format: input.is_insv ? "equirectangular360" : "standard",
       images_per_equirect: input.is_insv ? 8 : undefined,
       crop_bottom: input.is_insv ? 0.15 : undefined,
-      num_frames_target: input.is_insv ? 75 : 300,
-      max_num_iterations: iters,
+      num_frames_target: flight ? 90 : input.is_insv ? 75 : 300,
+      max_num_iterations: flight ? Math.min(iters, QUALITY.draft.iterations) : iters,
       insv_fov: input.is_insv ? 204 : undefined,
-      language_field: languageField,
+      trim_duration_s: flight ? 30 : undefined,
+      // glomap-first only when the engine is actually there — otherwise let the
+      // server default (colmap + auto-escalation) run; the trim still bounds cost.
+      sfm_backend: flight && glomapAvailable ? "glomap" : undefined,
+      language_field: flight ? false : languageField,
       // "Few Photos (AI poses)": dense-seed MASt3R sparse-view path (no COLMAP).
       capture_mode: sparseMode && !input.is_insv ? "sparse" : undefined,
       // "Imagine a Splat": single-image generative lane (skips SfM/train entirely).
@@ -278,7 +293,7 @@ export default function SplatLabPage() {
   const glomapAvailable = Boolean(status?.engines?.glomap_available);
 
   return (
-    <div className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
+    <div className="mx-auto max-w-[1880px] px-4 py-8 sm:px-6 xl:px-10">
       {/* hero */}
       <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-4">
@@ -316,7 +331,7 @@ export default function SplatLabPage() {
         </div>
       )}
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(380px,0.9fr)]">
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(380px,0.9fr)] 2xl:grid-cols-[minmax(460px,640px)_minmax(0,1fr)]">
         {/* left: create */}
         <Card className="p-5">
           <h2 className="text-base font-semibold text-white">Make a 3D scene</h2>
@@ -384,6 +399,35 @@ export default function SplatLabPage() {
               </div>
             )}
           </div>
+
+          {uploaded?.is_insv && (
+            <button
+              type="button"
+              onClick={() => setTestFlight((v) => !v)}
+              className={`mt-3 flex w-full items-start gap-3 rounded-2xl border p-3 text-left transition-all ${
+                testFlight
+                  ? "border-emerald-400/40 bg-emerald-400/10"
+                  : "border-white/10 bg-white/[0.02] hover:border-emerald-500/20"
+              }`}
+            >
+              <span
+                className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
+                  testFlight ? "border-emerald-400 bg-emerald-400 text-[#04121a]" : "border-white/20 bg-white/5"
+                }`}
+              >
+                {testFlight && <CheckCircle2 className="h-3.5 w-3.5" />}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="flex items-center gap-1.5 text-sm font-semibold text-white">
+                  <Rocket className="h-3.5 w-3.5 text-emerald-200" /> Test flight (~20 min)
+                </span>
+                <span className="mt-0.5 block text-xs text-zinc-400">
+                  Trims a short window from the middle of the clip and runs the whole pipeline on it —
+                  prove the capture and settings before committing to the full multi-hour build.
+                </span>
+              </span>
+            </button>
+          )}
 
           {langfieldEngineAvailable && (
             <button
@@ -807,7 +851,7 @@ function ResultsGallery({
         </Card>
       )}
 
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
         {jobs.map((j) => (
           <SceneCard
             key={j.job_id}

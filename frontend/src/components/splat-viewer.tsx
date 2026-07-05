@@ -374,7 +374,7 @@ export function SplatViewer({
       className={
         fill
           ? "relative h-full w-full overflow-hidden bg-black/70"
-          : "relative h-[460px] overflow-hidden rounded-[24px] border border-white/10 bg-black/70"
+          : "relative h-[460px] 2xl:h-[560px] overflow-hidden rounded-[24px] border border-white/10 bg-black/70"
       }
     >
       <div ref={rootRef} className="h-full w-full" />
