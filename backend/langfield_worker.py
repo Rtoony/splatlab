@@ -638,6 +638,31 @@ class HeroReq(BaseModel):
     lfdir: str
 
 
+class SelectSphereReq(BaseModel):
+    config: str
+    lfdir: str
+    center: list[float]  # [x,y,z] in the viewer/.ply frame
+    radius: float
+
+
+class OverrideAddReq(BaseModel):
+    config: str
+    lfdir: str
+    label: str
+    aliases: list[str] = []
+    op: str = "assign"
+    alpha: float | None = None
+    indices_b64: str  # base64 little-endian uint32, EXPORTED-PLY order
+    force: bool = False
+    note: str = ""
+
+
+class OverrideDeleteReq(BaseModel):
+    config: str
+    lfdir: str
+    override_id: str
+
+
 app = FastAPI(title="Splat Lab Language Field — Warm Query Worker")
 
 
@@ -762,10 +787,22 @@ async def relevancy(req: RelevancyReq) -> Response:
                 # reorder/filter to exported-ply row order BEFORE quantizing so
                 # X-Min/X-Max describe exactly the rows the client receives
                 rel_np = rel_np[ply_map]
+            # EXACT-LABEL RECALL: a query that names a painted label/alias pins
+            # that region to max relevancy — deterministic for "liberal" labels
+            # whose text embedding alone is semantically weak.
+            label_hit = False
+            label_rows = getattr(sc, "label_rows", None)
+            if label_rows and ply_map is not None:
+                key = _overrides_mod().clean_label(req.text)
+                rows = label_rows.get(key)
+                if rows is not None and rows.size:
+                    rel_np = rel_np.copy()
+                    rel_np[rows] = float(rel_np.max())
+                    label_hit = True
             payload, rmin, rmax = quantize_relevancy(rel_np)
-            return payload, rmin, rmax, focus
+            return payload, rmin, rmax, focus, label_hit
 
-        payload, rmin, rmax, focus = await asyncio.to_thread(_compute)
+        payload, rmin, rmax, focus, label_hit = await asyncio.to_thread(_compute)
     finally:
         async with STATE.lock:
             sc.in_use -= 1
@@ -779,8 +816,121 @@ async def relevancy(req: RelevancyReq) -> Response:
             "X-Min": repr(rmin),
             "X-Max": repr(rmax),
             "X-Matches": json.dumps(focus, separators=(",", ":")),
+            "X-Label-Hit": "1" if label_hit else "0",
         },
     )
+
+
+async def _acquire_scene(config: str, lfdir: str):
+    """Shared cached-or-build scene acquisition (same dance as /relevancy)."""
+    if not (_HEAVY_OK and STATE.ready):
+        raise HTTPException(503, f"worker not ready (siglip loaded: {STATE.ready})")
+    if not Path(config).is_file():
+        raise HTTPException(404, f"config not found: {config}")
+    async with STATE.lock:
+        sc = STATE.get_scene_cached(config)
+        if sc is None:
+            sc = await _build_scene_locked(config, lfdir, Path(lfdir).name or config)
+            STATE.insert_scene(sc)
+        else:
+            sc.touch()
+        sc.in_use += 1
+    return sc
+
+
+async def _release_scene(sc) -> None:
+    async with STATE.lock:
+        sc.in_use -= 1
+        sc.touch()
+
+
+@app.post("/select_sphere")
+async def select_sphere(req: SelectSphereReq) -> Response:
+    """Paint-brush stroke: ply-order rows within `radius` of `center` (viewer
+    frame). LOCKLESS GPU distance test on the resident positions. Body =
+    little-endian uint32 rows; X-Count header."""
+    if len(req.center) != 3 or not (0 < req.radius < 100):
+        raise HTTPException(400, "center must be [x,y,z]; radius in (0, 100)")
+    sc = await _acquire_scene(req.config, req.lfdir)
+    try:
+        def _compute():
+            import numpy as np
+            ply_map = getattr(sc, "ply_map", None)
+            if ply_map is None:
+                raise HTTPException(409, "scene has no ply->ckpt map — painting unavailable")
+            means_ply = getattr(sc, "means_ply", None)
+            if means_ply is None:
+                mp_t = torch.from_numpy(ply_map).to(sc.means.device)
+                means_ply = sc.means[mp_t]
+                sc.means_ply = means_ply  # ~16MB VRAM for 1.3M splats; freed with the scene
+            c = torch.tensor(req.center, device=means_ply.device, dtype=means_ply.dtype)
+            d2 = ((means_ply - c[None, :]) ** 2).sum(-1)
+            idx = torch.nonzero(d2 <= req.radius * req.radius).squeeze(-1)
+            return idx.cpu().numpy().astype("<u4")
+
+        idx = await asyncio.to_thread(_compute)
+    finally:
+        await _release_scene(sc)
+    return Response(
+        content=idx.tobytes(),
+        media_type="application/octet-stream",
+        headers={"X-Count": str(int(idx.size)), "Cache-Control": "no-store"},
+    )
+
+
+@app.post("/overrides_add")
+async def overrides_add(req: OverrideAddReq) -> dict[str, Any]:
+    """Commit one paint action. Guardrails (min count, max scene fraction,
+    bounds) are enforced in langfield_overrides — 400 with a human message on
+    violation. Invalidate the cached scene so the next query composes it."""
+    import base64
+    import numpy as np
+    lov = _overrides_mod()
+    try:
+        raw = base64.b64decode(req.indices_b64, validate=True)
+    except Exception as exc:
+        raise HTTPException(400, f"indices_b64 is not valid base64: {exc}")
+    if len(raw) % 4 != 0:
+        raise HTTPException(400, "indices payload is not a uint32 array")
+    indices = np.frombuffer(raw, dtype="<u4").astype(np.int64)
+
+    # n_ply from the alignment map (authoritative client-space row count)
+    sc = await _acquire_scene(req.config, req.lfdir)
+    try:
+        ply_map = getattr(sc, "ply_map", None)
+        if ply_map is None:
+            raise HTTPException(409, "scene has no ply->ckpt map — painting unavailable")
+        n_ply = int(ply_map.shape[0])
+    finally:
+        await _release_scene(sc)
+
+    try:
+        record = lov.add_override(
+            Path(req.lfdir),
+            label=req.label,
+            aliases=req.aliases,
+            op=req.op,
+            alpha=req.alpha,
+            indices=indices,
+            n_ply=n_ply,
+            force=req.force,
+            note=req.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    await _invalidate_scene(req.config)
+    log.info("paint override added: %s '%s' (%d rows)", record["op"], record["label"], record["count"])
+    return {"ok": True, "override": record}
+
+
+@app.post("/overrides_delete")
+async def overrides_delete(req: OverrideDeleteReq) -> dict[str, Any]:
+    lov = _overrides_mod()
+    removed = lov.delete_override(Path(req.lfdir), req.override_id)
+    if not removed:
+        raise HTTPException(404, "override not found")
+    await _invalidate_scene(req.config)
+    return {"ok": True, "deleted": req.override_id}
 
 
 @app.post("/inventory")
@@ -880,7 +1030,80 @@ async def _build_scene_locked(config_path: str, lfdir: str, scene_id: str) -> Sc
             sc = await asyncio.to_thread(Scene, config_path, lfdir)
         finally:
             gpu_arbiter.clear_holder()
+    # Paint overrides compose onto the freshly-loaded field (LOCKLESS: text
+    # encode + row writes, no rasterization). Never fatal — a broken override
+    # file degrades to the base field, not a dead scene.
+    try:
+        await asyncio.to_thread(_apply_paint_overrides, STATE, sc, lfdir)
+    except Exception:
+        log.exception("paint-override apply failed; serving the base field")
     return sc
+
+
+def _overrides_mod():
+    import sys as _sys
+    _here = str(Path(__file__).resolve().parent)
+    if _here not in _sys.path:
+        _sys.path.insert(0, _here)
+    import langfield_overrides
+    return langfield_overrides
+
+
+def _apply_paint_overrides(state: "WorkerState", sc: Scene, lfdir: str) -> None:
+    """Blend the sidecar paint records into the in-memory field (never the npz).
+
+    assign/boost: feat[rows] <- normalize(alpha*label_emb + (1-alpha)*feat[rows])
+      (an unseen/zero row becomes the label embedding outright — this is what
+      makes 'liberal' labels for abstract, never-grounded regions work)
+    suppress:     feat[rows] <- normalize(feat[rows] - alpha*proj_onto(label))
+
+    Also builds sc.label_rows: cleaned label/alias -> ply-order rows, for
+    EXACT-LABEL RECALL in /relevancy (deterministic hit even when the label's
+    text embedding is semantically weak — 'the weird corner' just works).
+    """
+    lov = _overrides_mod()
+    recs = lov.load_overrides(Path(lfdir))
+    sc.label_rows = {}
+    if not recs:
+        return
+    ply_map = getattr(sc, "ply_map", None)
+    if ply_map is None:
+        log.warning("paint overrides present but no ply->ckpt map — skipping apply")
+        return
+    import numpy as np
+    mp_t = torch.from_numpy(ply_map).to(sc.feat_n.device)
+    applied = 0
+    for rec, idx in recs:
+        idx = idx[(idx >= 0) & (idx < ply_map.shape[0])]
+        if idx.size == 0:
+            continue
+        rows = mp_t[torch.from_numpy(idx).to(sc.feat_n.device)]
+        prompts = [rec["label"], *rec.get("aliases", [])]
+        emb = F.normalize(state._text_emb(prompts).mean(0), dim=-1).to(sc.feat_n.dtype)
+        a = float(rec.get("alpha", 0.9))
+        if rec.get("op") in ("assign", "boost"):
+            blended = a * emb[None, :] + (1.0 - a) * sc.feat_n[rows]
+            sc.feat_n[rows] = F.normalize(blended, dim=-1)
+        elif rec.get("op") == "suppress":
+            proj = (sc.feat_n[rows] @ emb)[:, None] * emb[None, :]
+            sc.feat_n[rows] = F.normalize(sc.feat_n[rows] - a * proj, dim=-1)
+        if rec.get("op") != "suppress":
+            for name in prompts:
+                key = lov.clean_label(name)
+                if not key:
+                    continue
+                prev = sc.label_rows.get(key)
+                sc.label_rows[key] = np.union1d(prev, idx) if prev is not None else idx.copy()
+        applied += 1
+    log.info("paint overrides applied: %d record(s), %d recall label(s)", applied, len(sc.label_rows))
+
+
+async def _invalidate_scene(config_path: str) -> None:
+    """Drop a cached scene so the next query rebuilds with current overrides."""
+    async with STATE.lock:
+        sc = STATE.scenes.pop(config_path, None)
+        if sc is not None and sc.in_use == 0:
+            sc.free()
 
 
 async def _render_locked(sc: Scene, text: str, scene_id: str) -> str:

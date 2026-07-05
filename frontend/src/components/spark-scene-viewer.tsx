@@ -13,7 +13,7 @@ import {
 } from "@/lib/spark-heatmap";
 import type { SplatJob } from "@/lib/contracts";
 import { Button, SectionLabel } from "@/components/ui";
-import { Loader2, Plus, Ruler, Search, Trash2, X } from "lucide-react";
+import { Loader2, Paintbrush, Plus, Ruler, Trash2, Undo2, X } from "lucide-react";
 
 // SPARK BETA viewer for the /view page — the Wave-2 cutover surface.
 // - Multi-query language overlay: up to 4 simultaneous text searches, one
@@ -71,6 +71,26 @@ function formatReal(meters: number): string {
   return `${meters.toFixed(3)} m · ${(meters / M_PER_FT).toFixed(2)} ft`;
 }
 
+// chunked btoa — a big selection is a few MB of uint32s and one giant binary
+// string would blow the btoa argument path
+function b64FromUint32(arr: Uint32Array): string {
+  const bytes = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
+interface OverrideRecord {
+  id: string;
+  label: string;
+  aliases: string[];
+  op: string;
+  count: number;
+}
+
 export function SparkSceneViewer({ job }: { job: SplatJob }) {
   // Langfield scenes MUST load langweb: relevancy rows are exported-ply order
   // and langweb preserves it; web.ply is decimated + reordered.
@@ -87,6 +107,7 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
   const enabledDynosRef = useRef<ReturnType<typeof dyno.dynoBool>[]>([]);
   const thresholdDynoRef = useRef<ReturnType<typeof dyno.dynoFloat> | null>(null);
   const applyOverlayRef = useRef<() => void>(() => {});
+  const refreshModifierRef = useRef<() => void>(() => {});
 
   const dimsRef = useRef<Dim[]>([]);
   const dimGroupRef = useRef<THREE.Group | null>(null);
@@ -108,6 +129,26 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
   const [rampName, setRampName] = useState("viridis");
   const [threshold, setThreshold] = useState(0.75);
 
+  // paint-the-embeddings (langfield scenes only)
+  const paintModeRef = useRef(false);
+  const strokeAtRef = useRef<(p: THREE.Vector3) => void>(() => {});
+  const selSetRef = useRef<Set<number>>(new Set());
+  const strokesRef = useRef<Uint32Array[]>([]);
+  const [paintMode, setPaintMode] = useState(false);
+  const [brushRadius, setBrushRadius] = useState(0.1);
+  const brushRadiusRef = useRef(0.1);
+  const [selCount, setSelCount] = useState(0);
+  const [strokeBusy, setStrokeBusy] = useState(false);
+  const [paintLabel, setPaintLabel] = useState("");
+  const [paintAliases, setPaintAliases] = useState("");
+  const [paintOp, setPaintOp] = useState<"assign" | "boost" | "suppress">("assign");
+  const [limitToQuery, setLimitToQuery] = useState(false);
+  const [paintBusy, setPaintBusy] = useState(false);
+  const [paintError, setPaintError] = useState<string | null>(null);
+  const [paintNeedsForce, setPaintNeedsForce] = useState(false);
+  const [paintNotice, setPaintNotice] = useState<string | null>(null);
+  const [overrides, setOverrides] = useState<OverrideRecord[]>([]);
+
   const [dims, setDims] = useState<Dim[]>([]);
   const [measureArm, setMeasureArm] = useState(false);
   const [hasPending, setHasPending] = useState(false);
@@ -125,6 +166,18 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
       setHasPending(false);
     }
   }, [measureArm]);
+
+  useEffect(() => {
+    paintModeRef.current = paintMode;
+    if (paintMode) setMeasureArm(false); // one click-owner at a time
+    // entering/leaving paint swaps the modifier (selection preview <-> queries)
+    refreshModifierRef.current();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paintMode]);
+
+  useEffect(() => {
+    brushRadiusRef.current = brushRadius;
+  }, [brushRadius]);
 
   // ---- dims persistence -------------------------------------------------
   function syncDims(next: Dim[]) {
@@ -171,7 +224,165 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
     });
     mesh.updateGenerator();
   }
-  applyOverlayRef.current = () => rebuildOverlay(channelsRef.current, mode, rampName);
+  applyOverlayRef.current = () => refreshModifierRef.current();
+
+  // ---- paint-the-embeddings ----------------------------------------------
+  function previewSelection() {
+    const mesh = meshRef.current;
+    if (!mesh) return;
+    const numSplats = mesh.packedSplats?.numSplats ?? mesh.numSplats ?? 0;
+    if (numSplats === 0) return;
+    const bytes = new Uint8Array(numSplats);
+    for (const i of selSetRef.current) if (i < numSplats) bytes[i] = 255;
+    const scalarArray = new RgbaArray({ array: packChannelsRgba([bytes], numSplats), count: numSplats });
+    mesh.worldModifier = buildOverlayModifier({
+      scalarArray,
+      channelCount: 1,
+      channelColors: [[0.13, 0.83, 0.93]], // selection cyan
+      channelEnabled: [dyno.dynoBool(true)],
+      mode: "highlight",
+      ramp: rampName,
+      threshold: dyno.dynoFloat(0.5),
+    });
+    mesh.updateGenerator();
+  }
+
+  function refreshModifier() {
+    if (paintModeRef.current && selSetRef.current.size > 0) previewSelection();
+    else rebuildOverlay(channelsRef.current, mode, rampName);
+  }
+  refreshModifierRef.current = refreshModifier;
+
+  async function strokeAt(p: THREE.Vector3) {
+    setStrokeBusy(true);
+    setPaintError(null);
+    try {
+      const res = await fetch(`/api/splat/jobs/${job.job_id}/langfield/select/sphere`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ center: [p.x, p.y, p.z], radius: brushRadiusRef.current }),
+      });
+      if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).slice(0, 200)}`);
+      const idx = new Uint32Array(await res.arrayBuffer());
+      // optional hygiene: clip the sloppy sphere to the current query's matches
+      let clipped: Uint32Array | number[] = idx;
+      if (limitToQuery) {
+        const ch = channelsRef.current.find((c) => c.enabled);
+        if (ch) {
+          const cut = Math.round(threshold * 255);
+          const keep: number[] = [];
+          for (const i of idx) if (ch.bytes[i] >= cut) keep.push(i);
+          clipped = keep;
+        }
+      }
+      const delta: number[] = [];
+      for (const i of clipped) {
+        if (!selSetRef.current.has(i)) {
+          selSetRef.current.add(i);
+          delta.push(i);
+        }
+      }
+      if (delta.length) strokesRef.current.push(Uint32Array.from(delta));
+      setSelCount(selSetRef.current.size);
+      refreshModifierRef.current();
+    } catch (cause) {
+      setPaintError(cause instanceof Error ? cause.message : "Brush stroke failed.");
+    } finally {
+      setStrokeBusy(false);
+    }
+  }
+  strokeAtRef.current = (p) => void strokeAt(p);
+
+  function undoStroke() {
+    const last = strokesRef.current.pop();
+    if (!last) return;
+    for (const i of last) selSetRef.current.delete(i);
+    setSelCount(selSetRef.current.size);
+    refreshModifierRef.current();
+  }
+
+  function clearSelection() {
+    selSetRef.current.clear();
+    strokesRef.current = [];
+    setSelCount(0);
+    setPaintNeedsForce(false);
+    refreshModifierRef.current();
+  }
+
+  async function loadOverridesList() {
+    try {
+      const data = await apiRequest<{ overrides: OverrideRecord[] }>(
+        `/api/splat/jobs/${job.job_id}/langfield/overrides`,
+      );
+      setOverrides(data.overrides ?? []);
+    } catch {
+      /* list is a convenience — leave whatever we had */
+    }
+  }
+
+  async function commitPaint(force = false) {
+    const label = paintLabel.trim();
+    const n = selSetRef.current.size;
+    if (!label || n === 0) return;
+    setPaintBusy(true);
+    setPaintError(null);
+    setPaintNotice(null);
+    try {
+      const resp = await fetch(`/api/splat/jobs/${job.job_id}/langfield/overrides`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          label,
+          aliases: paintAliases.split(",").map((s) => s.trim()).filter(Boolean),
+          op: paintOp,
+          indices_b64: b64FromUint32(Uint32Array.from(selSetRef.current)),
+          force,
+        }),
+      });
+      if (!resp.ok) {
+        const detail = String(
+          ((await resp.json().catch(() => null)) as { detail?: string } | null)?.detail ?? "commit failed",
+        );
+        setPaintNeedsForce(detail.includes("force"));
+        throw new Error(detail);
+      }
+      setPaintNeedsForce(false);
+      setPaintNotice(
+        `${paintOp === "suppress" ? "Suppressed" : "Pinned"} ${n.toLocaleString()} splats as “${label}”. ` +
+          "Searches respect it now (the first query re-composes the scene, ~10-30s). " +
+          "Colored queries added BEFORE this paint are stale — re-add them to refresh.",
+      );
+      setPaintLabel("");
+      setPaintAliases("");
+      clearSelection();
+      void loadOverridesList();
+    } catch (cause) {
+      setPaintError(cause instanceof Error ? cause.message : "Commit failed.");
+    } finally {
+      setPaintBusy(false);
+    }
+  }
+
+  async function removeOverride(oid: string) {
+    try {
+      const resp = await fetch(`/api/splat/jobs/${job.job_id}/langfield/overrides/${oid}`, {
+        method: "DELETE",
+        credentials: "same-origin",
+      });
+      if (!resp.ok) throw new Error(`${resp.status}`);
+      setPaintNotice("Override reverted — the field is back to its unpainted state for that region.");
+      void loadOverridesList();
+    } catch (cause) {
+      setPaintError(cause instanceof Error ? cause.message : "Delete failed.");
+    }
+  }
+
+  useEffect(() => {
+    if (job.langfield_available) void loadOverridesList();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job.job_id]);
 
   async function addQuery() {
     const mesh = meshRef.current;
@@ -509,8 +720,13 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
       }
     }
     function onClick(e: MouseEvent) {
-      if (!measureArmRef.current) return;
       if (Math.hypot(e.clientX - downX, e.clientY - downY) > 6) return;
+      if (paintModeRef.current) {
+        const hit = raycastAt(e.clientX, e.clientY);
+        if (hit) strokeAtRef.current(hit);
+        return;
+      }
+      if (!measureArmRef.current) return;
       const hit = raycastAt(e.clientX, e.clientY);
       if (!hit) return;
       const pending = pendingPointRef.current;
@@ -533,7 +749,7 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
       }
     }
     function onDoubleClick(event: MouseEvent) {
-      if (measureArmRef.current) return; // measuring owns clicks
+      if (measureArmRef.current || paintModeRef.current) return; // click-owners active
       const hit = raycastAt(event.clientX, event.clientY);
       if (hit) {
         controls.target.copy(hit);
@@ -715,6 +931,135 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
           <p className="text-[10px] leading-snug text-zinc-500">
             No language field on this scene — re-run with the language field enabled to search it.
           </p>
+        )}
+
+        {job.langfield_available && (
+          <>
+            <div className="h-px bg-white/10" />
+            <SectionLabel>Paint the field</SectionLabel>
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                variant={paintMode ? "primary" : "outline"}
+                onClick={() => setPaintMode((v) => !v)}
+                title="Brush splats with a sphere, then pin them to a label — corrects or extends the AI's understanding. Fully revertible."
+              >
+                {strokeBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Paintbrush className="h-3.5 w-3.5" />}{" "}
+                {paintMode ? "Painting…" : "Paint"}
+              </Button>
+              {selCount > 0 && (
+                <>
+                  <Button type="button" size="sm" variant="outline" onClick={undoStroke} title="Undo last stroke">
+                    <Undo2 className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button type="button" size="sm" variant="outline" onClick={clearSelection} title="Clear selection">
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </>
+              )}
+            </div>
+            {paintMode && (
+              <>
+                <div className="flex items-center gap-2">
+                  <span className="shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">brush</span>
+                  <input
+                    type="range"
+                    min={0.02}
+                    max={0.4}
+                    step={0.01}
+                    value={brushRadius}
+                    onChange={(e) => setBrushRadius(Number(e.target.value))}
+                    className="w-full"
+                  />
+                  <span className="w-16 shrink-0 text-right text-zinc-400">
+                    {metersPerUnit ? `${(brushRadius * metersPerUnit).toFixed(2)} m` : `${brushRadius.toFixed(2)} u`}
+                  </span>
+                </div>
+                {channels.length > 0 && (
+                  <label className="flex items-center gap-2 text-[10px] text-zinc-400">
+                    <input type="checkbox" checked={limitToQuery} onChange={(e) => setLimitToQuery(e.target.checked)} />
+                    clip strokes to “{channels.find((c) => c.enabled)?.text ?? channels[0].text}” matches ≥{" "}
+                    {threshold.toFixed(2)} (snaps sloppy strokes to the object)
+                  </label>
+                )}
+                <p className="text-[10px] leading-snug text-zinc-500">
+                  Click the scene to add sphere strokes ({selCount.toLocaleString()} splats selected, shown cyan).
+                </p>
+                {selCount > 0 && (
+                  <div className="space-y-1.5">
+                    <input
+                      value={paintLabel}
+                      onChange={(e) => setPaintLabel(e.target.value)}
+                      placeholder='Label — anything, e.g. "dad’s corner"'
+                      className="w-full rounded border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-cyan-400/50 focus:outline-none"
+                    />
+                    <input
+                      value={paintAliases}
+                      onChange={(e) => setPaintAliases(e.target.value)}
+                      placeholder="Aliases, comma-separated (optional)"
+                      className="w-full rounded border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-cyan-400/50 focus:outline-none"
+                    />
+                    {overrides.some((o) => o.label.trim().toLowerCase() === paintLabel.trim().toLowerCase()) && (
+                      <p className="text-[10px] leading-snug text-amber-300/90">
+                        A paint with this exact label already exists — both will answer to it. Delete the old one
+                        below if this is a re-do.
+                      </p>
+                    )}
+                    <div className="flex items-center gap-1.5">
+                      <select
+                        value={paintOp}
+                        onChange={(e) => setPaintOp(e.target.value as typeof paintOp)}
+                        className="rounded border border-white/10 bg-white/5 px-1.5 py-1 text-xs text-zinc-100 focus:outline-none"
+                        title="Pin = trust your label fully · Boost = nudge/confirm the AI · Not this = push the label away"
+                      >
+                        <option value="assign">Pin label</option>
+                        <option value="boost">Boost</option>
+                        <option value="suppress">Not this</option>
+                      </select>
+                      <Button
+                        type="button"
+                        size="sm"
+                        onClick={() => void commitPaint(false)}
+                        disabled={paintBusy || !paintLabel.trim()}
+                      >
+                        {paintBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : `Commit ${selCount.toLocaleString()}`}
+                      </Button>
+                      {paintNeedsForce && (
+                        <Button type="button" size="sm" variant="outline" onClick={() => void commitPaint(true)}>
+                          Force
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+            {paintError && <p className="text-[10px] leading-snug text-rose-300/90">{paintError}</p>}
+            {paintNotice && <p className="text-[10px] leading-snug text-emerald-300/90">{paintNotice}</p>}
+            {overrides.length > 0 && (
+              <div className="space-y-1">
+                <p className="text-[10px] uppercase tracking-wide text-zinc-500">Painted labels</p>
+                {overrides.map((o) => (
+                  <div key={o.id} className="flex items-center gap-2">
+                    <span className="min-w-0 flex-1 truncate" title={[o.label, ...(o.aliases ?? [])].join(", ")}>
+                      {o.op === "suppress" ? "🚫 " : "📌 "}
+                      {o.label}
+                    </span>
+                    <span className="shrink-0 text-[10px] text-zinc-500">{o.count.toLocaleString()}</span>
+                    <button
+                      type="button"
+                      onClick={() => void removeOverride(o.id)}
+                      className="shrink-0 text-zinc-500 hover:text-rose-300"
+                      title="Revert this paint (fully non-destructive)"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
         )}
 
         <div className="h-px bg-white/10" />

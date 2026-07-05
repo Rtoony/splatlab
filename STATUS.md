@@ -330,3 +330,29 @@ parked, replaced by survey/scale/benchmark design — see reports dir).
   (never mutate gauss_emb), query-select/sphere/brush rungs, worker apply +
   CRUD -> ~/reports/splatlab-embedding-paint-design-2026-07-04/DESIGN.md.
   P1 unblocked by today's langfield_align work.
+
+## PAINT-THE-EMBEDDINGS SHIPPED (2026-07-04 night) — RToony's feature
+- Backend COMPLETE + worker-verified live on Garden; frontend brush UI built.
+  ⚠️ app proxy endpoints (select/sphere, overrides CRUD) need a splatlab.service
+  restart — GATED until splat_192e4223fb finishes (no restarts mid-job). The
+  worker side (:3417) is already live.
+- Mechanism: sidecar overrides (backend/langfield_overrides.py — manifest json
+  + per-record uint32 npy in _langfield/, EXPORTED-PLY order; gauss_emb.npz
+  NEVER touched). Worker composes at scene load (assign/boost = blend toward
+  label embedding — a zero/unseen row BECOMES the label, which is what makes
+  abstract "liberal" labels work; suppress = remove projection). Worker
+  endpoints: /select_sphere (GPU sphere test on resident positions),
+  /overrides_add (guardrails: min 10 splats, ≤30% of scene unless force=true,
+  bounds check), /overrides_delete; scene cache invalidated on mutation.
+- EXACT-LABEL RECALL: /relevancy pins a painted region to max relevancy when
+  the query names its label OR alias (X-Label-Hit header) — deterministic for
+  labels SigLIP can't ground ("lucky orb" verified).
+- LIVE RECEIPTS (worker-direct, Garden): sphere stroke @ ball focus r=0.12 ->
+  2,229 rows; committed label "lucky orb" alias "the special thing" -> both
+  queries X-Label-Hit:1; delete -> hit:0, files gone, manifest empty (full
+  revert). 154 backend tests (8 new for guardrails/roundtrip).
+- UI (beta viewer "Paint the field"): brush radius slider (meters when scale
+  set), stroke preview in cyan w/ live count, UNDO per stroke + clear,
+  "clip strokes to <query> matches" hygiene toggle, duplicate-label warning,
+  Pin/Boost/Not-this ops, force-flow for oversized selections, painted-labels
+  list with one-click revert.

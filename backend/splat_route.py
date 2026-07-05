@@ -2089,7 +2089,7 @@ async def _langfield_worker_query(config_path: str, lfdir: str, clean_text: str)
 # The worker's /relevancy response headers the proxy passes through to the client:
 # X-Count/X-Min/X-Max = dequantization params for the uint8 body, X-Matches = the
 # clustered 3D instances JSON (same shape as /query's, minus the rendered thumbs).
-RELEVANCY_FORWARD_HEADERS = ("x-count", "x-min", "x-max", "x-matches")
+RELEVANCY_FORWARD_HEADERS = ("x-count", "x-min", "x-max", "x-matches", "x-label-hit")
 
 
 async def _langfield_worker_relevancy(config_path: str, lfdir: str, clean_text: str):
@@ -2107,6 +2107,18 @@ async def _langfield_worker_relevancy(config_path: str, lfdir: str, clean_text: 
                 json={"config": config_path, "lfdir": lfdir, "text": clean_text},
             )
         return resp if resp.status_code == 200 else None
+    except Exception:
+        return None
+
+
+async def _langfield_worker_json(path: str, payload: dict):
+    """POST a JSON request to the warm worker; returns the httpx.Response or
+    None on transport failure (caller maps None -> 503). Worker-side HTTPErrors
+    (4xx) pass through so guardrail messages reach the client verbatim."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=1.5)) as client:
+            return await client.post(f"{LANGFIELD_WORKER_URL}{path}", json=payload)
     except Exception:
         return None
 
@@ -3205,6 +3217,102 @@ async def langfield_relevancy(job_id: str, payload: dict[str, Any]):
     headers = {k: v for k, v in resp.headers.items() if k.lower() in RELEVANCY_FORWARD_HEADERS}
     headers["Cache-Control"] = "no-store"
     return Response(content=resp.content, media_type="application/octet-stream", headers=headers)
+
+
+def _langfield_paint_context(job_id: str) -> tuple[str, str]:
+    """Shared resolution + guards for the paint endpoints: returns
+    (config_path, lfdir) or raises. Same checks as /relevancy."""
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    job_dir = _job_dir(job_id)
+    lfdir = job_dir / LANGFIELD_DIRNAME
+    if not (lfdir / "gauss_emb.npz").is_file():
+        raise HTTPException(status_code=404, detail="Language field not built for this scene")
+    _langfield_stale_guard(lfdir)
+    config_path = _find_latest_config(job_dir)
+    if config_path is None:
+        raise HTTPException(status_code=409, detail="Scene checkpoint missing")
+    return str(config_path), str(lfdir)
+
+
+@router.post("/jobs/{job_id}/langfield/select/sphere")
+async def langfield_select_sphere(job_id: str, payload: dict[str, Any]):
+    """Paint-brush stroke: rows (exported-ply order, LE uint32 binary) within a
+    3D sphere. Proxied to the warm worker (GPU distance test on the resident
+    positions — no numpy in this venv)."""
+    config_path, lfdir = _langfield_paint_context(job_id)
+    center = payload.get("center")
+    radius = payload.get("radius")
+    if not (isinstance(center, list) and len(center) == 3) or not isinstance(radius, (int, float)):
+        raise HTTPException(status_code=400, detail="body must be {center:[x,y,z], radius}")
+    resp = await _langfield_worker_json(
+        "/select_sphere", {"config": config_path, "lfdir": lfdir, "center": center, "radius": radius}
+    )
+    if resp is None:
+        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield on :3417).")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.json().get("detail", "worker error"))
+    return Response(
+        content=resp.content,
+        media_type="application/octet-stream",
+        headers={"X-Count": resp.headers.get("X-Count", "0"), "Cache-Control": "no-store"},
+    )
+
+
+@router.get("/jobs/{job_id}/langfield/overrides")
+async def langfield_overrides_list(job_id: str):
+    """The scene's paint-override manifest (labels, ops, counts). Read straight
+    from disk — works even when the worker is down."""
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    manifest = _job_dir(job_id) / LANGFIELD_DIRNAME / "overrides.json"
+    if not manifest.is_file():
+        return {"overrides": []}
+    try:
+        items = json.loads(manifest.read_text())
+    except (json.JSONDecodeError, OSError):
+        items = []
+    return {"overrides": items if isinstance(items, list) else []}
+
+
+@router.post("/jobs/{job_id}/langfield/overrides")
+async def langfield_overrides_add(job_id: str, payload: dict[str, Any]):
+    """Commit a paint action (label + indices). Guardrails (min count, max
+    scene fraction, bounds) are enforced worker-side; their human-readable 400s
+    pass through so the UI can offer force=true."""
+    config_path, lfdir = _langfield_paint_context(job_id)
+    body = {
+        "config": config_path,
+        "lfdir": lfdir,
+        "label": str(payload.get("label", "")),
+        "aliases": payload.get("aliases", []) if isinstance(payload.get("aliases"), list) else [],
+        "op": str(payload.get("op", "assign")),
+        "alpha": payload.get("alpha"),
+        "indices_b64": str(payload.get("indices_b64", "")),
+        "force": bool(payload.get("force", False)),
+        "note": str(payload.get("note", "")),
+    }
+    resp = await _langfield_worker_json("/overrides_add", body)
+    if resp is None:
+        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield on :3417).")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.json().get("detail", "worker error"))
+    return resp.json()
+
+
+@router.delete("/jobs/{job_id}/langfield/overrides/{override_id}")
+async def langfield_overrides_delete(job_id: str, override_id: str):
+    config_path, lfdir = _langfield_paint_context(job_id)
+    if not re.fullmatch(r"[0-9a-f]{8}", override_id):
+        raise HTTPException(status_code=404, detail="override not found")
+    resp = await _langfield_worker_json(
+        "/overrides_delete", {"config": config_path, "lfdir": lfdir, "override_id": override_id}
+    )
+    if resp is None:
+        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield on :3417).")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.json().get("detail", "worker error"))
+    return resp.json()
 
 
 @router.get("/jobs/{job_id}/langfield/inventory")
