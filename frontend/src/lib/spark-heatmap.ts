@@ -175,6 +175,22 @@ export function packChannelsRgba(channels: Uint8Array[], numSplats: number): Uin
   return rgba;
 }
 
+// Per-channel percentile cutoff: the byte value (as 0..1) above which ~pct%
+// of THIS query's splats fall. Relevancy bytes are per-query min-max
+// normalized, so a raw shared threshold means something different for every
+// query — "top X%" is the semantics a human actually wants.
+export function cutoffForTopPercent(bytes: Uint8Array, pct: number): number {
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < bytes.length; i += 1) hist[bytes[i]] += 1;
+  const target = (pct / 100) * bytes.length;
+  let above = 0;
+  for (let b = 255; b >= 1; b -= 1) {
+    above += hist[b];
+    if (above >= target) return b / 255;
+  }
+  return 1 / 255;
+}
+
 export function buildOverlayModifier({
   scalarArray,
   channelCount,
@@ -182,7 +198,8 @@ export function buildOverlayModifier({
   channelEnabled,
   mode,
   ramp,
-  threshold,
+  channelCutoffs,
+  tintChannel = 0,
 }: {
   scalarArray: RgbaArray;
   channelCount: number;
@@ -190,7 +207,8 @@ export function buildOverlayModifier({
   channelEnabled: ReturnType<typeof dyno.dynoBool>[]; // live uniforms
   mode: OverlayMode; // baked
   ramp: string; // baked; used by "tint" (single-query ramp view)
-  threshold: ReturnType<typeof dyno.dynoFloat>; // live uniform
+  channelCutoffs: ReturnType<typeof dyno.dynoFloat>[]; // live uniforms, one per channel
+  tintChannel?: number; // baked; which channel the "tint" ramp reads
 }) {
   return dyno.dynoBlock({ gsplat: dyno.Gsplat }, { gsplat: dyno.Gsplat }, ({ gsplat }) => {
     if (!gsplat) throw new Error("overlay modifier: no gsplat input");
@@ -203,7 +221,7 @@ export function buildOverlayModifier({
       const stops = (RAMPS[ramp] ?? RAMPS.viridis).map((s) =>
         dyno.dynoVec3(new THREE.Vector3(s[0], s[1], s[2])),
       );
-      const t = chans[0];
+      const t = chans[Math.min(Math.max(tintChannel, 0), chans.length - 1)];
       // widen to mix()'s DynoVal type so the loop reassignment type-checks
       let col = dyno.mix(stops[0], stops[0], dyno.dynoFloat(0));
       for (let i = 1; i < stops.length; i += 1) {
@@ -213,13 +231,14 @@ export function buildOverlayModifier({
           dyno.smoothstep(dyno.dynoFloat((i - 1) / (stops.length - 1)), dyno.dynoFloat(i / (stops.length - 1)), t),
         );
       }
-      const on = dyno.float(channelEnabled[0]);
+      const on = dyno.float(channelEnabled[Math.min(Math.max(tintChannel, 0), channelEnabled.length - 1)]);
       return { gsplat: dyno.combineGsplat({ gsplat, rgb: dyno.mix(rgb, col, on) }) };
     }
 
     // Multi-query modes: a splat "matches" channel i when that channel is
-    // enabled AND its relevancy exceeds the threshold. The winning channel is
-    // the highest-relevancy match (select-chain, later-higher wins).
+    // enabled AND its relevancy exceeds ITS OWN percentile cutoff (per-query
+    // normalization makes a shared raw threshold meaningless). The winning
+    // channel is the highest-relevancy match (select-chain).
     // Initializers go through no-op select()s so the accumulators carry
     // select's widened DynoVal types (reassignment stays type-compatible).
     const never = dyno.dynoBool(false);
@@ -227,7 +246,7 @@ export function buildOverlayModifier({
     let bestColor = dyno.select(never, rgb, rgb);
     let anyMatch = dyno.select(never, dyno.dynoFloat(0), dyno.dynoFloat(0));
     for (let i = 0; i < chans.length; i += 1) {
-      const above = dyno.and(channelEnabled[i], dyno.lessThan(threshold, chans[i]));
+      const above = dyno.and(channelEnabled[i], dyno.lessThan(channelCutoffs[i], chans[i]));
       const wins = dyno.and(above, dyno.lessThan(bestT, chans[i]));
       const color = dyno.dynoVec3(new THREE.Vector3(...(channelColors[i] ?? [1, 1, 0])));
       bestT = dyno.select(wins, chans[i], bestT);

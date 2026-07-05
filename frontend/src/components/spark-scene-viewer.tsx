@@ -5,6 +5,7 @@ import { dyno, RgbaArray, SparkRenderer, SplatFileType, SplatMesh } from "@spark
 import { apiRequest } from "@/lib/api";
 import {
   buildOverlayModifier,
+  cutoffForTopPercent,
   fetchRelevancy,
   packChannelsRgba,
   rampCssGradient,
@@ -105,7 +106,7 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
 
   const channelsRef = useRef<QueryChannel[]>([]);
   const enabledDynosRef = useRef<ReturnType<typeof dyno.dynoBool>[]>([]);
-  const thresholdDynoRef = useRef<ReturnType<typeof dyno.dynoFloat> | null>(null);
+  const cutoffDynosRef = useRef<ReturnType<typeof dyno.dynoFloat>[]>([]);
   const applyOverlayRef = useRef<() => void>(() => {});
   const refreshModifierRef = useRef<() => void>(() => {});
 
@@ -127,7 +128,11 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
   const [queryError, setQueryError] = useState<string | null>(null);
   const [mode, setMode] = useState<OverlayMode>("highlight");
   const [rampName, setRampName] = useState("viridis");
-  const [threshold, setThreshold] = useState(0.75);
+  // "top X%" per query — relevancy is per-query min-max normalized, so a raw
+  // shared threshold means something different for every query; a percentile
+  // is the semantics a human expects ("light up this much of the scene").
+  const [topPct, setTopPct] = useState(2);
+  const topPctRef = useRef(2);
 
   // paint-the-embeddings (langfield scenes only)
   const paintModeRef = useRef(false);
@@ -170,6 +175,8 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
   useEffect(() => {
     paintModeRef.current = paintMode;
     if (paintMode) setMeasureArm(false); // one click-owner at a time
+    setPaintError(null); // never carry a stale error across a mode flip
+    setPaintNeedsForce(false);
     // entering/leaving paint swaps the modifier (selection preview <-> queries)
     refreshModifierRef.current();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -212,7 +219,10 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
       count: numSplats,
     });
     enabledDynosRef.current = nextChannels.map((c) => dyno.dynoBool(c.enabled));
-    if (!thresholdDynoRef.current) thresholdDynoRef.current = dyno.dynoFloat(threshold);
+    cutoffDynosRef.current = nextChannels.map((c) =>
+      dyno.dynoFloat(cutoffForTopPercent(c.bytes, topPctRef.current)),
+    );
+    const firstEnabled = Math.max(0, nextChannels.findIndex((c) => c.enabled));
     mesh.worldModifier = buildOverlayModifier({
       scalarArray,
       channelCount: nextChannels.length,
@@ -220,7 +230,8 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
       channelEnabled: enabledDynosRef.current,
       mode: nextMode,
       ramp: nextRamp,
-      threshold: thresholdDynoRef.current,
+      channelCutoffs: cutoffDynosRef.current,
+      tintChannel: firstEnabled,
     });
     mesh.updateGenerator();
   }
@@ -242,7 +253,7 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
       channelEnabled: [dyno.dynoBool(true)],
       mode: "highlight",
       ramp: rampName,
-      threshold: dyno.dynoFloat(0.5),
+      channelCutoffs: [dyno.dynoFloat(0.5)],
     });
     mesh.updateGenerator();
   }
@@ -263,6 +274,11 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ center: [p.x, p.y, p.z], radius: brushRadiusRef.current }),
       });
+      if (res.status === 404 || res.status === 405) {
+        throw new Error(
+          "Paint backend not deployed yet — it goes live on the next splatlab restart (waiting for the running job to finish).",
+        );
+      }
       if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).slice(0, 200)}`);
       const idx = new Uint32Array(await res.arrayBuffer());
       // optional hygiene: clip the sloppy sphere to the current query's matches
@@ -270,7 +286,7 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
       if (limitToQuery) {
         const ch = channelsRef.current.find((c) => c.enabled);
         if (ch) {
-          const cut = Math.round(threshold * 255);
+          const cut = Math.round(cutoffForTopPercent(ch.bytes, topPctRef.current) * 255);
           const keep: number[] = [];
           for (const i of idx) if (ch.bytes[i] >= cut) keep.push(i);
           clipped = keep;
@@ -430,6 +446,11 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
     const next = channelsRef.current.map((c, i) => (i === idx ? { ...c, enabled } : c));
     channelsRef.current = next;
     setChannels(next);
+    if (mode === "tint") {
+      // the ramp's source channel is BAKED as the first enabled query
+      rebuildOverlay(next, mode, rampName);
+      return;
+    }
     const dynoBool = enabledDynosRef.current[idx];
     if (dynoBool) {
       dynoBool.value = enabled;
@@ -445,6 +466,7 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
 
   function changeMode(next: OverlayMode) {
     setMode(next);
+    setQueryError(null);
     rebuildOverlay(channelsRef.current, next, rampName);
   }
 
@@ -453,12 +475,15 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
     if (mode === "tint") rebuildOverlay(channelsRef.current, mode, next);
   }
 
-  function changeThreshold(next: number) {
-    setThreshold(next);
-    if (thresholdDynoRef.current) {
-      thresholdDynoRef.current.value = next;
-      meshRef.current?.updateVersion();
+  function changeTopPct(next: number) {
+    setTopPct(next);
+    topPctRef.current = next;
+    const chans = channelsRef.current;
+    for (let i = 0; i < chans.length; i += 1) {
+      const cut = cutoffDynosRef.current[i];
+      if (cut) cut.value = cutoffForTopPercent(chans[i].bytes, next);
     }
+    meshRef.current?.updateVersion();
   }
 
   // ---- scale calibration --------------------------------------------------
@@ -783,7 +808,7 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
       meshRef.current = null;
       dimGroupRef.current = null;
       enabledDynosRef.current = [];
-      thresholdDynoRef.current = null;
+      cutoffDynosRef.current = [];
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url]);
@@ -911,17 +936,17 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
                   </select>
                 ) : (
                   <div className="flex items-center gap-2">
-                    <span className="shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">match ≥</span>
+                    <span className="shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">top</span>
                     <input
                       type="range"
-                      min={0}
-                      max={1}
-                      step={0.01}
-                      value={threshold}
-                      onChange={(e) => changeThreshold(Number(e.target.value))}
+                      min={0.5}
+                      max={25}
+                      step={0.5}
+                      value={topPct}
+                      onChange={(e) => changeTopPct(Number(e.target.value))}
                       className="w-full"
                     />
-                    <span className="w-9 shrink-0 text-right text-zinc-400">{threshold.toFixed(2)}</span>
+                    <span className="w-10 shrink-0 text-right text-zinc-400">{topPct}%</span>
                   </div>
                 )}
               </>
@@ -979,8 +1004,8 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
                 {channels.length > 0 && (
                   <label className="flex items-center gap-2 text-[10px] text-zinc-400">
                     <input type="checkbox" checked={limitToQuery} onChange={(e) => setLimitToQuery(e.target.checked)} />
-                    clip strokes to “{channels.find((c) => c.enabled)?.text ?? channels[0].text}” matches ≥{" "}
-                    {threshold.toFixed(2)} (snaps sloppy strokes to the object)
+                    clip strokes to the top {topPct}% of “{channels.find((c) => c.enabled)?.text ?? channels[0].text}”
+                    (snaps sloppy strokes to the object)
                   </label>
                 )}
                 <p className="text-[10px] leading-snug text-zinc-500">
@@ -1142,20 +1167,25 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
 
       {/* legend — updates live with queries, colors, mode, and threshold */}
       {channels.length > 0 && (
-        <div className="absolute bottom-3 right-3 z-20 w-64 space-y-2 rounded-xl border border-white/10 bg-black/70 p-3 text-xs text-zinc-200 shadow backdrop-blur-md">
+        <div className="absolute bottom-16 right-3 z-20 w-64 space-y-2 rounded-xl border border-white/10 bg-black/70 p-3 text-xs text-zinc-200 shadow backdrop-blur-md">
           <SectionLabel>Legend</SectionLabel>
           {mode === "tint" ? (
-            <>
-              <div className="h-3 w-full rounded" style={{ background: rampCssGradient(rampName) }} />
-              <div className="flex justify-between text-[10px] text-zinc-400">
-                <span>{channels[0].relMin ? Number(channels[0].relMin).toFixed(2) : "low"}</span>
-                <span className="truncate px-2 text-zinc-300">“{channels[0].text}” relevancy</span>
-                <span>{channels[0].relMax ? Number(channels[0].relMax).toFixed(2) : "high"}</span>
-              </div>
-              {channels.length > 1 && (
-                <p className="text-[10px] text-zinc-500">Ramp mode shows the first query only.</p>
-              )}
-            </>
+            (() => {
+              const tc = channels.find((c) => c.enabled) ?? channels[0];
+              return (
+                <>
+                  <div className="h-3 w-full rounded" style={{ background: rampCssGradient(rampName) }} />
+                  <div className="flex justify-between text-[10px] text-zinc-400">
+                    <span>{tc.relMin ? Number(tc.relMin).toFixed(2) : "low"}</span>
+                    <span className="truncate px-2 text-zinc-300">“{tc.text}” relevancy</span>
+                    <span>{tc.relMax ? Number(tc.relMax).toFixed(2) : "high"}</span>
+                  </div>
+                  {channels.length > 1 && (
+                    <p className="text-[10px] text-zinc-500">Ramp shows the first ENABLED query.</p>
+                  )}
+                </>
+              );
+            })()
           ) : (
             <>
               {channels.map((c, i) => (
@@ -1168,9 +1198,9 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
                 </div>
               ))}
               <p className="text-[10px] text-zinc-500">
-                {mode === "highlight" && `Colored = relevancy above ${threshold.toFixed(2)}; rest natural.`}
-                {mode === "isolate" && `Only matches above ${threshold.toFixed(2)} visible, natural colors.`}
-                {mode === "spotlight" && `Matches above ${threshold.toFixed(2)} colored; rest dimmed.`}
+                {mode === "highlight" && `Colored = each query's top ${topPct}%; rest natural.`}
+                {mode === "isolate" && `Only each query's top ${topPct}% visible, natural colors.`}
+                {mode === "spotlight" && `Each query's top ${topPct}% colored; rest dimmed.`}
               </p>
             </>
           )}

@@ -356,3 +356,18 @@ parked, replaced by survey/scale/benchmark design — see reports dir).
   "clip strokes to <query> matches" hygiene toggle, duplicate-label warning,
   Pin/Boost/Not-this ops, force-flow for oversized selections, painted-labels
   list with one-click revert.
+
+## SCREENSHOT-DRIVEN FIX PASS (2026-07-04 late night, from RToony's 8 captures)
+- **Percentile thresholds**: raw "match ≥ 0.75" replaced by "top X%" per query
+  (cutoffForTopPercent histogram → per-channel cutoff uniforms). Root cause of
+  the all-yellow Spotlight/Kitchen shots: relevancy is per-query min-max
+  normalized so raw thresholds are meaningless across queries. Default top 2%.
+- **Ramp mode honors enables**: tint channel + legend = first ENABLED query
+  (was hardwired to channel 0 — RToony had ch0 disabled, got nothing + wrong
+  legend). Enable toggles rebuild in tint mode.
+- Stale paint 405 error cleared on mode/paint flips; stroke 404/405 now says
+  "paint backend deploys on next splatlab restart (waiting for running job)".
+- Legend raised above the Feedback FAB (was overlapped/truncated).
+- Verified live on Garden: ball @ top-2% highlight, legend copy, dim persisted.
+- Paintbrush 405 itself = the KNOWN deploy gate (old app process; endpoints
+  land with the post-job restart). No code change needed.
