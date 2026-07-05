@@ -371,3 +371,15 @@ parked, replaced by survey/scale/benchmark design — see reports dir).
 - Verified live on Garden: ball @ top-2% highlight, legend copy, dim persisted.
 - Paintbrush 405 itself = the KNOWN deploy gate (old app process; endpoints
   land with the post-job restart). No code change needed.
+
+## Test Flight + widescreen + segmentation program (2026-07-05)
+- Program pack (plan for post-Fable executors): ~/reports/splatlab-360-sample-segment-plan-2026-07-05/
+  (PLAN.md phased w/ acceptance gates, STATUS.md spine, evidence/ = 5-agent ultracode map).
+- SHIPPED: Test Flight trim window (trim_start_s/trim_duration_s on /train; input-side
+  -ss/-t on stitch; auto-centered; 400 on non-insv; meta now persists num_frames_target/
+  sfm_backend/language_field/trim_*). 56/56 stitch tests. Frontend toggle (insv-only) +
+  widescreen pass (max-w-[1880px], 2xl grid split, gallery 5-col, viewer 2xl:h-560).
+- SHIPPED: ~/bin/splatlab-safe-restart — the ONLY sanctioned way to restart the service
+  (the raw restart killed 2 real jobs on 07-04 = the "-15" cards).
+- NEXT: Phase 3 segmentation (SfM-level join via colmap4 model_merger + bundle_adjuster,
+  probe script first), train-resume via --load-dir. See the pack's PLAN.md.
