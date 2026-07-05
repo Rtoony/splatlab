@@ -8,6 +8,7 @@ status payload via the **meta spread, reject garbage, and clear with null.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -63,7 +64,24 @@ def test_scale_null_clears(client):
 def test_scale_rejects_garbage(client, bad):
     http, outputs = client
     _mk_job(outputs)
-    r = http.post("/api/splat/jobs/splat_5ca1e0/scale", json={"meters_per_unit": bad})
+    if isinstance(bad, float) and not math.isfinite(bad):
+        # httpx's own request encoder refuses to serialize NaN/Infinity
+        # (RFC 8259 has no such literals — httpx calls json.dumps(...,
+        # allow_nan=False)), so http.post(json={...}) would raise
+        # client-side before the request ever reaches the server, never
+        # exercising the endpoint's own rejection at all. A real client can
+        # still send these as literal JSON tokens (Python's json.loads
+        # accepts them as an extension on the decode side, with no
+        # allow_nan-equivalent restriction) — send raw bytes to actually
+        # test the server's math.isfinite() check.
+        body = json.dumps({"meters_per_unit": bad}, allow_nan=True).encode()
+        r = http.post(
+            "/api/splat/jobs/splat_5ca1e0/scale",
+            content=body,
+            headers={"Content-Type": "application/json"},
+        )
+    else:
+        r = http.post("/api/splat/jobs/splat_5ca1e0/scale", json={"meters_per_unit": bad})
     assert r.status_code == 400, f"{bad!r} must be rejected"
 
 
