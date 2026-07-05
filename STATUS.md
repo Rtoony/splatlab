@@ -383,3 +383,59 @@ parked, replaced by survey/scale/benchmark design — see reports dir).
   (the raw restart killed 2 real jobs on 07-04 = the "-15" cards).
 - NEXT: Phase 3 segmentation (SfM-level join via colmap4 model_merger + bundle_adjuster,
   probe script first), train-resume via --load-dir. See the pack's PLAN.md.
+
+## Langfield optional-stage bookkeeping fix (2026-07-05, from HANDOFF-PLAYBOOK PACKET 7)
+**Bug**: langfield is a deliberately best-effort/opt-in stage — its failure correctly
+never flips the job to `failed` (the splat itself is already done). But the pipeline loop
+unconditionally appended `"langfield"` to `stages_completed` on both the non-zero-exit path
+and the catch-all `except Exception` path, with no other record that it actually failed —
+so a job's meta made a failed optional stage look identical to a successful one.
+
+**Fix** (`backend/splat_route.py`, langfield stage only — compress/webopt share the
+identical pattern but were left untouched, out of scope per the brief):
+- New `_new_meta()` key `"stages_failed": []`, parallel to `stages_completed`.
+- New helper `_record_stage_failure(job_id, stage, reason)` — read-patch-write, same
+  pattern as the existing `stages_completed` append.
+- Called from both langfield failure paths: `rc != 0` → `f"exit code {rc}"`; caught
+  `Exception` → `f"error: {exc}"`. The "no config / toolchain unavailable" **skip** path is
+  deliberately NOT recorded as a failure (it's a normal no-op, not a stage that ran and failed).
+- `stages_completed` still gets `"langfield"` appended unconditionally either way — job
+  semantics UNCHANGED: `final_status` still ends up `"completed"`, splat still "done".
+- Also threaded `stages_failed` into the `audit_operator_event` metadata dict (the audit
+  trail was hiding the same failure).
+- Confirmed visible end-to-end: `grep -rn "stages_completed\|stages_failed"` showed every
+  consumer — `_job_payload()` spreads `**meta` verbatim into every job API response (status
+  list, stop, preview endpoints), so `stages_failed` reaches the frontend with zero extra
+  plumbing. Updated `frontend/src/lib/contracts.ts` (`SplatJob.stages_failed?`) and
+  `frontend/src/pages/splat.tsx` (gallery card: amber "field failed" badge + reason tooltip
+  when `langfield_available` is false AND a `stages_failed` entry names `"langfield"`).
+
+**Verification (real receipts, backend/):**
+```
+$ ~/.local/bin/pytest backend/tests/test_langfield_stage_bookkeeping.py -v
+backend/tests/test_langfield_stage_bookkeeping.py::test_langfield_nonzero_exit_does_not_fail_job PASSED
+backend/tests/test_langfield_stage_bookkeeping.py::test_langfield_exception_does_not_fail_job PASSED
+backend/tests/test_langfield_stage_bookkeeping.py::test_langfield_success_leaves_stages_failed_empty PASSED
+backend/tests/test_langfield_stage_bookkeeping.py::test_langfield_skipped_no_config_is_not_recorded_as_failure PASSED
+4 passed in 0.15s
+
+$ ~/.local/bin/pytest backend/tests/ -q
+FAILED backend/tests/test_scale_calibration.py::test_scale_rejects_garbage[nan]
+FAILED backend/tests/test_scale_calibration.py::test_scale_rejects_garbage[inf]
+2 failed, 169 passed, 4 warnings in 2.19s
+```
+The 2 failures are PRE-EXISTING and unrelated (JSON `nan`/`inf` encoding in the scale
+calibration endpoint) — confirmed identical (165 passed / 2 failed) on a `git stash` of this
+diff before making any change. No regressions from this fix; 4 new tests, 0 net new failures.
+
+Frontend typecheck (`npx tsc --noEmit` in `frontend/`): 43 pre-existing errors, byte-identical
+before and after this diff (all in `splat-viewer.tsx` / `feedback.tsx` / `feedback-api.ts` /
+`splat-view.tsx` — none in the two files this fix touched).
+
+**Out-of-scope note**: `compress` and `webopt` (lines ~2437-2517 as of this commit) have the
+IDENTICAL bug — best-effort, log-only on failure, unconditional `stages_completed` append,
+no `stages_failed` record. Left untouched per the brief ("Do NOT touch the compress/webopt
+stages... just note in your report"). Same `_record_stage_failure` helper would cover them
+if/when someone picks that up.
+
+Committed locally (not pushed): see git log for the Problem/Fix/Verification/Risk message.

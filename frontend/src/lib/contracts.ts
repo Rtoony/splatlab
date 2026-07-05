@@ -11,6 +11,12 @@ export interface SplatJob {
   stage: string | null;
   stages_planned: string[];
   stages_completed: string[];
+  // Best-effort/optional stages (currently: langfield) that ran but failed —
+  // parallel to stages_completed, never instead of it. A failed optional
+  // stage still lands in stages_completed (the stage rail treats it as
+  // traversed) AND here (so the failure itself stays visible). Absent on
+  // jobs with no optional-stage failures.
+  stages_failed?: { stage: string; reason: string }[];
   pid: number | null;
   exit_code: number | null;
   error_message: string | null;

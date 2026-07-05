@@ -933,10 +933,22 @@ function SceneCard({
               {fmtCount(job.stats.gaussians)} splats
             </span>
           ) : null}
-          {job.langfield_available && (
+          {job.langfield_available ? (
             <span className="absolute bottom-1 right-1 rounded bg-cyan-400/20 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-200 backdrop-blur-sm">
               searchable
             </span>
+          ) : (
+            (() => {
+              const lfFail = job.stages_failed?.find((f) => f.stage === "langfield");
+              return lfFail ? (
+                <span
+                  title={`Language field build failed — scene isn't text-searchable: ${lfFail.reason}`}
+                  className="absolute bottom-1 right-1 flex items-center gap-1 rounded bg-amber-400/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-200 backdrop-blur-sm"
+                >
+                  <AlertTriangle className="h-3 w-3" /> field failed
+                </span>
+              ) : null;
+            })()
           )}
           {job.source_type === "generative-image" ? (
             <span

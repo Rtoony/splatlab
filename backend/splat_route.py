@@ -365,6 +365,10 @@ def _new_meta(job_id: str, req: SplatTrainRequest, input_path: Path, job_dir: Pa
         "stage": None,
         "stages_planned": stages,
         "stages_completed": [],
+        # Parallel to stages_completed: best-effort/optional stages (langfield)
+        # that ran but failed land here too, so a failed optional stage stays
+        # distinguishable from a genuinely successful one. See _record_stage_failure.
+        "stages_failed": [],
         "input_path": str(input_path),
         "output_dir": str(job_dir),
         "capture_format": req.capture_format,
@@ -430,6 +434,24 @@ def _patch_meta(job_id: str, **fields: Any) -> dict[str, Any] | None:
     meta.update(fields)
     _write_meta(job_id, meta)
     return meta
+
+
+def _record_stage_failure(job_id: str, stage: str, reason: str) -> None:
+    """Append a {stage, reason} record to meta['stages_failed'] — parallel to,
+    never instead of, stages_completed.
+
+    For a best-effort/optional stage (currently: langfield) a non-zero exit or
+    a caught exception must NEVER flip the job to "failed" — the splat itself
+    already succeeded independent of it. But before this helper existed, the
+    only bookkeeping was appending the stage name to stages_completed
+    unconditionally, which made a failed optional stage indistinguishable from
+    a successful one in job meta / the API payload / the frontend. This is the
+    fix: stages_completed keeps its existing meaning (semantics unchanged,
+    final_status still "completed"), and stages_failed makes the failure
+    durably visible alongside it.
+    """
+    failed = (_read_meta(job_id) or {}).get("stages_failed", [])
+    _patch_meta(job_id, stages_failed=[*failed, {"stage": stage, "reason": reason[:300]}])
 
 
 def _all_metas() -> list[dict[str, Any]]:
@@ -2516,8 +2538,13 @@ async def _run_pipeline(job: SplatJob) -> None:
                             job.log_lines.append(
                                 "[langfield] build failed; the splat is unaffected (no language search for this scene)."
                             )
+                            # Bookkeeping only — never flips final_status. Without this,
+                            # stages_completed below makes a failed optional stage look
+                            # identical to a successful one in job meta / the API / the UI.
+                            _record_stage_failure(job.job_id, stage, f"exit code {rc}")
                 except Exception as exc:  # noqa: BLE001 — best-effort: never fail the splat
                     job.log_lines.append(f"[langfield] skipped (build error: {exc}); the splat is unaffected.")
+                    _record_stage_failure(job.job_id, stage, f"error: {exc}")
                 completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
                 _patch_meta(job.job_id, stages_completed=[*completed, stage])
                 continue
@@ -2681,6 +2708,9 @@ async def _run_pipeline(job: SplatJob) -> None:
             "job_id": job.job_id,
             "status": final_status,
             "stages_completed": meta.get("stages_completed", []),
+            # Optional-stage failures (e.g. langfield) — job status stays
+            # "completed", but the audit trail shouldn't hide that one failed.
+            "stages_failed": meta.get("stages_failed", []),
             "output_dir": job.output_dir,
         },
     )
