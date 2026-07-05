@@ -163,3 +163,60 @@ Extract Splat Lab from the Nexus portal into its own standalone app at
   (#3) reroute process uniquely named `reprocess<n>` → no duplicate stage-rail key / no
   false double-green. Review CONFIRMED safe: infinite-loop guards, mid-run list mutation,
   no false-escalation of good captures, default path + manual button intact.
+
+## WAVE 1 — 360 fix + heatmap backend + edit-ops + Spark spike (2026-07-04, IN FLIGHT)
+Master plan: ~/reports/splatlab-ultra-plan-2026-07-04/PLAN.md (RToony GO'd waves; UE
+parked, replaced by survey/scale/benchmark design — see reports dir).
+- [x] Housekeeping: 07-02 feedback+camera pass committed (e2a8409 XC-1 gpu_arbiter alert,
+      6628092 feedback+camera). Tree was clean before wave-1 agents started.
+- [x] 360 ROOT CAUSE (probe receipts in PLAN.md Appendix A): X4 .insv = TWO HEVC streams
+      (one square fisheye per lens); ffmpeg -i read only stream 0 -> corrupt equirect ->
+      2/624 (0.3%) registration on splat_ec1b984ffb. Fix VALIDATED manually:
+      hstack both streams -> v360 dfisheye -> coherent panorama (scratchpad receipts).
+- [x] BUILT + REVIEWED + FIXED + COMMITTED (workflow wf_aa28b8d5-7f4 + 2 fix agents;
+      commits 9e565a3 360-fix / 48e701a langfield-heatmap-backend / 7174809 edit-ops /
+      7d75ea0 spark-spike+supersplat-link; full suite 127 passed; adversarial reviews:
+      backend SHIP w/ 4 findings fixed, edit-ops FIX_FIRST w/ all 10 fixed incl.
+      dequantization blocker; splat-transform bumped 2.5.1->2.7.1 by the supersplat
+      2.28.1 install — compress/webopt argv SMOKE-TESTED OK):
+      A1 splat_route.py 360 fix (hstack compose, fail-loud, sanity gate, equirect
+      matcher, glomap escalation, 360-param persistence) then langfield relevancy
+      backend (langweb artifact + worker /relevancy + app proxy);
+      A2 backend/edit_ops.py NEW (snapshots/versions, splat-transform ops, text-select
+      delete/isolate/extract, MERGE scenes) — orchestrator mounts router in main.py;
+      A3 frontend Spark spike /spark-test (fake-scalar heatmap via dyno worldModifier,
+      nav prototype: reset/presets/pivot);
+      A4 ~/projects/supersplat bump 2.27.4->2.28.1 (NODE_ENV-unset build gotcha);
+      A5 survey/scale/benchmark DESIGN -> ~/reports/splatlab-survey-scale-design-2026-07-04/.
+- [x] DEPLOYED 2026-07-04 ~17:04: splatlab.service (36 vars, healthz ok) +
+      splatlab-langfield.service (worker /relevancy live in openapi). edit_ops
+      router mounted (5 routes) + langfield STALE guard added to query/relevancy/
+      inventory.
+- [ ] LIVE 360 VALIDATION IN FLIGHT: job splat_98095cb055 = the SAME .insv, SAME
+      params as failed splat_ec1b984ffb. Acceptance: registration >=30% (target
+      >50%) + coherent render. Watcher bg6s98ixl.
+- Deferred to next wave: "Edit in SuperSplat" deep-link + heatmap/nav UI on the real
+  viewer (blocked on Spark spike verdict); portal dead-code deletion (0.5).
+
+### Live 360 validation findings (2026-07-04 evening)
+- splat_98095cb055 (the office .insv, SAME params as the original failure):
+  stitch = hstack compose RAN (both HEVC streams mapped — receipt in job.log),
+  sanity gate PASSED (no false-positive on the static-ish capture), sequential
+  matcher used... registration STILL 2/624 (0.3%) -> ROOT CAUSE #2 (visual
+  receipts in scratchpad/motion/): the clip is a SELFIE — operator holds the X4
+  at arm's length facing himself; face/torso/arm dominate the sphere and move
+  WITH the camera (dynamic occluder, camera-stable features) -> geometric
+  verification rejects nearly all matches. NOT a pipeline bug; SfM physics.
+  The new auto-escalation then fired (glomap_sfm rung, COLMAP 4.1 global_mapper,
+  overlap 16) — mechanics receipt regardless of its verdict on doomed data.
+- FOUND proper validation capture: ~/transfers/splatlab/VID_20260514_073947_00_002.insv
+  (1.65GB, 106s, 3197 frames, dual-stream) = OUTDOOR POOL FACILITY WALKTHROUGH,
+  camera overhead on stick, operator only at nadir (crop_bottom trims), textured
+  concrete/buildings. Frames: scratchpad/may14/. This is the real acceptance run.
+  (Also VID_20260514_064632_00_001.insv, 6.7GB/434s — same site, longer.)
+- FOLLOW-UP FEATURE (high value, next wave): operator auto-masking for 360 —
+  SAM2.1 person segmentation on fan-out crops -> COLMAP ImageReader.mask_path;
+  would make selfie-style/visible-operator captures reconstructable. We already
+  have SAM2.1 + the sam2 env on disk.
+- UI guidance follow-up: 360 upload card should say "hold the camera OVERHEAD
+  on a stick — if you're visible anywhere but straight down, the scan fails".
