@@ -7,3 +7,4 @@ frontend/node_modules/
 .DS_Store
 *.log
 data/
+tools/probe-segment-merge-output/

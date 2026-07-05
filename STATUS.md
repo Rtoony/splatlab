@@ -543,3 +543,74 @@ this session; no job was running at last 0b check, but deploy happens right befo
 Committed locally (not pushed): see git log.
 
 Committed locally (not pushed): see git log for the Problem/Fix/Verification/Risk message.
+
+## Phase 3.1 segment-merge probe: GATE PASSED 2026-07-05 (Sonnet 5 swarm session)
+`tools/probe-segment-merge.sh` proves Architecture A (SfM-level join) works, after 3
+failed attempts that each surfaced a real, distinct problem — none of them fixed by
+retrying, each fixed by understanding root cause:
+
+**Attempt 1 — FAILED, non-architectural**: dev clip, SEG1=[0,40)/SEG2=[30,70) @3fps,
+independent per-segment databases. seg1 succeeded (960/960, 4MB points); seg2 posed
+all cameras but triangulated ZERO points — the [30,70)s window of that specific clip
+lacks parallax somewhere past t=40s (operator likely held still). Same failure class
+as G3 attempt 1. Fixed by switching to the pool clip
+(`VID_20260514_073947_00_002.insv`) with SEG1=[15,55)/SEG2=[45,85), centered on the
+window G3 already proved has strong parallax (`[30.837,75.837)`).
+
+**Attempt 2 — per-segment SfM PASSED, model_merger CRASHED (real architecture bug)**:
+both segments' independent SfM succeeded cleanly (959/960 @ 70k pts, 960/960 @ 113k
+pts) — proves the per-segment SfM step is solid given real parallax. But
+`model_merger` SIGABRT'd: `Check failed: src_images[i]->ImageId() ==
+tgt_images[i]->ImageId()` (`estimators/alignment.cc:76`,
+`ReconstructionAlignmentEstimator::Estimate`). Root cause, traced through
+colmap4-src: model_merger's alignment estimator requires the SAME numeric ImageId for
+a common-by-name image across both input models — true only when both models load
+from ONE shared database (colmap's actual "merge disconnected sub-models of one run"
+use case, doc/faq.rst:315), not two independently-run segments with independently
+assigned IDs. `database_merger` is NOT a workaround: `Database::Merge`
+(scene/database.cc:60) explicitly refuses to merge databases sharing any image name —
+built for disjoint sets, the opposite of what an overlap join needs. **Fix**: one
+shared database + one shared `feature_extractor`/`sequential_matcher` pass, then two
+bounded `global_mapper --GlobalMapper.image_list_path <segN.txt>` calls (confirmed in
+source — `option_manager.cc:1195` + `global_pipeline.cc:81-82` — this genuinely
+restricts the DatabaseCache input, not a post-hoc filter). Script rewritten to this
+design; `model_merger` succeeded (ratio 1.000) on the very next attempt.
+
+**Attempt 3 — merge succeeded, bundle_adjuster DIVERGED (NO_CONVERGENCE, one runaway
+point)**: registration ratio 1.000 (1679/1679), but post-BA mean reprojection error
+was an astronomical garbage value (~1.2e149 px) — one degenerate correspondence
+admitted at `model_merger`'s default `--max_reproj_error 64` (a loose RANSAC inlier
+threshold for the alignment sim3, not a point-quality filter) ran away during BA.
+Diagnosed and fixed WITHOUT re-running any SfM: reused the existing seg1/seg2 sparse
+models on disk, tightened `model_merger --max_reproj_error` to 8, ran colmap's own
+`point_filtering` (`--max_reproj_error 4 --min_track_len 2`) on the merged model
+before `bundle_adjuster`. Pre-BA error 2.67px → 1.32px (tight merge) → 0.99px
+(+filter) → 0.89px stable post-BA (verified by hand against the real attempt-2
+models before landing in the script).
+
+**Attempt 4 (FINAL, clean single-invocation run of the fully-fixed script) — GATE
+PASS**:
+```
+seg1 registered: 959   seg2 registered: 960
+union (distinct names, seg1|seg2): 1679
+merged (post-BA) registered: 1679
+registration ratio (merged/union): 1.000 (gate: >= 0.80)
+mean reprojection error: 0.807224px (gate: <= 1.50px)
+GATE: PASS (ratio OK, reproj OK)
+```
+Full log: `tools/probe-segment-merge-run4.log` (repo-root, gitignored via `*.log`).
+Output artifacts: `tools/probe-segment-merge-output/` (gitignored).
+
+**⚠️ Correction needed before Phase 3.2 implementation**: PLAN.md's Phase 3.2 §3.2 text
+(and its Phase 3 preamble) describes independent per-segment databases — that's the
+design attempt 2 disproved. Phase 3.2 must instead: one shared database per job,
+`feature_extractor`+`sequential_matcher` run once over the full frame set,
+per-segment `global_mapper --GlobalMapper.image_list_path` calls (this is still the
+independently-checkpointable expensive step — the restart-survival property is
+preserved), `model_merger --max_reproj_error 8` (not the default 64), then
+`point_filtering --max_reproj_error 4 --min_track_len 2` before the final
+`bundle_adjuster`. `tools/probe-segment-merge.sh` is the reference implementation for
+all of this — Phase 3.2 should port its logic into `_plan_3d_job`/new pipeline stages,
+not re-derive it.
+
+Committed (script + this STATUS.md, NOT the gitignored output/log): see git log.
