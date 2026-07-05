@@ -606,3 +606,147 @@ def test_meta_persists_360_sub_params():
     assert meta["images_per_equirect"] == 14
     assert meta["crop_bottom"] == 0.22
     assert meta["insv_fov"] == 208.0
+
+
+# ---------------------------------------------------------------------------
+# Test Flight trim window: -ss/-t on the stitch INPUT (both stream layouts),
+# auto-centering, no-op clamp, loud rejections, meta persistence.
+# ---------------------------------------------------------------------------
+
+
+def test_stitch_command_trim_is_input_side_both_layouts(monkeypatch):
+    monkeypatch.setenv("SPLAT_STITCH_CPUS", "0")
+    for dual in (False, True):
+        cmd = splat_route._stitch_command(
+            "/bin/ffmpeg", Path("/in/a.insv"), Path("/out/eq.mp4"), 204.0,
+            dual_stream=dual, trim_start=30.85, trim_duration=45.0,
+        )
+        i_at = cmd.index("-i")
+        assert cmd[cmd.index("-ss") + 1] == "30.850"
+        assert cmd[cmd.index("-t") + 1] == "45.000"
+        # INPUT options: must precede -i or ffmpeg decodes the whole clip.
+        assert cmd.index("-ss") < i_at and cmd.index("-t") < i_at
+
+
+def test_stitch_command_bare_start_trims_head_only(monkeypatch):
+    monkeypatch.setenv("SPLAT_STITCH_CPUS", "0")
+    cmd = splat_route._stitch_command(
+        "/bin/ffmpeg", Path("/in/a.insv"), Path("/out/eq.mp4"), 204.0,
+        trim_start=12.0, trim_duration=None,
+    )
+    assert cmd[cmd.index("-ss") + 1] == "12.000"
+    assert "-t" not in cmd
+
+
+def test_stitch_command_no_trim_unchanged(monkeypatch):
+    monkeypatch.setenv("SPLAT_STITCH_CPUS", "0")
+    cmd = splat_route._stitch_command("/bin/ffmpeg", Path("/in/a.insv"), Path("/out/eq.mp4"), 204.0)
+    assert "-ss" not in cmd and "-t" not in cmd
+
+
+def test_plan_insv_trim_autocenters_window(monkeypatch):
+    monkeypatch.setattr(splat_route, "_probe_video_duration", lambda ffprobe, src: 106.7)
+    req = _req(input_path="cap.insv", trim_duration_s=45.0)
+    stages, commands, _ = _plan(req, "/in/cap.insv", monkeypatch, probe=DUAL_PROBE)
+    cmd = commands["stitch"]
+    assert float(cmd[cmd.index("-ss") + 1]) == pytest.approx((106.7 - 45.0) / 2, abs=0.01)
+    assert float(cmd[cmd.index("-t") + 1]) == 45.0
+
+
+def test_plan_insv_trim_explicit_start_wins_over_centering(monkeypatch):
+    monkeypatch.setattr(splat_route, "_probe_video_duration", lambda ffprobe, src: 106.7)
+    req = _req(input_path="cap.insv", trim_start_s=10.0, trim_duration_s=45.0)
+    _, commands, _ = _plan(req, "/in/cap.insv", monkeypatch, probe=DUAL_PROBE)
+    cmd = commands["stitch"]
+    assert cmd[cmd.index("-ss") + 1] == "10.000"
+
+
+def test_plan_insv_trim_window_wider_than_clip_is_noop(monkeypatch):
+    monkeypatch.setattr(splat_route, "_probe_video_duration", lambda ffprobe, src: 106.7)
+    req = _req(input_path="cap.insv", trim_duration_s=300.0)
+    _, commands, _ = _plan(req, "/in/cap.insv", monkeypatch, probe=DUAL_PROBE)
+    assert "-ss" not in commands["stitch"] and "-t" not in commands["stitch"]
+
+
+def test_plan_insv_trim_start_beyond_clip_rejected(monkeypatch):
+    monkeypatch.setattr(splat_route, "_probe_video_duration", lambda ffprobe, src: 106.7)
+    req = _req(input_path="cap.insv", trim_start_s=500.0)
+    with pytest.raises(HTTPException) as exc:
+        _plan(req, "/in/cap.insv", monkeypatch, probe=DUAL_PROBE)
+    assert exc.value.status_code == 400
+    assert "beyond the end" in exc.value.detail
+
+
+def test_plan_insv_trim_unknown_duration_falls_back_to_start_zero(monkeypatch):
+    # Probe failure must not kill a job the stitch can still run.
+    monkeypatch.setattr(splat_route, "_probe_video_duration", lambda ffprobe, src: None)
+    req = _req(input_path="cap.insv", trim_duration_s=45.0)
+    _, commands, _ = _plan(req, "/in/cap.insv", monkeypatch, probe=DUAL_PROBE)
+    cmd = commands["stitch"]
+    assert cmd[cmd.index("-ss") + 1] == "0.000"
+    assert cmd[cmd.index("-t") + 1] == "45.000"
+
+
+def test_plan_non_insv_trim_rejected_loud(monkeypatch):
+    req = _req(input_path="clip.mp4", trim_duration_s=45.0)
+    with pytest.raises(HTTPException) as exc:
+        _plan(req, "/in/clip.mp4", monkeypatch)
+    assert exc.value.status_code == 400
+    assert "only applies to raw .insv" in exc.value.detail
+
+
+def test_meta_persists_trim_and_rerun_params():
+    req = _req(input_path="cap.insv", trim_start_s=None, trim_duration_s=45.0,
+               num_frames_target=75, sfm_backend="glomap", language_field=False)
+    meta = splat_route._new_meta("splat_bbb222", req, Path("/in/cap.insv"),
+                                 Path("/jobs/splat_bbb222"), ["stitch", "process"])
+    assert meta["trim_start_s"] is None
+    assert meta["trim_duration_s"] == 45.0
+    assert meta["num_frames_target"] == 75
+    assert meta["sfm_backend"] == "glomap"
+    assert meta["language_field"] is False
+
+
+def test_plan_generative_image_trim_rejected_loud(monkeypatch):
+    # The generative lane early-returns before the insv split — the trim guard
+    # must fire first, not silently swallow the params (adversarial finding F1).
+    monkeypatch.setattr(splat_route, "_splat_transform_path", lambda: None)
+    avail = dict(AVAIL)
+    avail["triposplat_available"] = True
+    avail["triposplat_runner"] = "/bin/triposplat"
+    req = _req(input_path="pic.jpg", source_type="generative-image", trim_duration_s=45.0)
+    with pytest.raises(HTTPException) as exc:
+        splat_route._plan_3d_job(req, avail, Path("/jobs/splat_snapshot"), Path("/in/pic.jpg"))
+    assert exc.value.status_code == 400
+    assert "only applies to raw .insv" in exc.value.detail
+
+
+def test_glomap_script_asserts_nonempty_points3d():
+    # splat_9da9dff4b2: glomap posed 599/600 cameras with ZERO 3D points and
+    # exited 0 -> downstream einsum crash. The stage script must fail itself.
+    cmd = splat_route._glomap_sfm_command(
+        "/bin/colmap4", "/bin/ffmpeg", Path("/jobs/splat_x"),
+        Path("/jobs/splat_x/processed"), Path("/jobs/splat_x/stitched/equirect.mp4"),
+        is_video=True, num_frames_target=75, is_equirect=True,
+        images_per_equirect=8, crop_bottom=0.15,
+    )
+    script = cmd[-1]
+    assert 'points3D.bin' in script
+    assert '-le 8' in script and 'exit 1' in script
+
+
+def test_glomap_points3d_gate_bash_semantics(tmp_path):
+    # Execute the exact gate fragment against real files: 8-byte header-only
+    # file must fail, >8 bytes must pass.
+    import subprocess
+    model = tmp_path
+    (model / "cameras.bin").write_bytes(b"x")
+    frag = (
+        f'test -f "{model}/cameras.bin" || exit 1; '
+        f'PTS=$(stat -c%s "{model}/points3D.bin" 2>/dev/null || echo 0); '
+        f'if [ "$PTS" -le 8 ]; then echo FATAL >&2; exit 1; fi'
+    )
+    (model / "points3D.bin").write_bytes(b"\x00" * 8)  # 0-point model
+    assert subprocess.run(["bash", "-c", frag]).returncode == 1
+    (model / "points3D.bin").write_bytes(b"\x00" * 9000)  # real points
+    assert subprocess.run(["bash", "-c", frag]).returncode == 0

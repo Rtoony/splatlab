@@ -295,6 +295,14 @@ class SplatTrainRequest(BaseModel):
     # OPT-IN source. "capture" (default) = photos/video -> the normal pipeline. "generative-
     # image" = "Imagine a Splat": a SINGLE image -> TripoSplat -> a 3DGS .ply, NO SfM/train.
     source_type: Literal["capture", "generative-image"] = "capture"
+    # OPT-IN "Test Flight" trim window: stitch (and therefore the whole
+    # pipeline) consumes only [trim_start_s, trim_start_s + trim_duration_s]
+    # of the source .insv, proving capture + settings in minutes before a
+    # multi-hour full run. trim_duration_s alone centers the window in the
+    # clip. Only valid for raw .insv inputs (the stitch is the trim point);
+    # any other input type is rejected loudly rather than silently ignored.
+    trim_start_s: float | None = Field(default=None, ge=0.0)
+    trim_duration_s: float | None = Field(default=None, ge=5.0, le=600.0)
 
 
 @dataclass
@@ -368,6 +376,14 @@ def _new_meta(job_id: str, req: SplatTrainRequest, input_path: Path, job_dir: Pa
         "crop_bottom": req.crop_bottom,
         "insv_fov": req.insv_fov,
         "max_num_iterations": req.max_num_iterations,
+        # Remaining request knobs, persisted for the same reason as the 360
+        # sub-params above: a Re-run/"promote Test Flight to full" must know
+        # exactly what the original job ran with.
+        "num_frames_target": req.num_frames_target,
+        "sfm_backend": req.sfm_backend,
+        "language_field": req.language_field,
+        "trim_start_s": req.trim_start_s,
+        "trim_duration_s": req.trim_duration_s,
         # Record the ACTUAL engaged capture mode: "sparse" only when the plan starts with
         # the dense-seed MASt3R rung (the sole plan-time producer of a leading mast3r_sfm
         # stage), so a sparse request that didn't apply (equirect/dataset) isn't mis-badged.
@@ -1057,7 +1073,24 @@ def _stitch_cpu_leash() -> list[str]:
     return prefix
 
 
-def _stitch_command(ffmpeg: str, src: Path, dst: Path, fov: float, dual_stream: bool = False) -> list[str]:
+def _probe_video_duration(ffprobe: str, src: Path) -> float | None:
+    """Container duration in seconds, best-effort (None on any failure)."""
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "json", str(src)],
+            capture_output=True, text=True, timeout=20,
+        )
+        raw = json.loads(out.stdout or "{}").get("format", {}).get("duration")
+        return float(raw) if raw is not None else None
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _stitch_command(
+    ffmpeg: str, src: Path, dst: Path, fov: float, dual_stream: bool = False,
+    trim_start: float | None = None, trim_duration: float | None = None,
+) -> list[str]:
     """ffmpeg v360: Insta360 dual-fisheye -> equirectangular MP4 (open-source,
     no SDK). Seams are visible at the lens boundary but splatfacto tolerates
     them; for seamless output, export equirect from the Insta360 app instead.
@@ -1080,14 +1113,23 @@ def _stitch_command(ffmpeg: str, src: Path, dst: Path, fov: float, dual_stream: 
         f":w={STITCH_WIDTH}:h={STITCH_HEIGHT}:interp=lanczos"
     )
     leash = _stitch_cpu_leash()
+    # Test Flight trim: INPUT-side -ss/-t is a fast container seek that bounds
+    # every mapped stream of the single input (both lenses of a dual-stream
+    # X4/X5 file), so the expensive 5760x2880 x264 encode only ever sees the
+    # window. Output-side placement would decode the whole clip — don't.
+    trim: list[str] = []
+    if trim_start is not None or trim_duration is not None:
+        trim = ["-ss", f"{trim_start or 0.0:.3f}"]
+        if trim_duration is not None:
+            trim += ["-t", f"{trim_duration:.3f}"]
     if dual_stream:
         filter_complex = f"[0:v:0][0:v:1]hstack=inputs=2[d];[d]{v360}[eq]"
         return [
-            *leash, ffmpeg, "-y", "-i", str(src),
+            *leash, ffmpeg, "-y", *trim, "-i", str(src),
             "-filter_complex", filter_complex, "-map", "[eq]",
             "-c:v", "libx264", "-crf", "18", "-an", str(dst),
         ]
-    return [*leash, ffmpeg, "-y", "-i", str(src), "-vf", v360, "-c:v", "libx264", "-crf", "18", "-an", str(dst)]
+    return [*leash, ffmpeg, "-y", *trim, "-i", str(src), "-vf", v360, "-c:v", "libx264", "-crf", "18", "-an", str(dst)]
 
 
 def _equirect_frame_corruption(rows: list[list[int]]) -> tuple[str, int] | None:
@@ -1476,7 +1518,18 @@ def _glomap_sfm_command(
         # global_mapper writes its first reconstruction to sparse/0/ already;
         # assert the expected model exists so the stage fails loud if SfM produced
         # nothing (rather than letting ns-process-data choke downstream).
-        f'test -f "{model_dir}/cameras.bin"'
+        f'test -f "{model_dir}/cameras.bin" || exit 1; '
+        # And assert it triangulated actual 3D points: glomap can pose every
+        # camera yet emit ZERO points ("Cannot run bundle adjustment: no 3D
+        # points to optimize") and still exit 0 — an empty points3D.bin is
+        # exactly its 8-byte count header, and ns-process-data downstream
+        # einsum-crashes on the empty array while ALSO exiting 0 (proven live,
+        # splat_9da9dff4b2). Fail HERE with the real reason instead.
+        f'PTS=$(stat -c%s "{model_dir}/points3D.bin" 2>/dev/null || echo 0); '
+        f'if [ "$PTS" -le 8 ]; then '
+        f'echo "[glomap] FATAL: cameras were posed but 0 3D points were triangulated '
+        f'(points3D.bin=$PTS bytes). The footage window may lack camera movement or '
+        f'frame density is too low." >&2; exit 1; fi'
     )
     return ["bash", "-c", script]
 
@@ -1767,6 +1820,18 @@ def _plan_3d_job(
     Inputs already containing a Nerfstudio dataset (transforms.json) skip the
     ns-process-data stage and train directly on the input.
     """
+    # Test Flight trim is a stitch-time feature: only raw .insv inputs have a
+    # stitch. Reject every other lane HERE, before any early return (the
+    # generative-image branch below would otherwise swallow it silently).
+    if (req.trim_start_s is not None or req.trim_duration_s is not None) and (
+        req.source_type == "generative-image"
+        or input_path.suffix.lower() not in INSV_EXTENSIONS
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Test Flight trim (trim_start_s/trim_duration_s) only applies to raw .insv inputs.",
+        )
+
     # ── Generative image-to-3D ("Imagine a Splat"): one image -> TripoSplat -> a Z-up
     #    .ply. Skips the ENTIRE capture pipeline (no SfM, no ns-train, no capture tools),
     #    then reuses compress/webopt to produce the viewer/download artifacts. ──
@@ -1850,10 +1915,31 @@ def _plan_3d_job(
             else:
                 # Positive detection of a layout the auto-stitch cannot compose.
                 raise HTTPException(status_code=400, detail=layout_err)
+        # Test Flight trim window. trim_duration_s alone -> center the window
+        # (skips the start/stop fumbling at the capture ends). If the probe
+        # can't get a duration, fall back to start=0 rather than failing a
+        # job the stitch itself can still run; if the clip is shorter than
+        # the window, trim is a no-op (drop it entirely).
+        trim_start = req.trim_start_s
+        trim_duration = req.trim_duration_s
+        if trim_start is not None or trim_duration is not None:
+            duration = _probe_video_duration(ffprobe, input_path) if ffprobe else None
+            if duration is not None and trim_start is not None and trim_start >= duration:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"trim_start_s ({trim_start:g}s) is beyond the end of the clip ({duration:.1f}s).",
+                )
+            if trim_duration is not None:
+                if duration is not None and duration <= trim_duration:
+                    trim_start = None
+                    trim_duration = None  # window >= clip: trim is a no-op
+                elif trim_start is None:
+                    trim_start = max(0.0, ((duration or 0.0) - trim_duration) / 2)
         stitched = _stitched_path(job_dir)
         commands["stitch"] = _stitch_command(
             availability["ffmpeg_path"], input_path, stitched, req.insv_fov,
             dual_stream=(layout == "dual"),
+            trim_start=trim_start, trim_duration=trim_duration,
         )
         stages.append("stitch")
         process_input = stitched
@@ -2471,9 +2557,31 @@ async def _run_pipeline(job: SplatJob) -> None:
                         if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
                     ) if images_dir.is_dir() else 0
                 except (OSError, ValueError, json.JSONDecodeError, KeyError) as exc:
+                    # FAIL CLOSED (2026-07-05): a missing/unreadable transforms.json
+                    # after a zero-exit process stage means SfM output was unusable
+                    # (proven live: glomap posed 599 images with 0 3D points ->
+                    # ns-process-data einsum'd, printed the error, exited 0, wrote
+                    # nothing -> train crashed on the missing file). Falling
+                    # through here sent a doomed job to the GPU; instead treat it
+                    # exactly like a 0% registration: escalate solvers if
+                    # possible, else fail with the real reason.
                     job.log_lines.append(
-                        f"[process] registration check skipped (could not read transforms/images: {exc})."
+                        f"[process] transforms.json missing/unreadable after process ({exc})."
                     )
+                    if _maybe_escalate_sfm(job, stage_index, 0, extracted or 0, "0.0%"):
+                        continue
+                    final_status = "failed"
+                    tried_label = ", ".join(sorted(job.sfm_tried)) or "colmap"
+                    error_message = (
+                        "Camera solving produced no usable output (no transforms.json) — "
+                        f"the SfM model was empty or degenerate. Auto-fallback tried {tried_label}. "
+                        "If this was a Test Flight, the sampled window may lack camera movement "
+                        "(standing still) or enough frames — try a different window or a denser "
+                        "sample. Training was skipped to save GPU time."
+                    )
+                    job.log_lines.append(error_message)
+                    _patch_meta(job.job_id, status=final_status, stage=None, error_message=error_message)
+                    break
 
                 if registered is not None and extracted:
                     ratio = registered / extracted
