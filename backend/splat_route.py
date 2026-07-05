@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import math
 import os
 import re
@@ -36,12 +37,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Request, UploadFile
+from fastapi import APIRouter, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 import gpu_arbiter
 from operator_audit import audit_operator_event
+
+log = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -178,6 +181,52 @@ MIN_REGISTRATION_RATIO = 0.30
 # cameras; nerfstudio downscales from here as needed.
 STITCH_WIDTH = 5760
 STITCH_HEIGHT = 2880
+# The guidance every unsupported-.insv failure points at ("Entry B" in
+# docs/360-ingestion.md): Insta360 Studio's optical-flow stitch is both the
+# quality path and the universal fallback for layouts we can't auto-compose.
+INSV_ENTRY_B_HINT = (
+    "Export an equirectangular MP4 from Insta360 Studio and upload that instead "
+    "(360 mode, no stitch stage needed)."
+)
+# ── Post-stitch sanity gate (R0) ────────────────────────────────────────────
+# After the ffmpeg stitch, two frames are extracted and checked for the KNOWN
+# corrupt signature of a mis-composed dual-fisheye (job splat_ec1b984ffb:
+# COLMAP registered 2/624 because half the pano was structurally garbage).
+# Thresholds are deliberately conservative — only blatant corruption trips
+# them; a dark night pano or a normal v360 lens seam must never false-fail.
+# Skippable via SPLAT_STITCH_SANITY=0.
+STITCH_SANITY_ANALYSIS_SIZE = (512, 256)  # downscale for analysis: fast + denoising
+STITCH_SANITY_NEAR_BLACK = 6              # 0-255 luminance considered "black"
+STITCH_SANITY_BLACK_COL_FRAC = 0.97       # column is "dead" if >=97% of its upper half is black
+STITCH_SANITY_WEDGE_MIN_FRAC = 0.30       # dead wedge must span >=30% of the width
+STITCH_SANITY_CONTEXT_MIN_LUMA = 20.0     # rest of the upper half must be non-dark (night guard)
+STITCH_SANITY_SPIKE_MIN = 60.0            # hard vertical cut: adjacent column-mean jump (0-255)
+STITCH_SANITY_SPIKE_DOMINANCE = 12.0      # ... and >=12x the median column-to-column change
+# The cross-frame "same column in both frames" seam check only has power when
+# content MOVES between the two sampled frames. On a static capture (tripod,
+# test pattern) every content edge sits at the same column in both frames, so
+# the check false-fails healthy stitches (proved: a static test pattern AND a
+# healthy hstack+v360 static dual-stream stitch both tripped it). Below this
+# mean-absolute-delta floor the frames are treated as static and a seam
+# finding alone may NOT fail the gate — only the wedge signature (the proven
+# corruption mode) stays fatal.
+STITCH_SANITY_STATIC_DELTA_FLOOR = 3.0    # mean |Δ| (0-255) between the two analysis frames
+# v360 dfisheye->e places the two lens boundaries at fixed relative x positions
+# (~0.25 and ~0.75 of the width for an hstack'd dual fisheye). A discontinuity
+# within tolerance of those columns is an EXPECTED lens seam, never corruption.
+STITCH_SANITY_LENS_COL_FRACS = (0.25, 0.75)  # expected lens-boundary columns, fraction of width
+STITCH_SANITY_LENS_COL_TOL_FRAC = 0.02       # ± tolerance around a lens column, fraction of width
+# nerfstudio 1.1.5 does NOT expose COLMAP's SequentialMatching.overlap (its
+# colmap_utils builds "<method>_matcher" with no overlap flag), so sequential
+# matching only pairs images <=10 positions apart (COLMAP default). The
+# equirect fan-out names crops <frame>_<k>.jpg grouped per frame, so same-view
+# temporal neighbors are exactly images_per_equirect apart: sequential works
+# for 8 crops/frame (8<=10) and misses ALL temporal pairs for 14 (14>10).
+NS_SEQUENTIAL_DEFAULT_OVERLAP = 10
+# SfM rungs that understand the equirect fan-out. MASt3R is deliberately
+# excluded: it is a perspective-pairwise matcher — pointing it at hundreds of
+# reprojected crops is the wrong tool (wrong scene graph, O(n^2) pairs).
+EQUIRECT_CAPABLE_SOLVERS = {"colmap", "glomap"}
 # AUTO-FALLBACK solver escalation. When the A1 registration gate trips on a
 # video/image-folder capture, the pipeline climbs this chain automatically
 # (zero clicks) instead of failing: it reroutes to the NEXT solver after the
@@ -228,9 +277,10 @@ class SplatTrainRequest(BaseModel):
     # registers far more frames on hard captures (proved 311/311 on a backyard
     # clip vs 2/311 for incremental). It runs feature_extractor + sequential
     # matching + global_mapper itself, then hands the model to ns-process-data
-    # via --skip-colmap. Only applied to video / image-folder inputs (not a
-    # pre-processed dataset, not equirectangular — for now); otherwise it falls
-    # back to the default path silently.
+    # via --skip-colmap. Applied to video / image-folder inputs including
+    # equirectangular 360 (the stage reproduces nerfstudio's perspective
+    # fan-out before COLMAP); a pre-processed dataset falls back to the
+    # default path silently.
     sfm_backend: Literal["colmap", "glomap"] = "colmap"
     # OPT-IN: build a text-searchable language field after training (SAM 2.1 +
     # SigLIP 2, training-free lift). Default off → the pipeline is byte-identical.
@@ -268,7 +318,7 @@ class SplatJob:
     # against any infinite loop. sfm_context carries the plan-time inputs the
     # gate needs to rebuild SfM stage commands for a different solver mid-run;
     # it is only populated for escalation-eligible jobs (video / image-folder,
-    # NOT equirect / pre-processed-dataset).
+    # incl. equirect — NOT a pre-processed dataset).
     sfm_tried: set[str] = field(default_factory=set)
     reroute_count: int = 0
     sfm_context: dict[str, Any] | None = None
@@ -310,6 +360,13 @@ def _new_meta(job_id: str, req: SplatTrainRequest, input_path: Path, job_dir: Pa
         "input_path": str(input_path),
         "output_dir": str(job_dir),
         "capture_format": req.capture_format,
+        # 360 sub-params, persisted so Re-run/Retry can rebuild the EXACT
+        # request (they were previously dropped: a 360 re-run silently reverted
+        # to the defaults). Present on every job for a uniform payload shape;
+        # harmless no-ops for standard captures.
+        "images_per_equirect": req.images_per_equirect,
+        "crop_bottom": req.crop_bottom,
+        "insv_fov": req.insv_fov,
         "max_num_iterations": req.max_num_iterations,
         # Record the ACTUAL engaged capture mode: "sparse" only when the plan starts with
         # the dense-seed MASt3R rung (the sole plan-time producer of a leading mast3r_sfm
@@ -491,7 +548,12 @@ def _ffmpeg_has_v360(ffmpeg: str | None) -> bool:
 
 
 def _probe_video_streams(ffprobe: str, src: Path) -> dict:
-    """Return {streams, width, height} for the first video stream, best-effort."""
+    """Return {streams, width, height, dims} for the video streams, best-effort.
+
+    width/height describe the FIRST stream (legacy callers); dims is the
+    per-stream [(w, h), ...] list the .insv layout classifier needs to tell a
+    dual-lens X4/X5 file (two equal square streams) from anything else.
+    """
     try:
         out = subprocess.run(
             [ffprobe, "-v", "error", "-select_streams", "v", "-show_entries",
@@ -501,9 +563,50 @@ def _probe_video_streams(ffprobe: str, src: Path) -> dict:
         data = json.loads(out.stdout or "{}")
         streams = data.get("streams", [])
         first = streams[0] if streams else {}
-        return {"streams": len(streams), "width": first.get("width"), "height": first.get("height")}
+        return {
+            "streams": len(streams),
+            "width": first.get("width"),
+            "height": first.get("height"),
+            "dims": [(s.get("width"), s.get("height")) for s in streams],
+        }
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
-        return {"streams": 0, "width": None, "height": None}
+        return {"streams": 0, "width": None, "height": None, "dims": []}
+
+
+def _stitch_layout(info: dict) -> tuple[str, str | None]:
+    """Classify a probed .insv stream layout for the stitch planner.
+
+    Returns ("single", None)  — one video stream: the file already carries
+                                side-by-side dual-fisheye; use the legacy -vf form.
+            ("dual", None)    — exactly two streams of equal square dims (X4/X5
+                                one-lens-per-stream): hstack them first.
+            ("error", msg)    — anything else. NO warn-and-limp: a mis-read
+                                layout produces a structurally corrupt equirect
+                                that wastes a full COLMAP run (splat_ec1b984ffb
+                                registered 2/624), so refuse loudly instead.
+    """
+    n = info.get("streams", 0)
+    dims = info.get("dims") or []
+    if n == 1:
+        return "single", None
+    if n == 2 and len(dims) == 2:
+        (w0, h0), (w1, h1) = dims
+        if w0 and h0 and (w0, h0) == (w1, h1) and w0 == h0:
+            return "dual", None
+        return "error", (
+            f".insv has 2 video streams but not the expected equal square fisheyes "
+            f"({w0}x{h0} + {w1}x{h1}) — the auto-stitch would mis-compose them. "
+            f"{INSV_ENTRY_B_HINT}"
+        )
+    if n == 0:
+        return "error", (
+            f"Could not probe any video stream in this .insv — cannot determine the "
+            f"lens layout to stitch. {INSV_ENTRY_B_HINT}"
+        )
+    return "error", (
+        f".insv has {n} video streams — an unrecognized layout the auto-stitch does "
+        f"not support. {INSV_ENTRY_B_HINT}"
+    )
 
 
 def _engine_availability() -> dict:
@@ -684,6 +787,28 @@ def _preview_web_path(output_dir: Path) -> Path:
     return _preview_dir_path(output_dir) / "web.ply"
 
 
+def _preview_langweb_path(output_dir: Path) -> Path:
+    # Full-count SH-stripped .ply for the CLIENT-SIDE language heatmap: its row
+    # order matches gauss_emb.npz (== the raw splat.ply export order), unlike
+    # web.ply which is decimated AND merge-reordered (index-incompatible).
+    return _preview_dir_path(output_dir) / "langweb.ply"
+
+
+def _langweb_command(transform: str, output_dir: Path) -> list[str]:
+    """splat-transform argv for the langweb artifact: harmonics stripped, NO
+    decimation. Probe-verified (2026-07-04, splat-transform 2.7.1, 487k-gaussian
+    splatfacto export): --filter-harmonics 0 alone preserves row order bit-exactly,
+    so langweb.ply row i == splat.ply row i == gauss_emb.npz row i. Adding
+    --decimate would break that correspondence — never add it here."""
+    return [
+        transform,
+        str(_preview_file_path(output_dir)),
+        "--filter-harmonics",
+        "0",
+        str(_preview_langweb_path(output_dir)),
+    ]
+
+
 def _splat_transform_path() -> str | None:
     override = os.environ.get("SPLAT_TRANSFORM_BIN", "").strip()
     if override:
@@ -747,6 +872,7 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
     output_dir = Path(meta["output_dir"])
     preview_file = _preview_file_path(output_dir)
     preview_spz = _preview_spz_path(output_dir)
+    langfield_built = (output_dir / LANGFIELD_DIRNAME / "gauss_emb.npz").is_file()
     if live is not None:
         log_lines = list(live.log_lines)
         pid = live.pid
@@ -772,7 +898,15 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
         "preview_web_url": f"/api/splat/jobs/{job_id}/preview/file?fmt=web" if preview_file.is_file() else None,
         # Opt-in language field: a built per-gaussian feature sidecar exists -> the
         # scene is text-searchable (the viewer shows the query UI when this is true).
-        "langfield_available": (output_dir / LANGFIELD_DIRNAME / "gauss_emb.npz").is_file(),
+        "langfield_available": langfield_built,
+        # Client-side heatmap splat: SH-stripped, FULL count, row order == gauss_emb.npz.
+        # fmt=langweb falls back to the raw .ply server-side (same order), so this is
+        # offered whenever the scene has both a preview and a built language field.
+        "preview_langweb_url": (
+            f"/api/splat/jobs/{job_id}/preview/file?fmt=langweb"
+            if langfield_built and preview_file.is_file()
+            else None
+        ),
         # Cheap per-scene stats for the gallery card (gaussian count, resolution, images).
         "stats": _scene_stats(job_id, output_dir, meta),
     }
@@ -892,15 +1026,255 @@ def _stitched_path(job_dir: Path) -> Path:
     return job_dir / "stitched" / "equirect.mp4"
 
 
-def _stitch_command(ffmpeg: str, src: Path, dst: Path, fov: float) -> list[str]:
+def _stitch_command(ffmpeg: str, src: Path, dst: Path, fov: float, dual_stream: bool = False) -> list[str]:
     """ffmpeg v360: Insta360 dual-fisheye -> equirectangular MP4 (open-source,
     no SDK). Seams are visible at the lens boundary but splatfacto tolerates
-    them; for seamless output, export equirect from the Insta360 app instead."""
-    vf = (
+    them; for seamless output, export equirect from the Insta360 app instead.
+
+    dual_stream=False (legacy, byte-for-byte the original command): the single
+    video stream already carries both fisheyes side-by-side; -vf v360 reads it
+    directly.
+
+    dual_stream=True (X4/X5): the .insv carries TWO video streams, one square
+    fisheye per lens. Plain -vf reads ONLY stream 0 -> a structurally corrupt
+    equirect (proved: COLMAP registered 2/624 on splat_ec1b984ffb). So hstack
+    the two streams into one side-by-side dual-fisheye first, THEN v360 it —
+    validated on the real X4 capture (two clean circles -> coherent pano).
+    """
+    v360 = (
         f"v360=input=dfisheye:output=e:ih_fov={fov}:iv_fov={fov}"
         f":w={STITCH_WIDTH}:h={STITCH_HEIGHT}:interp=lanczos"
     )
-    return [ffmpeg, "-y", "-i", str(src), "-vf", vf, "-c:v", "libx264", "-crf", "18", "-an", str(dst)]
+    if dual_stream:
+        filter_complex = f"[0:v:0][0:v:1]hstack=inputs=2[d];[d]{v360}[eq]"
+        return [
+            ffmpeg, "-y", "-i", str(src),
+            "-filter_complex", filter_complex, "-map", "[eq]",
+            "-c:v", "libx264", "-crf", "18", "-an", str(dst),
+        ]
+    return [ffmpeg, "-y", "-i", str(src), "-vf", v360, "-c:v", "libx264", "-crf", "18", "-an", str(dst)]
+
+
+def _equirect_frame_corruption(rows: list[list[int]]) -> tuple[str, int] | None:
+    """Detect the blatant corrupt-stitch signature in ONE analysis frame.
+
+    rows = grayscale pixel rows (already downscaled to the analysis size).
+    Returns (kind, column) or None:
+      - ("wedge", start_col): a large contiguous near-black wedge in the UPPER
+        half (wrap-aware — panoramas are circular) while the rest of the upper
+        half has real content. This is what reading only lens 0 produces.
+      - ("seam", col): a hard vertical discontinuity — one adjacent-column
+        luminance jump that towers over the frame's normal column-to-column
+        variation. Content edges move between frames; a projection fault sits
+        at a FIXED column, which the caller cross-checks across two frames.
+    Pure python on a ~512x256 grid (no numpy: the runtime venv ships Pillow
+    only). Thresholds are conservative by design — catch only blatant
+    corruption, never a healthy pano (incl. dark night scenes: the wedge check
+    requires the REST of the sky to be non-dark before it may fire).
+    """
+    height = len(rows)
+    width = len(rows[0]) if height else 0
+    if height < 8 or width < 16:
+        return None
+    half = height // 2
+
+    # ── Wedge: per-column near-black fraction over the upper half ──
+    dead_cols: list[bool] = []
+    col_upper_sums: list[float] = []
+    for c in range(width):
+        black = 0
+        total = 0
+        for r in range(half):
+            v = rows[r][c]
+            total += v
+            if v <= STITCH_SANITY_NEAR_BLACK:
+                black += 1
+        dead_cols.append(black / half >= STITCH_SANITY_BLACK_COL_FRAC)
+        col_upper_sums.append(total / half)
+
+    # Longest contiguous dead run, wrap-aware (scan the doubled array, cap at width).
+    best_run, best_start, run, run_start = 0, 0, 0, 0
+    for i in range(2 * width):
+        if dead_cols[i % width]:
+            if run == 0:
+                run_start = i % width
+            run += 1
+            if min(run, width) > best_run:
+                best_run, best_start = min(run, width), run_start
+        else:
+            run = 0
+    if best_run >= STITCH_SANITY_WEDGE_MIN_FRAC * width:
+        alive = [col_upper_sums[c] for c in range(width) if not dead_cols[c]]
+        if alive and (sum(alive) / len(alive)) > STITCH_SANITY_CONTEXT_MIN_LUMA:
+            return ("wedge", best_start)
+
+    # ── Seam: adjacent full-height column-mean jump, magnitude + dominance ──
+    col_means = [sum(rows[r][c] for r in range(height)) / height for c in range(width)]
+    diffs = [abs(col_means[c + 1] - col_means[c]) for c in range(width - 1)]
+    if diffs:
+        spike = max(diffs)
+        spike_col = diffs.index(spike)
+        median = sorted(diffs)[len(diffs) // 2]
+        if spike >= STITCH_SANITY_SPIKE_MIN and spike >= STITCH_SANITY_SPIKE_DOMINANCE * max(median, 1.0):
+            return ("seam", spike_col)
+    return None
+
+
+def _load_analysis_rows(image_path: Path) -> list[list[int]] | None:
+    """Load a frame as a downscaled grayscale row grid for the corruption check.
+    Returns None (caller skips the check) if Pillow is unavailable or the read fails."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        with Image.open(image_path) as im:
+            g = im.convert("L").resize(STITCH_SANITY_ANALYSIS_SIZE)
+            w, h = g.size
+            data = list(g.getdata())
+        return [data[r * w:(r + 1) * w] for r in range(h)]
+    except Exception:
+        return None
+
+
+def _frames_mean_abs_delta(a: list[list[int]], b: list[list[int]]) -> float:
+    """Mean absolute per-pixel luminance delta between two analysis-row grids.
+
+    Near-zero means the two sampled frames are (near-)identical — a static
+    capture — where the cross-frame same-column seam check has no power.
+    """
+    total = 0
+    count = 0
+    for row_a, row_b in zip(a, b):
+        for va, vb in zip(row_a, row_b):
+            total += abs(va - vb)
+            count += 1
+    return total / count if count else 0.0
+
+
+def _is_lens_boundary_column(col: int, width: int) -> bool:
+    """True when `col` sits within tolerance of a v360 dfisheye->e lens seam.
+
+    For an hstack'd dual fisheye stitched to equirect the lens boundaries land
+    at fixed relative x positions (~0.25 and ~0.75 of the width). A hard
+    vertical discontinuity there is an expected lens seam — splatfacto
+    tolerates it (see _stitch_command) — never the corruption signature.
+    """
+    if width <= 0:
+        return False
+    tol = max(2, int(STITCH_SANITY_LENS_COL_TOL_FRAC * width))
+    return any(abs(col - frac * width) <= tol for frac in STITCH_SANITY_LENS_COL_FRACS)
+
+
+def _stitch_sanity_check(job: "SplatJob", stitched: Path) -> str | None:
+    """R0 gate: cheaply validate the stitched equirect BEFORE COLMAP burns time.
+
+    Checks, in order (any tooling hiccup logs a note and skips — the gate must
+    never fail a healthy job because ffprobe/Pillow misbehaved):
+      1. 2:1 aspect (an equirect that isn't 2:1 is structurally wrong).
+      2. Extract 2 frames (~25% / ~75% of the clip) next to the stitched file
+         (kept on disk as receipts) and run _equirect_frame_corruption on each.
+         The job only fails when BOTH frames show the same corruption class —
+         and for "seam", at (near) the same column, since a projection fault is
+         position-fixed while real content edges move with the camera.
+    Returns an actionable STITCH-scoped error message, or None when sane.
+    Skippable via SPLAT_STITCH_SANITY=0.
+    """
+    if os.environ.get("SPLAT_STITCH_SANITY", "").strip() == "0":
+        job.log_lines.append("[stitch] sanity gate skipped (SPLAT_STITCH_SANITY=0).")
+        return None
+    ffprobe = _tool_path("ffprobe", "SPLAT_FFPROBE_BIN")
+    ffmpeg = _tool_path("ffmpeg", "SPLAT_FFMPEG_BIN")
+    if not ffprobe or not ffmpeg:
+        job.log_lines.append("[stitch] sanity gate skipped (ffprobe/ffmpeg not found).")
+        return None
+
+    info = _probe_video_streams(ffprobe, stitched)
+    width, height = info.get("width"), info.get("height")
+    if not width or not height:
+        job.log_lines.append("[stitch] sanity gate skipped (could not probe stitched output).")
+        return None
+    if abs(width - 2 * height) > 4:
+        return (
+            f"Stitched output is {width}x{height}, not the 2:1 equirectangular shape — "
+            f"the stitch mis-composed this file. This is a stitching problem, not a "
+            f"capture problem. {INSV_ENTRY_B_HINT}"
+        )
+
+    duration = 0.0
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(stitched)],
+            capture_output=True, text=True, timeout=20,
+        )
+        duration = float((out.stdout or "0").strip() or 0.0)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    timestamps = [duration * 0.25, duration * 0.75] if duration > 2.0 else [0.0, max(duration - 0.1, 0.0)]
+
+    findings: list[tuple[str, int] | None] = []
+    frame_rows: list[list[list[int]]] = []
+    for idx, ts in enumerate(timestamps):
+        frame_path = stitched.parent / f"sanity_{idx}.png"
+        try:
+            proc = subprocess.run(
+                [ffmpeg, "-y", "-ss", f"{ts:.3f}", "-i", str(stitched), "-frames:v", "1", str(frame_path)],
+                capture_output=True, text=True, timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError):
+            proc = None
+        if proc is None or proc.returncode != 0 or not frame_path.is_file():
+            job.log_lines.append(f"[stitch] sanity gate: could not extract frame @{ts:.1f}s; check skipped.")
+            return None
+        rows = _load_analysis_rows(frame_path)
+        if rows is None:
+            job.log_lines.append("[stitch] sanity gate skipped (Pillow unavailable or unreadable frame).")
+            return None
+        frame_rows.append(rows)
+        findings.append(_equirect_frame_corruption(rows))
+
+    first, second = findings[0], findings[1]
+    corrupt = False
+    reason = ""
+    if first and second and first[0] == second[0]:
+        if first[0] == "wedge":
+            # The near-black wedge is the PROVEN corruption mode (reading only
+            # lens 0 of a dual-stream .insv) — fatal on its own, motion or not.
+            corrupt = True
+            reason = "a large near-black wedge covers the upper half in both sampled frames"
+        elif abs(first[1] - second[1]) <= max(8, int(0.02 * STITCH_SANITY_ANALYSIS_SIZE[0])):
+            seam_col = first[1]
+            analysis_width = STITCH_SANITY_ANALYSIS_SIZE[0]
+            frames_delta = _frames_mean_abs_delta(frame_rows[0], frame_rows[1])
+            if _is_lens_boundary_column(seam_col, analysis_width):
+                # Expected v360 lens seam (~0.25/0.75 of width) — never corruption.
+                job.log_lines.append(
+                    f"[stitch] sanity gate: vertical discontinuity at column ~{seam_col} is a known "
+                    f"v360 lens-boundary position (~0.25/0.75 of width) — expected lens seam, not corruption."
+                )
+            elif frames_delta < STITCH_SANITY_STATIC_DELTA_FLOOR:
+                # Static capture: content doesn't move between the sampled frames,
+                # so "same column in both frames" carries no signal. A seam finding
+                # alone must NOT fail the gate here (proved false-positive on a
+                # static test pattern AND a healthy static dual-stream stitch);
+                # only wedge-scale corroboration (handled above) stays fatal.
+                job.log_lines.append(
+                    f"[stitch] sanity gate: seam candidate at column ~{seam_col} on near-identical frames "
+                    f"(mean |Δ|={frames_delta:.2f} < {STITCH_SANITY_STATIC_DELTA_FLOOR}) — static capture, "
+                    f"cross-frame check has no power; not failing on the seam signal alone."
+                )
+            else:
+                corrupt = True
+                reason = f"a hard vertical discontinuity sits at the same column (~{seam_col}) in both sampled frames"
+    if corrupt:
+        return (
+            f"Stitched 360 panorama failed the coherence check: {reason}. The stitch "
+            f"mis-composed this capture — this is a stitching problem, not a capture-"
+            f"technique problem, and COLMAP would register almost nothing from it. "
+            f"{INSV_ENTRY_B_HINT} (Set SPLAT_STITCH_SANITY=0 to bypass this gate.)"
+        )
+    job.log_lines.append("[stitch] sanity gate passed (2:1 aspect, both sampled frames coherent).")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -922,6 +1296,9 @@ def _glomap_sfm_command(
     process_input: Path,
     is_video: bool,
     num_frames_target: int,
+    is_equirect: bool = False,
+    images_per_equirect: int = 8,
+    crop_bottom: float = 0.0,
 ) -> list[str]:
     """One self-contained shell command for the opt-in global-SfM backend.
 
@@ -929,6 +1306,18 @@ def _glomap_sfm_command(
       0. (video only) ffmpeg extracts ~num_frames_target evenly-spaced frames
          into colmap/images/ — so COLMAP and ns-process-data see identical
          filenames. (image input: the frames are symlinked/copied in as-is.)
+      0b. (equirect only) the raw frames land in colmap/equirect_frames/ instead,
+         then nerfstudio's OWN equirect_utils (splatops env python) fans each
+         one out into images_per_equirect perspective crops — the exact fan-out
+         (naming <frame>_<k>.jpg, crop_factor=(0, crop_bottom, 0, 0)) that
+         ns-process-data --camera-type equirectangular performs — into
+         colmap/images/. COLMAP 4.x then solves the CROPS, and because we drive
+         its CLI directly (nerfstudio 1.1.5 exposes no overlap flag) we set
+         SequentialMatching.overlap to 2x images_per_equirect so same-view
+         temporal neighbors (exactly images_per_equirect apart in filename
+         order) are always paired. The fan-out's torch remap runs on the GPU
+         briefly (~tens of MB working set) — lockless like the other light SfM
+         stages, per the documented precedent.
       1. colmap feature_extractor  (single shared camera; SIFT on GPU)
       2. colmap sequential_matcher (loop closure ON — same temporal-ordering
          intent as the incremental path's --matching-method sequential)
@@ -942,6 +1331,10 @@ def _glomap_sfm_command(
     db_path = job_dir / "colmap" / "database.db"
     sparse_dir = job_dir / "colmap" / "sparse"
     model_dir = sparse_dir / "0"
+    equirect_dir = job_dir / "colmap" / "equirect_frames"
+    # Raw ingest target: perspective inputs go straight to the COLMAP image
+    # dir; equirect frames land in a staging dir and are fanned out from there.
+    frames_dst = equirect_dir if is_equirect else img_dir
 
     if is_video:
         # -vf fps drops the clip to ~num_frames_target frames over its length;
@@ -951,7 +1344,7 @@ def _glomap_sfm_command(
         extract = (
             f'ffmpeg -y -i "{process_input}" '
             f'-vf "select=not(mod(n\\,$STRIDE))" -vsync vfr '
-            f'-q:v 2 "{img_dir}/frame_%05d.jpg"'
+            f'-q:v 2 "{frames_dst}/frame_%05d.jpg"'
         )
         # STRIDE = max(1, total_frames / target). Probe frame count with ffprobe;
         # fall back to stride 1 (keep all) if probing fails.
@@ -973,8 +1366,53 @@ def _glomap_sfm_command(
             f'for f in "{process_input}"/*.jpg "{process_input}"/*.jpeg '
             f'"{process_input}"/*.png "{process_input}"/*.webp '
             f'"{process_input}"/*.bmp "{process_input}"/*.tif "{process_input}"/*.tiff; '
-            f'do cp -n "$f" "{img_dir}/"; done'
+            f'do cp -n "$f" "{frames_dst}/"; done'
         )
+
+    if is_equirect:
+        # Fan the staged equirect frames out into perspective crops with
+        # nerfstudio's own equirect_utils (splatops env), reproducing what
+        # ns-process-data --camera-type equirectangular does before COLMAP:
+        # same crop naming (<frame>_<k>.jpg), same resolution heuristic, same
+        # crop_factor mapping (crop_bottom -> (0, cb, 0, 0)). The crops are
+        # moved into img_dir so feature_extractor + ns-process-data
+        # --skip-colmap both see one directory of identical basenames.
+        splatops_python = CONDA_ENV_BIN / "python"
+        fanout = (
+            f'"{splatops_python}" - <<\'PYEOF\'\n'
+            f'import shutil\n'
+            f'from pathlib import Path\n'
+            f'from nerfstudio.process_data import equirect_utils\n'
+            f'src = Path("{equirect_dir}")\n'
+            f'dst = Path("{img_dir}")\n'
+            f'size = equirect_utils.compute_resolution_from_equirect(src, {images_per_equirect})\n'
+            f'equirect_utils.generate_planar_projections_from_equirectangular(\n'
+            f'    src, size, {images_per_equirect}, crop_factor=(0.0, {crop_bottom}, 0.0, 0.0)\n'
+            f')\n'
+            f'dst.mkdir(parents=True, exist_ok=True)\n'
+            f'for p in sorted((src / "planar_projections").iterdir()):\n'
+            f'    shutil.move(str(p), dst / p.name)\n'
+            f'shutil.rmtree(src / "planar_projections", ignore_errors=True)\n'
+            # The trailing `true` gives the outer single-line command chain a
+            # token to attach its `; ` to after the heredoc terminator line
+            # (a line starting with `;` would be a bash syntax error).
+            f'PYEOF\n'
+            f'true'
+        )
+        ingest = ingest + '; ' + fanout
+        # Clear BOTH the staging dir and img_dir on entry: an auto-fallback
+        # reroute from colmap would otherwise mix stale crops into the fan-out.
+        extra_clear = f' "{equirect_dir}" "{img_dir}"'
+        mkdirs = f'"{equirect_dir}" "{img_dir}" "{sparse_dir}"'
+        # Same-view temporal neighbors are exactly images_per_equirect apart in
+        # filename order (crops are grouped per frame); COLMAP's default
+        # overlap of 10 misses them for 14 crops/frame. 2x covers the whole
+        # next frame either side — cheap next to global_mapper.
+        overlap_flag = f'--SequentialMatching.overlap {2 * images_per_equirect} '
+    else:
+        extra_clear = ''
+        mkdirs = f'"{img_dir}" "{sparse_dir}"'
+        overlap_flag = ''
 
     script = (
         f'set -euo pipefail; '
@@ -985,7 +1423,7 @@ def _glomap_sfm_command(
         # + images_2/4/8); ns-process-data does NOT guarantee a clean overwrite, so
         # the A1 registration gate could otherwise measure a stale colmap/glomap
         # mix. Mirrors the mast3r path's clear. (Fresh glomap-start jobs: no-op.)
-        f'rm -rf "{sparse_dir}" "{processed_dir}"; mkdir -p "{img_dir}" "{sparse_dir}"; '
+        f'rm -rf "{sparse_dir}" "{processed_dir}"{extra_clear}; mkdir -p {mkdirs}; '
         f'{ingest}; '
         f'"{colmap4}" feature_extractor '
         f'--database_path "{db_path}" --image_path "{img_dir}" '
@@ -996,7 +1434,7 @@ def _glomap_sfm_command(
         f'"{colmap4}" sequential_matcher '
         f'--database_path "{db_path}" '
         # 4.x: SiftMatching.use_gpu -> FeatureMatching.use_gpu.
-        f'--SequentialMatching.loop_detection 1 --FeatureMatching.use_gpu 1; '
+        f'{overlap_flag}--SequentialMatching.loop_detection 1 --FeatureMatching.use_gpu 1; '
         f'"{colmap4}" global_mapper '
         f'--database_path "{db_path}" --image_path "{img_dir}" '
         f'--output_path "{sparse_dir}"; '
@@ -1127,7 +1565,12 @@ def _sfm_stage_commands(
     if solver == "glomap":
         # COLMAP 4.x global SfM: we drive feature_extractor + sequential
         # matching + global_mapper ourselves into <job_dir>/colmap/sparse/0,
-        # then ns-process-data reads that model via --skip-colmap.
+        # then ns-process-data reads that model via --skip-colmap. For an
+        # equirect job the stage additionally reproduces nerfstudio's fan-out
+        # (each frame -> images_per_equirect perspective crops) BEFORE COLMAP,
+        # so global SfM solves the same crops the incremental path would; the
+        # downstream `process` then consumes those crops as plain images
+        # (nerfstudio itself flips camera_type to "perspective" post-fan-out).
         glomap_sfm = _glomap_sfm_command(
             colmap4=availability["glomap_path"],
             ffmpeg=availability["ffmpeg_path"],
@@ -1136,6 +1579,9 @@ def _sfm_stage_commands(
             process_input=process_input,
             is_video=(subcommand == "video"),
             num_frames_target=req.num_frames_target,
+            is_equirect=is_equirect,
+            images_per_equirect=req.images_per_equirect,
+            crop_bottom=req.crop_bottom,
         )
         process_cmd = [
             availability["ns_process_data_path"],
@@ -1219,9 +1665,21 @@ def _sfm_stage_commands(
     if subcommand == "video":
         process_cmd.extend(["--num-frames-target", str(req.num_frames_target)])
         # Sequential matching (loop closure) chains temporally-ordered frames
-        # far better than the default unordered-collection vocab_tree. Skip for
-        # equirect: each frame fans out into N perspective views, not a sequence.
+        # far better than the default unordered-collection vocab_tree.
+        #
+        # Equirect fan-out (decided from the nerfstudio 1.1.5 SOURCE, not the
+        # docs): equirect_utils names crops <frame>_<k>.jpg GROUPED PER FRAME,
+        # so in COLMAP's lexicographic ingest order same-view temporal
+        # neighbors sit exactly images_per_equirect positions apart, and
+        # adjacent-yaw crops of one frame (30° overlap at fov 120 / 90° step)
+        # are 1-3 apart. nerfstudio exposes NO SequentialMatching.overlap flag
+        # (colmap_utils builds "<method>_matcher" bare), so COLMAP's default
+        # overlap of 10 applies: sequential covers the pairs that matter for 8
+        # crops/frame (8 <= 10) but misses EVERY temporal pair for 14
+        # (14 > 10, loop detection off) — so 14 keeps the vocab_tree default.
         if not is_equirect:
+            process_cmd.extend(["--matching-method", "sequential"])
+        elif req.images_per_equirect <= NS_SEQUENTIAL_DEFAULT_OVERLAP:
             process_cmd.extend(["--matching-method", "sequential"])
     if is_equirect:
         process_cmd.extend(
@@ -1237,16 +1695,22 @@ def _sfm_stage_commands(
     return {"process": process_cmd}
 
 
-def _next_sfm_solver(tried: set[str], availability: dict) -> str | None:
+def _next_sfm_solver(tried: set[str], availability: dict, is_equirect: bool = False) -> str | None:
     """The next solver in SFM_ESCALATION that is AVAILABLE and not yet tried.
 
     Walks the whole chain from the start (not from a fixed index) so it works
     regardless of which rung the job started on, and so an unavailable rung is
     transparently skipped to the next available one. Returns None when the
     chain is exhausted.
+
+    Equirect jobs only climb to rungs in EQUIRECT_CAPABLE_SOLVERS (glomap yes,
+    MASt3R no — a perspective-pairwise matcher is the wrong tool for hundreds
+    of reprojected fan-out crops).
     """
     for candidate in SFM_ESCALATION:
         if candidate in tried:
+            continue
+        if is_equirect and candidate not in EQUIRECT_CAPABLE_SOLVERS:
             continue
         avail_key = SFM_SOLVER_AVAILABILITY.get(candidate)
         if avail_key is not None and not availability.get(avail_key):
@@ -1261,8 +1725,9 @@ def _plan_3d_job(
     """Build the ordered stage list, per-stage commands, and escalation context.
 
     The third return value (sfm_context) is non-None only for escalation-eligible
-    inputs (video / image-folder, not equirect / pre-processed dataset); it carries
-    the inputs the runner's A1 gate needs to rebuild SfM stages for a fallback solver.
+    inputs (video / image-folder, incl. equirect — but not a pre-processed dataset);
+    it carries the inputs the runner's A1 gate needs to rebuild SfM stages for a
+    fallback solver (equirect jobs only climb to the glomap rung).
 
     Inputs already containing a Nerfstudio dataset (transforms.json) skip the
     ns-process-data stage and train directly on the input.
@@ -1302,8 +1767,9 @@ def _plan_3d_job(
     commands: dict[str, list[str]] = {}
     processed_dir = job_dir / "processed"
     # Escalation context, populated only for escalation-eligible inputs below.
-    # A pre-processed dataset (transforms.json) or equirect job leaves it None,
-    # so the runner's gate never reroutes those.
+    # A pre-processed dataset (transforms.json) leaves it None, so the runner's
+    # gate never reroutes those. Equirect jobs get a context too; the gate
+    # limits them to the equirect-capable rungs (glomap, never MASt3R).
     sfm_context: dict[str, Any] | None = None
 
     # Raw Insta360 .insv: stitch dual-fisheye -> equirectangular MP4 first, then
@@ -1316,8 +1782,44 @@ def _plan_3d_job(
                 status_code=400,
                 detail="ffmpeg with the v360 filter is required to stitch .insv. Export an equirectangular MP4 from the Insta360 app instead.",
             )
+        # Stream-count-aware stitch planning: X4/X5 .insv carry TWO square HEVC
+        # fisheye streams; the legacy single-input v360 command reads only
+        # stream 0 and produces a structurally corrupt equirect
+        # (splat_ec1b984ffb: 2/624 registered). Probe the layout NOW and pick
+        # the right command. A POSITIVE detection of an unsupported layout
+        # (3+ streams, mismatched dims) refuses loudly before any GPU/COLMAP
+        # time is spent — but a failure of the PROBE ITSELF (ffprobe missing/
+        # timeout -> streams:0) proves nothing about the file, so it falls
+        # back to the legacy single-stream stitch (the pre-probe behavior)
+        # rather than 400-ing a single-stream-capable capture; the post-stitch
+        # sanity gate still catches a mis-composed result downstream.
+        ffprobe = _tool_path("ffprobe", "SPLAT_FFPROBE_BIN")
+        probe_info = (
+            _probe_video_streams(ffprobe, input_path)
+            if ffprobe
+            else {"streams": 0, "width": None, "height": None, "dims": []}
+        )
+        layout, layout_err = _stitch_layout(probe_info)
+        if layout == "error":
+            if not probe_info.get("streams"):
+                # Probe error (not a layout verdict): cannot determine the
+                # layout at all. Warn loudly and keep the legacy behavior.
+                log.warning(
+                    "[stitch] .insv layout probe failed for %s (%s) — falling back to the "
+                    "legacy single-stream v360 stitch; the post-stitch sanity gate will "
+                    "catch a mis-composed equirect.",
+                    input_path,
+                    "ffprobe not found" if not ffprobe else "no probeable video stream",
+                )
+                layout = "single"
+            else:
+                # Positive detection of a layout the auto-stitch cannot compose.
+                raise HTTPException(status_code=400, detail=layout_err)
         stitched = _stitched_path(job_dir)
-        commands["stitch"] = _stitch_command(availability["ffmpeg_path"], input_path, stitched, req.insv_fov)
+        commands["stitch"] = _stitch_command(
+            availability["ffmpeg_path"], input_path, stitched, req.insv_fov,
+            dual_stream=(layout == "dual"),
+        )
         stages.append("stitch")
         process_input = stitched
         is_video = True
@@ -1342,11 +1844,11 @@ def _plan_3d_job(
             )
 
         # SfM solver selection + AUTO-FALLBACK eligibility. The escalation chain
-        # only engages for plain video / image-folder inputs — NOT equirectangular
-        # (each 360 frame fans out into N perspective views, not one temporal
-        # sequence) and NOT a pre-processed dataset (handled above). For those
-        # excluded cases we run the requested solver once with no reroute.
-        escalation_eligible = (not is_equirect) and subcommand in ("video", "images")
+        # engages for video / image-folder inputs, INCLUDING equirectangular —
+        # the gate itself restricts equirect jobs to the equirect-capable rungs
+        # (glomap; never MASt3R) via sfm_context["is_equirect"]. A pre-processed
+        # dataset (handled above) never reroutes.
+        escalation_eligible = subcommand in ("video", "images")
 
         # Resolve the starting solver. The requested sfm_backend is honored when
         # available; an opt-in glomap that isn't actually present silently falls
@@ -1549,6 +2051,31 @@ async def _langfield_worker_query(config_path: str, lfdir: str, clean_text: str)
         return None
 
 
+# The worker's /relevancy response headers the proxy passes through to the client:
+# X-Count/X-Min/X-Max = dequantization params for the uint8 body, X-Matches = the
+# clustered 3D instances JSON (same shape as /query's, minus the rendered thumbs).
+RELEVANCY_FORWARD_HEADERS = ("x-count", "x-min", "x-max", "x-matches")
+
+
+async def _langfield_worker_relevancy(config_path: str, lfdir: str, clean_text: str):
+    """Ask the warm worker for the raw per-gaussian relevancy vector (uint8-quantized
+    binary body + X-* headers). Returns the httpx.Response on HTTP 200, else None.
+    WARM-WORKER ONLY — the caller turns None into a 503 (no cold-subprocess fallback:
+    this is an interactive client path and the cold path renders nothing useful for it).
+    The generous read timeout covers a first-touch scene build waiting behind a
+    training run on HEAVY_GPU_LOCK; the compute itself is lockless and sub-second."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=1.5)) as client:
+            resp = await client.post(
+                f"{LANGFIELD_WORKER_URL}/relevancy",
+                json={"config": config_path, "lfdir": lfdir, "text": clean_text},
+            )
+        return resp if resp.status_code == 200 else None
+    except Exception:
+        return None
+
+
 async def _langfield_worker_inventory(config_path: str, lfdir: str) -> dict | None:
     """Ask the warm worker for the scene's top-N object inventory (cached per scene).
     Returns the worker JSON on success, else None (no cold fallback — inventory is a
@@ -1626,14 +2153,15 @@ def _maybe_escalate_sfm(
 
     Infinite-loop safety, in order:
       - only escalation-eligible jobs reroute (sfm_context is set => video /
-        image-folder; equirect / pre-processed-dataset leave it None);
+        image-folder, incl. equirect; a pre-processed dataset leaves it None);
+      - equirect jobs only climb to EQUIRECT_CAPABLE_SOLVERS (glomap, not mast3r);
       - reroute_count is capped at len(SFM_ESCALATION);
       - the chosen solver is added to job.sfm_tried BEFORE rerouting, and
         _next_sfm_solver skips anything already tried — so no solver runs twice.
     """
     ctx = job.sfm_context
     if ctx is None:
-        # Equirect / pre-processed dataset: not eligible. Caller fails as before.
+        # Pre-processed dataset: not eligible. Caller fails as before.
         return False
     if job.reroute_count >= len(SFM_ESCALATION):
         # Hard cap: even if availability lies, never reroute more than there are
@@ -1641,7 +2169,7 @@ def _maybe_escalate_sfm(
         return False
 
     availability = _engine_availability()
-    next_solver = _next_sfm_solver(job.sfm_tried, availability)
+    next_solver = _next_sfm_solver(job.sfm_tried, availability, is_equirect=bool(ctx.get("is_equirect")))
     if next_solver is None:
         # Chain exhausted: every available solver after the current one is tried.
         return False
@@ -1715,27 +2243,40 @@ async def _run_pipeline(job: SplatJob) -> None:
                 break
 
             if stage == "stitch":
-                # Pre-flight ffprobe: X4/X5 store dual H.265 streams in one
-                # .insv and ffmpeg sees only the first, so warn (don't fail) if
-                # the layout looks wrong. Single side-by-side dual-fisheye is
-                # ~2:1; a near-1:1 or multi-stream file likely needs an app
-                # export instead.
+                # The stream layout was probed and classified AT PLAN TIME
+                # (_stitch_layout): single-stream -> legacy -vf v360, dual
+                # square streams -> hstack both lenses first, anything else
+                # was rejected before the job existed. Log the layout here
+                # for the receipt trail, then run the pre-built command.
                 stitched = _stitched_path(job_dir)
                 stitched.parent.mkdir(parents=True, exist_ok=True)
                 ffprobe = _tool_path("ffprobe", "SPLAT_FFPROBE_BIN")
                 if ffprobe:
                     info = _probe_video_streams(ffprobe, Path(job.input_path))
+                    dual = "-filter_complex" in job.stage_commands["stitch"]
                     job.log_lines.append(
                         f"[stitch] source: {info['streams']} video stream(s), "
-                        f"{info['width']}x{info['height']}"
+                        f"{info['width']}x{info['height']} — "
+                        f"{'dual-lens hstack compose' if dual else 'single-stream dfisheye'}"
                     )
-                    if info["streams"] > 1:
-                        job.log_lines.append(
-                            "[stitch] WARNING: multiple video streams — this model likely stores "
-                            "dual-stream fisheye; ffmpeg sees only the first. If the stitch looks "
-                            "half-empty, export an equirectangular MP4 from the Insta360 app instead."
-                        )
                 return_code = await _run_stage(job, stage, job.stage_commands["stitch"])
+                if return_code == 0 and not job.stop_requested:
+                    # R0 sanity gate: validate the equirect BEFORE COLMAP burns
+                    # ~10 min on a structurally corrupt pano. Failure here is a
+                    # STITCH problem and says so (never the misleading capture-
+                    # technique guidance). Skippable via SPLAT_STITCH_SANITY=0.
+                    # Off the event loop: the gate runs sync subprocess.run
+                    # (ffprobe + 2 frame extractions, ~280s worst case) plus
+                    # pure-python pixel analysis — thread-safe (no shared
+                    # mutable state beyond job.log_lines appends, which are
+                    # atomic under the GIL), so to_thread keeps the API
+                    # responsive instead of blocking every request.
+                    sanity_error = await asyncio.to_thread(_stitch_sanity_check, job, stitched)
+                    if sanity_error:
+                        final_status = "failed"
+                        error_message = sanity_error
+                        job.log_lines.append(error_message)
+                        break
             elif stage == "export":
                 config_path = _find_latest_config(job_dir)
                 if config_path is None:
@@ -1796,6 +2337,24 @@ async def _run_pipeline(job: SplatJob) -> None:
                     rc = await _run_stage(job, stage, command)
                     if rc != 0:
                         job.log_lines.append("[webopt] web-optimized .ply failed; viewer falls back to the raw .ply.")
+                    # langweb: full-count SH-stripped copy for the CLIENT-SIDE language
+                    # heatmap. No --decimate, so its row order matches gauss_emb.npz
+                    # (probe-verified — see _langweb_command). Built only for jobs that
+                    # will build a language field; best-effort like web.ply (fmt=langweb
+                    # falls back to the raw .ply server-side).
+                    # Distinct label: reusing "webopt" here would clobber the real
+                    # webopt receipt in meta (stage/command/exit_code would show the
+                    # langweb run under the webopt name). A label outside
+                    # stages_planned is safe: _run_stage only patches meta.stage/
+                    # command/exit_code, stages_completed still gets "webopt" below,
+                    # and the stage rail simply highlights no bar for the brief
+                    # secondary run (same degrade-to-raw-string path as reprocess<n>).
+                    if "langfield" in job.stages_planned:
+                        rc = await _run_stage(job, "webopt-langweb", _langweb_command(transform, job_dir))
+                        if rc != 0:
+                            job.log_lines.append(
+                                "[webopt] langweb .ply failed; the client heatmap falls back to the raw .ply."
+                            )
                 else:
                     job.log_lines.append("[webopt] skipped (tool or .ply unavailable).")
                 completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
@@ -2495,13 +3054,21 @@ async def get_splat_cameras(job_id: str, limit: int = 500):
 
 
 @router.get("/jobs/{job_id}/preview/file")
-async def get_splat_preview_file(job_id: str, fmt: Literal["ply", "spz", "web"] = "ply"):
+async def get_splat_preview_file(job_id: str, fmt: Literal["ply", "spz", "web", "langweb"] = "ply"):
     # Resolved purely from disk so preview URLs survive portal restarts.
     if not _safe_job_id(job_id):
         raise HTTPException(status_code=404, detail="Splat job not found")
     if fmt == "spz":
         preview_file = _preview_spz_path(_job_dir(job_id))
         suffix = "spz"
+    elif fmt == "langweb":
+        # Full-count SH-stripped copy whose row order matches gauss_emb.npz, for
+        # the client-side language heatmap. Falls back to the raw .ply — identical
+        # row order, just heavier — for jobs built before this artifact existed.
+        preview_file = _preview_langweb_path(_job_dir(job_id))
+        if not preview_file.is_file():
+            preview_file = _preview_file_path(_job_dir(job_id))
+        suffix = "ply"
     elif fmt == "web":
         # Lightweight copy for the web viewer; fall back to the raw .ply when the
         # web-optimized file hasn't been generated (older jobs, or webopt skipped).
@@ -2515,6 +3082,17 @@ async def get_splat_preview_file(job_id: str, fmt: Literal["ply", "spz", "web"] 
     if not preview_file.is_file():
         raise HTTPException(status_code=404, detail="Preview file not generated yet")
     return FileResponse(str(preview_file), media_type="application/octet-stream", filename=f"{job_id}.{suffix}")
+
+
+def _langfield_stale_guard(lfdir: Path) -> None:
+    """A geometry edit (edit_ops) row-masked splat.ply after the field was built, so
+    gauss_emb.npz rows no longer match the scene. Refuse to serve misaligned results."""
+    if (lfdir / "STALE").is_file():
+        raise HTTPException(
+            status_code=409,
+            detail="Language field is stale (the scene was edited after the field was "
+            "built) — re-run the language field for this scene to search it again.",
+        )
 
 
 @router.post("/jobs/{job_id}/langfield/query")
@@ -2532,6 +3110,7 @@ async def langfield_query(job_id: str, payload: dict[str, Any]):
     lfdir = job_dir / LANGFIELD_DIRNAME
     if not (lfdir / "gauss_emb.npz").is_file():
         raise HTTPException(status_code=404, detail="Language field not built for this scene")
+    _langfield_stale_guard(lfdir)
     config_path = _find_latest_config(job_dir)
     if config_path is None:
         raise HTTPException(status_code=409, detail="Scene checkpoint missing")
@@ -2556,6 +3135,43 @@ async def langfield_query(job_id: str, payload: dict[str, Any]):
     }
 
 
+@router.post("/jobs/{job_id}/langfield/relevancy")
+async def langfield_relevancy(job_id: str, payload: dict[str, Any]):
+    """Raw per-gaussian relevancy for the CLIENT-SIDE heatmap: a uint8-quantized
+    vector whose row i corresponds to gauss_emb.npz row i == the raw splat.ply /
+    fmt=langweb row i. Body = N bytes; X-Count/X-Min/X-Max dequantize it
+    (rel = min + q/255*(max-min)); X-Matches = the clustered 3D instances JSON.
+    WARM-WORKER ONLY: no PNG render, no GPU lock — a down worker is a fast 503,
+    never the ~30s cold-subprocess fallback (this is an interactive path).
+    (Auth via the router mount.)"""
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    raw = str(payload.get("text", "")).strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty query")
+    clean = _langfield_clean_text(raw)
+    job_dir = _job_dir(job_id)
+    lfdir = job_dir / LANGFIELD_DIRNAME
+    if not (lfdir / "gauss_emb.npz").is_file():
+        raise HTTPException(status_code=404, detail="Language field not built for this scene")
+    _langfield_stale_guard(lfdir)
+    config_path = _find_latest_config(job_dir)
+    if config_path is None:
+        raise HTTPException(status_code=409, detail="Scene checkpoint missing")
+    resp = await _langfield_worker_relevancy(str(config_path), str(lfdir), clean)
+    if resp is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Language-field worker is not running; the client-side heatmap needs "
+                "the warm worker (systemd unit splatlab-langfield on :3417)."
+            ),
+        )
+    headers = {k: v for k, v in resp.headers.items() if k.lower() in RELEVANCY_FORWARD_HEADERS}
+    headers["Cache-Control"] = "no-store"
+    return Response(content=resp.content, media_type="application/octet-stream", headers=headers)
+
+
 @router.get("/jobs/{job_id}/langfield/inventory")
 async def langfield_inventory(job_id: str):
     """Top-N objects auto-detected in this scene (open-vocab), for the toggle-to-highlight
@@ -2567,6 +3183,7 @@ async def langfield_inventory(job_id: str):
     lfdir = job_dir / LANGFIELD_DIRNAME
     if not (lfdir / "gauss_emb.npz").is_file():
         raise HTTPException(status_code=404, detail="Language field not built for this scene")
+    _langfield_stale_guard(lfdir)
     config_path = _find_latest_config(job_dir)
     if config_path is None:
         raise HTTPException(status_code=409, detail="Scene checkpoint missing")
