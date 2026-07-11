@@ -154,6 +154,17 @@ HEALTH_DIR = Path(__file__).resolve().parent / "health"
 HEALTH_RUNNER = HEALTH_DIR / "run_health.sh"
 HEALTH_DIRNAME = "_health"                # per-job artifact dir (sibling of _langfield)
 HEALTH_VRAM_MB = 4_000                    # checkpoint load + 2 rasterizations at 640px
+# ── Rig-constrained 360 SfM (opt-in via sfm_backend="rig") ───────────────────────
+# Root cause of the 360 fog cocoons (probe 2026-07-11, probe-operator-mask/STATUS.md):
+# the legacy fan-out solves each frame's crops as FREE cameras — same-frame centers
+# scatter a median 5.1 units where truth is 0 → the trajectory blows up to 12× the
+# scene → normalization collapses real geometry into the fog fingerprint. This lane
+# renders the stitched sphere into a RIG of virtual views (backend/rig/render_rig.py)
+# and solves with COLMAP 4.x rig constraints (shared center, fixed relative
+# rotations, rig-verified matching, rig+intrinsics held fixed in BA).
+RIG_LANE_DIR = Path(__file__).resolve().parent / "rig"
+RIG_RENDER_SCRIPT = RIG_LANE_DIR / "render_rig.py"
+COLMAP4_ENV_PYTHON = Path.home() / "miniconda3" / "envs" / "colmap4" / "bin" / "python"
 KEEP_UNPINNED_COMPLETED = 10
 FAILED_RETENTION_HOURS = 24
 PREVIEW_DIRNAME = "_preview"
@@ -261,6 +272,9 @@ SFM_SOLVER_AVAILABILITY = {
     # InstantSplat sparse-view rung: same MASt3R toolchain, dense-seed + low-iter path.
     # NOT in SFM_ESCALATION (it's a user-selected capture mode, not an auto-fallback rung).
     "mast3r-sparse": "mast3r_available",
+    # Rig-constrained 360 SfM: user-selected, equirect-only, NOT an auto-fallback rung
+    # (yet — default-flip is a separate decision after RToony grades real runs).
+    "rig": "rig_available",
 }
 _JOB_ID_RE = re.compile(r"^splat_[0-9a-f]{6,32}$")
 
@@ -291,7 +305,12 @@ class SplatTrainRequest(BaseModel):
     # equirectangular 360 (the stage reproduces nerfstudio's perspective
     # fan-out before COLMAP); a pre-processed dataset falls back to the
     # default path silently.
-    sfm_backend: Literal["colmap", "glomap"] = "colmap"
+    # "rig" is an OPT-IN equirect-only lane: renders the stitched sphere into a rig
+    # of virtual views and solves with COLMAP 4.x rig constraints — fixes the
+    # unrigged-crop pose scatter that fog-cocoons every 360 capture (2026-07-11
+    # root cause). Falls back to colmap silently on non-equirect inputs or when
+    # the toolchain is missing (same convention as an unavailable glomap).
+    sfm_backend: Literal["colmap", "glomap", "rig"] = "colmap"
     # OPT-IN: build a text-searchable language field after training (SAM 2.1 +
     # SigLIP 2, training-free lift). Default off → the pipeline is byte-identical.
     # Best-effort: a build failure never fails the splat job.
@@ -694,6 +713,9 @@ def _engine_availability() -> dict:
         # COLMAP 4.x global-SfM backend (opt-in via sfm_backend="glomap").
         "glomap_available": bool(colmap4),
         "glomap_path": colmap4,
+        # Rig-constrained 360 SfM (opt-in via sfm_backend="rig", equirect only):
+        # colmap4 binary + the rig render script + its env python (cv2/scipy).
+        "rig_available": bool(colmap4) and RIG_RENDER_SCRIPT.is_file() and COLMAP4_ENV_PYTHON.is_file(),
         # MASt3R-SfM rung (strongest escalation target): env python + runner +
         # converter + 2.6GB checkpoint. Spread into the dict so the gate sees
         # mast3r_available / mast3r_* alongside the COLMAP keys.
@@ -1680,6 +1702,60 @@ def _mast3r_sfm_command(
     return ["bash", "-c", script]
 
 
+def _rig_sfm_command(
+    *,
+    colmap4: str,
+    ffmpeg: str,
+    job_dir: Path,
+    processed_dir: Path,
+    process_input: Path,
+    num_frames_target: int,
+) -> list[str]:
+    """Rig-constrained 360 SfM (equirect video only): extract equirect frames,
+    render them into a rig of virtual perspective views (render_rig.py: 12 views,
+    ownership masks, rig_config.json), then colmap4 with the rig applied —
+    feature_extractor (per-folder pinhole) -> rig_configurator -> rig-verified
+    sequential matching -> global_mapper with rig + intrinsics held fixed.
+    Spike receipt (probe-operator-mask/STATUS.md): same capture, unrigged lane
+    same-frame pose scatter 5.1 units -> rig lane 1080/1080 registered and the
+    first recognizable insv reconstruction in the program."""
+    rig_dir = job_dir / "rig"
+    frames_dir = rig_dir / "equirect_frames"
+    db = rig_dir / "database.db"
+    sparse = rig_dir / "sparse"
+    script = (
+        f'set -euo pipefail; '
+        f'rm -rf "{rig_dir}" "{processed_dir}"; '
+        f'mkdir -p "{frames_dir}" "{sparse}"; '
+        # Evenly-spaced frame sampling — same STRIDE recipe as the glomap lane.
+        f'FFPROBE="$(dirname "{ffmpeg}")/ffprobe"; [ -x "$FFPROBE" ] || FFPROBE=ffprobe; '
+        f'TOTAL="$("$FFPROBE" -v error -count_frames -select_streams v:0 '
+        f'-show_entries stream=nb_read_frames -of csv=p=0 "{process_input}" 2>/dev/null)"; '
+        f'case "$TOTAL" in ""|*[!0-9]*) TOTAL=0;; esac; '
+        f'if [ "$TOTAL" -gt {num_frames_target} ]; then STRIDE=$(( TOTAL / {num_frames_target} )); else STRIDE=1; fi; '
+        f'"{ffmpeg}" -y -i "{process_input}" -vf "select=not(mod(n\\,$STRIDE))" -vsync vfr -q:v 2 '
+        f'"{frames_dir}/frame_%05d.jpg"; '
+        f'"{COLMAP4_ENV_PYTHON}" "{RIG_RENDER_SCRIPT}" "{frames_dir}" "{rig_dir}"; '
+        f'"{colmap4}" feature_extractor --database_path "{db}" --image_path "{rig_dir}/images" '
+        f'--ImageReader.single_camera_per_folder 1 --ImageReader.camera_model SIMPLE_PINHOLE '
+        f'--ImageReader.mask_path "{rig_dir}/masks" --FeatureExtraction.use_gpu 1; '
+        f'"{colmap4}" rig_configurator --database_path "{db}" '
+        f'--rig_config_path "{rig_dir}/rig_config.json"; '
+        f'"{colmap4}" sequential_matcher --database_path "{db}" '
+        f'--SequentialMatching.loop_detection 1 --FeatureMatching.rig_verification 1 '
+        f'--FeatureMatching.skip_image_pairs_in_same_frame 1 --FeatureMatching.use_gpu 1; '
+        f'"{colmap4}" global_mapper --database_path "{db}" --image_path "{rig_dir}/images" '
+        f'--output_path "{sparse}" --GlobalMapper.refine_sensor_from_rig 0 '
+        f'--GlobalMapper.ba_refine_focal_length 0 --GlobalMapper.ba_refine_extra_params 0; '
+        f'test -f "{sparse}/0/cameras.bin" || {{ echo "[rig] global mapper produced no model — '
+        f'the capture may need the glomap or Studio-stitch path" >&2; exit 1; }}; '
+        f'PTS=$(stat -c%s "{sparse}/0/points3D.bin" 2>/dev/null || echo 0); '
+        f'if [ "$PTS" -le 8 ]; then echo "[rig] global mapper posed cameras but triangulated '
+        f'0 points" >&2; exit 1; fi'
+    )
+    return ["bash", "-c", script]
+
+
 def _sfm_stage_commands(
     solver: str,
     req: SplatTrainRequest,
@@ -1700,6 +1776,34 @@ def _sfm_stage_commands(
     `elif solver == "mast3r":` branch here that emits its own pre-stage(s) + a
     `process` that consumes the model — no other call site changes.
     """
+    if solver == "rig":
+        # Rig-constrained 360 SfM. The `rig_sfm` stage does everything up to a
+        # posed sparse model in <job_dir>/rig/sparse/0; `process` hands it to
+        # ns-process-data via --skip-colmap (nested pano_camera*/ names proven
+        # to convert cleanly in the arm-R spike run).
+        rig_sfm = _rig_sfm_command(
+            colmap4=availability["glomap_path"],
+            ffmpeg=availability["ffmpeg_path"],
+            job_dir=job_dir,
+            processed_dir=processed_dir,
+            process_input=process_input,
+            num_frames_target=req.num_frames_target,
+        )
+        process_cmd = [
+            availability["ns_process_data_path"],
+            "images",
+            "--data",
+            str(job_dir / "rig" / "images"),
+            "--output-dir",
+            str(processed_dir),
+            "--skip-colmap",
+            "--colmap-model-path",
+            os.path.relpath(job_dir / "rig" / "sparse" / "0", processed_dir),
+            "--num-downscales",
+            "3",
+        ]
+        return {"rig_sfm": rig_sfm, "process": process_cmd}
+
     if solver == "glomap":
         # COLMAP 4.x global SfM: we drive feature_extractor + sequential
         # matching + global_mapper ourselves into <job_dir>/colmap/sparse/0,
@@ -2071,6 +2175,11 @@ def _plan_3d_job(
         start_solver = req.sfm_backend
         avail_key = SFM_SOLVER_AVAILABILITY.get(start_solver)
         if avail_key is not None and not availability.get(avail_key):
+            start_solver = "colmap"
+        # Rig SfM renders virtual views from the stitched SPHERE — meaningless for
+        # flat captures, and v1 only implements the video input path. A rig request
+        # outside that falls back silently (same convention as unavailable-glomap).
+        if start_solver == "rig" and (not is_equirect or subcommand != "video"):
             start_solver = "colmap"
 
         # InstantSplat "Few Photos (AI poses)": override to the dense-seed MASt3R rung.
