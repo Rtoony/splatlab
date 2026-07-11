@@ -806,3 +806,7 @@ UNCERTAIN (draft 7k iters; real 30k + floater cleanup expected to improve).
   drift only; health has its own plan-guard tests). Suite 199/199.
 - LIVE PROOF: splat_f4c9416afb dispatched with NO sfm_backend → planner routed it
   to rig_sfm (meta shows requested colmap default + rig_sfm planned).
+- CONFIRMED 13:23: splat_f4c9416afb (default path, auto-routed) COMPLETED all 8
+  stages, ~11.5 min — health 0/4 fog cams, median shell **0.014** (vs 0.997
+  baseline / 0.555 first rig run), spread 8.96, 2 healthy cams. Best 360 result
+  in the program; one cam short of formal HEALTHY. Grading datapoint for RToony.
