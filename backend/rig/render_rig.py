@@ -126,7 +126,11 @@ def main() -> None:
     # rig_config.json for `colmap rig_configurator` (doc/rigs.rst schema).
     # cam_from_rig = cam_from_pano @ pano_from_ref (ref = view 0), zero translation.
     cameras = []
-    params = f"{focal},{img_w / 2},{img_h / 2}"
+    # camera_params MUST be a JSON array of doubles — colmap's rig-config parser
+    # iterates the node's children (rig.cc ReadRigConfig); a comma string parses
+    # to an EMPTY params vector and poisons every camera row in the database
+    # (matcher aborts in ReadCameraRow). Cost one live flight to learn.
+    params = [float(focal), img_w / 2.0, img_h / 2.0]
     for k, rot in enumerate(rotations):
         cam = {"image_prefix": f"pano_camera{k}/",
                "camera_model_name": "SIMPLE_PINHOLE",
