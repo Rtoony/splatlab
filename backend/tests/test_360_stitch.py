@@ -70,6 +70,10 @@ GOLDEN_STANDARD_VIDEO_PLAN = {
 def _plan(req: splat_route.SplatTrainRequest, input_path: str, monkeypatch: pytest.MonkeyPatch,
           probe: dict | None = None):
     monkeypatch.setattr(splat_route, "_splat_transform_path", lambda: None)
+    # Keep the goldens focused on SfM/stitch plan drift: the report-only health
+    # stage (Capture Coach, 2026-07-11) is machine-dependent (langfield-spike
+    # toolchain) and has its own plan-guard tests in test_health_stage_bookkeeping.
+    monkeypatch.setattr(splat_route, "_health_available", lambda: False)
     if probe is not None:
         monkeypatch.setattr(splat_route, "_tool_path", lambda binary, env: f"/bin/{binary}")
         monkeypatch.setattr(splat_route, "_probe_video_streams", lambda ffprobe, src: probe)

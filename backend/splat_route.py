@@ -247,7 +247,10 @@ NS_SEQUENTIAL_DEFAULT_OVERLAP = 10
 # SfM rungs that understand the equirect fan-out. MASt3R is deliberately
 # excluded: it is a perspective-pairwise matcher — pointing it at hundreds of
 # reprojected crops is the wrong tool (wrong scene graph, O(n^2) pairs).
-EQUIRECT_CAPABLE_SOLVERS = {"colmap", "glomap"}
+EQUIRECT_CAPABLE_SOLVERS = {"colmap", "glomap", "rig"}
+# Solvers that ONLY make sense on equirect captures (rig renders virtual views
+# from the stitched sphere) — escalation skips them for flat captures.
+EQUIRECT_ONLY_SOLVERS = {"rig"}
 # AUTO-FALLBACK solver escalation. When the A1 registration gate trips on a
 # video/image-folder capture, the pipeline climbs this chain automatically
 # (zero clicks) instead of failing: it reroutes to the NEXT solver after the
@@ -262,7 +265,11 @@ EQUIRECT_CAPABLE_SOLVERS = {"colmap", "glomap"}
 # To add a rung later: append its name here AND add a branch in
 # _sfm_stage_commands + an availability key in SFM_SOLVER_AVAILABILITY. Nothing
 # in the escalation loop hardcodes the number of rungs.
-SFM_ESCALATION = ["colmap", "glomap", "mast3r"]
+#   - "rig": rig-constrained 360 SfM — equirect-only (EQUIRECT_ONLY_SOLVERS);
+#     FIRST in the chain because the unrigged fan-out fog-cocoons every 360
+#     capture (2026-07-11 root cause) — for equirect it is the strongest rung,
+#     and flat captures skip it entirely.
+SFM_ESCALATION = ["rig", "colmap", "glomap", "mast3r"]
 # Per-solver availability key in _engine_availability(). A solver is only a
 # valid escalation target when its key is truthy. "colmap" is always present
 # (validated by _plan_3d_job up front), so it has no gating key.
@@ -1974,6 +1981,8 @@ def _next_sfm_solver(tried: set[str], availability: dict, is_equirect: bool = Fa
             continue
         if is_equirect and candidate not in EQUIRECT_CAPABLE_SOLVERS:
             continue
+        if not is_equirect and candidate in EQUIRECT_ONLY_SOLVERS:
+            continue
         avail_key = SFM_SOLVER_AVAILABILITY.get(candidate)
         if avail_key is not None and not availability.get(avail_key):
             continue
@@ -2181,6 +2190,15 @@ def _plan_3d_job(
         # outside that falls back silently (same convention as unavailable-glomap).
         if start_solver == "rig" and (not is_equirect or subcommand != "video"):
             start_solver = "colmap"
+        # DEFAULT-FLIP (2026-07-11, RToony's go): equirect VIDEO captures start on
+        # the rig lane whenever its toolchain is present — the unrigged fan-out
+        # fog-cocooned every 360 capture ever run (probe-operator-mask/STATUS.md;
+        # live receipts splat_3885b68e54). The A1 gate still escalates through the
+        # legacy rungs if rig under-registers, so the old behavior remains the
+        # fallback, not the default.
+        if (start_solver == "colmap" and is_equirect and subcommand == "video"
+                and availability.get("rig_available")):
+            start_solver = "rig"
 
         # InstantSplat "Few Photos (AI poses)": override to the dense-seed MASt3R rung.
         # A handful of photos won't COLMAP, so there is NO auto-fallback (escalation off);

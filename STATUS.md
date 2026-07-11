@@ -793,3 +793,16 @@ UNCERTAIN (draft 7k iters; real 30k + floater cleanup expected to improve).
 - **Open for default-flip**: RToony grades the live receipts; then candidates =
   full-quality 30k run, person-mask training stage (masks proven, ~30s/720 crops),
   rig-first escalation for equirect. All opt-in until graded.
+
+## DEFAULT-FLIP: 360 captures route to the rig lane (2026-07-11, RToony /goal)
+- The problem: the rig fix only worked if you typed sfm_backend="rig" — a default
+  insv job still took the fog-producing unrigged fan-out.
+- Backend: SFM_ESCALATION = [rig, colmap, glomap, mast3r] with EQUIRECT_ONLY_SOLVERS
+  guard (flat captures never route into rig); _plan_3d_job upgrades default-colmap
+  equirect VIDEO to rig when rig_available; legacy rungs remain the A1-gate fallback.
+- Frontend: flights no longer force glomap when the rig toolchain exists (that
+  override would have bypassed the server flip); glomap kept when rig is missing.
+- Tests: golden-snapshot helper pins _health_available False (goldens = SfM/stitch
+  drift only; health has its own plan-guard tests). Suite 199/199.
+- LIVE PROOF: splat_f4c9416afb dispatched with NO sfm_backend → planner routed it
+  to rig_sfm (meta shows requested colmap default + rig_sfm planned).

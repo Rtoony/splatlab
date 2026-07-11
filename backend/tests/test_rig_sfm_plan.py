@@ -55,5 +55,29 @@ def test_rig_request_model_accepts_backend():
 
 def test_rig_availability_key_registered():
     assert splat_route.SFM_SOLVER_AVAILABILITY["rig"] == "rig_available"
-    # rig must NOT be an auto-escalation rung (opt-in only until default-flip).
-    assert "rig" not in splat_route.SFM_ESCALATION
+    # DEFAULT-FLIP (2026-07-11): rig IS the first escalation rung — but strictly
+    # equirect-only, so flat captures must never route into it.
+    assert splat_route.SFM_ESCALATION[0] == "rig"
+    assert "rig" in splat_route.EQUIRECT_ONLY_SOLVERS
+    assert "rig" in splat_route.EQUIRECT_CAPABLE_SOLVERS
+
+
+def test_next_solver_skips_rig_for_flat_captures():
+    avail = {"rig_available": True, "glomap_available": True, "mast3r_available": False}
+    assert splat_route._next_sfm_solver(set(), avail, is_equirect=False) == "colmap"
+    assert splat_route._next_sfm_solver({"colmap"}, avail, is_equirect=False) == "glomap"
+
+
+def test_next_solver_prefers_rig_for_equirect():
+    avail = {"rig_available": True, "glomap_available": True, "mast3r_available": True}
+    assert splat_route._next_sfm_solver(set(), avail, is_equirect=True) == "rig"
+    # After rig fails, the legacy rungs remain the fallback (mast3r never, per
+    # EQUIRECT_CAPABLE_SOLVERS).
+    assert splat_route._next_sfm_solver({"rig"}, avail, is_equirect=True) == "colmap"
+    assert splat_route._next_sfm_solver({"rig", "colmap"}, avail, is_equirect=True) == "glomap"
+    assert splat_route._next_sfm_solver({"rig", "colmap", "glomap"}, avail, is_equirect=True) is None
+
+
+def test_next_solver_rig_unavailable_falls_through():
+    avail = {"rig_available": False, "glomap_available": True}
+    assert splat_route._next_sfm_solver(set(), avail, is_equirect=True) == "colmap"

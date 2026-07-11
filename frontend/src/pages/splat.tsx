@@ -251,7 +251,10 @@ export default function SplatLabPage() {
       trim_duration_s: flight ? 30 : undefined,
       // glomap-first only when the engine is actually there — otherwise let the
       // server default (colmap + auto-escalation) run; the trim still bounds cost.
-      sfm_backend: flight && glomapAvailable ? "glomap" : undefined,
+      // insv: omit the backend so the server's default-flip resolves to the rig
+      // lane (the old glomap-first flight override would BYPASS it). Only force
+      // glomap when the rig toolchain is missing on this host.
+      sfm_backend: flight && glomapAvailable && !rigAvailable ? "glomap" : undefined,
       language_field: flight ? false : languageField,
       // "Few Photos (AI poses)": dense-seed MASt3R sparse-view path (no COLMAP).
       capture_mode: sparseMode && !input.is_insv ? "sparse" : undefined,
@@ -329,6 +332,7 @@ export default function SplatLabPage() {
     });
   }
   const glomapAvailable = Boolean(status?.engines?.glomap_available);
+  const rigAvailable = Boolean(status?.engines?.rig_available);
 
   return (
     <div className="mx-auto max-w-[1880px] px-4 py-8 sm:px-6 xl:px-10">
