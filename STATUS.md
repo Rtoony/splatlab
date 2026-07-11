@@ -744,3 +744,38 @@ verdict headline (report-only wording), reshoot coaching, per-camera receipt str
 (`SPLAT_HEALTH_ENFORCE_FOG` skipping langfield/mesh) is a later, per-gate, revocable
 opt-in after RToony grades real-run receipts. Next: Phase 1 capture probe, Phase 2
 upload-time Tier-0 heuristics (see the capture-coach plan file).
+
+## 360 FOG ROOT CAUSE + RIG LANE (2026-07-11, Capture Coach spin-off)
+
+**ROOT CAUSE of every insv fog cocoon — pinned by probes, not vibes**
+(full ledger: probe-operator-mask/STATUS.md):
+- Masking arms (seam bands, person masks) moved NOTHING: FOG, shell 1.0.
+- Geometry probes on the SfM output: camera-path bbox 1584 units vs point-cloud 129
+  (12×); same-frame 8-crop camera centers (physically identical) solved median
+  **5.1 units apart** vs true step 0.13 — the unrigged fan-out scatters poses, the
+  trajectory explodes, normalization collapses real geometry to depth ~0.01 = the
+  fog fingerprint. All 3 insv scenes FOG, all 4 pinhole scenes HEALTHY.
+- **Arm R (colmap4 panorama_sfm rig)**: 1080/1080 registered, shell 0.997→0.23,
+  first recognizable insv reconstruction (pool receipts in the arm_R/_health dir).
+
+**Gate v2 (fog_gate.py)**: sky-pitch exemption (cams pitched >+20° up = no parallax,
+near-shell is legal — env HEALTH_FOG_SKY_PITCH_DEG) + mask-aware stats (person-masked
+px are unsupervised, excluded) + default 8 probe cams + pitch in every receipt label.
+**Recalibrated: gate_p0 PASS exit 0** (graded verdicts unchanged; report at
+~/reports/2026-07-11-capture-coach-fog-calibration-v2/). Arm RP under v2: honest
+UNCERTAIN (draft 7k iters; real 30k + floater cleanup expected to improve).
+
+**RIG LANE WIRED, OPT-IN (`sfm_backend="rig"`, equirect video only)**:
+- `backend/rig/render_rig.py` (colmap4 env): sphere → 12 virtual views (4 yaw ×
+  3 pitch, 90°) + per-pixel ownership masks + rig_config.json.
+- `_rig_sfm_command`: ffmpeg STRIDE extract → render_rig → colmap4 feature_extractor
+  (per-folder SIMPLE_PINHOLE + ownership masks, GPU) → **rig_configurator** →
+  sequential_matcher (rig_verification + skip_same_frame + loop_detection) →
+  global_mapper (refine_sensor_from_rig 0, focal/extra fixed) → guards → ns-process-data
+  --skip-colmap. Stage name `rig_sfm` (frontend labels added).
+- NOT in SFM_ESCALATION, NOT default — falls back to colmap silently on non-equirect/
+  non-video/missing toolchain. Default-flip = RToony's call after graded real runs.
+- NEW DEP: pycolmap 4.1.0 pip-installed in colmap4 env (render script needs only
+  cv2/scipy/PIL; pycolmap used by the spike's panorama_sfm arm, kept for parity).
+- Tests: test_rig_sfm_plan.py (+ suite green, 14/14). Live acceptance:
+  splat_ff2b9dd395 dispatched via the pipeline with rig_sfm planned.

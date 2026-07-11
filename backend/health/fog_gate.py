@@ -54,13 +54,20 @@ P50_CLEAN = float(os.environ.get("HEALTH_FOG_P50_CLEAN", "0.1"))       # median 
 ACC_MIN = float(os.environ.get("HEALTH_FOG_ACC_MIN", "0.98"))
 CAM_FRAC = float(os.environ.get("HEALTH_FOG_CAM_FRAC", "0.66"))  # 2/3 majority (4/6 must pass)
 MIN_VALID_PX = 500  # below this a camera sees almost nothing — don't let it vote
+# Gate v2 (360-rig fairness, 2026-07-11): cameras pitched steeply UP stare at
+# featureless sky — zero parallax means gaussians legally sit anywhere, reading
+# as near-shell on a perfectly good scene. Exempt them from the vote. And when
+# the dataset carries per-frame masks (person-masked training), masked pixels
+# are UNSUPERVISED — junk accumulates there without meaning the scene failed —
+# so exclude them from the per-camera statistics.
+SKY_PITCH_DEG = float(os.environ.get("HEALTH_FOG_SKY_PITCH_DEG", "20"))
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("config", type=Path, help="nerfstudio checkpoint config.yml")
     ap.add_argument("out_dir", type=Path, help="artifact dir (e.g. <job_dir>/_health)")
-    ap.add_argument("--cams", type=int, default=6)
+    ap.add_argument("--cams", type=int, default=8)
     ap.add_argument("--max-width", type=int, default=640)
     args = ap.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -72,11 +79,16 @@ def main() -> None:
     scales = torch.exp(m.scales.detach())
     opac = torch.sigmoid(m.opacities.detach()).squeeze(-1)
     sh = torch.cat([m.features_dc.detach()[:, None, :], m.features_rest.detach()], dim=1)
-    cams = pipeline.datamanager.train_dataset.cameras.to(DEV)
+    dataset = pipeline.datamanager.train_dataset
+    cams = dataset.cameras.to(DEV)
     n_cams = int(cams.camera_to_worlds.shape[0])
     k = max(1, min(args.cams, n_cams))
     cam_ids = sorted({round(i * (n_cams - 1) / max(1, k - 1)) for i in range(k)})
-    print(f"[fog-gate] {means.shape[0]} gaussians, {n_cams} cameras, probing {cam_ids}", flush=True)
+    # Per-frame training masks (person-masked scenes): exclude those pixels
+    # from the stats — they are unsupervised, not evidence of fog.
+    mask_files = list(getattr(dataset._dataparser_outputs, "mask_filenames", None) or [])
+    print(f"[fog-gate] {means.shape[0]} gaussians, {n_cams} cameras, probing {cam_ids}"
+          f"{' (masked dataset)' if mask_files else ''}", flush=True)
 
     zeros3 = means.new_zeros(means.shape[0], 3)
     white = torch.ones(3, device=DEV)
@@ -105,16 +117,33 @@ def main() -> None:
         w = min(args.max_width, full_w)
         h = max(1, round(full_h * w / full_w))
 
+        # Camera pitch in the Z-up nerfstudio world: forward = -Z column of c2w.
+        c2w = cams.camera_to_worlds[ci]
+        forward = -c2w[:3, 2]
+        pitch_deg = float(torch.rad2deg(torch.asin(
+            (forward[2] / (forward.norm() + 1e-9)).clamp(-1, 1))))
+
         ed, alpha = render(zeros3, None, "ED", ci, w, h)
         depth = ed[0, ..., 0]
         a = alpha[0, ..., 0]
         valid = a > 0.5
+        supervised = None
+        if mask_files and ci < len(mask_files):
+            m = Image.open(mask_files[ci]).convert("L").resize((w, h), Image.NEAREST)
+            supervised = torch.from_numpy(np.array(m) > 0).to(DEV)
+            valid = valid & supervised
         n_valid = int(valid.sum())
-        acc_mean = float(a.mean())
+        acc_px = a[supervised] if supervised is not None else a
+        acc_mean = float(acc_px.mean()) if acc_px.numel() else 0.0
 
-        row = {"cam": int(ci), "valid_px": n_valid, "acc_mean": round(acc_mean, 4)}
-        if n_valid < MIN_VALID_PX:
-            row.update({"counted": False, "note": "too few opaque pixels to measure"})
+        row = {"cam": int(ci), "valid_px": n_valid, "acc_mean": round(acc_mean, 4),
+               "pitch_deg": round(pitch_deg, 1)}
+        if pitch_deg > SKY_PITCH_DEG:
+            row.update({"counted": False, "note": f"sky-pitch exempt (+{pitch_deg:.0f}° up — "
+                                                  "no parallax there, near-shell is legal"})
+            p5 = p50 = p95 = spread = shell_frac = None
+        elif n_valid < MIN_VALID_PX:
+            row.update({"counted": False, "note": "too few opaque/supervised pixels to measure"})
             p5 = p50 = p95 = spread = shell_frac = None
         else:
             d = depth[valid]
@@ -148,7 +177,7 @@ def main() -> None:
         strip = np.concatenate([rgb, heat], axis=1)
         img = Image.fromarray((strip * 255).astype(np.uint8))
         label = (f"cam {ci} | shell {shell_frac:.0%} | spread {spread:.2f} | p50 {p50:.4f} | acc {acc_mean:.3f}"
-                 if spread is not None else f"cam {ci} | too few opaque pixels")
+                 if spread is not None else f"cam {ci} | {row.get('note', 'not counted')}")
         ImageDraw.Draw(img).text((6, 4), label, fill=(255, 255, 0))
         spread_tag = f"{spread:.1f}" if spread is not None else "na"
         p50_tag = f"{p50:.3f}" if p50 is not None else "na"
@@ -189,6 +218,7 @@ def main() -> None:
             "shell_d": SHELL_D, "shell_frac_fog": SHELL_FRAC_FOG,
             "shell_frac_clean": SHELL_FRAC_CLEAN, "p50_clean": P50_CLEAN,
             "acc_min": ACC_MIN, "cam_frac": CAM_FRAC,
+            "sky_pitch_deg": SKY_PITCH_DEG, "gate_v": 2,
         },
         "receipts": receipts,
     }
