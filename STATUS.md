@@ -704,3 +704,43 @@ pending-grade row. Receipts: ~/reports/2026-07-11-capture-coach-fog-calibration/
 export (kill-switch SPLAT_HEALTH_GATE) + meta["health"] + SceneCard badge +
 CaptureHealthCard; then Phase 1 capture probe, Phase 2 upload heuristics. Enforcement
 stays opt-in-later per gate.
+
+## CAPTURE COACH PHASE 0.5 — health stage WIRED + LIVE, report-only (2026-07-11)
+
+RToony graded the Phase-0 calibration receipts ("receipts check out") → go.
+
+**Backend (splat_route.py)**:
+- [x] Constants + `_health_available()` (runner + langfield-spike python only — NOT
+      `_langfield_available()`, which also demands sam2) + `_append_health_stage()`
+      (kill-switch `SPLAT_HEALTH_GATE=0`; extracted as a helper so the guard is unit-testable).
+- [x] `health` planned right after train/export, before compress/webopt/langfield;
+      generative lane naturally excluded (early-returns before the append).
+- [x] Runner branch cloned from the langfield best-effort contract: whole body wrapped,
+      `_run_locked_stage` under HEAVY_GPU_LOCK (HEALTH_VRAM_MB=4000), verdict from
+      `_health/fog.json` → `_patch_meta(health={"v":1,"fog":{...,"enforced":False}})`,
+      failure = `_record_stage_failure` + continue, provably never flips final_status.
+- [x] Receipt route `GET /jobs/{id}/health/receipt/{name}` (regex-guarded, webp/png).
+
+**Frontend**: contracts.ts `health?` block (all-optional, old scenes deserialize
+unchanged); STAGE_HUMAN/SHORT "Checking capture health"/"Health"; SceneCard verdict
+pill (amber "likely fog" / green "healthy" / gray "unverified") sharing the bottom-right
+corner with the searchable badge; `CaptureHealthCard` under the featured viewer —
+verdict headline (report-only wording), reshoot coaching, per-camera receipt strip.
+
+**Gates + deploy (all receipts real)**:
+- `tools/gates/gate_p05_wiring.sh` → **PASS exit 0**: 7/7 pytest
+  (test_health_stage_bookkeeping.py — non-fatal on failure/exception, meta persisted,
+  plan guard + kill-switch), frontend build OK, live API serves 7 scenes with verdicts,
+  receipt route returns image/webp with bearer auth.
+- Deployed via `splatlab-safe-restart` (no jobs in flight); healthz OK.
+- Backfill `--write-meta` patched all 7 calibration scenes → badges live in gallery.
+- Live traversal proof: Test Flight `splat_7f3d29f3de` (pool clip, 30s trim, glomap)
+  dispatched with `health` in stages_planned after export — verdict lands when it
+  finishes (expected FOG per the Phase-0 finding on the full-clip scene).
+- Gotcha (repeat offender): `python3 - <<'PY'` heredoc CLOBBERS a curl pipe into
+  stdin — fetch inside the script. And never pipe a gate through `| tail` (masks exit).
+
+**Enforcement stays OFF** (`enforced:false` everywhere). The flip
+(`SPLAT_HEALTH_ENFORCE_FOG` skipping langfield/mesh) is a later, per-gate, revocable
+opt-in after RToony grades real-run receipts. Next: Phase 1 capture probe, Phase 2
+upload-time Tier-0 heuristics (see the capture-coach plan file).

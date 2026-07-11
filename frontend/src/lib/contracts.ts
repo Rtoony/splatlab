@@ -63,6 +63,43 @@ export interface SplatJob {
     height?: number;
     images?: number;
   } | null;
+  // Capture-health verdict (report-only fog gate, Capture Coach). Written by the
+  // post-train "health" stage or the backfill CLI; absent on scenes never checked.
+  // enforced stays false until the doctrine flip — the UI must present verdicts
+  // as advisory, never as a hard state.
+  health?: {
+    v: number;
+    fog?: {
+      verdict: "FOG" | "HEALTHY" | "UNCERTAIN";
+      checked_at: string;
+      runtime_s?: number;
+      cameras: {
+        cam: number;
+        counted?: boolean;
+        valid_px?: number;
+        acc_mean?: number;
+        p5?: number;
+        p50?: number;
+        p95?: number;
+        spread?: number;
+        shell_frac?: number;
+        fog?: boolean;
+        healthy?: boolean;
+      }[];
+      summary: {
+        n_cams: number;
+        n_counted: number;
+        n_fog: number;
+        n_healthy: number;
+        median_shell_frac: number | null;
+        median_spread: number | null;
+        median_p50: number | null;
+        median_acc: number | null;
+      };
+      receipts: string[];
+      enforced?: boolean;
+    };
+  } | null;
 }
 
 // Result of a Language Field text query: a server-rendered 3-view relevancy

@@ -144,6 +144,16 @@ LANGFIELD_DIRNAME = "_langfield"          # per-job artifact dir (sibling of _pr
 LANGFIELD_VRAM_MB = 10_000                # SAM2.1 ~5GB + SigLIP2 ~2.3GB + gsplat render
 QUERY_VRAM_MB = 4_000                     # per-query render reserve (lock held ~ms)
 LANGFIELD_WORKER_URL = os.environ.get("SPLAT_LANGFIELD_WORKER_URL", "http://127.0.0.1:3417")
+# ── Capture-health fog gate (report-only, Capture Coach Phase 0.5) ───────────────
+# Post-train reconstruction-health verdict (backend/health/fog_gate.py, calibrated
+# 2026-07-11 vs RToony-graded scenes — tools/gates/gate_p0_fog_calibration.sh).
+# Best-effort stage in the langfield mold: subprocessed into the langfield-spike
+# env, failure never fails the job, verdict lands in meta["health"] REPORT-ONLY
+# (enforcement is a later per-gate opt-in). Kill-switch: SPLAT_HEALTH_GATE=0.
+HEALTH_DIR = Path(__file__).resolve().parent / "health"
+HEALTH_RUNNER = HEALTH_DIR / "run_health.sh"
+HEALTH_DIRNAME = "_health"                # per-job artifact dir (sibling of _langfield)
+HEALTH_VRAM_MB = 4_000                    # checkpoint load + 2 rasterizations at 640px
 KEEP_UNPINNED_COMPLETED = 10
 FAILED_RETENTION_HOURS = 24
 PREVIEW_DIRNAME = "_preview"
@@ -566,6 +576,22 @@ def _langfield_available() -> bool:
     lf_py = os.environ.get("SPLAT_LANGFIELD_PYTHON", "").strip() or str(LANGFIELD_ENV_PYTHON)
     sam_py = os.environ.get("SPLAT_SAM2_PYTHON", "").strip() or str(SAM2_ENV_PYTHON)
     return all(Path(p).is_file() for p in (LANGFIELD_RUNNER, lf_py, sam_py))
+
+
+def _health_available() -> bool:
+    """True iff the fog-gate toolchain is present: the runner + the langfield-spike
+    env python (fog_gate.py renders via nerfstudio+gsplat there). Deliberately NOT
+    _langfield_available() — that also demands the sam2 env, which the gate never uses."""
+    hf_py = os.environ.get("SPLAT_HEALTH_PYTHON", "").strip() or str(LANGFIELD_ENV_PYTHON)
+    return all(Path(p).is_file() for p in (HEALTH_RUNNER, hf_py))
+
+
+def _append_health_stage(stages: list[str]) -> None:
+    """Append the report-only capture-health stage when the toolchain is present
+    and the kill-switch (SPLAT_HEALTH_GATE=0) isn't set. Called exactly once by
+    _plan_3d_job, right after train/export — never by the generative lane."""
+    if _health_available() and os.environ.get("SPLAT_HEALTH_GATE", "").strip() != "0":
+        stages.append("health")
 
 
 _V360_CACHE: bool | None = None
@@ -2111,6 +2137,10 @@ def _plan_3d_job(
         "True",
     ]
     stages.extend(["train", "export"])
+    # Capture-health fog gate: REPORT-ONLY verdict right after export, before the
+    # optional tail (compress/webopt/langfield) — so the verdict exists even when
+    # those are skipped, and a later opt-in enforcement flip can skip them on FOG.
+    _append_health_stage(stages)
     # The export command needs the config.yml path that only exists after
     # training; the runner builds it when the stage starts. The compress
     # stage (best-effort .spz for fast preview) is appended only when the
@@ -2560,6 +2590,41 @@ async def _run_pipeline(job: SplatJob) -> None:
                             _record_stage_failure(job.job_id, "webopt-langweb", f"exit code {rc}")
                 else:
                     job.log_lines.append("[webopt] skipped (tool or .ply unavailable).")
+                completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
+                _patch_meta(job.job_id, stages_completed=[*completed, stage])
+                continue
+            elif stage == "health":
+                # Best-effort capture-health fog gate (REPORT-ONLY, Capture Coach).
+                # Renders depth at 6 training cameras in the langfield-spike env,
+                # writes FOG/HEALTHY/UNCERTAIN + receipt images into _health/, then
+                # meta["health"]. Same never-fail contract as langfield: the whole
+                # body is wrapped; any failure is bookkeeping, never job state.
+                try:
+                    config_path = _find_latest_config(job_dir)
+                    if config_path is None or not _health_available():
+                        job.log_lines.append("[health] skipped (no config or toolchain unavailable).")
+                    else:
+                        hdir = job_dir / HEALTH_DIRNAME
+                        hdir.mkdir(parents=True, exist_ok=True)
+                        command = ["bash", str(HEALTH_RUNNER), str(config_path), str(hdir)]
+                        rc = await _run_locked_stage(job, stage, command, HEALTH_VRAM_MB)
+                        fog_json = hdir / "fog.json"
+                        if rc == 0 and fog_json.is_file():
+                            fog = json.loads(fog_json.read_text())
+                            fog["enforced"] = False  # report-only until the doctrine flip
+                            _patch_meta(job.job_id, health={"v": 1, "fog": fog})
+                            summ = fog.get("summary", {})
+                            job.log_lines.append(
+                                f"[health] verdict: {fog.get('verdict')} — "
+                                f"{summ.get('n_fog')}/{summ.get('n_counted')} cameras read as fog cocoon "
+                                f"(median shell {summ.get('median_shell_frac')}). Report-only."
+                            )
+                        else:
+                            job.log_lines.append("[health] fog gate failed; the splat is unaffected.")
+                            _record_stage_failure(job.job_id, stage, f"exit code {rc}")
+                except Exception as exc:  # noqa: BLE001 — best-effort: never fail the splat
+                    job.log_lines.append(f"[health] skipped (error: {exc}); the splat is unaffected.")
+                    _record_stage_failure(job.job_id, stage, f"error: {exc}")
                 completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
                 _patch_meta(job.job_id, stages_completed=[*completed, stage])
                 continue
@@ -3529,6 +3594,18 @@ async def langfield_heatmap(job_id: str, name: str):
     if not heat.is_file():
         raise HTTPException(status_code=404, detail="heatmap not rendered yet")
     return FileResponse(str(heat), media_type="image/png")
+
+
+@router.get("/jobs/{job_id}/health/receipt/{name}")
+async def health_receipt(job_id: str, name: str):
+    # name is constrained to the fog gate's fog_*.webp/png shape — no path traversal.
+    if not _safe_job_id(job_id) or not re.match(r"^fog_[\w.-]+\.(png|webp)$", name):
+        raise HTTPException(status_code=404, detail="not found")
+    receipt = _job_dir(job_id) / HEALTH_DIRNAME / name
+    if not receipt.is_file():
+        raise HTTPException(status_code=404, detail="receipt not rendered")
+    media = "image/webp" if name.endswith(".webp") else "image/png"
+    return FileResponse(str(receipt), media_type=media)
 
 
 @router.post("/jobs/{job_id}/stop")
