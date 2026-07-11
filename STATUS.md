@@ -659,3 +659,48 @@ dimension-bug fixes below are deferred/already-fixed — see below):
   "Retry with global SfM" button doesn't know if that solver was already exhausted);
   reroute reasons only appear in scrolling logs, not the stage rail; exhaustion
   guidance text is video-flavored regardless of actual capture type (photo vs video).
+
+## CAPTURE COACH PHASE 0 — fog-fingerprint gate + calibration PASSED (2026-07-11)
+
+**Goal**: score reconstruction health so fog scenes stop being discovered after hours
+of GPU spend (the 07-10 root-cause finding, splat-geometry-health-gate memory). Plan:
+~/.claude/plans/lets-brainstorm-my-next-functional-backus.md (Phases 0→2 + earned
+enforcement). REPORT-ONLY per the metric-trust doctrine.
+
+**Shipped (new files only, no server change, no restart)**:
+- [x] `backend/health/fog_gate.py` — langfield-spike env; renders ED depth + RGB at 6
+      spread training cameras (640px downscale); per-cam metrics over opaque px;
+      writes `<job>/_health/fog.json` + side-by-side [RGB|turbo log-depth] receipts.
+      Exit 0 = analysis ran (any verdict); non-zero = execution failure only.
+- [x] `backend/health/run_health.sh` — run_langfield.sh clone minus SAM (env
+      hardening: unset CPATH/LIBRARY_PATH, pin CUDA_HOME). `SPLAT_HEALTH_PYTHON` override.
+- [x] `backend/health/backfill_fog.py` — stdlib CLI; REFUSES while any meta.json is
+      starting/running or GPU free <6GB (--force); --write-meta patches meta["health"]
+      (only safe because of that preflight); writes calibration report + summary.json.
+- [x] `tools/gates/gate_p0_fog_calibration.sh` — executable acceptance gate.
+
+**METRIC CHANGE (calibration finding)**: the raw 07-10 fingerprint (p95/p5 spread < 3)
+failed on the MIXED selfie scene splat_98095cb055 — every camera has p5 pinned at the
+near plane (cocoon contamination) but 3 cams punch through to real structure, inflating
+p95 (spread up to 45 while still junk). Verdict now uses per-camera **shell fraction**
+(share of opaque px with depth ≤ 0.03 = 3× near plane): fog cam = shell ≥ 50% @ acc ≥
+.98; clean cam = shell ≤ 5% AND p50 ≥ 0.1; 2/3 camera majority (CAM_FRAC=0.66 — 0.67
+rejects a legit 4/6). Spread still reported for context. All thresholds HEALTH_FOG_* env.
+
+**GATE PASS (exit 0), full separation on graded scenes** (~4s/scene after JIT warm):
+| scene | graded | verdict |
+| splat_5177f8d99a | FOG (07-10) | FOG 6/6 |
+| splat_98095cb055 | FOG (07-10) | FOG 4/6 (mixed — operator cocoon + real office) |
+| splat_32d926d9 garden | HEALTHY | HEALTHY |
+| kitchen/bonsai/counter | unlabeled | HEALTHY (matches langfield-verified geometry) |
+
+**⚠️ FINDING — pool scene splat_192e4223fb is FOG**: depth pinned at the near plane
+(spread 1.00, p50 0.0100) at ALL cameras; RGB receipt is a structureless smear. Its
+"HEALTHY" label was an ungraded assumption (07-05 acceptance passed on 90% REGISTRATION
+— registration ≠ reconstruction). Gate asserts only RToony-graded scenes; pool is a
+pending-grade row. Receipts: ~/reports/2026-07-11-capture-coach-fog-calibration/index.md.
+
+**Next (gated on RToony's receipt review)**: Phase 0.5 = wire `health` stage after
+export (kill-switch SPLAT_HEALTH_GATE) + meta["health"] + SceneCard badge +
+CaptureHealthCard; then Phase 1 capture probe, Phase 2 upload heuristics. Enforcement
+stays opt-in-later per gate.
