@@ -779,3 +779,17 @@ UNCERTAIN (draft 7k iters; real 30k + floater cleanup expected to improve).
   cv2/scipy/PIL; pycolmap used by the spike's panorama_sfm arm, kept for parity).
 - Tests: test_rig_sfm_plan.py (+ suite green, 14/14). Live acceptance:
   splat_ff2b9dd395 dispatched via the pipeline with rig_sfm planned.
+
+## RIG LANE LIVE ACCEPTANCE — PASS (2026-07-11 10:57)
+- First flight splat_ff2b9dd395 FAILED in sequential_matcher (exit 134): rig-config
+  camera_params was a comma STRING; colmap's parser iterates it as a JSON array →
+  empty params → poisoned camera rows. Fixed b1a594a (array form).
+- Retry **splat_3885b68e54 COMPLETED end-to-end**: stitch → rig_sfm → process → train
+  → export → health → compress → webopt, stages_failed=[], **~11.5 min total** (vs
+  ~14.5 min for the glomap flight — the rig lane is FASTER despite 12 views/frame).
+- Health (gate v2, no person masks, draft 7k): UNCERTAIN — shell 0.555, spread 21.8,
+  4 counted / 4 sky-exempt. Consistent with the spike arms; receipts in the gallery
+  health card for RToony's grading.
+- **Open for default-flip**: RToony grades the live receipts; then candidates =
+  full-quality 30k run, person-mask training stage (masks proven, ~30s/720 crops),
+  rig-first escalation for equirect. All opt-in until graded.
