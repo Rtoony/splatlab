@@ -45,7 +45,9 @@ async def _lifespan(_app: FastAPI):
     with contextlib.suppress(Exception):
         splat_route.migrate_legacy_metas()
     with contextlib.suppress(Exception):
-        splat_route.cleanup_orphan_jobs()
+        # Resume-on-start: auto-restart the newest orphaned in-flight job
+        # (SPLAT_RESUME_ON_START=0 restores the old mark-failed-only behavior).
+        await splat_route.resume_orphan_jobs()
     with contextlib.suppress(Exception):
         feedback.init_db()
     yield

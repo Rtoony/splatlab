@@ -810,3 +810,15 @@ UNCERTAIN (draft 7k iters; real 30k + floater cleanup expected to improve).
   stages, ~11.5 min — health 0/4 fog cams, median shell **0.014** (vs 0.997
   baseline / 0.555 first rig run), spread 8.96, 2 healthy cams. Best 360 result
   in the program; one cam short of formal HEALTHY. Grading datapoint for RToony.
+
+## RESUME-ON-START SHIPPED (2026-07-11 evening, Lane B #1)
+- `resume_orphan_jobs()` replaces mark-failed-only at startup: the NEWEST orphaned
+  in-flight job is re-planned from its persisted meta (every request knob persists in
+  _new_meta) and relaunched under the SAME job_id from stage 1 (stage scripts are
+  self-cleaning). Guards: SPLAT_RESUME_ON_START=0 kill-switch, RESUME_MAX_AGE_HOURS
+  (12, env), RESUME_MAX_RESTARTS=2 crash-loop cap, input-still-exists, one restart
+  only (single-job GPU), any error → honest failed marker (never wedges startup).
+  Older orphans still get the failed marker. restart_count/restarted_at in meta.
+- Tests: test_resume_on_start.py (7 cases). Suite 205/205.
+- ⚠️ NOT YET DEPLOYED — full pool run splat_7c369afbde in flight; deploy via
+  splatlab-safe-restart after it completes.

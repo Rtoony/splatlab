@@ -3020,6 +3020,107 @@ def _prune_old_jobs() -> int:
     return pruned
 
 
+# Resume-on-start: how recent an orphaned job must be to earn an auto-restart
+# (after a long outage the input may be gone / the user has moved on), and how
+# many auto-restarts a single job gets before we stop believing in it (guards
+# against a job that somehow crash-loops the service).
+RESUME_MAX_AGE_HOURS = float(os.environ.get("SPLAT_RESUME_MAX_AGE_H", "12"))
+RESUME_MAX_RESTARTS = 2
+
+
+def _req_from_meta(meta: dict[str, Any]) -> SplatTrainRequest | None:
+    """Rebuild the original training request from persisted meta (every request
+    knob is persisted by _new_meta precisely so re-runs can be exact)."""
+    keys = ("mode", "input_path", "capture_format", "images_per_equirect",
+            "crop_bottom", "num_frames_target", "max_num_iterations", "insv_fov",
+            "sfm_backend", "language_field", "capture_mode", "source_type",
+            "trim_start_s", "trim_duration_s")
+    fields = {k: meta[k] for k in keys if meta.get(k) is not None}
+    try:
+        return SplatTrainRequest(output_dir="outputs/3d", **fields)
+    except Exception:  # noqa: BLE001 — legacy/hand-edited meta: not restartable
+        return None
+
+
+def _restart_job(meta: dict[str, Any], req: SplatTrainRequest) -> None:
+    """Re-plan and relaunch an orphaned job under its ORIGINAL job_id. Stage
+    scripts are self-cleaning (each rm -rfs its own outputs), so restarting from
+    the first stage is safe; prior escalation state is deliberately dropped
+    (worst case a rung is retried). Must run inside a live event loop."""
+    job_id = meta["job_id"]
+    availability = _engine_availability()
+    input_path = _resolve_input_path(req.input_path)
+    job_dir = _job_dir(job_id)
+    stages, commands, sfm_context = _plan_3d_job(req, availability, job_dir, input_path)
+    job = SplatJob(
+        job_id=job_id,
+        output_dir=str(job_dir),
+        input_path=str(input_path),
+        stages_planned=stages,
+        stage_commands=commands,
+        sfm_tried=_seed_sfm_tried(sfm_context, stages),
+        sfm_context=sfm_context,
+        sfm_req=req if sfm_context else None,
+    )
+    fresh = _new_meta(job_id, req, input_path, job_dir, stages)
+    fresh["created_at"] = meta.get("created_at") or fresh["created_at"]
+    fresh["pinned"] = bool(meta.get("pinned"))
+    fresh["restart_count"] = int(meta.get("restart_count") or 0) + 1
+    fresh["restarted_at"] = _utc_now()
+    _write_meta(job_id, fresh)
+    JOBS[job_id] = job
+    job.log_lines.append(
+        "Auto-restarted after a service restart (in-flight work does not survive "
+        "the restart; stages are self-cleaning). Planned stages: " + " -> ".join(stages)
+    )
+    job.runner_task = asyncio.create_task(_run_pipeline(job))
+
+
+async def resume_orphan_jobs() -> int:
+    """On startup, AUTO-RESTART the newest orphaned in-flight job instead of
+    just declaring it dead (the pre-2026-07-11 behavior, kept as the fallback
+    for everything else and behind SPLAT_RESUME_ON_START=0).
+
+    Only the newest orphan restarts — one job runs at a time on the 5090 —
+    and only when it is fresh (RESUME_MAX_AGE_HOURS), below the restart cap,
+    and its input still exists. Every other orphan gets the honest failed
+    marker exactly as before. Any error falls back to mark-failed: resume must
+    never be able to wedge startup."""
+    if os.environ.get("SPLAT_RESUME_ON_START", "").strip() == "0":
+        return 0 if cleanup_orphan_jobs() >= 0 else 0
+    orphans = [m for m in _all_metas() if m.get("status") in ("starting", "running")]
+    orphans.sort(key=lambda m: m.get("started_at") or m.get("created_at") or "", reverse=True)
+    restarted = 0
+    for idx, meta in enumerate(orphans):
+        job_id = meta["job_id"]
+        reason = "splatlab restarted while job was active"
+        if idx == 0 and restarted == 0:
+            req = _req_from_meta(meta)
+            born = meta.get("started_at") or meta.get("created_at")
+            fresh_enough = False
+            with contextlib.suppress(Exception):
+                age_h = (datetime.now(timezone.utc)
+                         - datetime.fromisoformat(born)).total_seconds() / 3600
+                fresh_enough = age_h <= RESUME_MAX_AGE_HOURS
+            if (req is not None and fresh_enough
+                    and int(meta.get("restart_count") or 0) < RESUME_MAX_RESTARTS
+                    and _resolve_input_path(req.input_path).exists()):
+                try:
+                    _restart_job(meta, req)
+                    restarted += 1
+                    continue
+                except Exception as exc:  # noqa: BLE001 — never wedge startup
+                    reason = f"auto-restart after service restart failed ({exc})"
+        _patch_meta(
+            job_id,
+            status="failed",
+            stage=None,
+            error_message=reason,
+            completed_at=_utc_now(),
+        )
+    return restarted
+
+
 def cleanup_orphan_jobs() -> int:
     """On portal start, mark jobs stuck in starting/running as failed.
 
