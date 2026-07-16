@@ -823,6 +823,23 @@ UNCERTAIN (draft 7k iters; real 30k + floater cleanup expected to improve).
 - ⚠️ NOT YET DEPLOYED — full pool run splat_7c369afbde in flight; deploy via
   splatlab-safe-restart after it completes.
 
+## WORKSTATION SAFETY ENVELOPE (2026-07-11 crash follow-up)
+- `splat_7c369afbde` triggered a second abrupt platform reset while its x264
+  stitch used about 12 cores. Telemetry ruled out OOM, thermal, GPU, and storage
+  exhaustion; the load exposed underlying platform instability.
+- The reboot auto-deployed resume-on-start and relaunched the same job. Recovery
+  is now opt-in only: `SPLAT_RESUME_ON_START=1`. Unset, invalid, and `0` values
+  leave interrupted jobs stopped for manual review.
+- `splatlab.service.d/60-safety-guard.conf` confines the full service tree to
+  E-cores 8-15, a four-core average CPU quota, nice 10, low CPU weight,
+  32G/48G memory thresholds, 8G swap, and 512 tasks. This covers stitch, COLMAP,
+  training, export, and every descendant, not just ffmpeg.
+- Raw Insta360 work now defaults to the existing 30-second Test Flight. Full
+  capture builds require a deliberate toggle and staged promotion.
+- The interrupted full run is preserved as failed with stitch complete. It must
+  not be resumed until the hardware gate and bounded flight ladder in
+  `~/reports/splatlab-safe-evaluation-2026-07-11/plan.md` pass.
+
 ## LOCATE-IN-THE-WORLD SHIPPED (2026-07-15, RToony /goal — splatedit.app-inspired)
 Pin any scene to real WGS84 coordinates (feature work only — GPU pause, maintenance
 marker, and Flight A ladder all untouched; endpoints are metadata/CPU-only and

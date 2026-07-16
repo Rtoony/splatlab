@@ -1,0 +1,32 @@
+[Unit]
+Description=SplatLab bounded Flight A transition (%I)
+Documentation=file:///home/rtoony/projects/splatlab/tools/splatlab-flight-a-supervisor.py
+Wants=nexus-secrets-ready.target
+After=nexus-secrets-ready.target network.target
+ConditionPathExists=/home/rtoony/reports/splatlab-safe-evaluation-2026-07-11/acceptance/%I
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/rtoony/projects/splatlab
+ExecStartPre=/bin/rm -f /dev/shm/nexus-env-splatlab-flight-a
+ExecStartPre=/usr/bin/timeout --signal=TERM --kill-after=2s 15s /home/rtoony/bin/nexus-svc-inject splatlab-flight-a "Rtoony Portal" "Infrastructure"
+EnvironmentFile=-/dev/shm/nexus-env-splatlab-flight-a
+ExecStart=/home/rtoony/projects/splatlab/tools/splatlab-flight-a-supervisor.py run --receipt %I --authorize-exact-flight-a
+ExecStopPost=/home/rtoony/projects/splatlab/tools/splatlab-flight-a-supervisor.py recover
+ExecStopPost=/bin/rm -f /dev/shm/nexus-env-splatlab-flight-a
+TimeoutStartSec=2h15min
+TimeoutStopSec=120
+KillMode=control-group
+Slice=splatlab.slice
+CPUAffinity=8-15
+CPUQuota=100%
+MemoryMax=1G
+TasksMax=64
+NoNewPrivileges=yes
+UMask=0077
+Environment=HOME=/home/rtoony
+Environment=PATH=/home/rtoony/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONDONTWRITEBYTECODE=1
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=splatlab-flight-a

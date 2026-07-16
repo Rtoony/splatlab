@@ -121,9 +121,9 @@ export default function SplatLabPage() {
   const [showCustom, setShowCustom] = useState(false);
   // Opt-in: build a text-searchable Language Field alongside the scene.
   const [languageField, setLanguageField] = useState(false);
-  // Opt-in: "Test Flight" — trim a centered window from a big .insv and run the
-  // full pipeline fast (glomap-first, draft iters) to prove capture + settings.
-  const [testFlight, setTestFlight] = useState(false);
+  // Safe default: raw .insv evaluations start as a bounded Test Flight. A full
+  // capture build now requires the operator to deliberately turn this off.
+  const [testFlight, setTestFlight] = useState(true);
   // Opt-in: "Few Photos (AI poses)" — MASt3R dense-seed sparse-view mode (InstantSplat).
   const [sparseMode, setSparseMode] = useState(false);
   // Opt-in: "Imagine a Splat" — TripoSplat single-image generative lane.

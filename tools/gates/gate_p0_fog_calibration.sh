@@ -15,6 +15,11 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
+GATE="$REPO/tools/splatlab-compute-gate.sh"
+if ! "$GATE" --is-contained; then
+  exec "$GATE" --run "$0" "$@"
+fi
+"$GATE" --check || exit $?
 REPORT_DIR="${1:-$HOME/reports/$(date +%F)-capture-coach-fog-calibration}"
 
 python3 "$REPO/backend/health/backfill_fog.py" \

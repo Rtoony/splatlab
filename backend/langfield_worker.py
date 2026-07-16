@@ -11,11 +11,10 @@ import because query_render_v2 runs a full render at module import (it's a
 script); copying the pure functions keeps the result identical with no side
 effects.
 
-GPU SAFETY: the SigLIP text-encode and the per-gaussian cosine relevancy run
-LOCKLESS (cheap, ~no VRAM beyond the resident text encoder). The cross-process
-``gpu_arbiter.HEAVY_GPU_LOCK`` is taken ONLY around the gsplat ``rasterization``
-calls, with ``set_holder("langfield", <scene_id>)`` + ``acquire_gpu(4000)``, so a
-query WAITS behind a training run or a TRELLIS job and never preempts/OOMs them.
+GPU SAFETY: startup, scene loading, SigLIP inference, relevancy computation, and
+gsplat rasterization all run through ``gpu_arbiter.run_sync_gpu_operation``.
+The runner holds the canonical host/Redis lease until synchronous CUDA work has
+actually stopped, including when the requesting coroutine is cancelled.
 
 Run in the ``langfield-spike`` conda env. Stateless across restarts: the scene
 cache rebuilds from ``lfdir`` + ``config`` on demand, and idle-evicts after ~10
@@ -34,15 +33,19 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel
+
 # gpu_arbiter is a sibling module (backend/gpu_arbiter.py). Import it the same way
 # whether we're launched as ``backend.langfield_worker`` (uvicorn from repo root)
 # or as a bare module — so the warm path shares the SAME Redis lock keys as the
 # portal/splat lane.
 try:  # package-relative first (uvicorn backend.langfield_worker:app)
-    from . import gpu_arbiter  # type: ignore
+    from . import gpu_arbiter, maintenance_gate  # type: ignore
 except Exception:  # pragma: no cover - fallback for direct/script execution
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import gpu_arbiter  # type: ignore
+    import maintenance_gate  # type: ignore
 
 log = logging.getLogger("langfield_worker")
 
@@ -102,12 +105,13 @@ VOCAB = [
 VOCAB = list(dict.fromkeys(VOCAB))   # de-dupe (a few words appear in >1 group)
 QW, QH = 640, 480
 THUMB = 224                    # per-match result thumbnail side (square, px)
-QUERY_VRAM_MB = 4000            # headroom we ask acquire_gpu() to guarantee per render
+QUERY_VRAM_MB = 4000            # headroom reserved by the canonical GPU runner
 SCENE_CACHE_MAX = int(os.environ.get("SPLAT_LANGFIELD_SCENE_CACHE", "2"))  # LRU size (1-2)
 IDLE_EVICT_SEC = float(os.environ.get("SPLAT_LANGFIELD_IDLE_SEC", str(10 * 60)))  # ~10 min
 IDLE_CHECK_SEC = 30.0
 PORT = int(os.environ.get("SPLAT_LANGFIELD_WORKER_PORT", "3417"))
 HOST = "127.0.0.1"             # LAN-only
+WORKER_MAINTENANCE_REASON = os.environ.get("SPLAT_TRAINING_DISABLED_REASON", "").strip()
 
 # ── heavy deps are guarded so this file at least PARSES/imports for tooling that
 #    can't load torch/gsplat. The real service (langfield-spike env) gets them. ──
@@ -143,10 +147,6 @@ except Exception as _e:  # pragma: no cover - lets py_compile / ast.parse pass a
     np = torch = F = None  # type: ignore
     eval_setup = get_viewmat = rasterization = None  # type: ignore
     AutoModel = AutoProcessor = cm = Image = None  # type: ignore
-
-from fastapi import FastAPI, HTTPException, Response
-from pydantic import BaseModel
-
 
 # ── relevancy + overlay math — COPIED VERBATIM from query_render_v2.py ────────────
 # These are the only numerical primitives that decide what q_<safe>.png looks like.
@@ -199,9 +199,8 @@ class Scene:
         self.config_path = config_path
         self.lfdir = lfdir
         self.last_used = time.monotonic()
-        # refcount of in-flight queries holding this scene; the idle-evictor must
-        # NOT free a scene that is mid-query (e.g. waiting on HEAVY_GPU_LOCK behind a
-        # long training run, which can exceed IDLE_EVICT_SEC).
+        # Refcount of in-flight queries holding this scene; the idle-evictor must
+        # not free a scene while it waits for the canonical GPU runner.
         self.in_use = 0
 
         config_p = Path(config_path)
@@ -492,7 +491,7 @@ def _scene_inventory(state: "WorkerState", sc: Scene, topn: int = 20) -> list[di
 
 
 def _render_view_overlay(sc: Scene, rel3, ci: int):
-    """LOCKED (caller holds HEAVY_GPU_LOCK): render one camera view as an RGB base with
+    """SERIALIZED: render one camera view as an RGB base with
     the relevancy heatmap composited over it. Overlay math VERBATIM from query_render_v2.
     Returns an HxWx3 uint8 array."""
     turbo = cm.get_cmap("turbo")
@@ -516,7 +515,7 @@ def _render_view_overlay(sc: Scene, rel3, ci: int):
 
 
 def _render_hero_locked(sc: Scene, out_path: Path, long_side: int = 512) -> None:
-    """LOCKED (caller holds HEAVY_GPU_LOCK): render ONE clean RGB hero view (a
+    """SERIALIZED: render ONE clean RGB hero view (a
     representative training camera) as a webp — a real splat image for the gallery
     thumbnail, framed by the scene's own aspect (no heatmap)."""
     ci = sc.n_cams // 2
@@ -566,8 +565,10 @@ def _render_match_thumbs_locked(sc: Scene, rel3, matches: list[dict], text: str)
         if proj is not None:
             u, v, z, fx = proj
             s = float(np.clip(fx * 2.4 * float(m["radius"]) / z, 150.0, float(min(W, H))))
-            x0 = int(np.clip(u - s / 2, 0, W - 1)); x1 = int(np.clip(u + s / 2, 1, W))
-            y0 = int(np.clip(v - s / 2, 0, H - 1)); y1 = int(np.clip(v + s / 2, 1, H))
+            x0 = int(np.clip(u - s / 2, 0, W - 1))
+            x1 = int(np.clip(u + s / 2, 1, W))
+            y0 = int(np.clip(v - s / 2, 0, H - 1))
+            y1 = int(np.clip(v + s / 2, 1, H))
             if x1 - x0 >= 24 and y1 - y0 >= 24:
                 crop = img[y0:y1, x0:x1]
         name = f"q_{safe}.png" if i == 0 else f"q_{safe}_{i}.png"
@@ -666,16 +667,38 @@ class OverrideDeleteReq(BaseModel):
 app = FastAPI(title="Splat Lab Language Field — Warm Query Worker")
 
 
+async def _run_cuda_sync(operation_id: str, func, *args):
+    """Run one synchronous CUDA inference without releasing early on cancellation."""
+    try:
+        return await gpu_arbiter.run_sync_gpu_operation(
+            lane="langfield",
+            operation_id=operation_id,
+            vram_mb=QUERY_VRAM_MB,
+            func=func,
+            args=args,
+        )
+    except gpu_arbiter.GPUArbiterUnavailable as exc:
+        raise HTTPException(503, f"GPU admission failed: {exc}") from exc
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     logging.basicConfig(level=logging.INFO)
+    reason = maintenance_gate.maintenance_reason(WORKER_MAINTENANCE_REASON)
+    if reason:
+        raise RuntimeError(f"LangField worker blocked by hardware maintenance: {reason}")
     if not _HEAVY_OK:
         # Don't crash the process on import-time dep gaps — /healthz will report
         # siglip=false so an operator sees exactly what's wrong.
         log.error("heavy deps unavailable, SigLIP NOT loaded: %s", _HEAVY_ERR)
         return
-    # load SigLIP once, off the event loop (it touches the GPU but is small/lockless)
-    await asyncio.to_thread(STATE.load_siglip)
+    # Startup is CUDA work too: serialize it before making the worker ready.
+    await gpu_arbiter.run_sync_gpu_operation(
+        lane="langfield-startup",
+        operation_id="siglip",
+        vram_mb=QUERY_VRAM_MB,
+        func=STATE.load_siglip,
+    )
     app.state._idle_task = asyncio.create_task(_idle_evictor())
 
 
@@ -733,8 +756,8 @@ async def query(req: QueryReq) -> dict[str, Any]:
         sc.in_use += 1   # pin: the idle-evictor must not free us mid-query
 
     try:
-        # ── render: heavy lock ONLY around the gsplat calls. Views are now chosen
-        #    per-match (best camera for each instance), so req.views is unused. ──
+        # Views are chosen per match (best camera for each instance), so
+        # req.views is unused. Relevancy and rendering share one GPU operation.
         scene_id = Path(req.lfdir).name or req.config
         sc.touch()   # refresh right before the (possibly long) lock wait behind train
         heatmap_name, focus = await _render_locked(sc, req.text, scene_id)
@@ -747,10 +770,9 @@ async def query(req: QueryReq) -> dict[str, Any]:
 
 @app.post("/relevancy")
 async def relevancy(req: RelevancyReq) -> Response:
-    """Raw per-gaussian relevancy for the CLIENT-SIDE heatmap. ENTIRELY LOCKLESS:
-    SigLIP text-encode + cosine relevancy + 3D match clustering only — no gsplat
-    render, no PNG, so it never takes HEAVY_GPU_LOCK (a first-touch scene build
-    still serializes via _build_scene_locked, same as every route). Body = the
+    """Raw per-gaussian relevancy for the client-side heatmap. SigLIP text encode,
+    cosine relevancy, and 3D clustering run as one serialized GPU operation. It
+    performs no gsplat render or PNG write. Body = the
     uint8-quantized [N] vector in EXPORTED-PLY row order when the scene's
     ply->ckpt map exists (langfield_align; ns-export filters gaussians, so raw
     gauss_emb/ckpt order does NOT match the ply), else raw gauss_emb order —
@@ -802,7 +824,10 @@ async def relevancy(req: RelevancyReq) -> Response:
             payload, rmin, rmax = quantize_relevancy(rel_np)
             return payload, rmin, rmax, focus, label_hit
 
-        payload, rmin, rmax, focus, label_hit = await asyncio.to_thread(_compute)
+        scene_id = lf_p.name or req.config
+        payload, rmin, rmax, focus, label_hit = await _run_cuda_sync(
+            f"{scene_id}:relevancy", _compute
+        )
     finally:
         async with STATE.lock:
             sc.in_use -= 1
@@ -847,14 +872,13 @@ async def _release_scene(sc) -> None:
 @app.post("/select_sphere")
 async def select_sphere(req: SelectSphereReq) -> Response:
     """Paint-brush stroke: ply-order rows within `radius` of `center` (viewer
-    frame). LOCKLESS GPU distance test on the resident positions. Body =
+    frame). The GPU distance test uses the canonical runner. Body =
     little-endian uint32 rows; X-Count header."""
     if len(req.center) != 3 or not (0 < req.radius < 100):
         raise HTTPException(400, "center must be [x,y,z]; radius in (0, 100)")
     sc = await _acquire_scene(req.config, req.lfdir)
     try:
         def _compute():
-            import numpy as np
             ply_map = getattr(sc, "ply_map", None)
             if ply_map is None:
                 raise HTTPException(409, "scene has no ply->ckpt map — painting unavailable")
@@ -868,7 +892,8 @@ async def select_sphere(req: SelectSphereReq) -> Response:
             idx = torch.nonzero(d2 <= req.radius * req.radius).squeeze(-1)
             return idx.cpu().numpy().astype("<u4")
 
-        idx = await asyncio.to_thread(_compute)
+        scene_id = Path(req.lfdir).name or req.config
+        idx = await _run_cuda_sync(f"{scene_id}:select-sphere", _compute)
     finally:
         await _release_scene(sc)
     return Response(
@@ -966,7 +991,10 @@ async def inventory(req: InventoryReq) -> dict[str, Any]:
         sc.in_use += 1   # pin against idle-evict while scoring
 
     try:
-        items = await asyncio.to_thread(_scene_inventory, STATE, sc, req.topn)
+        scene_id = lf_p.name or req.config
+        items = await _run_cuda_sync(
+            f"{scene_id}:inventory", _scene_inventory, STATE, sc, req.topn
+        )
     finally:
         async with STATE.lock:
             sc.in_use -= 1
@@ -1007,13 +1035,9 @@ async def hero(req: HeroReq) -> dict[str, Any]:
 
     try:
         scene_id = Path(req.lfdir).name or req.config
-        async with gpu_arbiter.HEAVY_GPU_LOCK:
-            gpu_arbiter.set_holder("langfield", scene_id)
-            try:
-                await gpu_arbiter.acquire_gpu(QUERY_VRAM_MB)
-                await asyncio.to_thread(_render_hero_locked, sc, hero_path)
-            finally:
-                gpu_arbiter.clear_holder()
+        await _run_cuda_sync(
+            f"{scene_id}:hero", _render_hero_locked, sc, hero_path
+        )
     finally:
         async with STATE.lock:
             sc.in_use -= 1
@@ -1022,22 +1046,18 @@ async def hero(req: HeroReq) -> dict[str, Any]:
 
 
 async def _build_scene_locked(config_path: str, lfdir: str, scene_id: str) -> Scene:
-    """Build a Scene with the heavy GPU lock held around the GPU-touching load."""
-    async with gpu_arbiter.HEAVY_GPU_LOCK:
-        gpu_arbiter.set_holder("langfield", scene_id)
+    """Build and compose a Scene as one serialized CUDA operation."""
+    def build() -> Scene:
+        sc = Scene(config_path, lfdir)
+        # Override composition includes SigLIP text encoding and CUDA row writes,
+        # so it must stay inside the same operation as the scene load.
         try:
-            await gpu_arbiter.acquire_gpu(QUERY_VRAM_MB)
-            sc = await asyncio.to_thread(Scene, config_path, lfdir)
-        finally:
-            gpu_arbiter.clear_holder()
-    # Paint overrides compose onto the freshly-loaded field (LOCKLESS: text
-    # encode + row writes, no rasterization). Never fatal — a broken override
-    # file degrades to the base field, not a dead scene.
-    try:
-        await asyncio.to_thread(_apply_paint_overrides, STATE, sc, lfdir)
-    except Exception:
-        log.exception("paint-override apply failed; serving the base field")
-    return sc
+            _apply_paint_overrides(STATE, sc, lfdir)
+        except Exception:
+            log.exception("paint-override apply failed; serving the base field")
+        return sc
+
+    return await _run_cuda_sync(f"{scene_id}:scene-load", build)
 
 
 def _overrides_mod():
@@ -1107,26 +1127,14 @@ async def _invalidate_scene(config_path: str) -> None:
 
 
 async def _render_locked(sc: Scene, text: str, scene_id: str) -> str:
-    """The text-encode + per-gaussian cosine relevancy run LOCKLESS; the heavy GPU
-    lock is taken ONLY around the gsplat rasterizations (the part that contends for
-    VRAM with training/TRELLIS). A query thus WAITS behind a heavy lane and never
-    preempts/OOMs it. Renders one result thumbnail per clustered match (each framed
-    by its best camera); the primary is q_<safe>.png. Returns (primary_name, focus).
-    """
-    # LOCKLESS: SigLIP text-encode + per-gaussian relevancy + the 3D match centroids
-    rel3 = await asyncio.to_thread(_compute_relevancy, STATE, sc, text)
-    focus = await asyncio.to_thread(_relevancy_focus, sc, rel3)
+    """Compute relevancy and render thumbnails as one serialized CUDA operation."""
+    def render():
+        rel3 = _compute_relevancy(STATE, sc, text)
+        focus = _relevancy_focus(sc, rel3)
+        names = _render_match_thumbs_locked(sc, rel3, focus["matches"], text)
+        return names[0], focus
 
-    # LOCKED: gsplat render + overlay composite (per-match thumbnails)
-    async with gpu_arbiter.HEAVY_GPU_LOCK:
-        gpu_arbiter.set_holder("langfield", scene_id)
-        try:
-            await gpu_arbiter.acquire_gpu(QUERY_VRAM_MB)
-            names = await asyncio.to_thread(
-                _render_match_thumbs_locked, sc, rel3, focus["matches"], text)
-            return names[0], focus   # names[0] == q_<safe>.png (primary, back-compat)
-        finally:
-            gpu_arbiter.clear_holder()
+    return await _run_cuda_sync(f"{scene_id}:query", render)
 
 
 if __name__ == "__main__":  # pragma: no cover - convenience launcher

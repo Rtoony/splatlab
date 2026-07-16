@@ -45,6 +45,11 @@
 set -euo pipefail
 
 SPLATLAB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GATE="$SPLATLAB_ROOT/tools/splatlab-compute-gate.sh"
+if ! "$GATE" --is-contained; then
+  exec "$GATE" --run "$0" "$@"
+fi
+"$GATE" --check || exit $?
 SRC_INSV="${1:-$HOME/transfers/splatlab/VID_20260514_064632_first90s.insv}"
 OUT="$SPLATLAB_ROOT/tools/probe-segment-merge-output"
 

@@ -10,9 +10,9 @@ job board, plus a job.log tail flushed on stage transitions. The in-memory
 JOBS dict holds only live handles (process, runner task, log ring buffer) —
 a portal restart keeps every finished job listable and previewable.
 
-GPU: the train stage serialises against TRELLIS inference through
-server/lib/gpu_arbiter.HEAVY_GPU_LOCK and asks the nexus-gpu-orchestrator to
-evict resident services for VRAM headroom before training.
+GPU: every CUDA-capable stage runs through ``gpu_arbiter.run_gpu_operation``.
+That runner holds one host-local flock plus the shared Redis lease for the full
+operation and asks nexus-gpu-orchestrator to reserve VRAM headroom first.
 
 The 4D pipeline is deferred until the 3D path is validated end-to-end.
 """
@@ -42,6 +42,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 import gpu_arbiter
+import maintenance_gate
 from operator_audit import audit_operator_event
 
 log = logging.getLogger(__name__)
@@ -124,6 +125,12 @@ MAX_LOG_LINES = 400
 MAX_SAMPLE_MEDIA = 8
 MAX_LISTED_JOBS = 24
 TRAIN_VRAM_MB = 16_000
+# COLMAP feature extraction/matching, rig/global SfM, and ns-export all invoke
+# CUDA in at least one supported lane. Reserve enough headroom for their measured
+# working sets plus driver/JIT variance instead of treating them as CPU-only.
+PROCESS_VRAM_MB = 8_000
+SFM_VRAM_MB = 8_000
+EXPORT_VRAM_MB = 8_000
 # MASt3R-SfM ViT-Large inference peaks ~3.46 GB measured; reserve headroom so the
 # arbiter frees enough before the heavy step (it serialises against TRELLIS).
 MAST3R_VRAM_MB = 6_000
@@ -169,8 +176,44 @@ KEEP_UNPINNED_COMPLETED = 10
 FAILED_RETENTION_HOURS = 24
 PREVIEW_DIRNAME = "_preview"
 STOP_GRACE_SECONDS = 10
-# Web-viewer splat budget: the shareable /splat/view page loads a lightweight
-# copy (spherical harmonics dropped + decimated to this many splats) so a scene
+# Non-secret operational gate: keep the read-only UI available while explicitly
+# blocking evaluation launches during hardware maintenance.
+TRAINING_DISABLED_REASON = os.environ.get("SPLAT_TRAINING_DISABLED_REASON", "").strip()
+
+
+def require_compute_enabled() -> None:
+    """Reject GPU-capable work while preserving read-only SplatLab routes."""
+    reason = maintenance_gate.maintenance_reason(TRAINING_DISABLED_REASON)
+    if reason:
+        raise HTTPException(
+            status_code=409,
+            detail=f"SplatLab compute is disabled: {reason}",
+        )
+
+
+def require_heavy_work_admitted() -> None:
+    """Apply maintenance and backup admission to every heavy/mutating route."""
+    require_compute_enabled()
+    backup_busy, backup_unit, backup_state = _backup_interlock_busy()
+    if backup_busy:
+        raise HTTPException(
+            status_code=409,
+            detail=_backup_interlock_detail(backup_unit, backup_state),
+        )
+
+# A backup and a SplatLab pipeline must never compete for workstation resources.
+# Scope is explicit because core is a system unit while the other local backups
+# are user units; state checks also cover jobs that do not yet take the flock.
+BACKUP_INTERLOCK_UNITS = (
+    ("system", "restic-backup-core.service"),
+    ("user", "restic-tier0-offsite.service"),
+    ("user", "restic-tier0-offsite-cold.service"),
+    ("user", "nexus-backup.service"),
+    ("user", "backup-docker-services.service"),
+    ("user", "vaultwarden-backup.service"),
+    ("user", "vm300-databases-backup.service"),
+)
+BACKUP_INTERLOCK_BUSY_STATES = {"activating", "active", "reloading", "deactivating", "unknown"}
 # that exports at hundreds of MB streams in ~12x smaller and orbits smoothly on
 # a laptop. Best-effort: if it can't be made, the viewer falls back to the raw .ply.
 WEB_DECIMATE_TARGET = 1_200_000
@@ -374,6 +417,14 @@ class SplatJob:
 
 JOBS: dict[str, SplatJob] = {}
 JOBS_LOCK = asyncio.Lock()
+_PREVIEW_EXPORT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _preview_export_lock(job_id: str) -> asyncio.Lock:
+    lock = _PREVIEW_EXPORT_LOCKS.get(job_id)
+    if lock is None:
+        lock = _PREVIEW_EXPORT_LOCKS[job_id] = asyncio.Lock()
+    return lock
 
 
 def _utc_now() -> str:
@@ -1646,11 +1697,8 @@ def _mast3r_sfm_command(
          ns-process-data call: the converter output IS the finished dataset, so
          the downstream `train` stage consumes processed_dir unchanged.
 
-    GPU NOTE (reviewer flag): like the colmap/glomap process stages, the MASt3R
-    ViT inference here runs OUTSIDE gpu_arbiter.HEAVY_GPU_LOCK — only the `train`
-    stage takes that lock. This matches existing SfM-stage behavior; the run is
-    short and modest (~3.46GB peak VRAM measured), but it is NOT serialised
-    against TRELLIS inference. Consistent with colmap/glomap, flagged for review.
+    GPU NOTE: the pipeline dispatcher runs this complete command under the
+    canonical GPU runner, including its ViT inference and conversion steps.
     """
     img_dir = _mast3r_image_dir(job_dir)
     run_out = job_dir / "mast3r" / "out"
@@ -2306,6 +2354,47 @@ async def _consume_stream(job: SplatJob, stream: asyncio.StreamReader | None, la
             job.log_lines.append(f"[{label}] {text}")
 
 
+async def _terminate_subprocess(process: asyncio.subprocess.Process) -> None:
+    """Stop and reap a subprocess before a cancelled GPU lease can be released."""
+    if process.returncode is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(asyncio.shield(process.wait()), timeout=STOP_GRACE_SECONDS)
+        return
+    except asyncio.TimeoutError:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    await asyncio.shield(process.wait())
+
+
+async def _run_capture_subprocess(command: list[str]) -> tuple[int, bytes, bytes]:
+    """Run a captured command and guarantee cancellation cannot orphan it."""
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=str(SPLAT_ROOT),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=_subprocess_env(),
+        start_new_session=True,
+    )
+    communicate_task = asyncio.create_task(process.communicate())
+    try:
+        stdout, stderr = await asyncio.shield(communicate_task)
+    except asyncio.CancelledError:
+        await _terminate_subprocess(process)
+        with contextlib.suppress(asyncio.CancelledError):
+            await communicate_task
+        raise
+    return process.returncode if process.returncode is not None else -1, stdout, stderr
+
+
 async def _run_stage(job: SplatJob, stage: str, command: list[str]) -> int:
     _patch_meta(job.job_id, stage=stage, command=command)
     job.log_lines.append(f"[{stage}] $ {' '.join(command)}")
@@ -2324,8 +2413,16 @@ async def _run_stage(job: SplatJob, stage: str, command: list[str]) -> int:
 
     stdout_task = asyncio.create_task(_consume_stream(job, process.stdout, stage))
     stderr_task = asyncio.create_task(_consume_stream(job, process.stderr, f"{stage} stderr"))
-    return_code = await process.wait()
-    await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+    try:
+        return_code = await process.wait()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+    except asyncio.CancelledError:
+        await _terminate_subprocess(process)
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        job.process = None
+        _patch_meta(job.job_id, exit_code=process.returncode)
+        _flush_log(job)
+        raise
 
     job.process = None
     _patch_meta(job.job_id, exit_code=return_code)
@@ -2334,32 +2431,39 @@ async def _run_stage(job: SplatJob, stage: str, command: list[str]) -> int:
 
 
 async def _run_locked_stage(job: SplatJob, stage: str, command: list[str], vram_mb: int) -> int:
-    """Run a heavy-GPU stage under the cross-route lock (gpu_arbiter.HEAVY_GPU_LOCK).
-
-    Used by `train` and the MASt3R-SfM rung. MASt3R loads a 2.6 GB ViT-Large and
-    does dense matching on the GPU (~3.46 GB peak measured), so — unlike the light
-    COLMAP/GLOMAP SfM stages — it MUST serialise against the portal's TRELLIS lane
-    on the shared 5090, or a concurrent TRELLIS run can OOM (or be OOM'd by) it.
-    """
+    """Run one complete CUDA-capable stage through the canonical GPU runner."""
     if gpu_arbiter.HEAVY_GPU_LOCK.locked():
         holder = gpu_arbiter.holder_info()
         job.log_lines.append(
             f"[{stage}] Waiting for GPU — currently held by {holder.get('lane')} job {holder.get('job_id')}."
         )
         _flush_log(job)
-    async with gpu_arbiter.HEAVY_GPU_LOCK:
+    if job.stop_requested:
+        return -1
+
+    def status(detail: str) -> None:
+        job.log_lines.append(f"[{stage}] GPU arbiter: {detail}")
+        _flush_log(job)
+
+    async def operation() -> int:
         if job.stop_requested:
             return -1
-        gpu_arbiter.set_holder("splat", job.job_id)
-        try:
-            ok, msg = await gpu_arbiter.acquire_gpu(vram_mb)
-            job.log_lines.append(f"[{stage}] GPU arbiter: {msg}")
-            if not ok:
-                _patch_meta(job.job_id, error_message=f"GPU acquire failed: {msg}")
-                return -1
-            return await _run_stage(job, stage, command)
-        finally:
-            gpu_arbiter.clear_holder()
+        return await _run_stage(job, stage, command)
+
+    try:
+        return await gpu_arbiter.run_gpu_operation(
+            lane="splat",
+            operation_id=f"{job.job_id}:{stage}",
+            vram_mb=vram_mb,
+            operation=operation,
+            status_callback=status,
+        )
+    except gpu_arbiter.GPUArbiterUnavailable as exc:
+        detail = f"GPU admission failed: {exc}"
+        job.log_lines.append(f"[{stage}] {detail}")
+        _patch_meta(job.job_id, error_message=detail)
+        _flush_log(job)
+        return -1
 
 
 async def _run_train_stage(job: SplatJob, command: list[str]) -> int:
@@ -2384,6 +2488,7 @@ async def _langfield_worker_query(config_path: str, lfdir: str, clean_text: str)
     """Try the warm worker (resident SigLIP + cached scene = sub-second). Returns the
     worker's JSON (incl. the 3D match `focus`/`radius`) on success, else None so the
     caller falls back to the cold path."""
+    require_heavy_work_admitted()
     import httpx
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=1.5)) as client:
@@ -2407,8 +2512,9 @@ async def _langfield_worker_relevancy(config_path: str, lfdir: str, clean_text: 
     binary body + X-* headers). Returns the httpx.Response on HTTP 200, else None.
     WARM-WORKER ONLY — the caller turns None into a 503 (no cold-subprocess fallback:
     this is an interactive client path and the cold path renders nothing useful for it).
-    The generous read timeout covers a first-touch scene build waiting behind a
-    training run on HEAVY_GPU_LOCK; the compute itself is lockless and sub-second."""
+    The generous read timeout covers the worker waiting behind another complete
+    GPU operation; relevancy inference itself is normally sub-second."""
+    require_heavy_work_admitted()
     import httpx
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=1.5)) as client:
@@ -2425,6 +2531,7 @@ async def _langfield_worker_json(path: str, payload: dict):
     """POST a JSON request to the warm worker; returns the httpx.Response or
     None on transport failure (caller maps None -> 503). Worker-side HTTPErrors
     (4xx) pass through so guardrail messages reach the client verbatim."""
+    require_heavy_work_admitted()
     import httpx
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=1.5)) as client:
@@ -2437,6 +2544,7 @@ async def _langfield_worker_inventory(config_path: str, lfdir: str) -> dict | No
     """Ask the warm worker for the scene's top-N object inventory (cached per scene).
     Returns the worker JSON on success, else None (no cold fallback — inventory is a
     warm-worker-only convenience)."""
+    require_heavy_work_admitted()
     import httpx
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=1.5)) as client:
@@ -2460,6 +2568,9 @@ async def ensure_hero_thumb(output_dir: Path) -> Path | None:
     hero = lfdir / "hero.webp"
     if hero.is_file():
         return hero
+    if maintenance_gate.maintenance_reason(TRAINING_DISABLED_REASON):
+        # Thumbnail GET remains available through the existing CPU fallback.
+        return None
     config_path = _find_latest_config(output_dir)
     if config_path is None:
         return None
@@ -2481,22 +2592,22 @@ async def _langfield_query_cold(scene_id: str, config_path: str, lfdir: str, cle
     """Fallback when the worker is down: cold subprocess render under HEAVY_GPU_LOCK
     (loads SigLIP + the pipeline, ~20-40s) so it serialises with train/TRELLIS and can
     never OOM them. The lock releases the moment the render finishes."""
+    require_heavy_work_admitted()
     command = ["bash", str(LANGFIELD_QUERY_RUNNER), config_path, lfdir, clean_text]
-    async with gpu_arbiter.HEAVY_GPU_LOCK:
-        gpu_arbiter.set_holder("langfield", scene_id)
-        try:
-            ok, _msg = await gpu_arbiter.acquire_gpu(QUERY_VRAM_MB)
-            if not ok:
-                return False
-            proc = await asyncio.create_subprocess_exec(
-                *command, cwd=str(SPLAT_ROOT),
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env=_subprocess_env(), start_new_session=True,
-            )
-            await proc.communicate()
-            return proc.returncode == 0
-        finally:
-            gpu_arbiter.clear_holder()
+
+    async def operation() -> bool:
+        return_code, _stdout, _stderr = await _run_capture_subprocess(command)
+        return return_code == 0
+
+    try:
+        return await gpu_arbiter.run_gpu_operation(
+            lane="langfield-cold",
+            operation_id=scene_id,
+            vram_mb=QUERY_VRAM_MB,
+            operation=operation,
+        )
+    except gpu_arbiter.GPUArbiterUnavailable:
+        return False
 
 
 def _maybe_escalate_sfm(
@@ -2598,6 +2709,15 @@ async def _run_pipeline(job: SplatJob) -> None:
         for stage_index, stage in enumerate(job.stages_planned):
             if job.stop_requested:
                 break
+            try:
+                # The marker is read on every iteration, not snapshotted when the
+                # backend imported. Activating maintenance stops the next stage.
+                require_compute_enabled()
+            except HTTPException as exc:
+                final_status = "failed"
+                error_message = f"Stage '{stage}' blocked: {exc.detail}"
+                job.log_lines.append(error_message)
+                break
 
             if stage == "stitch":
                 # The stream layout was probed and classified AT PLAN TIME
@@ -2642,7 +2762,9 @@ async def _run_pipeline(job: SplatJob) -> None:
                     break
                 availability = _engine_availability()
                 command = _export_command(availability["ns_export_path"], config_path, job_dir)
-                return_code = await _run_stage(job, stage, command)
+                return_code = await _run_locked_stage(
+                    job, stage, command, EXPORT_VRAM_MB
+                )
             elif stage == "train":
                 return_code = await _run_train_stage(job, job.stage_commands["train"])
             elif stage == "generate":
@@ -2657,6 +2779,10 @@ async def _run_pipeline(job: SplatJob) -> None:
                 # (The light COLMAP/GLOMAP SfM stages stay lockless via `else`.)
                 return_code = await _run_locked_stage(
                     job, stage, job.stage_commands[stage], MAST3R_VRAM_MB
+                )
+            elif stage in {"rig_sfm", "glomap_sfm"}:
+                return_code = await _run_locked_stage(
+                    job, stage, job.stage_commands[stage], SFM_VRAM_MB
                 )
             elif stage == "compress":
                 # Best-effort: compress the exported .ply into a viewer-native
@@ -2798,7 +2924,9 @@ async def _run_pipeline(job: SplatJob) -> None:
                 # A "reprocess<n>" stage is an auto-fallback solver's process step
                 # (uniquely named so it never collides with the original "process"
                 # on the stage rail); it runs through the exact same gate.
-                return_code = await _run_stage(job, stage, job.stage_commands[stage])
+                return_code = await _run_locked_stage(
+                    job, stage, job.stage_commands[stage], PROCESS_VRAM_MB
+                )
                 if job.stop_requested:
                     break
                 if return_code != 0:
@@ -3042,6 +3170,56 @@ def _req_from_meta(meta: dict[str, Any]) -> SplatTrainRequest | None:
         return None
 
 
+def _backup_interlock_state(scope: str, unit: str) -> str:
+    """Return one workstation backup unit's systemd state.
+
+    Unknown state fails closed: an evaluation can wait, while an unchecked
+    overlap could destabilize the workstation again.
+    """
+    command = ["systemctl"]
+    if scope == "user":
+        command.append("--user")
+    command.extend(("show", unit, "--property=ActiveState", "--value"))
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        log.exception("Could not query %s backup interlock unit %s", scope, unit)
+        return "unknown"
+    state = result.stdout.strip()
+    if result.returncode != 0 or not state:
+        log.error(
+            "Could not query %s backup interlock unit %s (rc=%s)",
+            scope,
+            unit,
+            result.returncode,
+        )
+        return "unknown"
+    return state
+
+
+def _backup_interlock_busy() -> tuple[bool, str, str]:
+    for scope, unit in BACKUP_INTERLOCK_UNITS:
+        state = _backup_interlock_state(scope, unit)
+        if state in BACKUP_INTERLOCK_BUSY_STATES:
+            return True, unit, state
+    return False, "", "inactive"
+
+
+def _backup_interlock_detail(unit: str, state: str) -> str:
+    if state == "unknown":
+        return (
+            f"Backup state for {unit} could not be verified. "
+            "SplatLab is refusing heavy work for workstation safety."
+        )
+    return f"Backup {unit} is {state}. Wait for it to finish before starting a SplatLab evaluation."
+
+
 def _restart_job(meta: dict[str, Any], req: SplatTrainRequest) -> None:
     """Re-plan and relaunch an orphaned job under its ORIGINAL job_id. Stage
     scripts are self-cleaning (each rm -rfs its own outputs), so restarting from
@@ -3077,17 +3255,51 @@ def _restart_job(meta: dict[str, Any], req: SplatTrainRequest) -> None:
 
 
 async def resume_orphan_jobs() -> int:
-    """On startup, AUTO-RESTART the newest orphaned in-flight job instead of
-    just declaring it dead (the pre-2026-07-11 behavior, kept as the fallback
-    for everything else and behind SPLAT_RESUME_ON_START=0).
+    """On startup, optionally restart the newest orphaned in-flight job.
+
+    Recovery is deliberately opt-in with SPLAT_RESUME_ON_START=1. A service
+    restart must not silently reapply a heavy workstation workload; the safe
+    default marks interrupted jobs failed so an operator can inspect and rerun
+    them deliberately.
 
     Only the newest orphan restarts — one job runs at a time on the 5090 —
     and only when it is fresh (RESUME_MAX_AGE_HOURS), below the restart cap,
     and its input still exists. Every other orphan gets the honest failed
     marker exactly as before. Any error falls back to mark-failed: resume must
     never be able to wedge startup."""
-    if os.environ.get("SPLAT_RESUME_ON_START", "").strip() == "0":
-        return 0 if cleanup_orphan_jobs() >= 0 else 0
+    if os.environ.get("SPLAT_RESUME_ON_START", "").strip() != "1":
+        cleanup_orphan_jobs()
+        return 0
+    maintenance_reason = maintenance_gate.maintenance_reason(TRAINING_DISABLED_REASON)
+    if maintenance_reason:
+        for meta in _all_metas():
+            if meta.get("status") in ("starting", "running"):
+                _patch_meta(
+                    meta["job_id"],
+                    status="failed",
+                    stage=None,
+                    error_message=(
+                        "SplatLab restarted while the job was active; automatic recovery "
+                        f"was blocked by the hardware maintenance gate: {maintenance_reason}"
+                    ),
+                    completed_at=_utc_now(),
+                )
+        return 0
+    backup_busy, backup_unit, backup_state = _backup_interlock_busy()
+    if backup_busy:
+        for meta in _all_metas():
+            if meta.get("status") in ("starting", "running"):
+                _patch_meta(
+                    meta["job_id"],
+                    status="failed",
+                    stage=None,
+                    error_message=(
+                        "SplatLab restarted while the job was active; automatic recovery was blocked "
+                        f"because backup {backup_unit} was {backup_state}"
+                    ),
+                    completed_at=_utc_now(),
+                )
+        return 0
     orphans = [m for m in _all_metas() if m.get("status") in ("starting", "running")]
     orphans.sort(key=lambda m: m.get("started_at") or m.get("created_at") or "", reverse=True)
     restarted = 0
@@ -3343,11 +3555,17 @@ async def upload_splat_input(file: UploadFile):
 
 @router.post("/train")
 async def start_splat_training(request: Request, req: SplatTrainRequest):
+    require_heavy_work_admitted()
+
     if req.mode == "4d":
         raise HTTPException(
             status_code=501,
             detail="The 4D pipeline is deferred while the 3D path is rebuilt. Its engine deps are not installed yet.",
         )
+
+    backup_busy, backup_unit, backup_state = _backup_interlock_busy()
+    if backup_busy:
+        raise HTTPException(status_code=409, detail=_backup_interlock_detail(backup_unit, backup_state))
 
     availability = _engine_availability()
     input_path = _resolve_input_path(req.input_path)
@@ -3403,6 +3621,12 @@ async def start_splat_training(request: Request, req: SplatTrainRequest):
             )
         job_dir.mkdir(parents=True, exist_ok=True)
         _write_meta(job_id, _new_meta(job_id, req, input_path, job_dir, stages))
+        # The starting meta is the reservation seen by restic's guard. Recheck
+        # after publishing it so either start order has exactly one winner.
+        backup_busy, backup_unit, backup_state = _backup_interlock_busy()
+        if backup_busy:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(status_code=409, detail=_backup_interlock_detail(backup_unit, backup_state))
         JOBS[job_id] = job
         # Drop live handles for finished jobs; their state lives in meta.json.
         for jid in [j for j, item in JOBS.items() if item.runner_task and item.runner_task.done()]:
@@ -3426,6 +3650,7 @@ async def start_splat_training(request: Request, req: SplatTrainRequest):
 
 @router.post("/jobs/{job_id}/preview")
 async def generate_splat_preview(request: Request, job_id: str):
+    require_heavy_work_admitted()
     if not _safe_job_id(job_id):
         raise HTTPException(status_code=404, detail="Splat job not found")
     availability = _engine_availability()
@@ -3446,33 +3671,60 @@ async def generate_splat_preview(request: Request, job_id: str):
     preview_dir.mkdir(parents=True, exist_ok=True)
     preview_file = _preview_file_path(output_dir)
 
+    export_lock = _preview_export_lock(job_id)
+    if export_lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail=f"A preview export is already running for {job_id}.",
+        )
+    await export_lock.acquire()
     command = _export_command(availability["ns_export_path"], config_path, output_dir)
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        cwd=str(SPLAT_ROOT),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_subprocess_env(),
-        start_new_session=True,
-    )
-    stdout, stderr = await process.communicate()
-    if process.returncode != 0 or not preview_file.is_file():
-        tail = "\n".join((stderr.decode("utf-8", errors="replace")).splitlines()[-10:])
-        raise HTTPException(status_code=500, detail=f"Preview export failed (exit {process.returncode}): {tail}")
+    try:
+        require_heavy_work_admitted()
+        exported = False
 
-    await audit_operator_event(
-        request=request,
-        title="Exported Splat preview",
-        description=f"{Path(meta['input_path']).name} -> {preview_file}",
-        variant="success",
-        action="splat.preview",
-        target=meta.get("mode", "3d"),
-        metadata={"job_id": job_id, "preview_file": str(preview_file)},
-    )
+        async def operation() -> tuple[int, bytes, bytes]:
+            nonlocal exported
+            # A different process may have completed this same request while we
+            # waited for the host GPU lease. Treat preview generation as idempotent.
+            if preview_file.is_file():
+                return 0, b"", b""
+            exported = True
+            return await _run_capture_subprocess(command)
+
+        try:
+            return_code, _stdout, stderr = await gpu_arbiter.run_gpu_operation(
+                lane="splat-preview",
+                operation_id=job_id,
+                vram_mb=EXPORT_VRAM_MB,
+                operation=operation,
+            )
+        except gpu_arbiter.GPUArbiterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"Preview export blocked: {exc}") from exc
+        if return_code != 0 or not preview_file.is_file():
+            tail = "\n".join((stderr.decode("utf-8", errors="replace")).splitlines()[-10:])
+            raise HTTPException(
+                status_code=500,
+                detail=f"Preview export failed (exit {return_code}): {tail}",
+            )
+    finally:
+        export_lock.release()
+
+    if exported:
+        await audit_operator_event(
+            request=request,
+            title="Exported Splat preview",
+            description=f"{Path(meta['input_path']).name} -> {preview_file}",
+            variant="success",
+            action="splat.preview",
+            target=meta.get("mode", "3d"),
+            metadata={"job_id": job_id, "preview_file": str(preview_file)},
+        )
     return {
         "job_id": job_id,
         "preview_file_path": str(preview_file),
         "preview_file_url": f"/api/splat/jobs/{job_id}/preview/file",
+        "cached": not exported,
     }
 
 
@@ -3624,6 +3876,7 @@ async def langfield_query(job_id: str, payload: dict[str, Any]):
     """Text-search a built language field -> a server-rendered relevancy heatmap.
     Prefers the warm worker (sub-second); falls back to a cold subprocess under the
     GPU lock. 404 if this scene has no built field. (Auth via the router mount.)"""
+    require_heavy_work_admitted()
     if not _safe_job_id(job_id):
         raise HTTPException(status_code=404, detail="Splat job not found")
     raw = str(payload.get("text", "")).strip()
@@ -3668,6 +3921,7 @@ async def langfield_relevancy(job_id: str, payload: dict[str, Any]):
     WARM-WORKER ONLY: no PNG render, no GPU lock — a down worker is a fast 503,
     never the ~30s cold-subprocess fallback (this is an interactive path).
     (Auth via the router mount.)"""
+    require_heavy_work_admitted()
     if not _safe_job_id(job_id):
         raise HTTPException(status_code=404, detail="Splat job not found")
     raw = str(payload.get("text", "")).strip()
@@ -3699,6 +3953,7 @@ async def langfield_relevancy(job_id: str, payload: dict[str, Any]):
 def _langfield_paint_context(job_id: str) -> tuple[str, str]:
     """Shared resolution + guards for the paint endpoints: returns
     (config_path, lfdir) or raises. Same checks as /relevancy."""
+    require_heavy_work_admitted()
     if not _safe_job_id(job_id):
         raise HTTPException(status_code=404, detail="Splat job not found")
     job_dir = _job_dir(job_id)
@@ -3797,6 +4052,7 @@ async def langfield_inventory(job_id: str):
     """Top-N objects auto-detected in this scene (open-vocab), for the toggle-to-highlight
     legend. Warm-worker only + cached per scene; 404 if no field, 503 if the worker is
     down (the UI just hides the legend). (Auth via the router mount.)"""
+    require_heavy_work_admitted()
     if not _safe_job_id(job_id):
         raise HTTPException(status_code=404, detail="Splat job not found")
     job_dir = _job_dir(job_id)

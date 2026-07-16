@@ -8,6 +8,11 @@ CONFIG="$1"      # nerfstudio checkpoint config.yml
 LFDIR="$2"       # <job_dir>/_langfield (has gauss_emb.npz)
 TEXT="$3"        # the natural-language query
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATE="$(cd "$HERE/../.." && pwd)/tools/splatlab-compute-gate.sh"
+if ! "$GATE" --is-contained; then
+  exec "$GATE" --run "$0" "$@"
+fi
+"$GATE" --check || exit $?
 LF_PY="${SPLAT_LANGFIELD_PYTHON:-/home/rtoony/miniconda3/envs/langfield-spike/bin/python}"
 unset CPATH LIBRARY_PATH || true
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"

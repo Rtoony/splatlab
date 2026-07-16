@@ -803,3 +803,260 @@ def test_concurrent_applies_second_gets_409(
     assert statuses == [200, 409], (r1.text, r2.text)
     loser = r1 if r1.status_code == 409 else r2
     assert "edit is already in progress" in loser.json()["detail"]
+
+
+def test_cpu_apply_holds_one_host_lease_through_complete_transaction(
+    outputs_root: Path,
+    client: TestClient,
+    stub_transform: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = "splat_dddd0001"
+    _make_job(outputs_root, job_id)
+    lease_active = False
+    calls = {"host": 0, "gpu": 0}
+
+    async def host_runner(*, operation):
+        nonlocal lease_active
+        calls["host"] += 1
+        lease_active = True
+        try:
+            return await operation()
+        finally:
+            lease_active = False
+
+    async def gpu_runner(**_kwargs):
+        calls["gpu"] += 1
+        pytest.fail("CPU apply must not request a GPU transaction")
+
+    original_snapshot = edit_ops._snapshot_preview
+    original_execute = edit_ops._execute_splat_transform
+    original_regen = edit_ops._regen_derived_artifacts
+    original_invalidate = edit_ops._invalidate_previews
+
+    def snapshot(*args, **kwargs):
+        assert lease_active is True
+        return original_snapshot(*args, **kwargs)
+
+    async def execute(argv):
+        assert lease_active is True
+        return await original_execute(argv)
+
+    async def regen(job_dir, *, coordinated=False):
+        assert lease_active is True
+        assert coordinated is True
+        return await original_regen(job_dir, coordinated=coordinated)
+
+    def invalidate(job_dir):
+        assert lease_active is True
+        return original_invalidate(job_dir)
+
+    monkeypatch.setattr(edit_ops.gpu_arbiter, "run_host_operation", host_runner)
+    monkeypatch.setattr(edit_ops.gpu_arbiter, "run_gpu_operation", gpu_runner)
+    monkeypatch.setattr(edit_ops, "_snapshot_preview", snapshot)
+    monkeypatch.setattr(edit_ops, "_execute_splat_transform", execute)
+    monkeypatch.setattr(edit_ops, "_regen_derived_artifacts", regen)
+    monkeypatch.setattr(edit_ops, "_invalidate_previews", invalidate)
+
+    response = client.post(f"/api/splat/jobs/{job_id}/edit/apply", json=_TRANSLATE_OPS)
+    assert response.status_code == 200, response.text
+    assert calls == {"host": 1, "gpu": 0}
+    assert lease_active is False
+
+
+def test_gpu_apply_uses_one_outer_gpu_transaction_without_nested_host_runner(
+    outputs_root: Path,
+    client: TestClient,
+    stub_transform: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = "splat_dddd0002"
+    _make_job(outputs_root, job_id)
+    calls = {"host": 0, "gpu": 0}
+
+    async def host_runner(**_kwargs):
+        calls["host"] += 1
+        pytest.fail("GPU apply must not nest a host transaction")
+
+    async def gpu_runner(**kwargs):
+        calls["gpu"] += 1
+        return await kwargs["operation"]()
+
+    monkeypatch.setattr(edit_ops.gpu_arbiter, "run_host_operation", host_runner)
+    monkeypatch.setattr(edit_ops.gpu_arbiter, "run_gpu_operation", gpu_runner)
+    response = client.post(
+        f"/api/splat/jobs/{job_id}/edit/apply",
+        json={"ops": [{"type": "filter_floaters"}]},
+    )
+
+    assert response.status_code == 200, response.text
+    assert calls == {"host": 0, "gpu": 1}
+
+
+def test_revert_copy_and_replace_are_inside_host_transaction(
+    outputs_root: Path,
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = "splat_dddd0003"
+    job_dir = _make_job(outputs_root, job_id)
+    edit_ops._snapshot_preview(job_dir, op="apply", params={})
+    (job_dir / "_preview" / "splat.ply").write_bytes(b"changed")
+    lease_active = False
+    calls = 0
+
+    async def host_runner(*, operation):
+        nonlocal calls, lease_active
+        calls += 1
+        lease_active = True
+        try:
+            return await operation()
+        finally:
+            lease_active = False
+
+    original_copy = edit_ops.shutil.copy2
+
+    def copy2(src, dst):
+        assert lease_active is True
+        return original_copy(src, dst)
+
+    monkeypatch.setattr(edit_ops.gpu_arbiter, "run_host_operation", host_runner)
+    monkeypatch.setattr(edit_ops.shutil, "copy2", copy2)
+    response = client.post(f"/api/splat/jobs/{job_id}/edit/revert", json={"version": 1})
+
+    assert response.status_code == 200, response.text
+    assert calls == 1
+    assert lease_active is False
+
+
+def test_semantic_scores_before_host_lease_then_mutates_inside_it(
+    outputs_root: Path,
+    client: TestClient,
+    stub_transform: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = "splat_dddd0004"
+    job_dir = _make_job(outputs_root, job_id)
+    ply = job_dir / "_preview" / "splat.ply"
+    _write_ply(ply, ["x", "y", "z"], [[float(i), 0.0, 0.0] for i in range(3)])
+    lf = job_dir / "_langfield"
+    lf.mkdir()
+    (lf / "gauss_emb.npz").write_bytes(b"stub")
+    (job_dir / "config.yml").write_text("stub: true\n")
+    lease_active = False
+
+    async def has_endpoint() -> bool:
+        return True
+
+    async def post_scores(*_args) -> httpx.Response:
+        assert lease_active is False
+        return httpx.Response(
+            200,
+            content=bytes([0, 255, 255]),
+            headers={"X-Count": "3", "X-Min": "0", "X-Max": "1"},
+        )
+
+    async def host_runner(*, operation):
+        nonlocal lease_active
+        lease_active = True
+        try:
+            return await operation()
+        finally:
+            lease_active = False
+
+    original_rewrite = edit_ops._rewrite_ply_masked
+
+    def rewrite(*args, **kwargs):
+        assert lease_active is True
+        return original_rewrite(*args, **kwargs)
+
+    monkeypatch.setattr(edit_ops, "_worker_has_relevancy_endpoint", has_endpoint)
+    monkeypatch.setattr(edit_ops, "_post_worker_relevancy", post_scores)
+    monkeypatch.setattr(edit_ops.gpu_arbiter, "run_host_operation", host_runner)
+    monkeypatch.setattr(edit_ops, "_rewrite_ply_masked", rewrite)
+    response = client.post(
+        f"/api/splat/jobs/{job_id}/edit/semantic",
+        json={"text": "chair", "threshold": 0.5, "mode": "delete", "cleanup": False},
+    )
+
+    assert response.status_code == 200, response.text
+    assert lease_active is False
+
+
+def test_semantic_refuses_source_replacement_during_worker_scoring(
+    outputs_root: Path,
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = "splat_dddd0007"
+    job_dir = _make_job(outputs_root, job_id)
+    ply = job_dir / "_preview" / "splat.ply"
+    rows = [[float(i), 0.0, 0.0] for i in range(3)]
+    _write_ply(ply, ["x", "y", "z"], rows)
+    lf = job_dir / "_langfield"
+    lf.mkdir()
+    (lf / "gauss_emb.npz").write_bytes(b"stub")
+    (job_dir / "config.yml").write_text("stub: true\n")
+
+    async def has_endpoint() -> bool:
+        return True
+
+    async def replace_during_scoring(*_args) -> httpx.Response:
+        replacement = ply.with_name("replacement.ply")
+        _write_ply(replacement, ["x", "y", "z"], rows)
+        replacement.replace(ply)
+        return httpx.Response(
+            200,
+            content=bytes([0, 255, 255]),
+            headers={"X-Count": "3", "X-Min": "0", "X-Max": "1"},
+        )
+
+    monkeypatch.setattr(edit_ops, "_worker_has_relevancy_endpoint", has_endpoint)
+    monkeypatch.setattr(edit_ops, "_post_worker_relevancy", replace_during_scoring)
+    response = client.post(
+        f"/api/splat/jobs/{job_id}/edit/semantic",
+        json={"text": "chair", "threshold": 0.5, "mode": "delete", "cleanup": False},
+    )
+
+    assert response.status_code == 409
+    assert "scene changed" in response.json()["detail"]
+    assert edit_ops._list_version_dirs(job_dir) == []
+
+
+def test_merge_holds_host_transaction_through_destination_commit(
+    outputs_root: Path,
+    client: TestClient,
+    stub_transform: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = "splat_dddd0005"
+    second = "splat_dddd0006"
+    _make_job(outputs_root, first)
+    _make_job(outputs_root, second)
+    lease_active = False
+    calls = 0
+    original_meta = edit_ops._write_derived_meta
+
+    async def host_runner(*, operation):
+        nonlocal calls, lease_active
+        calls += 1
+        lease_active = True
+        try:
+            return await operation()
+        finally:
+            lease_active = False
+
+    def write_meta(*args, **kwargs):
+        assert lease_active is True
+        return original_meta(*args, **kwargs)
+
+    monkeypatch.setattr(edit_ops.gpu_arbiter, "run_host_operation", host_runner)
+    monkeypatch.setattr(edit_ops, "_write_derived_meta", write_meta)
+    response = client.post(
+        "/api/splat/edit/merge",
+        json={"job_ids": [first, second], "name": "merged"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert calls == 1
+    assert lease_active is False

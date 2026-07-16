@@ -3,6 +3,11 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
+GATE="$REPO/tools/splatlab-compute-gate.sh"
+if ! "$GATE" --is-contained; then
+  exec "$GATE" --run "$0" "$@"
+fi
+"$GATE" --check || exit $?
 export PATH="/home/rtoony/miniconda3/envs/splatops/bin:/home/rtoony/miniconda3/envs/colmap/bin:$PATH"
 export PYTHONUNBUFFERED=1
 export CPATH="/home/rtoony/miniconda3/envs/splatops/targets/x86_64-linux/include"

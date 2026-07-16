@@ -82,6 +82,11 @@ def _edit_tmp_path(target: Path) -> Path:
     return target.with_name(f"{target.name}.{secrets.token_hex(4)}{_EDIT_TMP_SUFFIX}")
 
 
+def _file_identity(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
 # ── per-job edit serialization ─────────────────────────────────────────────────
 # One asyncio.Lock per job_id, held across EVERY mutating endpoint (apply /
 # semantic / revert; merge holds the locks of all its source jobs). Acquisition is
@@ -341,6 +346,7 @@ async def list_versions(job_id: str) -> dict[str, Any]:
 
 @router.post("/jobs/{job_id}/edit/revert")
 async def revert_version(job_id: str, req: RevertRequest, request: Request) -> dict[str, Any]:
+    splat_route.require_heavy_work_admitted()
     meta, job_dir = _require_editable_job(job_id)
     found = _find_version(job_dir, req.version)
     if found is None:
@@ -348,53 +354,49 @@ async def revert_version(job_id: str, req: RevertRequest, request: Request) -> d
     src_dir, _manifest = found
 
     async with _hold_edit_locks([job_id]):
-        # Reverting is itself a destructive overwrite of _preview/ — snapshot first
-        # so revert-of-a-revert works too.
-        snap_dir, _snap_manifest, snap_created = _snapshot_preview(
-            job_dir, op="revert", params={"reverted_to": req.version}
-        )
+        async def transaction() -> list[str]:
+            # Snapshot and every live artifact replacement share one backup lease.
+            snap_dir, _snap_manifest, snap_created = _snapshot_preview(
+                job_dir, op="revert", params={"reverted_to": req.version}
+            )
+            preview_dir = splat_route._preview_dir_path(job_dir)
+            preview_dir.mkdir(parents=True, exist_ok=True)
+            restored: list[str] = []
+            for name in SNAPSHOT_ARTIFACT_NAMES:
+                src = src_dir / name
+                dst = preview_dir / name
+                if src.is_file():
+                    tmp = _edit_tmp_path(dst)
+                    try:
+                        shutil.copy2(src, tmp)
+                        tmp.replace(dst)
+                    except OSError as exc:
+                        tmp.unlink(missing_ok=True)
+                        if name == "splat.ply":
+                            _discard_snapshot(snap_dir, snap_created)
+                            raise HTTPException(
+                                status_code=500,
+                                detail=f"failed to restore splat.ply from v{req.version}: {exc}",
+                            ) from exc
+                        continue
+                    restored.append(name)
+                elif dst.is_file():
+                    with contextlib.suppress(OSError):
+                        dst.unlink()
 
-        preview_dir = splat_route._preview_dir_path(job_dir)
-        preview_dir.mkdir(parents=True, exist_ok=True)
-        restored: list[str] = []
-        for name in SNAPSHOT_ARTIFACT_NAMES:
-            src = src_dir / name
-            dst = preview_dir / name
-            if src.is_file():
-                # Atomic restore: copy to a unique tmp then rename onto the live
-                # file (same pattern as apply) — a crash mid-copy must never leave
-                # a half-written live scene.
-                tmp = _edit_tmp_path(dst)
-                try:
-                    shutil.copy2(src, tmp)
-                    tmp.replace(dst)
-                except OSError as exc:
-                    tmp.unlink(missing_ok=True)
-                    if name == "splat.ply":
-                        # The scene itself didn't restore -> the revert did not
-                        # happen; drop the snapshot this attempt created.
-                        _discard_snapshot(snap_dir, snap_created)
-                        raise HTTPException(
-                            status_code=500,
-                            detail=f"failed to restore splat.ply from v{req.version}: {exc}",
-                        ) from exc
-                    continue  # secondary artifacts stay best-effort
-                restored.append(name)
-            elif dst.is_file():
-                # This artifact didn't exist yet at the reverted-to version (e.g. no
-                # .spz built at that point) — drop today's copy so the viewer doesn't
-                # show a stale newer file next to reverted geometry.
-                try:
-                    dst.unlink()
-                except OSError:
-                    pass
+            _prune_versions(job_dir)
+            _mark_langfield_stale(job_dir)
+            splat_route._patch_meta(job_id, stats=None)
+            return restored
 
-        _prune_versions(job_dir)
-
-        # Geometry may have changed; the language field (if any) no longer matches
-        # row-for-row. Never silently lie about search quality.
-        _mark_langfield_stale(job_dir)
-        splat_route._patch_meta(job_id, stats=None)
+        try:
+            restored = await _run_edit_transaction(
+                needs_gpu=False,
+                lane_id=job_id,
+                operation=transaction,
+            )
+        except gpu_arbiter.GPUArbiterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"revert coordination failed: {exc}") from exc
 
     await audit_operator_event(
         request=request,
@@ -650,38 +652,52 @@ def _ops_change_topology(ops: list[BaseModel]) -> bool:
 
 
 async def _run_splat_transform(argv: list[str], needs_gpu: bool, lane_id: str) -> tuple[int, str]:
-    """Run one splat-transform invocation to completion. GPU voxelization actions
-    (-G/-D) serialize on the shared 5090 exactly like the main pipeline's locked
-    stages (_run_locked_stage); everything else runs lock-free, matching how
-    splat_route's own compress/webopt stages behave today."""
+    """Safely coordinate one standalone splat-transform invocation."""
 
-    async def _exec() -> tuple[int, str]:
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(splat_route.SPLAT_ROOT),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=splat_route._subprocess_env(),
+    splat_route.require_heavy_work_admitted()
+
+    try:
+        return await _run_edit_transaction(
+            needs_gpu=needs_gpu,
+            lane_id=lane_id,
+            operation=lambda: _execute_splat_transform(argv),
         )
-        out, err = await proc.communicate()
-        log = (out.decode("utf-8", "replace") + err.decode("utf-8", "replace")).strip()
-        return proc.returncode if proc.returncode is not None else -1, log
-
-    if not needs_gpu:
-        return await _exec()
-
-    async with gpu_arbiter.HEAVY_GPU_LOCK:
-        gpu_arbiter.set_holder("splat-edit", lane_id)
-        try:
-            ok, msg = await gpu_arbiter.acquire_gpu(EDIT_GPU_VRAM_MB)
-            if not ok:
-                return -1, f"GPU acquire failed: {msg}"
-            return await _exec()
-        finally:
-            gpu_arbiter.clear_holder()
+    except gpu_arbiter.GPUArbiterUnavailable as exc:
+        return -1, f"GPU admission failed: {exc}"
 
 
-async def _regen_compress(job_dir: Path) -> bool:
+async def _execute_splat_transform(argv: list[str]) -> tuple[int, str]:
+    """Raw subprocess execution; caller must already own a transaction lease."""
+    return_code, out, err = await splat_route._run_capture_subprocess(argv)
+    log = (out.decode("utf-8", "replace") + err.decode("utf-8", "replace")).strip()
+    return return_code, log
+
+
+async def _run_edit_transaction(*, needs_gpu: bool, lane_id: str, operation):
+    """Select exactly one outer coordination lease for a complete edit."""
+    if needs_gpu:
+        return await gpu_arbiter.run_gpu_operation(
+            lane="splat-edit",
+            operation_id=lane_id,
+            vram_mb=EDIT_GPU_VRAM_MB,
+            operation=operation,
+        )
+    return await gpu_arbiter.run_host_operation(operation=operation)
+
+
+async def _run_transform_in_transaction(
+    argv: list[str],
+    *,
+    needs_gpu: bool,
+    lane_id: str,
+    coordinated: bool,
+) -> tuple[int, str]:
+    if coordinated:
+        return await _execute_splat_transform(argv)
+    return await _run_splat_transform(argv, needs_gpu, lane_id)
+
+
+async def _regen_compress(job_dir: Path, *, coordinated: bool = False) -> bool:
     """Rebuild the .spz from the CURRENT splat.ply (same command shape as
     splat_route.py's `compress` pipeline stage; unique tmp + replace for atomicity).
     On ANY failure the OLD splat.spz is UNLINKED: splat_route's fmt=spz fallback
@@ -694,7 +710,12 @@ async def _regen_compress(job_dir: Path) -> bool:
         spz.unlink(missing_ok=True)
         return False
     tmp = _edit_tmp_path(spz)
-    rc, _log = await _run_splat_transform([transform, "-w", str(ply), str(tmp)], needs_gpu=False, lane_id="compress")
+    rc, _log = await _run_transform_in_transaction(
+        [transform, "-w", str(ply), str(tmp)],
+        needs_gpu=False,
+        lane_id="compress",
+        coordinated=coordinated,
+    )
     if rc == 0 and tmp.is_file():
         tmp.replace(spz)
         return True
@@ -703,7 +724,7 @@ async def _regen_compress(job_dir: Path) -> bool:
     return False
 
 
-async def _regen_webopt(job_dir: Path) -> bool:
+async def _regen_webopt(job_dir: Path, *, coordinated: bool = False) -> bool:
     """Rebuild the web-viewer .ply (same command shape as splat_route.py's `webopt`
     pipeline stage). On ANY failure the OLD web.ply is UNLINKED so fmt=web really
     does fall back to the raw .ply instead of serving pre-edit geometry."""
@@ -724,7 +745,12 @@ async def _regen_webopt(job_dir: Path) -> bool:
         str(splat_route.WEB_DECIMATE_TARGET),
         str(tmp),
     ]
-    rc, _log = await _run_splat_transform(command, needs_gpu=False, lane_id="webopt")
+    rc, _log = await _run_transform_in_transaction(
+        command,
+        needs_gpu=False,
+        lane_id="webopt",
+        coordinated=coordinated,
+    )
     if rc == 0 and tmp.is_file():
         tmp.replace(web)
         return True
@@ -733,7 +759,7 @@ async def _regen_webopt(job_dir: Path) -> bool:
     return False
 
 
-async def _regen_langweb(job_dir: Path) -> bool:
+async def _regen_langweb(job_dir: Path, *, coordinated: bool = False) -> bool:
     """Rebuild langweb.ply after a geometry edit, mirroring splat_route's
     _langweb_command action flags EXACTLY: --filter-harmonics 0 and NO decimation
     (probe-verified to preserve row order bit-exactly, so langweb row i == splat.ply
@@ -756,7 +782,12 @@ async def _regen_langweb(job_dir: Path) -> bool:
         return False
     tmp = _edit_tmp_path(langweb)
     command = [transform, "-w", str(ply), "--filter-harmonics", "0", str(tmp)]
-    rc, _log = await _run_splat_transform(command, needs_gpu=False, lane_id="langweb")
+    rc, _log = await _run_transform_in_transaction(
+        command,
+        needs_gpu=False,
+        lane_id="langweb",
+        coordinated=coordinated,
+    )
     if rc == 0 and tmp.is_file():
         tmp.replace(langweb)
         return True
@@ -765,22 +796,23 @@ async def _regen_langweb(job_dir: Path) -> bool:
     return False
 
 
-async def _regen_derived_artifacts(job_dir: Path) -> list[str]:
+async def _regen_derived_artifacts(job_dir: Path, *, coordinated: bool = False) -> list[str]:
     """Rebuild every derived preview artifact from the freshly-edited splat.ply and
     return accurate warnings. Each failure UNLINKS its stale artifact (see the
     individual _regen_* docstrings), so the fallbacks the warnings promise are real."""
     warnings: list[str] = []
-    if not await _regen_compress(job_dir):
+    if not await _regen_compress(job_dir, coordinated=coordinated):
         warnings.append("compress (.spz) regeneration failed; stale splat.spz removed (no .spz until a later edit or re-export succeeds)")
-    if not await _regen_webopt(job_dir):
+    if not await _regen_webopt(job_dir, coordinated=coordinated):
         warnings.append("web-optimized preview regeneration failed; stale web.ply removed — viewer falls back to the raw .ply")
-    if not await _regen_langweb(job_dir):
+    if not await _regen_langweb(job_dir, coordinated=coordinated):
         warnings.append("langweb regeneration failed; stale langweb.ply removed — client heatmap falls back to the raw .ply")
     return warnings
 
 
 @router.post("/jobs/{job_id}/edit/apply")
 async def apply_edit_ops(job_id: str, req: ApplyOpsRequest, request: Request) -> dict[str, Any]:
+    splat_route.require_heavy_work_admitted()
     meta, job_dir = _require_editable_job(job_id)
     transform_bin = splat_route._splat_transform_path()
     if not transform_bin:
@@ -791,30 +823,48 @@ async def apply_edit_ops(job_id: str, req: ApplyOpsRequest, request: Request) ->
     changes_topology = _ops_change_topology(req.ops)
 
     async with _hold_edit_locks([job_id]):
-        snap_dir, manifest, snap_created = _snapshot_preview(
-            job_dir, op="apply", params={"ops": [op.model_dump() for op in req.ops]}
-        )
+        async def transaction() -> tuple[dict[str, Any], list[str]]:
+            snap_dir, manifest, snap_created = _snapshot_preview(
+                job_dir, op="apply", params={"ops": [op.model_dump() for op in req.ops]}
+            )
+            tmp_ply = _edit_tmp_path(src_ply)
+            landed = False
+            try:
+                argv = _build_apply_argv(transform_bin, src_ply, list(req.ops), tmp_ply)
+                rc, log = await _execute_splat_transform(argv)
+                if rc != 0:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"splat-transform failed (exit {rc}): {log[-2000:]}",
+                    )
+                if not tmp_ply.is_file():
+                    raise HTTPException(
+                        status_code=500,
+                        detail="splat-transform reported success but produced no output file",
+                    )
+                tmp_ply.replace(src_ply)
+                landed = True
+                _prune_versions(job_dir)
+                warnings = await _regen_derived_artifacts(job_dir, coordinated=True)
+                _invalidate_previews(job_dir)
+                if changes_topology:
+                    _mark_langfield_stale(job_dir)
+                splat_route._patch_meta(job_id, stats=None)
+                return manifest, warnings
+            except BaseException:
+                tmp_ply.unlink(missing_ok=True)
+                if not landed:
+                    _discard_snapshot(snap_dir, snap_created)
+                raise
 
-        tmp_ply = _edit_tmp_path(src_ply)
-        argv = _build_apply_argv(transform_bin, src_ply, list(req.ops), tmp_ply)
-        rc, log = await _run_splat_transform(argv, needs_gpu, job_id)
-        if rc != 0:
-            tmp_ply.unlink(missing_ok=True)
-            _discard_snapshot(snap_dir, snap_created)  # op failed pre-mutation: don't churn the version cap
-            raise HTTPException(status_code=500, detail=f"splat-transform failed (exit {rc}): {log[-2000:]}")
-        if not tmp_ply.is_file():
-            tmp_ply.unlink(missing_ok=True)
-            _discard_snapshot(snap_dir, snap_created)
-            raise HTTPException(status_code=500, detail="splat-transform reported success but produced no output file")
-        tmp_ply.replace(src_ply)
-        _prune_versions(job_dir)  # only AFTER the mutation landed
-
-        warnings = await _regen_derived_artifacts(job_dir)
-
-        _invalidate_previews(job_dir)
-        if changes_topology:
-            _mark_langfield_stale(job_dir)
-        splat_route._patch_meta(job_id, stats=None)
+        try:
+            manifest, warnings = await _run_edit_transaction(
+                needs_gpu=needs_gpu,
+                lane_id=job_id,
+                operation=transaction,
+            )
+        except gpu_arbiter.GPUArbiterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"edit coordination failed: {exc}") from exc
 
     await audit_operator_event(
         request=request,
@@ -1042,7 +1092,12 @@ class SemanticEditRequest(BaseModel):
     cleanup: bool = True
 
 
-async def _chain_floater_cleanup(ply_path: Path, lane_id: str) -> Path:
+async def _chain_floater_cleanup(
+    ply_path: Path,
+    lane_id: str,
+    *,
+    coordinated: bool = False,
+) -> Path:
     """Chain a -G floater cleanup after a row-mask edit (kills boundary halos left
     by the cut). Callers skip this entirely when the request sets cleanup=false.
     Best-effort: on any failure the un-cleaned masked result is kept rather than
@@ -1051,8 +1106,11 @@ async def _chain_floater_cleanup(ply_path: Path, lane_id: str) -> Path:
     if not transform_bin:
         return ply_path
     cleaned = ply_path.with_name(ply_path.name + ".float-clean")
-    rc, _log = await _run_splat_transform(
-        [transform_bin, "-w", str(ply_path), "-G", str(cleaned)], needs_gpu=True, lane_id=lane_id
+    rc, _log = await _run_transform_in_transaction(
+        [transform_bin, "-w", str(ply_path), "-G", str(cleaned)],
+        needs_gpu=True,
+        lane_id=lane_id,
+        coordinated=coordinated,
     )
     if rc == 0 and cleaned.is_file():
         ply_path.unlink(missing_ok=True)
@@ -1063,6 +1121,7 @@ async def _chain_floater_cleanup(ply_path: Path, lane_id: str) -> Path:
 
 @router.post("/jobs/{job_id}/edit/semantic")
 async def semantic_edit(job_id: str, req: SemanticEditRequest, request: Request) -> dict[str, Any]:
+    splat_route.require_heavy_work_admitted()
     meta, job_dir = _require_editable_job(job_id)
     lf_dir = job_dir / splat_route.LANGFIELD_DIRNAME
     gauss_emb = lf_dir / "gauss_emb.npz"
@@ -1094,14 +1153,14 @@ async def semantic_edit(job_id: str, req: SemanticEditRequest, request: Request)
     src_ply = splat_route._preview_file_path(job_dir)
 
     async with _hold_edit_locks([job_id]):
-        # Vertex count + scores are read INSIDE the lock: another edit mutating the
-        # rows mid-flight would silently misalign the mask.
         n = splat_route._ply_vertex_count(src_ply)
         if n is None:
             raise HTTPException(status_code=500, detail="could not read splat.ply vertex count")
-
+        source_identity = _file_identity(src_ply)
+        # The worker acquires the canonical GPU lease itself. Do not hold our host
+        # transaction while waiting or the two processes would deadlock.
         scores = await _worker_relevancy_scores(str(config_path), str(lf_dir), clean_text, n)
-        match_mask = [s >= req.threshold for s in scores]  # True = matches the query
+        match_mask = [s >= req.threshold for s in scores]
         n_matched = sum(match_mask)
         if n_matched == 0:
             raise HTTPException(
@@ -1111,100 +1170,134 @@ async def semantic_edit(job_id: str, req: SemanticEditRequest, request: Request)
 
         keep_mask = match_mask if req.mode in ("isolate", "extract") else [not m for m in match_mask]
 
-        if req.mode in ("delete", "isolate"):
-            snap_dir, manifest, snap_created = _snapshot_preview(
-                job_dir, op="semantic", params={"text": req.text, "threshold": req.threshold, "mode": req.mode}
-            )
-            tmp_masked = _edit_tmp_path(src_ply)
+        async def transaction() -> dict[str, Any]:
+            if _file_identity(src_ply) != source_identity or (lf_dir / "STALE").is_file():
+                raise HTTPException(
+                    status_code=409,
+                    detail="scene changed while semantic relevancy was computed; retry the edit",
+                )
+
+            if req.mode in ("delete", "isolate"):
+                snap_dir, manifest, snap_created = _snapshot_preview(
+                    job_dir,
+                    op="semantic",
+                    params={"text": req.text, "threshold": req.threshold, "mode": req.mode},
+                )
+                tmp_masked = _edit_tmp_path(src_ply)
+                cleaned = tmp_masked
+                landed = False
+                try:
+                    kept = _rewrite_ply_masked(src_ply, tmp_masked, keep_mask)
+                    if req.cleanup:
+                        cleaned = await _chain_floater_cleanup(
+                            tmp_masked,
+                            job_id,
+                            coordinated=True,
+                        )
+                    cleaned.replace(src_ply)
+                    landed = True
+                    _prune_versions(job_dir)
+                    rows_after = splat_route._ply_vertex_count(src_ply)
+                    warnings = await _regen_derived_artifacts(job_dir, coordinated=True)
+                    _invalidate_previews(job_dir)
+                    _mark_langfield_stale(job_dir)
+                    splat_route._patch_meta(job_id, stats=None)
+                    updated_meta = splat_route._read_meta(job_id) or meta
+                    return {
+                        "ok": True,
+                        "mode": req.mode,
+                        "matched": n_matched,
+                        "kept": kept,
+                        "cleanup": req.cleanup,
+                        "rows_before_cleanup": kept,
+                        "rows_after_cleanup": rows_after,
+                        "version_before": manifest["seq"],
+                        "warnings": warnings,
+                        "language_field_stale": True,
+                        "job": splat_route._job_payload(updated_meta),
+                    }
+                except ValueError as exc:
+                    raise HTTPException(status_code=500, detail=f"row-mask rewrite failed: {exc}") from exc
+                finally:
+                    tmp_masked.unlink(missing_ok=True)
+                    if cleaned != tmp_masked:
+                        cleaned.unlink(missing_ok=True)
+                    if not landed:
+                        _discard_snapshot(snap_dir, snap_created)
+
+            new_job_id, new_job_dir = _create_derived_job_dir()
+            committed = False
             try:
+                new_preview = splat_route._preview_dir_path(new_job_dir)
+                new_preview.mkdir(parents=True, exist_ok=True)
+                final_ply = new_preview / "splat.ply"
+                tmp_masked = _edit_tmp_path(final_ply)
                 kept = _rewrite_ply_masked(src_ply, tmp_masked, keep_mask)
-            except ValueError as exc:
-                tmp_masked.unlink(missing_ok=True)
-                _discard_snapshot(snap_dir, snap_created)  # nothing was mutated
-                raise HTTPException(status_code=500, detail=f"row-mask rewrite failed: {exc}") from exc
-            cleaned = await _chain_floater_cleanup(tmp_masked, job_id) if req.cleanup else tmp_masked
-            cleaned.replace(src_ply)
-            _prune_versions(job_dir)  # only AFTER the mutation landed
-            rows_after = splat_route._ply_vertex_count(src_ply)
+                cleaned = tmp_masked
+                if req.cleanup:
+                    cleaned = await _chain_floater_cleanup(
+                        tmp_masked,
+                        new_job_id,
+                        coordinated=True,
+                    )
+                cleaned.replace(final_ply)
+                rows_after = splat_route._ply_vertex_count(final_ply)
+                await _regen_compress(new_job_dir, coordinated=True)
+                await _regen_webopt(new_job_dir, coordinated=True)
+                name = (req.name or f"{req.text} (from {job_id})")[:120]
+                _write_derived_meta(
+                    new_job_id,
+                    new_job_dir,
+                    source_type="extracted",
+                    parents=[job_id],
+                    name=name,
+                    extra={"extract_query": req.text, "extract_threshold": req.threshold},
+                )
+                committed = True
+                return {
+                    "ok": True,
+                    "mode": "extract",
+                    "matched": n_matched,
+                    "kept": kept,
+                    "cleanup": req.cleanup,
+                    "rows_before_cleanup": kept,
+                    "rows_after_cleanup": rows_after,
+                    "new_job_id": new_job_id,
+                    "job": splat_route._job_payload(splat_route._read_meta(new_job_id)),
+                }
+            except HTTPException:
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - convert filesystem/PLY errors
+                raise HTTPException(status_code=500, detail=f"semantic extract failed: {exc}") from exc
+            finally:
+                if not committed:
+                    shutil.rmtree(new_job_dir, ignore_errors=True)
 
-            warnings = await _regen_derived_artifacts(job_dir)
-            _invalidate_previews(job_dir)
-            _mark_langfield_stale(job_dir)
-            splat_route._patch_meta(job_id, stats=None)
-
-            await audit_operator_event(
-                request=request,
-                title="Semantic Splat edit",
-                description=f"{job_id}: {req.mode} '{req.text}'",
-                variant="default",
-                action="splat.edit_semantic",
-                target="3d",
-            )
-            updated_meta = splat_route._read_meta(job_id) or meta
-            return {
-                "ok": True,
-                "mode": req.mode,
-                "matched": n_matched,
-                "kept": kept,
-                "cleanup": req.cleanup,
-                "rows_before_cleanup": kept,
-                "rows_after_cleanup": rows_after,
-                "version_before": manifest["seq"],
-                "warnings": warnings,
-                "language_field_stale": True,
-                "job": splat_route._job_payload(updated_meta),
-            }
-
-        # extract -> brand-new job dir; ORIGINAL job's splat.ply is never touched.
-        new_job_id, new_job_dir = _create_derived_job_dir()
         try:
-            new_preview = splat_route._preview_dir_path(new_job_dir)
-            new_preview.mkdir(parents=True, exist_ok=True)
-            final_ply = new_preview / "splat.ply"
-            tmp_masked = _edit_tmp_path(final_ply)
-            kept = _rewrite_ply_masked(src_ply, tmp_masked, keep_mask)
-            cleaned = await _chain_floater_cleanup(tmp_masked, new_job_id) if req.cleanup else tmp_masked
-            cleaned.replace(final_ply)
-            rows_after = splat_route._ply_vertex_count(final_ply)
-
-            await _regen_compress(new_job_dir)
-            await _regen_webopt(new_job_dir)
-
-            name = (req.name or f"{req.text} (from {job_id})")[:120]
-            _write_derived_meta(
-                new_job_id,
-                new_job_dir,
-                source_type="extracted",
-                parents=[job_id],
-                name=name,
-                extra={"extract_query": req.text, "extract_threshold": req.threshold},
+            result = await _run_edit_transaction(
+                needs_gpu=req.cleanup,
+                lane_id=job_id,
+                operation=transaction,
             )
-        except HTTPException:
-            shutil.rmtree(new_job_dir, ignore_errors=True)  # no orphan half-built job dir
-            raise
-        except Exception as exc:  # noqa: BLE001 - e.g. _rewrite_ply_masked ValueError
-            shutil.rmtree(new_job_dir, ignore_errors=True)
-            raise HTTPException(status_code=500, detail=f"semantic extract failed: {exc}") from exc
+        except gpu_arbiter.GPUArbiterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"semantic edit coordination failed: {exc}") from exc
 
+    extracted = result["mode"] == "extract"
     await audit_operator_event(
         request=request,
-        title="Extracted Splat scene",
-        description=f"{job_id} -> {new_job_id} ('{req.text}')",
-        variant="success",
+        title="Extracted Splat scene" if extracted else "Semantic Splat edit",
+        description=(
+            f"{job_id} -> {result['new_job_id']} ('{req.text}')"
+            if extracted
+            else f"{job_id}: {req.mode} '{req.text}'"
+        ),
+        variant="success" if extracted else "default",
         action="splat.edit_semantic",
         target="3d",
     )
-    return {
-        "ok": True,
-        "mode": "extract",
-        "matched": n_matched,
-        "kept": kept,
-        "cleanup": req.cleanup,
-        "rows_before_cleanup": kept,
-        "rows_after_cleanup": rows_after,
-        "new_job_id": new_job_id,
-        "job": splat_route._job_payload(splat_route._read_meta(new_job_id)),
-    }
+    return result
 
 
 # =============================================================================
@@ -1418,6 +1511,7 @@ def _build_merge_argv(
 
 @router.post("/edit/merge")
 async def merge_scenes(req: MergeRequest, request: Request) -> dict[str, Any]:
+    splat_route.require_heavy_work_admitted()
     transform_bin = splat_route._splat_transform_path()
     if not transform_bin:
         raise HTTPException(status_code=503, detail="splat-transform binary not available on this host")
@@ -1449,28 +1543,59 @@ async def merge_scenes(req: MergeRequest, request: Request) -> dict[str, Any]:
     # Hold EVERY source job's edit lock (409 if any is mid-edit): merging a scene
     # while another endpoint is rewriting its splat.ply would read a torn source.
     async with _hold_edit_locks(list(req.job_ids)):
-        new_job_id, new_job_dir = _create_derived_job_dir()
-        new_preview = splat_route._preview_dir_path(new_job_dir)
-        new_preview.mkdir(parents=True, exist_ok=True)
-        out_ply = new_preview / "splat.ply"
+        async def transaction() -> tuple[str, Path]:
+            new_job_id, new_job_dir = _create_derived_job_dir()
+            committed = False
+            try:
+                # Revalidate after winning the host flock. No source may change
+                # between this point and the merged destination commit.
+                for source_job_id, ply in job_plys:
+                    source_meta = splat_route._read_meta(source_job_id)
+                    if source_meta is None or source_meta.get("status") in {"starting", "running"}:
+                        raise HTTPException(status_code=409, detail=f"job {source_job_id} changed before merge")
+                    if not ply.is_file():
+                        raise HTTPException(status_code=409, detail=f"job {source_job_id} preview disappeared")
 
-        argv = _build_merge_argv(transform_bin, job_plys, transforms, out_ply)
-        rc, log = await _run_splat_transform(argv, needs_gpu=False, lane_id=new_job_id)
-        if rc != 0 or not out_ply.is_file():
-            shutil.rmtree(new_job_dir, ignore_errors=True)
-            raise HTTPException(status_code=500, detail=f"splat-transform merge failed (exit {rc}): {log[-2000:]}")
+                new_preview = splat_route._preview_dir_path(new_job_dir)
+                new_preview.mkdir(parents=True, exist_ok=True)
+                out_ply = new_preview / "splat.ply"
+                argv = _build_merge_argv(transform_bin, job_plys, transforms, out_ply)
+                rc, log = await _execute_splat_transform(argv)
+                if rc != 0 or not out_ply.is_file():
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"splat-transform merge failed (exit {rc}): {log[-2000:]}",
+                    )
 
-        await _regen_compress(new_job_dir)
-        await _regen_webopt(new_job_dir)
+                await _regen_compress(new_job_dir, coordinated=True)
+                await _regen_webopt(new_job_dir, coordinated=True)
+                _write_derived_meta(
+                    new_job_id,
+                    new_job_dir,
+                    source_type="merged",
+                    parents=list(req.job_ids),
+                    name=req.name,
+                    extra={
+                        "merge_transforms": {
+                            key: value.model_dump(exclude_none=True)
+                            for key, value in transforms.items()
+                        }
+                    },
+                )
+                committed = True
+                return new_job_id, new_job_dir
+            finally:
+                if not committed:
+                    shutil.rmtree(new_job_dir, ignore_errors=True)
 
-        _write_derived_meta(
-            new_job_id,
-            new_job_dir,
-            source_type="merged",
-            parents=list(req.job_ids),
-            name=req.name,
-            extra={"merge_transforms": {k: v.model_dump(exclude_none=True) for k, v in transforms.items()}},
-        )
+        try:
+            new_job_id, _new_job_dir = await _run_edit_transaction(
+                needs_gpu=False,
+                lane_id="merge",
+                operation=transaction,
+            )
+        except gpu_arbiter.GPUArbiterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"merge coordination failed: {exc}") from exc
 
     await audit_operator_event(
         request=request,

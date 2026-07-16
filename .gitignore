@@ -8,3 +8,8 @@ frontend/node_modules/
 *.log
 data/
 tools/probe-segment-merge-output/
+# probe-operator-mask capture/mask artifacts (multi-GB, local-only)
+probe-operator-mask/arm_*/
+probe-operator-mask/masks_*/
+probe-operator-mask/out/
+probe-operator-mask/seam_masks/

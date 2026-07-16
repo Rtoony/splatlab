@@ -21,7 +21,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
@@ -46,8 +46,8 @@ async def _lifespan(_app: FastAPI):
     with contextlib.suppress(Exception):
         splat_route.migrate_legacy_metas()
     with contextlib.suppress(Exception):
-        # Resume-on-start: auto-restart the newest orphaned in-flight job
-        # (SPLAT_RESUME_ON_START=0 restores the old mark-failed-only behavior).
+        # Heavy-job recovery is opt-in. Normal starts mark orphans failed so a
+        # reboot cannot silently reapply a workstation-saturating workload.
         await splat_route.resume_orphan_jobs()
     with contextlib.suppress(Exception):
         feedback.init_db()

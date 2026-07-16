@@ -8,6 +8,11 @@ set -euo pipefail
 CONFIG="$1"        # nerfstudio checkpoint config.yml (from the just-trained job)
 LFDIR="$2"         # <job_dir>/_langfield  (gauss_emb.npz lands here)
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATE="$(cd "$HERE/../.." && pwd)/tools/splatlab-compute-gate.sh"
+if ! "$GATE" --is-contained; then
+  exec "$GATE" --run "$0" "$@"
+fi
+"$GATE" --check || exit $?
 LF_PY="${SPLAT_LANGFIELD_PYTHON:-/home/rtoony/miniconda3/envs/langfield-spike/bin/python}"
 SAM_PY="${SPLAT_SAM2_PYTHON:-/home/rtoony/miniconda3/envs/sam2/bin/python}"
 FEAT="$LFDIR/features"

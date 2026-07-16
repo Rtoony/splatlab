@@ -1,0 +1,20 @@
+[Unit]
+Description=Recover an interrupted SplatLab Flight A before normal startup
+Documentation=file:///home/rtoony/projects/splatlab/tools/splatlab-flight-a-supervisor.py
+Before=splatlab.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/rtoony/projects/splatlab/tools/splatlab-flight-a-supervisor.py recover --defer-service-start --allow-active-transition
+TimeoutStartSec=120
+NoNewPrivileges=yes
+UMask=0077
+Environment=HOME=/home/rtoony
+Environment=PATH=/home/rtoony/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONDONTWRITEBYTECODE=1
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=splatlab-flight-a-recovery
+
+[Install]
+WantedBy=default.target

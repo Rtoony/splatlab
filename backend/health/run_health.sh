@@ -7,6 +7,11 @@ CONFIG="$1"        # nerfstudio checkpoint config.yml
 OUTDIR="$2"        # <job_dir>/_health  (fog.json + receipt webps land here)
 shift 2
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATE="$(cd "$HERE/../.." && pwd)/tools/splatlab-compute-gate.sh"
+if ! "$GATE" --is-contained; then
+  exec "$GATE" --run "$0" "$@"
+fi
+"$GATE" --check || exit $?
 HF_PY="${SPLAT_HEALTH_PYTHON:-/home/rtoony/miniconda3/envs/langfield-spike/bin/python}"
 
 # The splatlab backend passes its train-stage env (CPATH/LIBRARY_PATH point at the

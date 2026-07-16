@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATE="$HERE/splatlab-compute-gate.sh"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+# Source the functions without running main so parsing can be tested against a
+# disposable marker without weakening the production marker path.
+source "$GATE"
+unset SPLAT_TRAINING_DISABLED_REASON
+
+if maintenance_reason "$TMP/missing" >/dev/null; then
+    echo "FAIL: absent marker reported maintenance" >&2
+    exit 1
+fi
+check_gate "$TMP/missing"
+
+printf '%s\n' 'SPLAT_TRAINING_DISABLED_REASON="test hardware hold"' > "$TMP/hold.conf"
+[[ "$(maintenance_reason "$TMP/hold.conf")" == "test hardware hold" ]]
+
+set +e
+check_gate "$TMP/hold.conf" >/dev/null 2>&1
+rc=$?
+set -e
+[[ $rc -eq 75 ]] || {
+    echo "FAIL: active marker returned $rc instead of 75" >&2
+    exit 1
+}
+
+printf '%s\n' '# malformed marker still blocks' > "$TMP/malformed.conf"
+[[ "$(maintenance_reason "$TMP/malformed.conf")" == "$DEFAULT_REASON" ]]
+
+ln -s "$TMP/missing-target" "$TMP/dangling.conf"
+[[ "$(maintenance_reason "$TMP/dangling.conf")" == "$DEFAULT_REASON" ]]
+
+SPLAT_TRAINING_DISABLED_REASON="environment hold"
+[[ "$(maintenance_reason "$TMP/missing")" == "environment hold" ]]
+unset SPLAT_TRAINING_DISABLED_REASON
+
+[[ -f "$MAINTENANCE_FILE" ]] || {
+    echo "FAIL: production hardware-maintenance marker is absent" >&2
+    exit 1
+}
+set +e
+"$GATE" --run /usr/bin/touch "$TMP/must-not-exist" >/dev/null 2>&1
+rc=$?
+set -e
+[[ $rc -eq 75 && ! -e "$TMP/must-not-exist" ]] || {
+    echo "FAIL: blocked --run escaped the hardware interlock" >&2
+    exit 1
+}
+
+grep -Fq 'gpu_command_runner.py' "$GATE"
+grep -Fq -- '--vram-mb "$MANUAL_VRAM_MB"' "$GATE"
+
+echo "PASS: SplatLab gate blocks maintenance and routes --run through GPU coordination"

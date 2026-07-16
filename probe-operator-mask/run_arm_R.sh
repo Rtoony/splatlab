@@ -9,6 +9,11 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
+GATE="$REPO/tools/splatlab-compute-gate.sh"
+if ! "$GATE" --is-contained; then
+  exec "$GATE" --run "$0" "$@"
+fi
+"$GATE" --check || exit $?
 SRC=/home/rtoony/projects/splatcli/outputs/3d/splat_7f3d29f3de
 ARM="$HERE/arm_R"
 PANO_PY=/home/rtoony/miniconda3/envs/colmap4/bin/python

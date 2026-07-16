@@ -1,8 +1,9 @@
-"""Resume-on-start: a service restart must AUTO-RESTART the newest orphaned
-in-flight job (stages are self-cleaning) instead of just marking it failed —
-but only when fresh, under the restart cap, with its input still on disk, and
-never more than one (single-job GPU). Everything else keeps the honest failed
-marker. CPU-only: _run_pipeline and planning are monkeypatched."""
+"""Resume-on-start is explicit and bounded.
+
+Normal starts mark interrupted jobs failed. SPLAT_RESUME_ON_START=1 may restart
+only the newest eligible orphan. CPU-only: pipeline work and planning are
+monkeypatched.
+"""
 
 from __future__ import annotations
 
@@ -49,7 +50,9 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(splat_route, "_plan_3d_job",
                         lambda req, availability, job_dir, input_path: (["train"], {"train": ["true"]}, None))
     monkeypatch.setattr(splat_route, "_run_pipeline", fake_pipeline)
-    monkeypatch.delenv("SPLAT_RESUME_ON_START", raising=False)
+    monkeypatch.setattr(splat_route, "_backup_interlock_busy", lambda: (False, "", "inactive"))
+    monkeypatch.setattr(splat_route, "TRAINING_DISABLED_REASON", "")
+    monkeypatch.setenv("SPLAT_RESUME_ON_START", "1")
     return outputs, clip, ran
 
 
@@ -78,15 +81,60 @@ def test_newest_orphan_restarts_older_marked_failed(env):
     assert "restarted while job was active" in older["error_message"]
 
 
-def test_kill_switch_restores_mark_failed_only(env, monkeypatch):
+def test_resume_is_disabled_by_default(env, monkeypatch):
     outputs, clip, ran = env
     _mk_orphan(outputs, "splat_ee000003", input_path=clip)
-    monkeypatch.setenv("SPLAT_RESUME_ON_START", "0")
+    monkeypatch.delenv("SPLAT_RESUME_ON_START", raising=False)
 
     assert asyncio.run(_resume_and_settle()) == 0
     assert ran == []
     meta = json.loads((outputs / "splat_ee000003" / "meta.json").read_text())
     assert meta["status"] == "failed"
+
+
+def test_explicit_zero_keeps_resume_disabled(env, monkeypatch):
+    outputs, clip, ran = env
+    _mk_orphan(outputs, "splat_ee000008", input_path=clip)
+    monkeypatch.setenv("SPLAT_RESUME_ON_START", "0")
+
+    assert asyncio.run(_resume_and_settle()) == 0
+    assert ran == []
+    meta = json.loads((outputs / "splat_ee000008" / "meta.json").read_text())
+    assert meta["status"] == "failed"
+
+
+def test_active_backup_blocks_opt_in_resume(env, monkeypatch):
+    outputs, clip, ran = env
+    _mk_orphan(outputs, "splat_ee000009", input_path=clip)
+    monkeypatch.setattr(
+        splat_route,
+        "_backup_interlock_busy",
+        lambda: (True, "restic-backup-core.service", "active"),
+    )
+
+    assert asyncio.run(_resume_and_settle()) == 0
+    assert ran == []
+    meta = json.loads((outputs / "splat_ee000009" / "meta.json").read_text())
+    assert meta["status"] == "failed"
+    assert "backup restic-backup-core.service was active" in meta["error_message"]
+
+
+def test_hardware_maintenance_gate_blocks_opt_in_resume(env, monkeypatch):
+    outputs, clip, ran = env
+    reason = "Persistent RTX 5090 PCIe AER requires physical remediation."
+    _mk_orphan(outputs, "splat_ee000010", input_path=clip)
+    monkeypatch.setattr(splat_route, "TRAINING_DISABLED_REASON", reason)
+    monkeypatch.setattr(
+        splat_route,
+        "_backup_interlock_busy",
+        lambda: pytest.fail("backup query must not run while training is disabled"),
+    )
+
+    assert asyncio.run(_resume_and_settle()) == 0
+    assert ran == []
+    meta = json.loads((outputs / "splat_ee000010" / "meta.json").read_text())
+    assert meta["status"] == "failed"
+    assert reason in meta["error_message"]
 
 
 def test_restart_cap_prevents_crash_loops(env):
