@@ -822,3 +822,29 @@ UNCERTAIN (draft 7k iters; real 30k + floater cleanup expected to improve).
 - Tests: test_resume_on_start.py (7 cases). Suite 205/205.
 - ⚠️ NOT YET DEPLOYED — full pool run splat_7c369afbde in flight; deploy via
   splatlab-safe-restart after it completes.
+
+## LOCATE-IN-THE-WORLD SHIPPED (2026-07-15, RToony /goal — splatedit.app-inspired)
+Pin any scene to real WGS84 coordinates (feature work only — GPU pause, maintenance
+marker, and Flight A ladder all untouched; endpoints are metadata/CPU-only and
+deliberately NOT behind require_heavy_work_admitted, same policy as /scale).
+- **Backend (b3168ba)**: `geo_route.py` mounted like edit_ops. POST /jobs/{id}/geo →
+  meta["geo"] = {lat, lon, alt_m, heading_deg (bearing of scene +Y), anchor_scene,
+  source, set_at}; {"geo": null} clears. GET geo/suggest = GPS from photo EXIF
+  (Pillow) / video tags (ffprobe ISO6709) / embedded tracks (exiftool -ee), fail-soft.
+  GET geo/footprint[.webp] = transparent top-down plan projection (`geo_footprint.py`,
+  thumb.py-style CPU sampling, cached _preview/footprint.{webp,json}) with exact
+  scene-unit bounds. GET geo/export?fmt=geojson|kml. Scene→ENU transform documented in
+  the module docstring. 21 new tests; suite 313/313.
+- **Frontend (602d594)**: "Locate" header button on /view/:jobId → lazy Leaflet modal
+  (Esri satellite + OSM, Nominatim search, "Use photo GPS", draggable anchor +
+  footprint overlay rotated by heading / scaled by meters_per_unit, opacity). Save
+  writes /geo; /scale only on deliberate adjustment (checkbox guard over an existing
+  calibration). Emerald "located" gallery badge. tsc 23 errors == baseline.
+- **Live receipts (splat_f4c9416afb)**: footprint 541×768 renders the pool deck;
+  heading 405.5→45.5; geo round-trips /status; KML/GeoJSON correct; clear → geo null
+  (no visible state left); unauth 401; suggest [] on the GPS-less pool .insv (23k
+  embedded records, 0 GPS tags — camera GPS was off). Deployed via splatlab-safe-restart
+  (no jobs in flight), healthz token:true.
+- Backlog ideas (NOT started): compass/north arrow in the 3D viewer once located;
+  geo-anchored DXF/LandXML export (ties into the deferred survey-export gap);
+  batch-locate from a GPS-tagged capture at upload time.
