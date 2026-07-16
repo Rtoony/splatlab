@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link, useRoute } from "wouter";
 import { apiRequest, fetchLangfieldInventory, fetchSplatCameras, queryLangfield } from "@/lib/api";
@@ -12,8 +12,11 @@ import type {
 } from "@/lib/contracts";
 import { SplatViewer, type ViewerCameraNodeTarget, type ViewerCameraViewTarget, type ViewerHighlight, type ViewerOverlay } from "@/components/splat-viewer";
 import { Button, Card, Input, SectionLabel } from "@/components/ui";
-import { ArrowLeft, Camera, ChevronDown, ChevronUp, Compass, Crosshair, Download, Eye, EyeOff, Layers, Loader2, Orbit, RotateCcw, Search, SlidersHorizontal, Sparkles, X } from "lucide-react";
+import { ArrowLeft, Camera, ChevronDown, ChevronUp, Compass, Crosshair, Download, Eye, EyeOff, Layers, Loader2, MapPin, Orbit, RotateCcw, Search, SlidersHorizontal, Sparkles, X } from "lucide-react";
 import { SparkSceneViewer } from "@/components/spark-scene-viewer";
+
+// Locate-in-the-world map modal — lazy so Leaflet only ships when opened.
+const GeoLocateModal = lazy(() => import("@/components/geo-locate"));
 
 // Distinct colors handed out to toggled inventory objects (stable per item index).
 const HL_PALETTE = ["#22d3ee", "#f59e0b", "#a78bfa", "#34d399", "#f472b6", "#60a5fa", "#fb7185", "#facc15", "#4ade80", "#c084fc"];
@@ -44,6 +47,7 @@ export default function SplatViewPage() {
   // heatmap + measure/scale tools; the classic viewer keeps overlays/search
   // fly-to until the full 2.4 port. Sticky per browser.
   const [sparkBeta, setSparkBeta] = useState(() => localStorage.getItem("splatlab.sparkBeta") === "1");
+  const [geoOpen, setGeoOpen] = useState(false);
   function toggleSparkBeta() {
     setSparkBeta((v) => {
       localStorage.setItem("splatlab.sparkBeta", v ? "0" : "1");
@@ -211,6 +215,18 @@ export default function SplatViewPage() {
           {job && viewUrl && (
             <Button
               type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setGeoOpen(true)}
+              title={job.geo ? `Located at ${job.geo.lat.toFixed(5)}, ${job.geo.lon.toFixed(5)} — open the map` : "Pin this scene to real-world coordinates on a map"}
+              className={job.geo ? "border-emerald-300/40 text-emerald-200" : ""}
+            >
+              <MapPin className="h-3.5 w-3.5" /> {job.geo ? "Located" : "Locate"}
+            </Button>
+          )}
+          {job && viewUrl && (
+            <Button
+              type="button"
               variant={sparkBeta ? "primary" : "outline"}
               size="sm"
               onClick={toggleSparkBeta}
@@ -364,6 +380,11 @@ export default function SplatViewPage() {
           </>
         )}
       </main>
+      {geoOpen && job && (
+        <Suspense fallback={null}>
+          <GeoLocateModal job={job} onClose={() => setGeoOpen(false)} />
+        </Suspense>
+      )}
     </div>
   );
 }

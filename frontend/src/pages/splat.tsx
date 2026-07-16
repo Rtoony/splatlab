@@ -21,6 +21,7 @@ import {
   Download,
   FolderOpen,
   Loader2,
+  MapPin,
   Orbit,
   Pin,
   RefreshCw,
@@ -1069,6 +1070,14 @@ function SceneCard({
             </span>
           ) : null}
           <span className="absolute bottom-1 right-1 flex items-center gap-1">
+            {job.geo ? (
+              <span
+                title={`Located at ${job.geo.lat.toFixed(5)}, ${job.geo.lon.toFixed(5)} · heading ${job.geo.heading_deg.toFixed(0)}° — open the scene to see it on the map`}
+                className="flex items-center gap-0.5 rounded bg-emerald-400/20 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-200 backdrop-blur-sm"
+              >
+                <MapPin className="h-3 w-3" /> located
+              </span>
+            ) : null}
             <HealthBadge job={job} />
             {job.langfield_available ? (
               <span className="rounded bg-cyan-400/20 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-200 backdrop-blur-sm">

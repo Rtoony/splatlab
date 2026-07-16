@@ -50,6 +50,11 @@ export interface SplatJob {
   // Survey-lane scale calibration: meters per scene unit (nerfstudio scenes are
   // non-metric). Set from the viewer's measure tool; absent/null = uncalibrated.
   meters_per_unit?: number | null;
+  // Locate-in-the-world anchor: pins the scene to real WGS84 coordinates.
+  // heading_deg = compass bearing (deg CW from true north) of the scene's +Y
+  // ground axis; anchor_scene = the scene-unit ground point at (lat, lon).
+  // Set from the map modal; absent/null = not located yet.
+  geo?: SplatGeoAnchor | null;
   // "sparse" when built via "Few Photos (AI poses)" (MASt3R dense-seed) — poses/geometry
   // are partly AI-inferred, so the card badges it as such. Absent/"standard" otherwise.
   capture_mode?: "standard" | "sparse";
@@ -100,6 +105,45 @@ export interface SplatJob {
       enforced?: boolean;
     };
   } | null;
+}
+
+// A scene's real-world anchor (meta["geo"], written by POST /jobs/{id}/geo).
+export interface SplatGeoAnchor {
+  v: number;
+  lat: number;
+  lon: number;
+  alt_m?: number | null;
+  heading_deg: number;
+  anchor_scene?: [number, number] | null;
+  source?: "map" | "exif" | "manual";
+  set_at?: string;
+}
+
+// Bootstrap for the Locate map modal (GET /jobs/{id}/geo/footprint).
+export interface SplatGeoFootprint {
+  job_id: string;
+  available: boolean;
+  reason?: string;
+  url?: string;
+  width?: number;
+  height?: number;
+  x0?: number;
+  x1?: number;
+  y0?: number;
+  y1?: number;
+  units_per_px?: number;
+  center?: [number, number];
+  meters_per_unit?: number | null;
+  geo?: SplatGeoAnchor | null;
+}
+
+// One GPS candidate from the capture source (GET /jobs/{id}/geo/suggest).
+export interface SplatGeoSuggestion {
+  lat: number;
+  lon: number;
+  alt_m?: number | null;
+  source: string;
+  detail: string;
 }
 
 // Result of a Language Field text query: a server-rendered 3-view relevancy
