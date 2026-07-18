@@ -840,6 +840,39 @@ UNCERTAIN (draft 7k iters; real 30k + floater cleanup expected to improve).
   not be resumed until the hardware gate and bounded flight ladder in
   `~/reports/splatlab-safe-evaluation-2026-07-11/plan.md` pass.
 
+## ROBUSTNESS WAVE (2026-07-18, RToony /plan: "hardware acceptance first, then robustness")
+
+Gate: `tools/gates/gate_robustness_wave.sh` — **PASS exit 0** (43 wave tests, full suite
+348, tsc 23-error baseline, build clean). Commits 5a26f54..f6cf297:
+- [x] **Dirty-tree audit landed** (5a26f54 supervised compute-unlock backend/tools,
+      b84f0ac gate-visibility UI) — audit caught + fixed a REAL TDZ render crash
+      (createDisabled referenced startMutation before declaration, splat.tsx:170).
+- [x] **glomap default for photo folders** (2f60824): _plan_3d_job upgrades default-colmap
+      flat image dirs to glomap when colmap4 present (07-17 A/B: 29/29 vs 17/29).
+      Video/equirect/sparse untouched; escalation keeps colmap as fallback rung.
+- [x] **Escalation surfacing** (83f003c): meta gains sfm_start_solver (RESOLVED) +
+      sfm_tried + reroute_count + structured sfm_reroutes; RerouteChips on stage rail +
+      failed card; Retry-with-glomap disabled when already tried; _recapture_guidance()
+      keys exhaustion advice to photo/video/360.
+- [x] **Optional-stage bookkeeping** (4fee640): failed langfield/compress/webopt/health
+      no longer ALSO append to stages_completed (stages_failed is the record; skips
+      unchanged; final_status semantics untouched).
+- [x] **Capture Coach Phase 1** (3d29117): backend/health/probe.py pre-train probe at the
+      A1 gate (pass AND fail paths) — trajectory/cloud bbox ratio (the 07-11 12x
+      fingerprint), map density, orbit/walkthrough shape → meta.health.probe
+      (MERGES with fog; fog patch now merges too). Report-only per doctrine.
+- [x] **Capture Coach Phase 2** (c8badfc): backend/health/precheck.py + POST
+      /api/splat/precheck (NOT compute-gated) — pure-Pillow blur/exposure/static +
+      density advisories at upload; amber advisory panel; Create NEVER disabled.
+- [x] **Polish** (f6cf297): 360 overhead-stick tip on the upload card; insv full runs
+      omit num_frames_target (server §1D′ rule is the single source of truth).
+- **Pre-Flight-A**: MemTest 4-pass ACCEPTED 07-16 16:21 (operator photo clarification);
+  staged `~/scripts/splatlab-preflight-a-run.sh` (dry-run default; --apply stops
+  langfield/sam-video-lab aux units, runs tools/gpu-hardware-acceptance.py with the
+  three boot-bound evidence records + all confirmations, verifies receipt+sidecar).
+  MUST run from a plain terminal (script refuses inside an aipc-safe-run scope).
+  STOP at PASS_PRE_FLIGHT_A — marker stays; Flight A is a separate explicit decision.
+
 ## LOCATE-IN-THE-WORLD SHIPPED (2026-07-15, RToony /goal — splatedit.app-inspired)
 Pin any scene to real WGS84 coordinates (feature work only — GPU pause, maintenance
 marker, and Flight A ladder all untouched; endpoints are metadata/CPU-only and
