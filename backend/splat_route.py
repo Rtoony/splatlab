@@ -454,6 +454,10 @@ class SplatJob:
     # incl. equirect — NOT a pre-processed dataset).
     sfm_tried: set[str] = field(default_factory=set)
     reroute_count: int = 0
+    # Structured reroute history ({from_solver, to_solver, registered, extracted,
+    # pct, at}) — persisted to meta on every reroute so the frontend can show
+    # WHY a job climbed the chain instead of burying it in scrolling logs.
+    sfm_reroutes: list[dict[str, Any]] = field(default_factory=list)
     sfm_context: dict[str, Any] | None = None
     # The original train request, kept so the gate can rebuild SfM stage commands
     # for a fallback solver mid-run (it needs num_frames_target / images-per-
@@ -490,7 +494,14 @@ def _job_dir(job_id: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _new_meta(job_id: str, req: SplatTrainRequest, input_path: Path, job_dir: Path, stages: list[str]) -> dict[str, Any]:
+def _new_meta(
+    job_id: str,
+    req: SplatTrainRequest,
+    input_path: Path,
+    job_dir: Path,
+    stages: list[str],
+    sfm_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "job_id": job_id,
         "mode": req.mode,
@@ -519,6 +530,14 @@ def _new_meta(job_id: str, req: SplatTrainRequest, input_path: Path, job_dir: Pa
         # exactly what the original job ran with.
         "num_frames_target": req.num_frames_target,
         "sfm_backend": req.sfm_backend,
+        # Escalation visibility: the RESOLVED starting solver (default-flips
+        # applied — may differ from the requested sfm_backend above), the solvers
+        # already run, and the structured reroute history. The frontend gets all
+        # of these free via the _job_payload meta spread.
+        "sfm_start_solver": (sfm_context or {}).get("start_solver"),
+        "sfm_tried": sorted(_seed_sfm_tried(sfm_context, stages)),
+        "reroute_count": 0,
+        "sfm_reroutes": [],
         "language_field": req.language_field,
         "trim_start_s": req.trim_start_s,
         "trim_duration_s": req.trim_duration_s,
@@ -2666,6 +2685,30 @@ async def _langfield_query_cold(scene_id: str, config_path: str, lfdir: str, cle
         return False
 
 
+def _recapture_guidance(ctx: dict[str, Any] | None) -> str:
+    """Capture-type-aware reshoot advice for SfM-exhaustion failures.
+
+    The old one-size text was video-flavored ("sweeps") even for photo folders
+    and said nothing 360-specific — misleading for the two capture types that
+    actually fail differently (07-05 finding).
+    """
+    if ctx and ctx.get("is_equirect"):
+        return (
+            "For 360 captures: hold the camera OVERHEAD on a stick and keep "
+            "moving — if you are visible anywhere but straight down, the scan "
+            "fails. Recapture with a slow, steady walk."
+        )
+    if ctx and ctx.get("subcommand") == "images":
+        return (
+            "For photo captures: shoot a deliberate orbit — 20-40 photos "
+            "circling the subject, each overlapping the last by about 70%, "
+            "with good light and no motion blur."
+        )
+    return (
+        "Recapture with slow, heavily-overlapping sweeps of a smaller area."
+    )
+
+
 def _maybe_escalate_sfm(
     job: SplatJob, process_index: int, registered: int, extracted: int, pct: str
 ) -> bool:
@@ -2705,8 +2748,23 @@ def _maybe_escalate_sfm(
 
     # Mark tried + count the reroute BEFORE mutating state, so any later failure
     # can never re-pick this solver.
+    from_solver = (
+        job.sfm_reroutes[-1]["to_solver"]
+        if job.sfm_reroutes
+        else (ctx.get("start_solver") or "colmap")
+    )
     job.sfm_tried.add(next_solver)
     job.reroute_count += 1
+    job.sfm_reroutes.append(
+        {
+            "from_solver": from_solver,
+            "to_solver": next_solver,
+            "registered": registered,
+            "extracted": extracted,
+            "pct": pct,
+            "at": _utc_now(),
+        }
+    )
 
     # Rebuild the SfM stage(s) + a fresh `process` for the new solver, using the
     # same plan-time inputs (paths rehydrated from the stashed context).
@@ -2745,7 +2803,13 @@ def _maybe_escalate_sfm(
     new_stage_names = list(new_cmds.keys())
     insert_at = process_index + 1
     job.stages_planned[insert_at:insert_at] = new_stage_names
-    _patch_meta(job.job_id, stages_planned=job.stages_planned)
+    _patch_meta(
+        job.job_id,
+        stages_planned=job.stages_planned,
+        sfm_tried=sorted(job.sfm_tried),
+        reroute_count=job.reroute_count,
+        sfm_reroutes=job.sfm_reroutes,
+    )
     return True
 
 
@@ -3028,7 +3092,8 @@ async def _run_pipeline(job: SplatJob) -> None:
                         f"the SfM model was empty or degenerate. Auto-fallback tried {tried_label}. "
                         "If this was a Test Flight, the sampled window may lack camera movement "
                         "(standing still) or enough frames — try a different window or a denser "
-                        "sample. Training was skipped to save GPU time."
+                        f"sample. {_recapture_guidance(job.sfm_context)} "
+                        "Training was skipped to save GPU time."
                     )
                     job.log_lines.append(error_message)
                     _patch_meta(job.job_id, status=final_status, stage=None, error_message=error_message)
@@ -3058,8 +3123,8 @@ async def _run_pipeline(job: SplatJob) -> None:
                         error_message = (
                             f"Only {registered} of {extracted} frames registered ({pct}). "
                             "The capture likely has low texture, motion blur, or not enough "
-                            f"overlap. Auto-fallback tried {tried_label}; recapture with slow, "
-                            "heavily-overlapping sweeps of a smaller area. "
+                            f"overlap. Auto-fallback tried {tried_label}. "
+                            f"{_recapture_guidance(job.sfm_context)} "
                             "Training was skipped to save GPU time."
                         )
                         job.log_lines.append(error_message)
@@ -3296,7 +3361,7 @@ def _restart_job(meta: dict[str, Any], req: SplatTrainRequest) -> None:
         sfm_context=sfm_context,
         sfm_req=req if sfm_context else None,
     )
-    fresh = _new_meta(job_id, req, input_path, job_dir, stages)
+    fresh = _new_meta(job_id, req, input_path, job_dir, stages, sfm_context)
     fresh["created_at"] = meta.get("created_at") or fresh["created_at"]
     fresh["pinned"] = bool(meta.get("pinned"))
     fresh["restart_count"] = int(meta.get("restart_count") or 0) + 1
@@ -3677,7 +3742,7 @@ async def start_splat_training(request: Request, req: SplatTrainRequest):
                 detail=f"Job {active[0]} is already running. One splat job runs at a time on the RTX 5090.",
             )
         job_dir.mkdir(parents=True, exist_ok=True)
-        _write_meta(job_id, _new_meta(job_id, req, input_path, job_dir, stages))
+        _write_meta(job_id, _new_meta(job_id, req, input_path, job_dir, stages, sfm_context))
         # The starting meta is the reservation seen by restic's guard. Recheck
         # after publishing it so either start order has exactly one winner.
         backup_busy, backup_unit, backup_state = _backup_interlock_busy()

@@ -1,5 +1,16 @@
 // Splat API contracts (mirrors the portal's server/routes/splat.py payloads).
 
+// One auto-fallback reroute: the registration result that triggered it and the
+// solver rung the job climbed to. Persisted by the backend on every reroute.
+export interface SfmReroute {
+  from_solver: string;
+  to_solver: string;
+  registered: number | null;
+  extracted: number | null;
+  pct: string;
+  at: string;
+}
+
 export interface SplatJob {
   job_id: string;
   mode: "3d" | "4d";
@@ -43,6 +54,14 @@ export interface SplatJob {
   // contradict how the scene was actually built).
   num_frames_target?: number;
   sfm_backend?: "colmap" | "glomap";
+  // Escalation visibility (2026-07-18): the RESOLVED starting solver (default
+  // flips applied — may differ from the requested sfm_backend), every solver
+  // already run, and the structured auto-fallback history. All optional so
+  // pre-existing scenes deserialize unchanged.
+  sfm_start_solver?: string | null;
+  sfm_tried?: string[];
+  reroute_count?: number;
+  sfm_reroutes?: SfmReroute[];
   // Test Flight trim window. Non-null trim_duration_s marks a scene as a
   // trimmed proof build (see the gallery card's "Promote to full build" action).
   trim_start_s?: number | null;

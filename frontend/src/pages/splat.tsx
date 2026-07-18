@@ -639,13 +639,20 @@ export default function SplatLabPage() {
                         Scene couldn’t be built — {latestFailed.input_path.split("/").pop()}
                       </p>
                       <p className="text-sm text-amber-200/90">{latestFailed.error_message}</p>
+                      <RerouteChips job={latestFailed} />
                       {glomapAvailable && (
                         <div className="pt-1.5">
-                          <Button size="sm" disabled={!!activeJob || computeControlsDisabled} onClick={() => retryGlomap(latestFailed)}>
+                          <Button
+                            size="sm"
+                            disabled={!!activeJob || computeControlsDisabled || (latestFailed.sfm_tried ?? []).includes("glomap")}
+                            onClick={() => retryGlomap(latestFailed)}
+                          >
                             <RefreshCw className="h-3.5 w-3.5" /> Retry with global SfM
                           </Button>
                           <p className="mt-1 text-[11px] text-amber-200/60">
-                            Re-registers the same footage with a stronger solver — rescues most low-overlap captures.
+                            {(latestFailed.sfm_tried ?? []).includes("glomap")
+                              ? "Global SfM already ran on this capture (see the fallback history above) — a retry would repeat the same result. Recapture instead."
+                              : "Re-registers the same footage with a stronger solver — rescues most low-overlap captures."}
                           </p>
                         </div>
                       )}
@@ -890,6 +897,32 @@ function TransfersPicker({
   );
 }
 
+// Auto-fallback history chips: one per reroute, e.g. "colmap → glomap · 10.3%
+// registered". Rendered under the stage rail (live) and on the failed card so
+// the WHY of a solver climb is visible without digging through logs.
+function RerouteChips({ job }: { job: SplatJob }) {
+  const reroutes = job.sfm_reroutes ?? [];
+  if (!reroutes.length) return null;
+  return (
+    <div className="mt-2 flex flex-wrap gap-1.5">
+      {reroutes.map((r, i) => (
+        <span
+          key={`${r.to_solver}-${i}`}
+          title={
+            r.registered != null && r.extracted != null
+              ? `Only ${r.registered}/${r.extracted} frames registered — auto-retried with ${r.to_solver}`
+              : `Auto-retried with ${r.to_solver}`
+          }
+          className="inline-flex items-center gap-1 rounded-full border border-amber-400/25 bg-amber-400/10 px-2 py-0.5 text-[10px] font-semibold text-amber-200"
+        >
+          <RefreshCw className="h-2.5 w-2.5" />
+          {r.from_solver} → {r.to_solver} · {r.pct} registered
+        </span>
+      ))}
+    </div>
+  );
+}
+
 // ── active job: stage rail + humanized stage + log ────────────────────────────
 function StageRail({ job }: { job: SplatJob }) {
   const planned = job.stages_planned?.length ? job.stages_planned : STAGE_ORDER;
@@ -940,6 +973,7 @@ function ActiveJobPanel({ job, onStop, stopping }: { job: SplatJob; onStop: () =
         </Button>
       </div>
       <StageRail job={job} />
+      <RerouteChips job={job} />
       <pre
         ref={logRef}
         className="mt-4 max-h-44 overflow-y-auto whitespace-pre-wrap rounded-xl border border-white/10 bg-black/40 p-3 font-mono text-[11px] leading-relaxed text-zinc-400"
