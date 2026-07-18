@@ -2908,6 +2908,7 @@ async def _run_pipeline(job: SplatJob) -> None:
                 # Best-effort: compress the exported .ply into a viewer-native
                 # .spz. A missing tool or non-zero exit is logged and skipped —
                 # the raw .ply preview already works.
+                stage_ok = True
                 transform = _splat_transform_path()
                 ply = _preview_file_path(job_dir)
                 if transform and ply.is_file():
@@ -2916,16 +2917,22 @@ async def _run_pipeline(job: SplatJob) -> None:
                     if rc != 0:
                         job.log_lines.append("[compress] .spz compression failed; keeping raw .ply preview.")
                         _record_stage_failure(job.job_id, stage, f"exit code {rc}")
+                        stage_ok = False
                 else:
                     job.log_lines.append("[compress] skipped (tool or .ply unavailable).")
-                completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
-                _patch_meta(job.job_id, stages_completed=[*completed, stage])
+                # A stage that ran and FAILED must not also claim completion —
+                # stages_failed is its record. Skips still count as completed
+                # (they are deliberate no-ops, unchanged behavior).
+                if stage_ok:
+                    completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
+                    _patch_meta(job.job_id, stages_completed=[*completed, stage])
                 continue
             elif stage == "webopt":
                 # Best-effort: a lightweight web-viewer .ply (spherical harmonics
                 # dropped + decimated) so the shareable /splat/view page loads
                 # ~12x smaller than the raw export. Failure is logged and the
                 # viewer falls back to the raw .ply (fmt=web -> .ply server-side).
+                stage_ok = True
                 transform = _splat_transform_path()
                 ply = _preview_file_path(job_dir)
                 if transform and ply.is_file():
@@ -2942,6 +2949,7 @@ async def _run_pipeline(job: SplatJob) -> None:
                     if rc != 0:
                         job.log_lines.append("[webopt] web-optimized .ply failed; viewer falls back to the raw .ply.")
                         _record_stage_failure(job.job_id, stage, f"exit code {rc}")
+                        stage_ok = False
                     # langweb: full-count SH-stripped copy for the CLIENT-SIDE language
                     # heatmap. No --decimate, so its row order matches gauss_emb.npz
                     # (probe-verified — see _langweb_command). Built only for jobs that
@@ -2963,8 +2971,11 @@ async def _run_pipeline(job: SplatJob) -> None:
                             _record_stage_failure(job.job_id, "webopt-langweb", f"exit code {rc}")
                 else:
                     job.log_lines.append("[webopt] skipped (tool or .ply unavailable).")
-                completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
-                _patch_meta(job.job_id, stages_completed=[*completed, stage])
+                # webopt claims completion iff ITS artifact built; a langweb
+                # sub-failure is tracked under its own "webopt-langweb" name.
+                if stage_ok:
+                    completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
+                    _patch_meta(job.job_id, stages_completed=[*completed, stage])
                 continue
             elif stage == "health":
                 # Best-effort capture-health fog gate (REPORT-ONLY, Capture Coach).
@@ -2972,6 +2983,7 @@ async def _run_pipeline(job: SplatJob) -> None:
                 # writes FOG/HEALTHY/UNCERTAIN + receipt images into _health/, then
                 # meta["health"]. Same never-fail contract as langfield: the whole
                 # body is wrapped; any failure is bookkeeping, never job state.
+                stage_ok = True
                 try:
                     config_path = _find_latest_config(job_dir)
                     if config_path is None or not _health_available():
@@ -2995,11 +3007,14 @@ async def _run_pipeline(job: SplatJob) -> None:
                         else:
                             job.log_lines.append("[health] fog gate failed; the splat is unaffected.")
                             _record_stage_failure(job.job_id, stage, f"exit code {rc}")
+                            stage_ok = False
                 except Exception as exc:  # noqa: BLE001 — best-effort: never fail the splat
                     job.log_lines.append(f"[health] skipped (error: {exc}); the splat is unaffected.")
                     _record_stage_failure(job.job_id, stage, f"error: {exc}")
-                completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
-                _patch_meta(job.job_id, stages_completed=[*completed, stage])
+                    stage_ok = False
+                if stage_ok:
+                    completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
+                    _patch_meta(job.job_id, stages_completed=[*completed, stage])
                 continue
             elif stage == "langfield":
                 # Best-effort OPT-IN: build the text-searchable language field (SAM 2.1
@@ -3011,6 +3026,7 @@ async def _run_pipeline(job: SplatJob) -> None:
                 # The whole body is wrapped so even an OSError (mkdir / config read /
                 # arbiter) is logged, not propagated — provably cannot flip the job to
                 # failed (one step beyond the compress/webopt best-effort precedent).
+                stage_ok = True
                 try:
                     config_path = _find_latest_config(job_dir)
                     if config_path is None or not _langfield_available():
@@ -3024,15 +3040,18 @@ async def _run_pipeline(job: SplatJob) -> None:
                             job.log_lines.append(
                                 "[langfield] build failed; the splat is unaffected (no language search for this scene)."
                             )
-                            # Bookkeeping only — never flips final_status. Without this,
-                            # stages_completed below makes a failed optional stage look
-                            # identical to a successful one in job meta / the API / the UI.
+                            # Bookkeeping only — never flips final_status.
                             _record_stage_failure(job.job_id, stage, f"exit code {rc}")
+                            stage_ok = False
                 except Exception as exc:  # noqa: BLE001 — best-effort: never fail the splat
                     job.log_lines.append(f"[langfield] skipped (build error: {exc}); the splat is unaffected.")
                     _record_stage_failure(job.job_id, stage, f"error: {exc}")
-                completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
-                _patch_meta(job.job_id, stages_completed=[*completed, stage])
+                    stage_ok = False
+                # A failed langfield no longer ALSO claims completion (2026-07-18);
+                # stages_failed is the failure record, final_status stays "completed".
+                if stage_ok:
+                    completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
+                    _patch_meta(job.job_id, stages_completed=[*completed, stage])
                 continue
             elif stage == "process" or stage.startswith("reprocess"):
                 # Registration-quality gate. The process (COLMAP/SfM) stage

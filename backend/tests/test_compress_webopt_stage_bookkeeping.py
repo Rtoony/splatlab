@@ -73,7 +73,8 @@ def test_compress_nonzero_exit_does_not_fail_job(job_env, monkeypatch):
     meta = json.loads((job_dir / "meta.json").read_text())
     assert meta["status"] == "completed"
     assert meta["error_message"] is None
-    assert meta["stages_completed"] == ["compress"]
+    # 2026-07-18: a failed optional stage no longer also claims completion.
+    assert meta["stages_completed"] == []
     assert meta["stages_failed"] == [{"stage": "compress", "reason": "exit code 1"}]
 
     payload = splat_route._job_payload(meta)
@@ -124,7 +125,8 @@ def test_webopt_nonzero_exit_does_not_fail_job(job_env, monkeypatch):
 
     meta = json.loads((job_dir / "meta.json").read_text())
     assert meta["status"] == "completed"
-    assert meta["stages_completed"] == ["webopt"]
+    # 2026-07-18: a failed optional stage no longer also claims completion.
+    assert meta["stages_completed"] == []
     assert meta["stages_failed"] == [{"stage": "webopt", "reason": "exit code 1"}]
 
 

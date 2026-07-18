@@ -82,7 +82,8 @@ def test_health_nonzero_exit_does_not_fail_job(job_env, monkeypatch):
     meta = json.loads((job_dir / "meta.json").read_text())
     assert meta["status"] == "completed"
     assert meta["error_message"] is None
-    assert meta["stages_completed"] == ["health"]
+    # 2026-07-18: a failed optional stage no longer also claims completion.
+    assert meta["stages_completed"] == []
     assert meta["stages_failed"] == [{"stage": "health", "reason": "exit code 1"}]
     assert "health" not in meta or meta.get("health") is None or "fog" not in (meta.get("health") or {})
 
@@ -130,7 +131,7 @@ def test_health_exception_does_not_fail_job(job_env, monkeypatch):
 
     meta = json.loads((job_dir / "meta.json").read_text())
     assert meta["status"] == "completed"
-    assert meta["stages_completed"] == ["health"]
+    assert meta["stages_completed"] == []
     assert len(meta["stages_failed"]) == 1
     assert meta["stages_failed"][0]["stage"] == "health"
     assert "disk full" in meta["stages_failed"][0]["reason"]

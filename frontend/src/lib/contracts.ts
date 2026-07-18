@@ -22,11 +22,11 @@ export interface SplatJob {
   stage: string | null;
   stages_planned: string[];
   stages_completed: string[];
-  // Best-effort/optional stages (currently: langfield) that ran but failed —
-  // parallel to stages_completed, never instead of it. A failed optional
-  // stage still lands in stages_completed (the stage rail treats it as
-  // traversed) AND here (so the failure itself stays visible). Absent on
-  // jobs with no optional-stage failures.
+  // Best-effort/optional stages (compress, webopt, webopt-langweb, health,
+  // langfield) that ran but FAILED. Since 2026-07-18 a failed optional stage
+  // lands ONLY here — it no longer also claims a slot in stages_completed
+  // (the stage rail shows it untraversed). Job status stays "completed";
+  // the splat itself is unaffected. Absent on jobs with no failures.
   stages_failed?: { stage: string; reason: string }[];
   pid: number | null;
   exit_code: number | null;

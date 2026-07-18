@@ -73,10 +73,10 @@ def test_langfield_nonzero_exit_does_not_fail_job(job_env, monkeypatch):
     # Job semantics unchanged: the splat is done regardless of langfield.
     assert meta["status"] == "completed"
     assert meta["error_message"] is None
-    # Existing behavior preserved: the stage still lands in stages_completed
-    # (the stage rail treats it as traversed).
-    assert meta["stages_completed"] == ["langfield"]
-    # The bug fix: the failure is now durably visible alongside it.
+    # 2026-07-18: a failed optional stage no longer ALSO claims completion —
+    # stages_failed is its record; the stage rail shows it untraversed.
+    assert meta["stages_completed"] == []
+    # The failure is durably visible.
     assert meta["stages_failed"] == [{"stage": "langfield", "reason": "exit code 1"}]
 
     # Visible end-to-end: _job_payload (the same **meta spread every API
@@ -100,7 +100,7 @@ def test_langfield_exception_does_not_fail_job(job_env, monkeypatch):
 
     meta = json.loads((job_dir / "meta.json").read_text())
     assert meta["status"] == "completed"
-    assert meta["stages_completed"] == ["langfield"]
+    assert meta["stages_completed"] == []
     assert len(meta["stages_failed"]) == 1
     assert meta["stages_failed"][0]["stage"] == "langfield"
     assert "disk full" in meta["stages_failed"][0]["reason"]
