@@ -147,6 +147,22 @@ export interface SplatJob {
   } | null;
 }
 
+// Tier-0 upload-time capture screen (POST /api/splat/precheck). Advisory-only:
+// the Create button is NEVER disabled by this.
+export interface SplatPrecheckResult {
+  v: number;
+  capture_type: "video" | "photo-folder" | "photo-zip" | "unknown";
+  advisories: string[];
+  metrics: {
+    n_frames?: number;
+    median_edge_energy?: number;
+    median_dark_frac?: number;
+    median_bright_frac?: number;
+    static_pair_ratio?: number;
+  };
+  note?: string;
+}
+
 // A scene's real-world anchor (meta["geo"], written by POST /jobs/{id}/geo).
 export interface SplatGeoAnchor {
   v: number;

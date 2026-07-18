@@ -4,6 +4,7 @@ import { apiRequest } from "@/lib/api";
 import { setSplatlabFeedbackContext } from "@/lib/feedback-context";
 import type {
   SplatJob,
+  SplatPrecheckResult,
   SplatStatusResponse,
   SplatTransferEntry,
   SplatTransfersResponse,
@@ -117,6 +118,27 @@ function fmtCount(n: number): string {
 export default function SplatLabPage() {
   const qc = useQueryClient();
   const [uploaded, setUploaded] = useState<SplatUploadResult | null>(null);
+  // Tier-0 capture screen (Capture Coach Phase 2): advisory strings for the
+  // freshly picked input. Fire-and-forget; failures just clear the panel —
+  // Create is NEVER disabled by this.
+  const [precheck, setPrecheck] = useState<SplatPrecheckResult | null>(null);
+  useEffect(() => {
+    setPrecheck(null);
+    if (!uploaded) return;
+    let cancelled = false;
+    apiRequest<SplatPrecheckResult>("/api/splat/precheck", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ input_path: uploaded.path }),
+    })
+      .then((result) => {
+        if (!cancelled) setPrecheck(result);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [uploaded]);
   const [iters, setIters] = useState<number>(QUALITY.standard.iterations);
   const [showCustom, setShowCustom] = useState(false);
   // Opt-in: build a text-searchable Language Field alongside the scene.
@@ -410,6 +432,19 @@ export default function SplatLabPage() {
             refreshing={transfersFetching}
             disabled={computeControlsDisabled}
           />
+          {precheck && precheck.advisories.length > 0 && (
+            <div className="mt-3 rounded-2xl border border-amber-400/25 bg-amber-400/5 p-3">
+              <p className="text-xs font-semibold text-amber-200">
+                Capture check
+                <span className="ml-2 font-normal text-amber-200/60">advisory only — you can still create</span>
+              </p>
+              <ul className="mt-1 space-y-0.5 text-[12px] text-amber-100/80">
+                {precheck.advisories.map((tip) => (
+                  <li key={tip}>· {tip}</li>
+                ))}
+              </ul>
+            </div>
+          )}
           <div className="mt-5 space-y-2">
             <div className="flex items-center justify-between">
               <SectionLabel>Quality</SectionLabel>

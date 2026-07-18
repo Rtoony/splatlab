@@ -43,6 +43,7 @@ from pydantic import BaseModel, Field
 
 import gpu_arbiter
 import maintenance_gate
+from health.precheck import precheck_input
 from health.probe import probe_capture
 from operator_audit import audit_operator_event
 
@@ -3655,6 +3656,38 @@ def _extract_image_zip(zip_path: Path, dest: Path) -> int:
                 shutil.copyfileobj(src, dst)
             extracted += 1
     return extracted
+
+
+class PrecheckRequest(BaseModel):
+    input_path: str
+
+
+@router.post("/precheck")
+async def precheck_capture(body: PrecheckRequest):
+    """Capture Coach Phase 2: Tier-0 ADVISORY screen of an input pre-dispatch.
+
+    CPU-only (Pillow + a few bounded ffmpeg stills), no GPU lock, and
+    deliberately NOT behind require_compute_enabled — advice works in
+    safe-browse mode too. The response never blocks Create.
+    """
+    input_path = _resolve_input_path(body.input_path)
+    if not input_path.exists():
+        raise HTTPException(status_code=404, detail=f"Input not found: {body.input_path}")
+    ffmpeg = _tool_path("ffmpeg", "SPLAT_FFMPEG_BIN")
+    ffprobe = _tool_path("ffprobe", "SPLAT_FFPROBE_BIN")
+    is_insv = input_path.suffix.lower() == ".insv"
+    duration = None
+    if ffprobe and input_path.is_file() and (
+        is_insv or input_path.suffix.lower() in VIDEO_EXTENSIONS
+    ):
+        duration = _probe_video_duration(ffprobe, input_path)
+    return await asyncio.to_thread(
+        precheck_input,
+        input_path,
+        ffmpeg,
+        duration,
+        8 if is_insv else None,
+    )
 
 
 @router.post("/upload")
