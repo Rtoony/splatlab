@@ -43,6 +43,7 @@ from pydantic import BaseModel, Field
 
 import gpu_arbiter
 import maintenance_gate
+from health.probe import probe_capture
 from operator_audit import audit_operator_event
 
 log = logging.getLogger(__name__)
@@ -2685,6 +2686,28 @@ async def _langfield_query_cold(scene_id: str, config_path: str, lfdir: str, cle
         return False
 
 
+def _patch_probe_health(
+    job_id: str,
+    processed_dir: Path,
+    registered: int | None = None,
+    extracted: int | None = None,
+) -> None:
+    """Capture Coach Phase 1: REPORT-ONLY pre-train probe -> meta.health.probe.
+
+    Best-effort by contract — it must never change the A1 gate's outcome, so
+    every failure is swallowed after a log line. Merges into the existing
+    health dict (the post-train fog stage merges the same way) so probe and
+    fog never clobber each other.
+    """
+    try:
+        result = probe_capture(processed_dir, registered=registered, extracted=extracted)
+        health = (_read_meta(job_id) or {}).get("health") or {}
+        health["probe"] = result
+        _patch_meta(job_id, health=health)
+    except Exception as exc:  # noqa: BLE001 — report-only: never affect the gate
+        log.warning("capture probe failed for %s: %s", job_id, exc)
+
+
 def _recapture_guidance(ctx: dict[str, Any] | None) -> str:
     """Capture-type-aware reshoot advice for SfM-exhaustion failures.
 
@@ -2997,7 +3020,11 @@ async def _run_pipeline(job: SplatJob) -> None:
                         if rc == 0 and fog_json.is_file():
                             fog = json.loads(fog_json.read_text())
                             fog["enforced"] = False  # report-only until the doctrine flip
-                            _patch_meta(job.job_id, health={"v": 1, "fog": fog})
+                            # Merge, don't overwrite: the pre-train probe already
+                            # lives under meta.health.probe.
+                            health_meta = (_read_meta(job.job_id) or {}).get("health") or {}
+                            health_meta.update({"v": 1, "fog": fog})
+                            _patch_meta(job.job_id, health=health_meta)
                             summ = fog.get("summary", {})
                             job.log_lines.append(
                                 f"[health] verdict: {fog.get('verdict')} — "
@@ -3102,6 +3129,7 @@ async def _run_pipeline(job: SplatJob) -> None:
                     job.log_lines.append(
                         f"[process] transforms.json missing/unreadable after process ({exc})."
                     )
+                    _patch_probe_health(job.job_id, processed_dir, 0, extracted or 0)
                     if _maybe_escalate_sfm(job, stage_index, 0, extracted or 0, "0.0%"):
                         continue
                     final_status = "failed"
@@ -3124,6 +3152,10 @@ async def _run_pipeline(job: SplatJob) -> None:
                     job.log_lines.append(
                         f"[process] registration: {registered}/{extracted} frames ({pct})."
                     )
+                    # Capture Coach probe: report-only coaching from the SfM
+                    # artifacts, patched on PASS and FAIL paths alike (a failed
+                    # flight still earns its coaching). Never gates.
+                    _patch_probe_health(job.job_id, processed_dir, registered, extracted)
                     if ratio < MIN_REGISTRATION_RATIO:
                         # AUTO-FALLBACK: try to climb the solver chain (zero
                         # clicks) before giving up. _maybe_escalate_sfm rebuilds

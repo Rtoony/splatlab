@@ -123,6 +123,27 @@ export interface SplatJob {
       receipts: string[];
       enforced?: boolean;
     };
+    // Capture Coach Phase 1: pre-train probe from the SfM artifacts (patched
+    // by the A1 gate on pass AND fail paths). Report-only, like fog.
+    probe?: {
+      v: number;
+      verdict: "GOOD" | "MARGINAL" | "POOR";
+      findings: string[];
+      coaching: string[];
+      metrics: {
+        n_posed?: number;
+        path_bbox_diag?: number;
+        mean_step?: number;
+        registration_ratio?: number;
+        n_points?: number;
+        cloud_bbox_diag?: number;
+        traj_cloud_ratio?: number;
+        inward_frac?: number;
+        capture_shape?: "orbit" | "walkthrough";
+      };
+      caveat: string;
+      enforced?: boolean;
+    };
   } | null;
 }
 
