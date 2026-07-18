@@ -277,7 +277,11 @@ export default function SplatLabPage() {
       capture_format: input.is_insv ? "equirectangular360" : "standard",
       images_per_equirect: input.is_insv ? 8 : undefined,
       crop_bottom: input.is_insv ? 0.15 : undefined,
-      num_frames_target: flight ? 90 : input.is_insv ? 75 : 300,
+      // insv full runs OMIT the target — the server's §1D′ duration-aware
+      // 3 fps rule computes the real value (the old literal 75 was a
+      // below-density-floor vestige the server had to override every time).
+      // Flight's 90 = 3 fps x 30 s, byte-identical to what the server derives.
+      num_frames_target: flight ? 90 : input.is_insv ? undefined : 300,
       max_num_iterations: flight ? Math.min(iters, QUALITY.draft.iterations) : iters,
       insv_fov: input.is_insv ? 204 : undefined,
       trim_duration_s: flight ? 30 : undefined,
@@ -618,6 +622,12 @@ export default function SplatLabPage() {
               </div>
               <div className="mt-1.5 space-y-0.5 text-zinc-400">
                 <p>{uploaded.is_insv ? "360 footage — auto-unwrapped." : uploaded.detail}</p>
+                {uploaded.is_insv && (
+                  <p className="text-amber-200/80">
+                    360 tip: hold the camera OVERHEAD on a stick and keep walking — if you're visible
+                    anywhere but straight down, the scan fails. Selfie-style captures don't reconstruct.
+                  </p>
+                )}
                 <p>
                   Estimated build: <span className="text-zinc-200">~{trainMinutes(iters)} min</span> training
                   {uploaded.kind === "file" ? " + a few min to find camera positions" : ""}.
