@@ -2293,6 +2293,16 @@ def _plan_3d_job(
         if (start_solver == "colmap" and is_equirect and subcommand == "video"
                 and availability.get("rig_available")):
             start_solver = "rig"
+        # DEFAULT-FLIP (2026-07-17, photo-orbit A/B): still-photo folders start on
+        # glomap whenever the colmap4 toolchain is present. Same-subject low-light
+        # iPhone orbit: incremental COLMAP registered 17/29 vs glomap 29/29 at
+        # +52s wall clock (jobs splat_a7d47243e4 / splat_e29ca078a1) — deliberate
+        # photo orbits are the small-site capture mode, so coverage beats seconds.
+        # Video keeps colmap-first (unmeasured there), and the A1 gate still
+        # escalates, so incremental COLMAP remains a fallback rung, not gone.
+        if (start_solver == "colmap" and subcommand == "images" and not is_equirect
+                and availability.get("glomap_available")):
+            start_solver = "glomap"
 
         # InstantSplat "Few Photos (AI poses)": override to the dense-seed MASt3R rung.
         # A handful of photos won't COLMAP, so there is NO auto-fallback (escalation off);
