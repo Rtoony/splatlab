@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -23,6 +26,39 @@ import splat_route  # noqa: E402
 
 REASON = "Persistent RTX 5090 PCIe AER requires physical remediation."
 JOB_ID = "splat_deadbeef"
+
+
+def _write_supervised_unlock(path: Path, **overrides) -> None:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    payload = {
+        "schema": maintenance_gate.UNLOCK_SCHEMA,
+        "enabled": True,
+        "mode": "supervised",
+        "reason": "supervised test window",
+        "operator": "pytest",
+        "created_at": now.isoformat().replace("+00:00", "Z"),
+        "expires_at": (now + timedelta(minutes=30)).isoformat().replace("+00:00", "Z"),
+        "max_active_jobs": 1,
+    }
+    payload.update(overrides)
+    path.write_text(json.dumps(payload))
+
+
+def _write_watcher_status(path: Path, **overrides) -> None:
+    payload = {
+        "run_success": True,
+        "finished_at_epoch": time.time(),
+        "fault_counts": {
+            "aer_current": 0,
+            "aer_previous": 1,
+            "aer_severe": 0,
+            "gpu_unreadable": 0,
+            "platform_fatal": 0,
+            "xid": 0,
+        },
+    }
+    payload.update(overrides)
+    path.write_text(json.dumps(payload))
 
 
 @pytest.fixture()
@@ -120,13 +156,89 @@ def test_read_only_routes_and_cpu_thumbnail_fallback_remain_available(
     monkeypatch.setattr(splat_route, "_sample_media_entries", lambda: [])
     monkeypatch.setattr(gpu_arbiter, "holder_info", lambda: {"locked": False})
 
-    assert gated_client.get("/api/splat/status").status_code == 200
+    status = gated_client.get("/api/splat/status")
+    assert status.status_code == 200
+    assert status.json()["compute"]["enabled"] is False
+    assert REASON in status.json()["compute"]["reason"]
+    assert "New splat generation" in status.json()["compute"]["blocked_capabilities"]
     assert gated_client.get(f"/api/splat/jobs/{JOB_ID}/preview/file").status_code == 200
     assert gated_client.get(f"/api/splat/jobs/{JOB_ID}/langfield/overrides").status_code == 200
     assert gated_client.get(f"/api/splat/jobs/{JOB_ID}/edit/versions").status_code == 200
     assert asyncio.run(splat_main.healthz())["ok"] is True
 
     assert asyncio.run(splat_route.ensure_hero_thumb(job_dir)) is None
+
+
+def test_supervised_unlock_admits_compute_with_marker_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = maintenance_gate.MAINTENANCE_FILE
+    unlock = maintenance_gate.SUPERVISED_UNLOCK_FILE
+    marker.write_text(f"{maintenance_gate.REASON_KEY}={REASON}\n")
+    _write_supervised_unlock(unlock)
+    _write_watcher_status(maintenance_gate.WATCHER_STATUS_FILE)
+    monkeypatch.setattr(splat_route, "TRAINING_DISABLED_REASON", REASON)
+
+    splat_route.require_compute_enabled()
+    payload = splat_route._compute_status_payload()
+    assert payload["enabled"] is True
+    assert payload["mode"] == "supervised"
+    assert payload["supervised_unlock"]["active"] is True
+    assert payload["supervised_unlock"]["max_active_jobs"] == 1
+    assert payload["supervised_unlock"]["watcher"]["ok"] is True
+    assert "Run LangField search queries" in payload["safe_capabilities"]
+    assert "Run bounded mesh/autoresearch trials" in payload["safe_capabilities"]
+    assert "Background mesh autoresearch" not in payload["blocked_capabilities"]
+    assert "Concurrent splat jobs" in payload["blocked_capabilities"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"enabled": False},
+        {"mode": "normal"},
+        {"max_active_jobs": 2},
+        {"expires_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()},
+        {"expires_at": (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()},
+    ],
+)
+def test_invalid_supervised_unlock_keeps_marker_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict,
+) -> None:
+    maintenance_gate.MAINTENANCE_FILE.write_text(f"{maintenance_gate.REASON_KEY}={REASON}\n")
+    _write_supervised_unlock(maintenance_gate.SUPERVISED_UNLOCK_FILE, **overrides)
+    _write_watcher_status(maintenance_gate.WATCHER_STATUS_FILE)
+    monkeypatch.setattr(splat_route, "TRAINING_DISABLED_REASON", REASON)
+
+    with pytest.raises(HTTPException) as exc:
+        splat_route.require_compute_enabled()
+    assert exc.value.status_code == 409
+    assert REASON in exc.value.detail
+
+
+@pytest.mark.parametrize(
+    "watcher",
+    [
+        {"run_success": False},
+        {"finished_at_epoch": time.time() - maintenance_gate.WATCHER_MAX_AGE_SECONDS - 1},
+        {"fault_counts": {"aer_current": 1}},
+        {"fault_counts": {"xid": 1}},
+    ],
+)
+def test_supervised_unlock_requires_fresh_clean_watcher(
+    monkeypatch: pytest.MonkeyPatch,
+    watcher: dict,
+) -> None:
+    maintenance_gate.MAINTENANCE_FILE.write_text(f"{maintenance_gate.REASON_KEY}={REASON}\n")
+    _write_supervised_unlock(maintenance_gate.SUPERVISED_UNLOCK_FILE)
+    _write_watcher_status(maintenance_gate.WATCHER_STATUS_FILE, **watcher)
+    monkeypatch.setattr(splat_route, "TRAINING_DISABLED_REASON", REASON)
+
+    with pytest.raises(HTTPException) as exc:
+        splat_route.require_compute_enabled()
+    assert exc.value.status_code == 409
+    assert REASON in exc.value.detail
 
 
 @pytest.mark.parametrize(("reason", "expected"), [("", 0), (REASON, 75)])
@@ -144,7 +256,12 @@ def test_worker_execstart_guard(tmp_path: Path, reason: str, expected: int) -> N
             str(script),
             str(marker),
         ],
-        env={**os.environ, "SPLAT_TRAINING_DISABLED_REASON": ""},
+        env={
+            **os.environ,
+            "SPLAT_TRAINING_DISABLED_REASON": "",
+            "SPLAT_COMPUTE_UNLOCK_FILE": str(tmp_path / "absent-unlock.json"),
+            "SPLAT_GPU_WATCHER_STATUS_FILE": str(tmp_path / "absent-watcher.json"),
+        },
         capture_output=True,
         text=True,
         check=False,

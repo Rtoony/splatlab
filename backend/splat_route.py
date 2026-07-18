@@ -201,6 +201,52 @@ def require_heavy_work_admitted() -> None:
             detail=_backup_interlock_detail(backup_unit, backup_state),
         )
 
+
+def _compute_status_payload() -> dict[str, Any]:
+    reason = maintenance_gate.maintenance_reason(TRAINING_DISABLED_REASON)
+    unlock = maintenance_gate.supervised_unlock_status()
+    enabled = not bool(reason)
+    armed = bool(unlock.get("active"))
+    return {
+        "enabled": enabled,
+        "maintenance_active": bool(reason),
+        "reason": reason or None,
+        "marker_path": str(maintenance_gate.MAINTENANCE_FILE),
+        "unlock_path": str(maintenance_gate.SUPERVISED_UNLOCK_FILE),
+        "mode": "supervised" if armed else ("normal" if enabled else "safe-browse"),
+        "supervised_unlock": unlock,
+        "safe_capabilities": (
+            [
+                "Start one supervised splat job",
+                "Run LangField search queries",
+                "Run bounded mesh/autoresearch trials",
+                "Continue browsing existing scenes",
+            ]
+            if armed
+            else [
+                "Browse existing scenes",
+                "Open viewers",
+                "Download scene artifacts",
+                "Review geo and capture-health metadata",
+                "Submit feedback",
+            ]
+        ),
+        "blocked_capabilities": (
+            [
+                "Concurrent splat jobs",
+                "Unsupervised worker restarts",
+            ]
+            if armed
+            else [
+                "New splat generation",
+                "GPU pipeline stages",
+                "Language Field worker queries",
+                "Scene edits and merges",
+                "Mesh autoresearch",
+            ]
+        ),
+    }
+
 # A backup and a SplatLab pipeline must never compete for workstation resources.
 # Scope is explicit because core is a system unit while the other local backups
 # are user units; state checks also cover jobs that do not yet take the flock.
@@ -3416,6 +3462,7 @@ async def get_splat_status():
             "conda_env_bin": str(CONDA_ENV_BIN),
         },
         "engines": availability,
+        "compute": _compute_status_payload(),
         "media_samples": _sample_media_entries(),
         "jobs": jobs,
         "active_jobs": sum(1 for job in jobs if job["status"] in {"starting", "running"}),

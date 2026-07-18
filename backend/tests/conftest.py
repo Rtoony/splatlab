@@ -20,3 +20,13 @@ def isolate_hardware_maintenance_marker(
         "MAINTENANCE_FILE",
         tmp_path / "absent-hardware-maintenance.conf",
     )
+    monkeypatch.setattr(
+        maintenance_gate,
+        "SUPERVISED_UNLOCK_FILE",
+        tmp_path / "absent-gpu-compute-unlock.json",
+    )
+    monkeypatch.setattr(
+        maintenance_gate,
+        "WATCHER_STATUS_FILE",
+        tmp_path / "absent-gpu-health-watch-status.json",
+    )
