@@ -162,6 +162,11 @@ export default function SplatLabPage() {
   const mast3rEngineAvailable = Boolean(status?.engines?.mast3r_available);
   // Whether the TripoSplat toolchain exists — gates the "Imagine a Splat" mode.
   const triposplatEngineAvailable = Boolean(status?.engines?.triposplat_available);
+  const compute = status?.compute;
+  const computeBlocked = Boolean(compute && !compute.enabled);
+  const computeArmed = Boolean(compute?.enabled && compute.mode === "supervised" && compute.supervised_unlock?.active);
+  const computeControlsDisabled = !status || computeBlocked;
+  const computeReason = !status ? "Waiting for SplatLab status." : compute?.reason ?? "SplatLab compute is disabled.";
 
   useEffect(() => {
     setSplatlabFeedbackContext({
@@ -187,9 +192,11 @@ export default function SplatLabPage() {
       },
       gpu_lane: gpu?.lane ?? null,
       gpu_locked: Boolean(gpu?.locked),
+      compute_enabled: compute?.enabled ?? null,
+      compute_reason: compute?.reason ?? null,
     });
     return () => setSplatlabFeedbackContext(null);
-  }, [activeJob, completed.length, generativeMode, gpu?.lane, gpu?.locked, iters, jobs, languageField, sparseMode, testFlight, uploaded]);
+  }, [activeJob, completed.length, compute?.enabled, compute?.reason, generativeMode, gpu?.lane, gpu?.locked, iters, jobs, languageField, sparseMode, testFlight, uploaded]);
 
   function flash(msg: string, bad = false) {
     setToast({ msg, bad });
@@ -210,6 +217,8 @@ export default function SplatLabPage() {
     },
     onError: (e) => flash(e instanceof Error ? e.message : "Could not start", true),
   });
+
+  const createDisabled = computeControlsDisabled || !uploaded || startMutation.isPending || !!activeJob || !engineReady;
 
   const stopMutation = useMutation({
     mutationFn: (id: string) => apiRequest(`/api/splat/jobs/${id}/stop`, { method: "POST" }),
@@ -351,12 +360,12 @@ export default function SplatLabPage() {
         <div className="flex items-center gap-2">
           <span
             className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-semibold ${
-              engineReady
+              !computeBlocked && engineReady
                 ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
                 : "border-amber-500/30 bg-amber-500/10 text-amber-300"
             }`}
           >
-            <Cpu className="h-3.5 w-3.5" /> Engine {engineReady ? "ready" : "warming"}
+            <Cpu className="h-3.5 w-3.5" /> {computeBlocked ? "Safe browse mode" : computeArmed ? "Supervised compute" : `Engine ${engineReady ? "ready" : "warming"}`}
           </span>
           <Badge className="border-cyan-500/30 bg-cyan-500/10 text-cyan-200">
             {status?.active_jobs ?? 0} active
@@ -374,12 +383,14 @@ export default function SplatLabPage() {
         </div>
       )}
 
+      <ComputeGateBanner compute={compute} />
+
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(380px,0.9fr)] 2xl:grid-cols-[minmax(460px,640px)_minmax(0,1fr)]">
         {/* left: create */}
         <Card className="p-5">
           <h2 className="text-base font-semibold text-white">Make a 3D scene</h2>
           <p className="mb-4 mt-0.5 text-sm text-zinc-400">A video, a 360 clip, or a zip of photos.</p>
-          <UploadBox onUploaded={setUploaded} onError={(m) => flash(m, true)} current={uploaded} />
+          <UploadBox onUploaded={setUploaded} onError={(m) => flash(m, true)} current={uploaded} disabled={computeControlsDisabled} disabledReason={computeReason} />
           <TransfersPicker
             entries={transfers?.entries ?? []}
             selectedPath={uploaded?.path ?? null}
@@ -397,6 +408,7 @@ export default function SplatLabPage() {
             }}
             onRefresh={() => refetchTransfers()}
             refreshing={transfersFetching}
+            disabled={computeControlsDisabled}
           />
           <div className="mt-5 space-y-2">
             <div className="flex items-center justify-between">
@@ -447,11 +459,12 @@ export default function SplatLabPage() {
             <button
               type="button"
               onClick={() => setTestFlight((v) => !v)}
+              disabled={computeControlsDisabled}
               className={`mt-3 flex w-full items-start gap-3 rounded-2xl border p-3 text-left transition-all ${
                 testFlight
                   ? "border-emerald-400/40 bg-emerald-400/10"
                   : "border-white/10 bg-white/[0.02] hover:border-emerald-500/20"
-              }`}
+              } disabled:cursor-not-allowed disabled:opacity-50`}
             >
               <span
                 className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
@@ -476,11 +489,12 @@ export default function SplatLabPage() {
             <button
               type="button"
               onClick={() => setLanguageField((v) => !v)}
+              disabled={computeControlsDisabled}
               className={`mt-3 flex w-full items-start gap-3 rounded-2xl border p-3 text-left transition-all ${
                 languageField
                   ? "border-cyan-400/40 bg-cyan-400/10"
                   : "border-white/10 bg-white/[0.02] hover:border-cyan-500/20"
-              }`}
+              } disabled:cursor-not-allowed disabled:opacity-50`}
             >
               <span
                 className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
@@ -505,11 +519,12 @@ export default function SplatLabPage() {
             <button
               type="button"
               onClick={() => setSparseMode((v) => !v)}
+              disabled={computeControlsDisabled}
               className={`mt-3 flex w-full items-start gap-3 rounded-2xl border p-3 text-left transition-all ${
                 sparseMode
                   ? "border-amber-400/40 bg-amber-400/10"
                   : "border-white/10 bg-white/[0.02] hover:border-amber-500/20"
-              }`}
+              } disabled:cursor-not-allowed disabled:opacity-50`}
             >
               <span
                 className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
@@ -534,11 +549,12 @@ export default function SplatLabPage() {
             <button
               type="button"
               onClick={() => setGenerativeMode((v) => !v)}
+              disabled={computeControlsDisabled}
               className={`mt-3 flex w-full items-start gap-3 rounded-2xl border p-3 text-left transition-all ${
                 generativeMode
                   ? "border-fuchsia-400/40 bg-fuchsia-400/10"
                   : "border-white/10 bg-white/[0.02] hover:border-fuchsia-500/20"
-              }`}
+              } disabled:cursor-not-allowed disabled:opacity-50`}
             >
               <span
                 className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
@@ -578,11 +594,13 @@ export default function SplatLabPage() {
           <Button
             size="lg"
             className="mt-4 w-full"
-            disabled={!uploaded || startMutation.isPending || !!activeJob || (!!status && !engineReady)}
+            disabled={createDisabled}
             onClick={() => uploaded && createFrom(uploaded)}
           >
             {startMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wand2 className="h-4 w-4" />}
-            {!!status && !engineReady
+            {computeBlocked
+              ? "GPU compute blocked"
+              : !!status && !engineReady
               ? "Engine warming up…"
               : activeJob
                 ? "A scene is already building…"
@@ -623,7 +641,7 @@ export default function SplatLabPage() {
                       <p className="text-sm text-amber-200/90">{latestFailed.error_message}</p>
                       {glomapAvailable && (
                         <div className="pt-1.5">
-                          <Button size="sm" disabled={!!activeJob} onClick={() => retryGlomap(latestFailed)}>
+                          <Button size="sm" disabled={!!activeJob || computeControlsDisabled} onClick={() => retryGlomap(latestFailed)}>
                             <RefreshCw className="h-3.5 w-3.5" /> Retry with global SfM
                           </Button>
                           <p className="mt-1 text-[11px] text-amber-200/60">
@@ -650,10 +668,72 @@ export default function SplatLabPage() {
         onRerun={rerun}
         onPromote={promoteToFullBuild}
         busy={!!activeJob}
+        computeBlocked={computeControlsDisabled}
         onPin={(j) => pinMutation.mutate(j)}
         onDelete={(id) => deleteMutation.mutate(id)}
       />
     </div>
+  );
+}
+
+function ComputeGateBanner({ compute }: { compute: SplatStatusResponse["compute"] }) {
+  if (!compute) return null;
+  if (compute.enabled && compute.mode === "supervised" && compute.supervised_unlock?.active) {
+    const minutes = Math.max(0, Math.ceil((compute.supervised_unlock.seconds_remaining ?? 0) / 60));
+    return (
+      <Card className="mb-5 border-emerald-500/30 bg-emerald-500/10 p-4">
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div className="flex min-w-0 gap-3">
+            <Cpu className="mt-0.5 h-5 w-5 shrink-0 text-emerald-300" />
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-emerald-100">Supervised compute is armed</p>
+              <p className="mt-1 text-sm text-emerald-100/80">
+                One SplatLab GPU job can run during this test window. Expires in about {minutes} minute{minutes === 1 ? "" : "s"}.
+              </p>
+              <p className="mt-1 truncate font-mono text-[11px] text-emerald-100/50">{compute.unlock_path || compute.supervised_unlock.path}</p>
+            </div>
+          </div>
+          <div className="grid gap-2 text-xs text-emerald-100/80 sm:grid-cols-2 md:w-[520px]">
+            <div className="rounded-xl border border-emerald-400/20 bg-black/20 p-2.5">
+              <p className="mb-1 font-semibold text-emerald-100">Available now</p>
+              <p>{compute.safe_capabilities.slice(0, 3).join(" · ")}</p>
+            </div>
+            <div className="rounded-xl border border-emerald-400/20 bg-black/20 p-2.5">
+              <p className="mb-1 font-semibold text-emerald-100">Still held back</p>
+              <p>{compute.blocked_capabilities.slice(0, 3).join(" · ")}</p>
+            </div>
+          </div>
+        </div>
+      </Card>
+    );
+  }
+  if (compute.enabled) return null;
+  return (
+    <Card className="mb-5 border-amber-500/30 bg-amber-500/10 p-4">
+      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+        <div className="flex min-w-0 gap-3">
+          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-300" />
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-amber-100">SplatLab is open in safe browse mode</p>
+            <p className="mt-1 text-sm text-amber-100/80">
+              GPU generation and scene mutations are blocked by the hardware-maintenance gate:{" "}
+              {compute.reason || "hardware maintenance is active."}
+            </p>
+            <p className="mt-1 truncate font-mono text-[11px] text-amber-100/50">{compute.marker_path}</p>
+          </div>
+        </div>
+        <div className="grid gap-2 text-xs text-amber-100/80 sm:grid-cols-2 md:w-[520px]">
+          <div className="rounded-xl border border-amber-400/20 bg-black/20 p-2.5">
+            <p className="mb-1 font-semibold text-amber-100">Available now</p>
+            <p>{compute.safe_capabilities.slice(0, 3).join(" · ")}</p>
+          </div>
+          <div className="rounded-xl border border-amber-400/20 bg-black/20 p-2.5">
+            <p className="mb-1 font-semibold text-amber-100">Paused</p>
+            <p>{compute.blocked_capabilities.slice(0, 3).join(" · ")}</p>
+          </div>
+        </div>
+      </div>
+    </Card>
   );
 }
 
@@ -662,15 +742,23 @@ function UploadBox({
   onUploaded,
   onError,
   current,
+  disabled,
+  disabledReason,
 }: {
   onUploaded: (r: SplatUploadResult) => void;
   onError: (m: string) => void;
   current: SplatUploadResult | null;
+  disabled: boolean;
+  disabledReason: string;
 }) {
   const [pct, setPct] = useState<number | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   function upload(file: File) {
+    if (disabled) {
+      onError(disabledReason);
+      return;
+    }
     const form = new FormData();
     form.append("file", file);
     const xhr = new XMLHttpRequest();
@@ -694,19 +782,28 @@ function UploadBox({
       onDragOver={(e) => e.preventDefault()}
       onDrop={(e) => {
         e.preventDefault();
-        if (e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]);
+        if (!disabled && e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]);
       }}
-      onClick={() => inputRef.current?.click()}
-      className="cursor-pointer rounded-2xl border border-dashed border-white/15 bg-white/[0.02] p-6 text-center transition-colors hover:border-cyan-400/40"
+      onClick={() => !disabled && inputRef.current?.click()}
+      className={`rounded-2xl border border-dashed border-white/15 bg-white/[0.02] p-6 text-center transition-colors ${
+        disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer hover:border-cyan-400/40"
+      }`}
     >
       <input
         ref={inputRef}
         type="file"
         accept="video/*,.insv,.zip"
         className="hidden"
+        disabled={disabled}
         onChange={(e) => e.target.files?.[0] && upload(e.target.files[0])}
       />
-      {pct !== null ? (
+      {disabled ? (
+        <div className="space-y-1">
+          <AlertTriangle className="mx-auto h-6 w-6 text-amber-300" />
+          <p className="text-sm font-medium text-amber-100">New capture uploads blocked</p>
+          <p className="text-xs text-amber-100/60">Existing scenes and downloads remain available.</p>
+        </div>
+      ) : pct !== null ? (
         <div className="space-y-2">
           <Loader2 className="mx-auto h-6 w-6 animate-spin text-cyan-300" />
           <div className="mx-auto h-1.5 w-2/3 overflow-hidden rounded-full bg-white/10">
@@ -736,12 +833,14 @@ function TransfersPicker({
   onSelect,
   onRefresh,
   refreshing,
+  disabled,
 }: {
   entries: SplatTransferEntry[];
   selectedPath: string | null;
   onSelect: (e: SplatTransferEntry) => void;
   onRefresh: () => void;
   refreshing: boolean;
+  disabled: boolean;
 }) {
   return (
     <div className="mt-4 space-y-2">
@@ -767,9 +866,10 @@ function TransfersPicker({
               <button
                 key={e.path}
                 onClick={() => onSelect(e)}
+                disabled={disabled}
                 className={`flex w-full items-center gap-3 rounded-xl border p-2.5 text-left transition-all ${
                   sel ? "border-cyan-400/40 bg-cyan-400/10" : "border-white/10 bg-white/[0.02] hover:border-cyan-500/20"
-                }`}
+                } disabled:cursor-not-allowed disabled:opacity-50`}
               >
                 <FolderOpen className={`h-4 w-4 shrink-0 ${sel ? "text-cyan-200" : "text-zinc-500"}`} />
                 <span className="min-w-0 flex-1">
@@ -943,6 +1043,7 @@ function ResultsGallery({
   onRerun,
   onPromote,
   busy,
+  computeBlocked,
   onPin,
   onDelete,
 }: {
@@ -950,6 +1051,7 @@ function ResultsGallery({
   onRerun: (job: SplatJob, mult?: number) => void;
   onPromote: (job: SplatJob) => void;
   busy: boolean;
+  computeBlocked: boolean;
   onPin: (job: SplatJob) => void;
   onDelete: (id: string) => void;
 }) {
@@ -994,6 +1096,7 @@ function ResultsGallery({
             onRerun={onRerun}
             onPromote={onPromote}
             busy={busy}
+            computeBlocked={computeBlocked}
             onPin={onPin}
             onDelete={onDelete}
           />
@@ -1010,6 +1113,7 @@ function SceneCard({
   onRerun,
   onPromote,
   busy,
+  computeBlocked,
   onPin,
   onDelete,
 }: {
@@ -1019,6 +1123,7 @@ function SceneCard({
   onRerun: (job: SplatJob, mult?: number) => void;
   onPromote: (job: SplatJob) => void;
   busy: boolean;
+  computeBlocked: boolean;
   onPin: (job: SplatJob) => void;
   onDelete: (id: string) => void;
 }) {
@@ -1036,9 +1141,10 @@ function SceneCard({
           e.stopPropagation();
           onPin(job);
         }}
+        disabled={computeBlocked}
         className={`absolute right-4 top-4 z-10 rounded-md bg-black/40 p-1 transition-opacity ${
           job.pinned ? "text-cyan-300 opacity-100" : "text-zinc-400 opacity-0 hover:text-zinc-100 group-hover:opacity-100"
-        }`}
+        } disabled:cursor-not-allowed disabled:opacity-40`}
         title={job.pinned ? "Unpin" : "Pin (protect from auto-cleanup)"}
       >
         <Pin className={`h-3.5 w-3.5 ${job.pinned ? "fill-current" : ""}`} />
@@ -1141,7 +1247,7 @@ function SceneCard({
             size="sm"
             variant="ghost"
             className="flex-1 border border-emerald-400/30 text-xs text-emerald-200 hover:bg-emerald-400/10"
-            disabled={busy}
+            disabled={busy || computeBlocked}
             onClick={() => onPromote(job)}
             title="Build the full clip at full quality, using the settings this proof validated"
           >
@@ -1149,10 +1255,10 @@ function SceneCard({
           </Button>
         ) : (
           <>
-            <Button size="sm" variant="ghost" className="flex-1 text-xs" disabled={busy} onClick={() => onRerun(job)} title="Re-run with the same settings">
+            <Button size="sm" variant="ghost" className="flex-1 text-xs" disabled={busy || computeBlocked} onClick={() => onRerun(job)} title="Re-run with the same settings">
               <RefreshCw className="h-3.5 w-3.5" /> Re-run
             </Button>
-            <Button size="sm" variant="ghost" className="flex-1 text-xs" disabled={busy} onClick={() => onRerun(job, 2)} title="Re-run at ~2x iterations">
+            <Button size="sm" variant="ghost" className="flex-1 text-xs" disabled={busy || computeBlocked} onClick={() => onRerun(job, 2)} title="Re-run at ~2x iterations">
               ↑ Quality
             </Button>
           </>
@@ -1162,6 +1268,7 @@ function SceneCard({
           variant="ghost"
           className={`text-xs ${confirmDel ? "text-red-300" : "text-zinc-500 hover:text-red-300"}`}
           onClick={() => (confirmDel ? onDelete(job.job_id) : setConfirmDel(true))}
+          disabled={computeBlocked}
           title="Delete scene"
         >
           <Trash2 className="h-3.5 w-3.5" /> {confirmDel ? "Sure?" : ""}

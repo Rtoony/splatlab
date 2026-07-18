@@ -5,7 +5,14 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { dyno, RgbaArray, SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
 import { apiRequest } from "@/lib/api";
-import { buildHeatmapModifier, fetchRelevancy, packRelevancyRgba } from "@/lib/spark-heatmap";
+import {
+  buildHeatmapModifier,
+  buildTestRelevancy,
+  fetchRelevancy,
+  packRelevancyRgba,
+  shouldUseTestRelevancy,
+  type RelevancyResult,
+} from "@/lib/spark-heatmap";
 import type { SplatJob, SplatStatusResponse } from "@/lib/contracts";
 import { Button, Card, SectionLabel } from "@/components/ui";
 import { ArrowLeft, Box, Compass, Crosshair, Flame, Gauge, Loader2, RotateCcw, Search, Sun } from "lucide-react";
@@ -37,6 +44,7 @@ export default function SparkTestPage() {
     () => (status?.jobs ?? []).filter((j) => j.preview_available && (j.preview_web_url || j.preview_view_url)),
     [status],
   );
+  const computeBlocked = Boolean(status?.compute && !status.compute.enabled);
 
   const [jobId, setJobId] = useState<string | null>(null);
   useEffect(() => {
@@ -83,7 +91,7 @@ export default function SparkTestPage() {
       </header>
       <main className="relative flex-1 overflow-hidden">
         {url && job ? (
-          <SparkViewport key={job.job_id} url={url} job={job} />
+          <SparkViewport key={job.job_id} url={url} job={job} safeMode={computeBlocked} />
         ) : (
           <div className="flex h-full items-center justify-center text-sm text-zinc-500">
             No previewable scene available yet.
@@ -100,7 +108,7 @@ function sceneLabel(job: SplatJob): string {
   return gaussians ? `${name} (${gaussians.toLocaleString()} splats)` : name;
 }
 
-function SparkViewport({ url, job }: { url: string; job: SplatJob }) {
+function SparkViewport({ url, job, safeMode }: { url: string; job: SplatJob; safeMode: boolean }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
@@ -125,7 +133,7 @@ function SparkViewport({ url, job }: { url: string; job: SplatJob }) {
   const [queryBusy, setQueryBusy] = useState(false);
   const [queryStatus, setQueryStatus] = useState<string | null>(null);
   const [queryError, setQueryError] = useState<string | null>(null);
-  const [realScalarLive, setRealScalarLive] = useState(false);
+  const [scalarMode, setScalarMode] = useState<"fake" | "real" | "test">("fake");
 
   useEffect(() => {
     const container = containerRef.current;
@@ -138,7 +146,7 @@ function SparkViewport({ url, job }: { url: string; job: SplatJob }) {
     setPivotMode("none");
     setQueryStatus(null);
     setQueryError(null);
-    setRealScalarLive(false);
+    setScalarMode("fake");
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 1000);
@@ -349,8 +357,20 @@ function SparkViewport({ url, job }: { url: string; job: SplatJob }) {
     setQueryBusy(true);
     setQueryError(null);
     try {
-      const result = await fetchRelevancy(job.job_id, text);
       const numSplats = mesh.packedSplats?.numSplats ?? mesh.numSplats ?? 0;
+      let result: RelevancyResult;
+      try {
+        result = job.langfield_available && !safeMode
+          ? await fetchRelevancy(job.job_id, text)
+          : buildTestRelevancy(
+              numSplats,
+              text,
+              job.langfield_available ? "hardware gate active; using safe test search" : "no language field on this scene",
+            );
+      } catch (cause) {
+        if (!shouldUseTestRelevancy(cause)) throw cause;
+        result = buildTestRelevancy(numSplats, text, "language worker unavailable in safe browse mode");
+      }
       if (result.bytes.length !== numSplats) {
         throw new Error(
           `relevancy rows (${result.bytes.length.toLocaleString()}) != loaded splats (${numSplats.toLocaleString()}) — scene not loaded as langweb?`,
@@ -364,14 +384,15 @@ function SparkViewport({ url, job }: { url: string; job: SplatJob }) {
         spotlightThreshold: spotlightThresholdDyno,
       });
       mesh.updateGenerator();
-      setRealScalarLive(true);
+      setScalarMode(result.source);
       setHeatmapOn(true);
       heatmapEnabled.value = true;
       mesh.updateVersion();
       setQueryStatus(
-        `"${text}" · ${result.bytes.length.toLocaleString()} rows · rel ${result.relMin ?? "?"}–${result.relMax ?? "?"}` +
+        `${result.source === "test" ? "TEST " : ""}"${text}" · ${result.bytes.length.toLocaleString()} rows · rel ${result.relMin ?? "?"}–${result.relMax ?? "?"}` +
           (result.matchCount !== null ? ` · ${result.matchCount} instance${result.matchCount === 1 ? "" : "s"}` : "") +
-          ` · ${result.ms}ms`,
+          ` · ${result.ms}ms` +
+          (result.detail ? ` · ${result.detail}` : ""),
       );
     } catch (cause) {
       setQueryError(cause instanceof Error ? cause.message : "Relevancy request failed.");
@@ -448,42 +469,50 @@ function SparkViewport({ url, job }: { url: string; job: SplatJob }) {
         </div>
 
         <div className="h-px bg-white/10" />
-        <SectionLabel>Language heatmap (real relevancy)</SectionLabel>
-        {job?.langfield_available ? (
-          <>
-            <form
-              className="flex items-center gap-2"
-              onSubmit={(e) => {
-                e.preventDefault();
-                void runRealQuery();
-              }}
-            >
-              <input
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder='Try "chair", "trash can"…'
-                className="w-full rounded border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-cyan-400/50 focus:outline-none"
-              />
-              <Button type="submit" size="sm" disabled={queryBusy || !query.trim()}>
-                {queryBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Search className="h-3.5 w-3.5" />}
-              </Button>
-            </form>
-            {queryStatus && <p className="text-[10px] leading-snug text-emerald-300/90">{queryStatus}</p>}
-            {queryError && <p className="text-[10px] leading-snug text-rose-300/90">{queryError}</p>}
-          </>
-        ) : (
-          <p className="text-[10px] leading-snug text-zinc-500">
-            This scene has no language field — run a job with the language field enabled
-            to drive the heatmap with real relevancy. The fake-scalar proof below still works.
+        <SectionLabel>{job?.langfield_available && !safeMode ? "Language heatmap" : "Test search heatmap"}</SectionLabel>
+        {(safeMode || !job?.langfield_available) && (
+          <p className="text-[10px] leading-snug text-amber-200/80">
+            {safeMode
+              ? "Hardware-gated safe mode is active, so searches use a deterministic test pattern to verify the Spark overlay."
+              : "This scene has no language field, so searches use a deterministic test pattern to verify the Spark overlay."}
           </p>
         )}
+        <form
+          className="flex items-center gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void runRealQuery();
+          }}
+        >
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder='Try "chair", "trash can"…'
+            className="w-full rounded border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-cyan-400/50 focus:outline-none"
+          />
+          <Button type="submit" size="sm" disabled={queryBusy || !query.trim()}>
+            {queryBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Search className="h-3.5 w-3.5" />}
+          </Button>
+        </form>
+        {queryStatus && <p className="text-[10px] leading-snug text-emerald-300/90">{queryStatus}</p>}
+        {queryError && <p className="text-[10px] leading-snug text-rose-300/90">{queryError}</p>}
 
         <div className="h-px bg-white/10" />
-        <SectionLabel>{realScalarLive ? "Heatmap (REAL relevancy live)" : "Heatmap mechanism proof (fake data)"}</SectionLabel>
+        <SectionLabel>
+          {scalarMode === "real"
+            ? "Heatmap (REAL relevancy live)"
+            : scalarMode === "test"
+              ? "Heatmap (TEST search live)"
+              : "Heatmap mechanism proof (fake data)"}
+        </SectionLabel>
         <label className="flex items-center gap-2">
           <input type="checkbox" checked={heatmapOn} onChange={(e) => onHeatmapToggle(e.target.checked)} />
           <Flame className="h-3.5 w-3.5 text-orange-300" />{" "}
-          {realScalarLive ? "Tint by query relevancy" : "Tint by fake per-splat scalar"}
+          {scalarMode === "real"
+            ? "Tint by query relevancy"
+            : scalarMode === "test"
+              ? "Tint by test search"
+              : "Tint by fake per-splat scalar"}
         </label>
         <label className="flex items-center gap-2">
           <input type="checkbox" checked={spotlightOn} onChange={(e) => onSpotlightToggle(e.target.checked)} />
@@ -502,8 +531,10 @@ function SparkViewport({ url, job }: { url: string; job: SplatJob }) {
           <span className="w-9 shrink-0 text-right text-zinc-400">{spotlightThreshold.toFixed(2)}</span>
         </div>
         <p className="text-[10px] leading-snug text-zinc-500">
-          {realScalarLive
+          {scalarMode === "real"
             ? "Tint + spotlight now read the real per-splat relevancy for the last query (turbo-style ramp: purple = low, yellow = high)."
+            : scalarMode === "test"
+              ? "Tint + spotlight are driven by a deterministic query-specific test pattern, not semantic language relevancy."
             : "Scalar is fake (sin-of-index, not a real relevancy score) — this only proves the per-splat-index → texture → shader wiring for the language-field heatmap."}
         </p>
       </Card>

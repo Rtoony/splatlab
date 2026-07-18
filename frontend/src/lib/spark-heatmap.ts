@@ -73,6 +73,8 @@ export interface RelevancyResult {
   relMax: string | null;
   matchCount: number | null;
   ms: number;
+  source: "real" | "test";
+  detail?: string;
 }
 
 // POST the query, return the raw uint8 vector + receipt metadata. The server
@@ -113,7 +115,64 @@ export async function fetchRelevancy(jobId: string, text: string): Promise<Relev
     relMax: res.headers.get("X-Max"),
     matchCount,
     ms: Math.round(performance.now() - started),
+    source: "real",
   };
+}
+
+function hashText(text: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function lcg(seed: number): () => number {
+  let x = seed >>> 0;
+  return () => {
+    x = (Math.imul(x, 1664525) + 1013904223) >>> 0;
+    return x / 0xffffffff;
+  };
+}
+
+export function buildTestRelevancy(numSplats: number, text: string, detail = "test search pattern"): RelevancyResult {
+  const count = Math.max(0, Math.floor(numSplats));
+  const bytes = new Uint8Array(count);
+  if (count === 0) {
+    return { bytes, relMin: "0", relMax: "1", matchCount: null, ms: 0, source: "test", detail };
+  }
+  const seed = hashText(text.trim().toLowerCase() || "splatlab-test-search");
+  const rand = lcg(seed);
+  const lobes = Array.from({ length: 4 }, () => ({
+    center: rand(),
+    width: 0.025 + rand() * 0.16,
+    weight: 0.55 + rand() * 0.45,
+  }));
+  for (let i = 0; i < count; i += 1) {
+    const t = count === 1 ? 0 : i / (count - 1);
+    let v = 0;
+    for (const lobe of lobes) {
+      const d = Math.min(Math.abs(t - lobe.center), 1 - Math.abs(t - lobe.center));
+      v = Math.max(v, lobe.weight * Math.exp(-(d * d) / (2 * lobe.width * lobe.width)));
+    }
+    const grain = ((Math.imul(i ^ seed, 2654435761) >>> 24) / 255) * 0.1;
+    bytes[i] = Math.max(0, Math.min(255, Math.round((v + grain) * 255)));
+  }
+  return { bytes, relMin: "0", relMax: "1", matchCount: null, ms: 0, source: "test", detail };
+}
+
+export function shouldUseTestRelevancy(cause: unknown): boolean {
+  const message = cause instanceof Error ? cause.message : String(cause ?? "");
+  return (
+    message.includes("409:") ||
+    message.includes("503:") ||
+    message.includes("hardware-maintenance") ||
+    message.includes("maintenance") ||
+    message.includes("warm worker") ||
+    message.includes("worker is not running") ||
+    message.includes("worker not ready")
+  );
 }
 
 // ---------------------------------------------------------------------------

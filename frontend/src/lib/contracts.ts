@@ -221,6 +221,30 @@ export interface SplatGpuHolder {
   locked: boolean;
 }
 
+export interface SplatComputeStatus {
+  enabled: boolean;
+  maintenance_active: boolean;
+  reason: string | null;
+  marker_path: string;
+  unlock_path?: string;
+  mode?: "safe-browse" | "supervised" | "normal";
+  supervised_unlock?: {
+    active: boolean;
+    path: string;
+    schema: string;
+    mode: string | null;
+    reason: string | null;
+    operator: string | null;
+    created_at: string | null;
+    expires_at: string | null;
+    seconds_remaining: number;
+    max_active_jobs: number;
+    detail: string | null;
+  };
+  safe_capabilities: string[];
+  blocked_capabilities: string[];
+}
+
 export interface SplatStatusResponse {
   workspace: {
     root: string;
@@ -240,6 +264,7 @@ export interface SplatStatusResponse {
     langfield_available?: boolean;
     [k: string]: unknown;
   };
+  compute?: SplatComputeStatus;
   media_samples: Array<{ name: string; path: string; kind: "file" | "directory" }>;
   jobs: SplatJob[];
   active_jobs: number;

@@ -5,11 +5,14 @@ import { dyno, RgbaArray, SparkRenderer, SplatFileType, SplatMesh } from "@spark
 import { apiRequest } from "@/lib/api";
 import {
   buildOverlayModifier,
+  buildTestRelevancy,
   cutoffForTopPercent,
   fetchRelevancy,
   packChannelsRgba,
   rampCssGradient,
   RAMPS,
+  shouldUseTestRelevancy,
+  type RelevancyResult,
   type OverlayMode,
 } from "@/lib/spark-heatmap";
 import type { SplatJob } from "@/lib/contracts";
@@ -47,6 +50,8 @@ interface QueryChannel {
   relMin: string | null;
   relMax: string | null;
   enabled: boolean;
+  source: "real" | "test";
+  detail?: string;
 }
 
 interface Dim {
@@ -92,7 +97,17 @@ interface OverrideRecord {
   count: number;
 }
 
-export function SparkSceneViewer({ job }: { job: SplatJob }) {
+export function SparkSceneViewer({
+  job,
+  safeMode = false,
+  computeReason = "",
+  onViewerError,
+}: {
+  job: SplatJob;
+  safeMode?: boolean;
+  computeReason?: string;
+  onViewerError?: (message: string) => void;
+}) {
   // Langfield scenes MUST load langweb: relevancy rows are exported-ply order
   // and langweb preserves it; web.ply is decimated + reordered.
   const url = `/api/splat/jobs/${job.job_id}/preview/file?fmt=${job.langfield_available ? "langweb" : "web"}`;
@@ -417,8 +432,20 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
     setQueryBusy(true);
     setQueryError(null);
     try {
-      const result = await fetchRelevancy(job.job_id, text);
       const numSplats = mesh.packedSplats?.numSplats ?? mesh.numSplats ?? 0;
+      let result: RelevancyResult;
+      try {
+        result = job.langfield_available && !safeMode
+          ? await fetchRelevancy(job.job_id, text)
+          : buildTestRelevancy(
+              numSplats,
+              text,
+              job.langfield_available ? "hardware gate active; using safe test search" : "no language field on this scene",
+            );
+      } catch (cause) {
+        if (!shouldUseTestRelevancy(cause)) throw cause;
+        result = buildTestRelevancy(numSplats, text, "language worker unavailable in safe browse mode");
+      }
       if (result.bytes.length !== numSplats) {
         throw new Error(
           `relevancy rows (${result.bytes.length.toLocaleString()}) != loaded splats (${numSplats.toLocaleString()}) — scene not loaded as langweb?`,
@@ -434,6 +461,8 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
           relMin: result.relMin,
           relMax: result.relMax,
           enabled: true,
+          source: result.source,
+          detail: result.detail,
         },
       ];
       setChannels(next);
@@ -546,6 +575,12 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
     setReady(false);
     setSplatCount(null);
 
+    function reportViewerError(cause: unknown, fallback: string) {
+      const message = cause instanceof Error ? cause.message : fallback;
+      setError(message);
+      onViewerError?.(message);
+    }
+
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 1000);
     camera.up.copy(INITIAL_CAMERA_UP);
@@ -553,12 +588,26 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
     camera.lookAt(INITIAL_CAMERA_LOOK_AT);
     cameraRef.current = camera;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: false });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    container.appendChild(renderer.domElement);
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: false });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      container.appendChild(renderer.domElement);
+    } catch (cause) {
+      reportViewerError(cause, "WebGL could not start the Spark viewer.");
+      return;
+    }
 
-    const spark = new SparkRenderer({ renderer });
-    scene.add(spark);
+    let spark: SparkRenderer;
+    try {
+      spark = new SparkRenderer({ renderer });
+      scene.add(spark);
+    } catch (cause) {
+      renderer.dispose();
+      if (renderer.domElement.parentElement === container) container.removeChild(renderer.domElement);
+      reportViewerError(cause, "Spark could not initialize this scene.");
+      return;
+    }
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.target.copy(INITIAL_CAMERA_LOOK_AT);
@@ -685,7 +734,7 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
       })
       .catch((cause: unknown) => {
         if (disposed) return;
-        setError(cause instanceof Error ? cause.message : "Could not load Spark preview.");
+        reportViewerError(cause, "Could not load Spark preview.");
       });
 
     function raycastAt(clientX: number, clientY: number): THREE.Vector3 | null {
@@ -887,9 +936,19 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
           </span>
         </div>
 
-        {job.langfield_available ? (
-          <>
-            <SectionLabel>Language overlay</SectionLabel>
+        <>
+            <SectionLabel>{job.langfield_available ? "Language overlay" : "Test search overlay"}</SectionLabel>
+            {safeMode && (
+              <p className="rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5 text-[10px] leading-snug text-amber-100/85">
+                Real language search is blocked by the current hardware gate. Spark search will use a deterministic
+                test pattern until the LangField worker is available.
+              </p>
+            )}
+            {!job.langfield_available && (
+              <p className="rounded-lg border border-cyan-300/15 bg-cyan-300/10 px-2 py-1.5 text-[10px] leading-snug text-cyan-100/80">
+                This scene has no language field, so searches use a test pattern to verify overlay controls.
+              </p>
+            )}
             <form
               className="flex items-center gap-2"
               onSubmit={(e) => {
@@ -924,7 +983,7 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
                   {c.text}
                 </span>
                 <span className="shrink-0 text-[10px] text-zinc-500">
-                  {c.matchCount !== null ? `${c.matchCount}×` : ""}
+                  {c.source === "test" ? "test" : c.matchCount !== null ? `${c.matchCount}×` : ""}
                 </span>
                 <button type="button" onClick={() => removeQuery(i)} className="shrink-0 text-zinc-500 hover:text-rose-300">
                   <X className="h-3.5 w-3.5" />
@@ -980,14 +1039,9 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
                 )}
               </>
             )}
-          </>
-        ) : (
-          <p className="text-[10px] leading-snug text-zinc-500">
-            No language field on this scene — re-run with the language field enabled to search it.
-          </p>
-        )}
+        </>
 
-        {job.langfield_available && (
+        {job.langfield_available && !safeMode && (
           <>
             <div className="h-px bg-white/10" />
             <SectionLabel>Paint the field</SectionLabel>
@@ -1113,6 +1167,15 @@ export function SparkSceneViewer({ job }: { job: SplatJob }) {
                 ))}
               </div>
             )}
+          </>
+        )}
+        {job.langfield_available && safeMode && (
+          <>
+            <div className="h-px bg-white/10" />
+            <p className="rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5 text-[10px] leading-snug text-amber-100/85">
+              Paint and semantic edits are disabled while the hardware-maintenance gate is active
+              {computeReason ? `: ${computeReason}` : "."}
+            </p>
           </>
         )}
 

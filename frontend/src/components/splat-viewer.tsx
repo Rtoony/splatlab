@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { RotateCcw } from "lucide-react";
 
 // In-browser Gaussian-splat viewer (mkkellogg). Ported from the portal; renders
 // a .ply (raw or web-optimized) or .spz. `fill` makes it fill its parent.
@@ -27,6 +28,7 @@ export function SplatViewer({
   url,
   format = "ply",
   fill = false,
+  fallbackImageUrl,
   focus = null,
   overlay = null,
   highlights = [],
@@ -41,6 +43,7 @@ export function SplatViewer({
   url: string;
   format?: "ply" | "spz";
   fill?: boolean;
+  fallbackImageUrl?: string;
   // When set (from a language search hit), fly the camera to this 3D point.
   focus?: ViewerPoint | null;
   // When set, draw a highlight marker on each 3D match + a label on the active one.
@@ -63,6 +66,7 @@ export function SplatViewer({
   const viewerRef = useRef<any>(null);
   const defaultFovRef = useRef<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [retryToken, setRetryToken] = useState(0);
   // Screen positions of each 3D match, updated every frame from the camera.
   const [markers, setMarkers] = useState<{ x: number; y: number; front: boolean }[]>([]);
   // Screen positions of each highlight group's points (colored legend highlights).
@@ -134,7 +138,7 @@ export function SplatViewer({
       viewerRef.current = null;
       if (viewer) void viewer.dispose();
     };
-  }, [url, format]);
+  }, [url, format, retryToken]);
 
   // Restore the viewer's default camera/orbit. Parent state clears overlays separately.
   useEffect(() => {
@@ -461,12 +465,30 @@ export function SplatViewer({
           {cameraMarkers.length} cameras
         </div>
       )}
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-4 py-3">
+      {!error && <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 to-transparent px-4 py-3">
         <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-white/65">Drag to orbit. Scroll to zoom.</p>
-      </div>
+      </div>}
       {error && (
-        <div className="absolute inset-4 flex items-center justify-center rounded-2xl border border-red-500/25 bg-red-500/10 p-4 text-sm text-red-200">
-          {error}
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-black">
+          {fallbackImageUrl && (
+            <img
+              src={fallbackImageUrl}
+              alt="Static scene preview"
+              className="absolute inset-0 h-full w-full object-contain opacity-70"
+            />
+          )}
+          <div className="relative m-4 max-w-lg rounded-lg border border-amber-300/25 bg-black/80 p-4 text-center text-sm text-zinc-100 shadow-xl backdrop-blur-md">
+            <p className="font-semibold">3D preview unavailable in this browser</p>
+            <p className="mt-1 break-words text-xs text-zinc-400">{error}</p>
+            <button
+              type="button"
+              onClick={() => setRetryToken((value) => value + 1)}
+              className="mx-auto mt-3 inline-flex items-center gap-2 rounded-lg border border-white/15 bg-white/10 px-3 py-2 text-xs font-semibold text-white hover:bg-white/15"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              Retry 3D
+            </button>
+          </div>
         </div>
       )}
     </div>

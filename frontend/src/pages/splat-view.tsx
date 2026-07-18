@@ -35,6 +35,8 @@ export default function SplatViewPage() {
     () => status?.jobs.find((j) => j.job_id === jobId),
     [status, jobId],
   );
+  const computeBlocked = Boolean(status?.compute && !status.compute.enabled);
+  const computeReason = status?.compute?.reason ?? "";
   const viewUrl = job?.preview_web_url ?? job?.preview_view_url ?? null;
   const title = job ? job.input_path?.split("/").pop() || job.job_id : jobId;
   const [cameraOverlayOn, setCameraOverlayOn] = useState(false);
@@ -53,6 +55,11 @@ export default function SplatViewPage() {
       localStorage.setItem("splatlab.sparkBeta", v ? "0" : "1");
       return !v;
     });
+  }
+
+  function fallBackFromSpark() {
+    localStorage.setItem("splatlab.sparkBeta", "0");
+    setSparkBeta(false);
   }
 
   const { data: cameras, isFetching: camerasLoading, error: camerasError } = useQuery({
@@ -150,7 +157,7 @@ export default function SplatViewPage() {
   const { data: inventory, isLoading: invLoading } = useQuery({
     queryKey: ["inventory", jobId],
     queryFn: () => fetchLangfieldInventory(jobId),
-    enabled: Boolean(jobId && job?.langfield_available),
+    enabled: Boolean(jobId && job?.langfield_available && !computeBlocked),
     staleTime: Infinity,
     retry: false,
   });
@@ -306,13 +313,20 @@ export default function SplatViewPage() {
             </div>
           </Centered>
         ) : sparkBeta ? (
-          <SparkSceneViewer key={job.job_id} job={job} />
+          <SparkSceneViewer
+            key={job.job_id}
+            job={job}
+            safeMode={computeBlocked}
+            computeReason={computeReason}
+            onViewerError={fallBackFromSpark}
+          />
         ) : (
           <>
             <SplatViewer
               url={viewUrl}
               format="ply"
               fill
+              fallbackImageUrl={`/api/splat/jobs/${job.job_id}/thumbnail`}
               focus={flyTarget}
               overlay={overlay}
               highlights={highlights}
@@ -341,7 +355,7 @@ export default function SplatViewPage() {
                 onView={viewFromCamera}
               />
             )}
-            {job.langfield_available && (invItems.length > 0 || invLoading) && (
+            {job.langfield_available && !computeBlocked && (invItems.length > 0 || invLoading) && (
               <InventoryLegend
                 items={invItems}
                 loading={invLoading}
@@ -360,7 +374,15 @@ export default function SplatViewPage() {
                 onClear={() => setActiveLabels(new Set())}
               />
             )}
-            {job.langfield_available && (
+            {job.langfield_available && computeBlocked && (
+              <div className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex justify-center p-3 sm:p-4">
+                <Card className="pointer-events-auto max-w-lg border-amber-300/25 bg-[#070b14]/85 p-3 text-xs text-amber-100 backdrop-blur-md">
+                  Real language search is blocked by the current hardware gate. Turn on Spark beta to use safe test
+                  search overlays without starting the LangField worker.
+                </Card>
+              </div>
+            )}
+            {job.langfield_available && !computeBlocked && (
               <LangfieldSearch
                 jobId={job.job_id}
                 result={result}
