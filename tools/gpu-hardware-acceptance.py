@@ -61,6 +61,12 @@ WATCHER_STATUS_TOOL = "nexus-gpu-health-watch"
 WATCHER_STATUS_UNIT = "nexus-gpu-health-watch.service"
 WATCHER_STATUS_MAX_AGE_SECONDS = 360.0
 WATCHER_STATUS_MAX_RUNTIME_SECONDS = 95.0
+# The watcher oneshot is not inactive/dead for its whole activation: the vault
+# ExecStartPre alone is allowed 10s (observed ~3-4s total, 2026-07-18). The
+# retry window (retries x 0.5s sleep) must outlast a normal activation, yet
+# stay under IDLE_SAMPLE_MAX_GAP_SECONDS or a mid-observation retry would trip
+# the sampling-gap check instead.
+WATCHER_UNIT_RACE_RETRIES = 16
 WATCHER_STATUS_MAX_BYTES = 64 * 1024
 WATCHER_STATUS_UID = 1000
 WATCHER_STATUS_GID = 1000
@@ -1704,7 +1710,7 @@ def check_watcher_status_receipt(
     monotonic_ns_fn: Callable[[], int] = time.monotonic_ns,
     sleep_fn: Callable[[float], None] = time.sleep,
     unit_state_fn: Callable[[], dict[str, str]] = read_watcher_unit_state,
-    race_retries: int = 6,
+    race_retries: int = WATCHER_UNIT_RACE_RETRIES,
 ) -> tuple[Check, dict[str, Any] | None]:
     last_race = "status_unavailable"
     for attempt in range(race_retries + 1):

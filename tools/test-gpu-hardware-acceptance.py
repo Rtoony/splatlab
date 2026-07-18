@@ -759,6 +759,35 @@ class AcceptanceToolTests(unittest.TestCase):
         self.assertFalse(running.passed)
         self.assertIn("watcher_unit_running", running.detail)
 
+    def test_watcher_receipt_default_retries_cover_normal_activation(self) -> None:
+        # 8s of budget rides out the ~4s production activation; the sub-gap
+        # bound keeps a mid-observation retry (sleeps + query overhead) from
+        # breaching the idle sampling-gap check.
+        self.assertGreaterEqual(acceptance.WATCHER_UNIT_RACE_RETRIES * 0.5, 8.0)
+        self.assertLess(
+            acceptance.WATCHER_UNIT_RACE_RETRIES * 0.5,
+            acceptance.IDLE_SAMPLE_MAX_GAP_SECONDS - 2.0,
+        )
+        paths = self.make_paths()
+        payload = self.watcher_payload()
+        self.write_watcher_payload(paths, payload)
+        activation_polls = 8  # one poll per 0.5s sleep across a 4s activation
+        states = [
+            self.watcher_unit_state(active_state="activating", sub_state="start")
+        ] * activation_polls + [self.watcher_unit_state(), self.watcher_unit_state()]
+
+        def unit_state() -> dict[str, str]:
+            return states.pop(0)
+
+        check, _ = acceptance.check_watcher_status_receipt(
+            paths,
+            wall_time_fn=lambda: 1_000.0,
+            monotonic_ns_fn=lambda: 1_000_000_000_000,
+            sleep_fn=lambda _seconds: None,
+            unit_state_fn=unit_state,
+        )
+        self.assertTrue(check.passed)
+
     def test_watcher_receipt_rejects_unsafe_file_and_duplicate_json(self) -> None:
         paths = self.make_paths()
         payload = self.watcher_payload()
