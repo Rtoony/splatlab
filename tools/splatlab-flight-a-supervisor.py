@@ -2242,7 +2242,7 @@ class Supervisor:
             job_id = job.get("job_id")
             if (
                 not isinstance(job_id, str)
-                or re.fullmatch(r"splat_[0-9a-f]{10}", job_id) is None
+                or re.fullmatch(r"splat_(?:[0-9a-f]{10}|[0-9a-f]{8})", job_id) is None
             ):
                 raise SafetyError("SplatLab job inventory contains an invalid job ID")
             observed.append(job_id)
