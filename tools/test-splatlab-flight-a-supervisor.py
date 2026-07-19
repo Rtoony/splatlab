@@ -944,27 +944,35 @@ def test_nexus_heavy_work_lock_blocks_before_transition(rig) -> None:
     assert not config.pending.exists()
 
 
-def test_nexus_heavy_work_lock_covers_final_recovery(rig) -> None:
+def test_nexus_heavy_work_lock_held_for_admission_released_for_flight(rig) -> None:
     supervisor, ops, config = rig
     original_start_service = ops.start_service
-    lock_probes = 0
+    lock_free_at_start: list[bool] = []
 
-    def start_service_with_lock_probe() -> None:
-        nonlocal lock_probes
+    def probe_lock_is_free() -> bool:
         fd = os.open(config.heavy_work_lock, os.O_RDWR)
         try:
-            with pytest.raises(BlockingIOError):
+            try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return True
         finally:
             os.close(fd)
-        lock_probes += 1
+
+    def start_service_with_lock_probe() -> None:
+        lock_free_at_start.append(probe_lock_is_free())
         original_start_service()
 
     ops.start_service = start_service_with_lock_probe  # type: ignore[method-assign]
 
     supervisor.run(RECEIPT_NAME)
 
-    assert lock_probes == 2  # fresh Flight A start and final gated recovery restart
+    # Held while the marker transition is admitted (fresh ungated start),
+    # released before submission — so the final gated recovery restart runs
+    # without it, exactly like the standalone `recover` command always has.
+    assert lock_free_at_start == [False, True]
     fd = os.open(config.heavy_work_lock, os.O_RDWR)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1641,3 +1649,32 @@ def test_watcher_long_activation_survives_race_budget(rig) -> None:
 
     assert status["invocation_id"] == "a" * 32
     assert ops.sleep_calls == 20
+
+
+def test_heavy_work_lock_released_immediately_before_submission(rig) -> None:
+    supervisor, ops, config = rig
+    original_submit = ops.submit_flight_a
+    observed: dict[str, bool] = {}
+
+    def submit_with_lock_probe() -> dict[str, Any]:
+        fd = os.open(config.heavy_work_lock, os.O_RDWR)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                observed["free_at_submit"] = True
+            except BlockingIOError:
+                observed["free_at_submit"] = False
+        finally:
+            os.close(fd)
+        return original_submit()
+
+    ops.submit_flight_a = submit_with_lock_probe  # type: ignore[method-assign]
+
+    supervisor.run(RECEIPT_NAME)
+
+    # The SplatLab GPU arbiter's host layer is this same lock file: it must
+    # be free by the time the job exists, or the job's first GPU stage
+    # deadlocks (observed 2026-07-19, flight splat_da70e534a3).
+    assert observed["free_at_submit"] is True
+    assert ops.submit_calls == 1

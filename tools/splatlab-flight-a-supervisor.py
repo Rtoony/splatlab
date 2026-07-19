@@ -3,8 +3,11 @@
 
 This is a transition supervisor, not a general launcher.  It accepts no payload
 overrides, never takes the GPU arbiter locks itself, and never retries an
-ambiguous submission.  It holds the host-wide Nexus heavy-work lock for the
-complete transition.  The existing SplatLab API remains the sole owner of the
+ambiguous submission.  It holds the host-wide Nexus heavy-work lock through
+admission and releases it immediately before job submission — since the
+07-13/14 pause-hardening the SplatLab GPU arbiter's host layer is this same
+file, so holding it across the flight deadlocks the job's first GPU stage
+(observed 2026-07-19, splat_da70e534a3).  The existing SplatLab API remains the sole owner of the
 host and Redis GPU leases.
 """
 
@@ -1507,6 +1510,7 @@ class Supervisor:
             fd = os.open(path, flags, 0o600)
         except OSError as exc:
             raise SafetyError(f"cannot open Nexus heavy-work lock: {exc}") from exc
+        self._heavy_work_fd = fd
         try:
             opened = os.fstat(fd)
             named = os.lstat(path)
@@ -1543,7 +1547,28 @@ class Supervisor:
                 ) from exc
             yield
         finally:
-            os.close(fd)
+            if self._heavy_work_fd == fd:
+                self._heavy_work_fd = None
+                os.close(fd)
+
+    _heavy_work_fd: int | None = None
+
+    def _release_heavy_work_lock(self) -> None:
+        """Release the host heavy-work flock before job submission.
+
+        Since the 07-13/14 pause-hardening, the SplatLab backend's GPU
+        arbiter uses this same file as its host-level lock; holding it for
+        the complete transition deadlocks the submitted job's first GPU
+        stage (observed 2026-07-19, flight splat_da70e534a3).  The monitor
+        loop still aborts on backups and competing workloads, so the
+        exclusion this flock provided during admission stays enforced for
+        the flight by the monitor instead.
+        """
+        fd, self._heavy_work_fd = self._heavy_work_fd, None
+        if fd is None:
+            return
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
     def current_boot_id(self) -> str:
         try:
@@ -3112,6 +3137,7 @@ class Supervisor:
                             "final admission expired immediately before submission"
                         )
                     signal_latch.check()
+                    self._release_heavy_work_lock()
                     try:
                         response = self.ops.submit_flight_a()
                     except Exception as exc:  # one POST may have reached the server
