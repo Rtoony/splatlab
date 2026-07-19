@@ -1678,3 +1678,70 @@ def test_heavy_work_lock_released_immediately_before_submission(rig) -> None:
     # deadlocks (observed 2026-07-19, flight splat_da70e534a3).
     assert observed["free_at_submit"] is True
     assert ops.submit_calls == 1
+
+
+APCACCESS_HEALTHY = (
+    "APC      : 001,038,1015\n"
+    "STATUS   : ONLINE\n"
+    "LINEV    : 116.0 Volts\n"
+    "LOADPCT  : 18.0 Percent\n"
+    "BCHARGE  : 100.0 Percent\n"
+)
+
+
+def _host_ops_with_apcaccess(outcomes: list[object]) -> tuple[Any, list[float]]:
+    """HostOps whose apcaccess runs pop scripted outcomes; sleeps recorded."""
+    ops = flight.HostOps(config=None)  # type: ignore[arg-type]
+    sleeps: list[float] = []
+
+    def scripted_run(argv, *, timeout=45):
+        assert argv[0] == "/usr/sbin/apcaccess"
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return subprocess.CompletedProcess(argv, outcome, stdout=APCACCESS_HEALTHY, stderr="")
+
+    ops.run = scripted_run  # type: ignore[method-assign]
+    ops.sleep = sleeps.append  # type: ignore[method-assign]
+    return ops, sleeps
+
+
+def test_ups_safety_tolerates_one_transient_apcaccess_stall() -> None:
+    # A single slow apcaccess read (UPS busy during a load step) must not
+    # abort the flight; the next attempt's healthy telemetry wins.
+    ops, sleeps = _host_ops_with_apcaccess(
+        [flight.SafetyError("command failed: /usr/sbin/apcaccess: timed out"), 0]
+    )
+    telemetry = ops.ups_safety()
+    assert telemetry == {"status": "ONLINE", "load_percent": 18.0}
+    assert sleeps == [flight.UPS_TELEMETRY_RETRY_DELAY_SECONDS]
+
+
+def test_ups_safety_aborts_after_exhausting_attempts() -> None:
+    outcomes: list[object] = [
+        flight.SafetyError("command failed: /usr/sbin/apcaccess: timed out"),
+        1,
+        flight.SafetyError("command failed: /usr/sbin/apcaccess: timed out"),
+    ]
+    assert len(outcomes) == flight.UPS_TELEMETRY_ATTEMPTS
+    ops, sleeps = _host_ops_with_apcaccess(outcomes)
+    with pytest.raises(flight.SafetyError, match="unreadable after 3 attempts"):
+        ops.ups_safety()
+    assert len(sleeps) == flight.UPS_TELEMETRY_ATTEMPTS - 1
+
+
+def test_ups_safety_danger_signals_abort_without_retry() -> None:
+    ops = flight.HostOps(config=None)  # type: ignore[arg-type]
+    calls: list[int] = []
+
+    def onbatt_run(argv, *, timeout=45):
+        calls.append(1)
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="STATUS   : ONBATT\nLOADPCT  : 18.0 Percent\n", stderr=""
+        )
+
+    ops.run = onbatt_run  # type: ignore[method-assign]
+    ops.sleep = lambda seconds: pytest.fail("danger signal must not retry")  # type: ignore[method-assign]
+    with pytest.raises(flight.SafetyError, match="UPS is not online: ONBATT"):
+        ops.ups_safety()
+    assert calls == [1]

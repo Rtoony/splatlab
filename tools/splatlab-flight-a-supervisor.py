@@ -57,6 +57,13 @@ MAX_FLIGHT_RUNTIME_SECONDS = 2 * 60 * 60
 MAX_CPU_TEMP_C = 85.0
 MAX_GPU_TEMP_C = 85.0
 MAX_UPS_LOAD_PERCENT = 80.0
+# apcaccess can stall past its 15s timeout when apcupsd's 60s USB poll lands on
+# a sharp UPS load transition (the UPS MCU answers HID reports slowly and
+# apcupsd holds its status lock for the whole device poll; observed aborting
+# flight attempt 9 on 2026-07-19 seconds after a ~300W load step). Telemetry
+# being briefly unreadable is not a danger signal, so retry before aborting.
+UPS_TELEMETRY_ATTEMPTS = 3
+UPS_TELEMETRY_RETRY_DELAY_SECONDS = 2.0
 MAX_SERVICE_MEMORY_BYTES = 31 * 1024**3
 MAX_SERVICE_SWAP_BYTES = 0
 MAX_SERVICE_TASKS = 480
@@ -1246,9 +1253,25 @@ class HostOps:
         return counts
 
     def ups_safety(self) -> dict[str, Any]:
-        result = self.run(["/usr/sbin/apcaccess", "status"], timeout=15)
-        if result.returncode != 0:
-            raise SafetyError("UPS telemetry is unreadable")
+        result: subprocess.CompletedProcess[str] | None = None
+        last_failure = ""
+        for attempt in range(1, UPS_TELEMETRY_ATTEMPTS + 1):
+            try:
+                candidate = self.run(["/usr/sbin/apcaccess", "status"], timeout=15)
+            except SafetyError as exc:
+                last_failure = str(exc)
+            else:
+                if candidate.returncode == 0:
+                    result = candidate
+                    break
+                last_failure = f"apcaccess exited {candidate.returncode}"
+            if attempt < UPS_TELEMETRY_ATTEMPTS:
+                self.sleep(UPS_TELEMETRY_RETRY_DELAY_SECONDS)
+        if result is None:
+            raise SafetyError(
+                "UPS telemetry is unreadable after "
+                f"{UPS_TELEMETRY_ATTEMPTS} attempts: {last_failure}"
+            )
         fields: dict[str, str] = {}
         for line in result.stdout.splitlines():
             if ":" in line:
