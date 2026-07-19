@@ -1631,3 +1631,13 @@ def test_cli_exposes_no_payload_overrides() -> None:
                 "8000",
             ]
         )
+
+
+def test_watcher_long_activation_survives_race_budget(rig) -> None:
+    supervisor, ops, _config = rig
+    ops.watcher_active_reads = 20
+
+    status = supervisor.validate_watcher_status(BOOT_ID)
+
+    assert status["invocation_id"] == "a" * 32
+    assert ops.sleep_calls == 20

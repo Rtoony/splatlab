@@ -45,6 +45,11 @@ RECEIPT_MAX_AGE_SECONDS = 30 * 60
 WATCHER_MAX_AGE_SECONDS = 6 * 60
 WATCHER_MAX_RUNTIME_SECONDS = 95
 MONITOR_INTERVAL_SECONDS = 2.0
+# The gpu-health-watch oneshot holds "activating" ~4s per 3-min timer firing
+# (vault ExecStartPre + probe), up to ~12s when the inject hits its 10s timeout.
+# 24 x 0.5s polls cover that worst case; a ~3s budget loses the race and aborts
+# the flight (observed 2026-07-19, same class as the acceptance-tool fix).
+WATCHER_UNIT_RACE_RETRIES = 24
 MAX_FLIGHT_RUNTIME_SECONDS = 2 * 60 * 60
 MAX_CPU_TEMP_C = 85.0
 MAX_GPU_TEMP_C = 85.0
@@ -2075,13 +2080,13 @@ class Supervisor:
         *,
         allowed_interlocks: frozenset[str] = frozenset({"already-active"}),
     ) -> dict[str, Any]:
-        for attempt in range(7):
+        for attempt in range(WATCHER_UNIT_RACE_RETRIES):
             unit_before = self.ops.watcher_unit_state()
             if (
                 unit_before.get("ActiveState") != "inactive"
                 or unit_before.get("SubState") != "dead"
             ):
-                if attempt < 6:
+                if attempt < WATCHER_UNIT_RACE_RETRIES - 1:
                     self.ops.sleep(0.5)
                     continue
                 raise SafetyError("GPU watcher is still running; no stable receipt")
@@ -2093,7 +2098,7 @@ class Supervisor:
             unit_state = self.ops.watcher_unit_state()
             if unit_before == unit_state:
                 break
-            if attempt < 6:
+            if attempt < WATCHER_UNIT_RACE_RETRIES - 1:
                 self.ops.sleep(0.5)
         else:  # pragma: no cover - loop either breaks or raises above
             raise SafetyError("GPU watcher invocation raced receipt validation")
