@@ -416,6 +416,11 @@ class _CrossProcessLock:
                         log.error("gpu_arbiter: Redis lease ownership was lost")
                         self._coordination_lost.set()
                         return
+                    # The holder record must live exactly as long as the lease
+                    # keeps renewing: if it expires mid-operation the status API
+                    # reports an anonymous locked GPU, and external watchers
+                    # (Flight A supervisor) treat that as an unauthorized holder.
+                    await asyncio.to_thread(r.pexpire, HOLDER_KEY, LOCK_TTL_MS * 2)
                 except Exception as exc:  # noqa: BLE001 - a lost heartbeat is unsafe
                     _mark_redis_down(str(exc))
                     self._coordination_lost.set()

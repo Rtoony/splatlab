@@ -336,3 +336,51 @@ def test_nested_host_lease_fails_fast(monkeypatch: pytest.MonkeyPatch) -> None:
                 await gpu_arbiter.run_host_operation(operation=lambda: asyncio.sleep(0))
 
     asyncio.run(scenario())
+
+
+def test_heartbeat_keeps_holder_record_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lease that keeps renewing must also re-arm the holder record's TTL.
+
+    Regression: HOLDER_KEY expired 2x LOCK_TTL after acquisition while the lock
+    lease kept refreshing, so a long GPU stage (rig_sfm colmap) made the status
+    API report an anonymous locked GPU and the Flight A supervisor aborted the
+    flight as "held by an unauthorized operation" (2026-07-18 flight failure).
+    """
+    beats = threading.Event()
+    calls: list[tuple[str, object, object]] = []
+
+    class _FakeRedis:
+        def eval(self, *_args: object) -> int:
+            calls.append(("eval", None, None))
+            return 1
+
+        def pexpire(self, key: str, ms: int) -> int:
+            calls.append(("pexpire", key, ms))
+            if sum(1 for c in calls if c[0] == "pexpire") >= 3:
+                beats.set()
+            return 1
+
+    monkeypatch.setattr(gpu_arbiter, "_redis", lambda: _FakeRedis())
+    monkeypatch.setattr(gpu_arbiter, "HEARTBEAT_SEC", 0.001)
+
+    async def scenario() -> None:
+        lock = gpu_arbiter._CrossProcessLock()
+        lock._coordination_lost = asyncio.Event()
+        hb = asyncio.create_task(lock._heartbeat("test-token"))
+        await asyncio.wait_for(asyncio.to_thread(beats.wait, 5.0), timeout=6.0)
+        hb.cancel()
+        try:
+            await hb
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    holder_refreshes = [c for c in calls if c[0] == "pexpire"]
+    assert len(holder_refreshes) >= 3
+    assert all(
+        c[1] == gpu_arbiter.HOLDER_KEY and c[2] == gpu_arbiter.LOCK_TTL_MS * 2
+        for c in holder_refreshes
+    )
