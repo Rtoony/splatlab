@@ -4222,6 +4222,7 @@ async def get_splat_preview_file(job_id: str, fmt: Literal["ply", "spz", "web", 
 
 TWIN_FINISH_SCRIPT = MESH_DIR / "twin_finish.py"
 MESH_GATE_SCRIPT = MESH_DIR / "mesh_gate.py"
+MESH_COMPLETENESS_SCRIPT = MESH_DIR / "mesh_completeness.py"
 MESH_GATE_VRAM_MB = 4_000  # one EGL offscreen renderer + dataparser (CPU)
 
 
@@ -4371,6 +4372,44 @@ async def generate_splat_mesh(request: Request, job_id: str, body: MeshExportBod
                 report["gate"] = {k: gate_report[k] for k in
                                   ("median_coverage", "median_psnr", "median_ssim", "convention")}
                 _patch_meta(job_id, mesh=report)
+
+            # WS2 completeness metric (Blender-lab, adopted 2026-07-21): 3D
+            # complement to the 2D gate — % of solid gaussians the mesh actually
+            # captured. CPU-only (open3d raycast, no renderer/checkpoint), so it
+            # runs directly under the export lock the gate already holds — no
+            # arbiter lane. Missing splat.ply skips with a note, never fails:
+            # older jobs without a preview export still get their gate scores.
+            splat_ply = _preview_file_path(output_dir)
+            if not splat_ply.is_file():
+                if report is not None:
+                    report["gate"]["completeness"] = {
+                        "skipped": "no _preview/splat.ply — run preview export, then re-run the gate"
+                    }
+                    _patch_meta(job_id, mesh=report)
+            else:
+                comp_cmd = [
+                    str(MESH_ENV_PYTHON), str(MESH_COMPLETENESS_SCRIPT),
+                    str(mesh_file), str(splat_ply), str(mesh_dir / "completeness.json"),
+                ]
+                comp_mpu = meta.get("meters_per_unit")
+                if comp_mpu:
+                    comp_cmd += ["--meters-per-unit", str(comp_mpu)]
+                comp_rc, _comp_out, comp_stderr = await _run_capture_subprocess(comp_cmd)
+                try:
+                    comp_report = json.loads((mesh_dir / "completeness.json").read_text()) if comp_rc == 0 else None
+                except Exception:  # noqa: BLE001
+                    comp_report = None
+                if comp_rc != 0 or comp_report is None:
+                    tail = "\n".join(comp_stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                    raise HTTPException(status_code=500, detail=f"Mesh completeness failed (exit {comp_rc}): {tail}")
+                if report is not None:
+                    # meta stays lean: headline numbers only; the full report
+                    # (lab baseline, timings) lives in _mesh/completeness.json.
+                    report["gate"]["completeness"] = {k: comp_report[k] for k in (
+                        "solid_in_bbox", "pct_within_5cm", "pct_beyond_10cm",
+                        "median_cm", "p90_cm", "units",
+                    ) if k in comp_report}
+                    _patch_meta(job_id, mesh=report)
     finally:
         export_lock.release()
 
