@@ -40,17 +40,56 @@ export TSDF_ALPHA_MIN="${TSDF_ALPHA_MIN:-0.5}"
 
 mkdir -p "$OUTDIR"
 cd "$REPO"
+
+# ── optional DN fine-tune escalation (MESH_FINETUNE=1) ───────────────────────
+# The recorded rung for scenes whose VANILLA checkpoint meshes fragmentary
+# (proven 2026-07-10: 30.2% -> 65% LCC at room scale): ~3k iters of ags-mesh
+# depth-gradient normal supervision on the EXISTING checkpoint, all
+# densification/culling OFF, means LR 10x down. ~10-15 min GPU vs ~2 min plain.
+EXPORT_CONFIG="$CONFIG"
+CKPT_LABEL="vanilla"
+if [ "${MESH_FINETUNE:-0}" = "1" ]; then
+  FT_ITERS="${MESH_FT_ITERS:-3000}"
+  LOAD_DIR="$(dirname "$CONFIG")/nerfstudio_models"
+  DATA_DIR="$(dirname "$(dirname "$(dirname "$CONFIG")")")"   # <job>/processed
+  [ -d "$LOAD_DIR" ] || { echo "FATAL: no nerfstudio_models beside config" >&2; exit 1; }
+  [ -f "$DATA_DIR/transforms.json" ] || { echo "FATAL: $DATA_DIR is not a processed dataset" >&2; exit 1; }
+  FT_DIR="$OUTDIR/finetune"
+  rm -rf "$FT_DIR"   # self-cleaning: a rerun never resumes a half-done fine-tune
+  ns-train ags-mesh \
+    --data "$DATA_DIR" \
+    --output-dir "$FT_DIR" \
+    --experiment-name scene \
+    --timestamp ft \
+    --load-dir "$LOAD_DIR" \
+    --max-num-iterations "$FT_ITERS" \
+    --steps-per-save 1000 \
+    --pipeline.model.warmup-length 999999 \
+    --pipeline.model.stop-split-at 0 \
+    --pipeline.model.continue-cull-post-densification False \
+    --pipeline.model.normal-supervision depth \
+    --optimizers.means.scheduler.lr-final 1.6e-5 \
+    --optimizers.means.scheduler.max-steps 1 \
+    --viewer.quit-on-train-completion True \
+    --vis viewer \
+    normal-nerfstudio --load-depths False --load-normals False \
+    > "$OUTDIR/finetune.log" 2>&1
+  EXPORT_CONFIG="$FT_DIR/scene/ags-mesh/ft/config.yml"
+  [ -f "$EXPORT_CONFIG" ] || { echo "FATAL: fine-tune produced no config.yml (see $OUTDIR/finetune.log)" >&2; exit 1; }
+  CKPT_LABEL="dn-finetune-$FT_ITERS"
+fi
+
 # Champion defaults (garden-proven); env-overridable because TSDF params are
 # scene-scale-dependent (mesh-trial finding) — large/open scenes may need
 # coarser integration. Overrides are recorded in the report via the recipe blob.
 VOXEL="${MESH_VOXEL_SIZE:-0.015}"
 SDF_TRUNC="${MESH_SDF_TRUNC:-0.045}"
 DEPTH_TRUNC="${MESH_DEPTH_TRUNC:-6}"
-gs-mesh o3dtsdf --load-config "$CONFIG" --output-dir "$OUTDIR" \
+gs-mesh o3dtsdf --load-config "$EXPORT_CONFIG" --output-dir "$OUTDIR" \
   --voxel-size "$VOXEL" --sdf-truc "$SDF_TRUNC" --depth-trunc "$DEPTH_TRUNC"
 
 MESH=$(ls "$OUTDIR"/*_mesh.ply 2>/dev/null | head -1)
 [ -n "$MESH" ] || { echo "FATAL: gs-mesh produced no *_mesh.ply in $OUTDIR" >&2; exit 1; }
 
-RECIPE="{\"method\":\"o3dtsdf\",\"voxel_size\":$VOXEL,\"sdf_truc\":$SDF_TRUNC,\"depth_trunc\":$DEPTH_TRUNC,\"tsdf_alpha_min\":${TSDF_ALPHA_MIN},\"checkpoint\":\"vanilla\"}"
+RECIPE="{\"method\":\"o3dtsdf\",\"voxel_size\":$VOXEL,\"sdf_truc\":$SDF_TRUNC,\"depth_trunc\":$DEPTH_TRUNC,\"tsdf_alpha_min\":${TSDF_ALPHA_MIN},\"checkpoint\":\"$CKPT_LABEL\"}"
 "$PY" "$HERE/mesh_report.py" "$MESH" "$OUTDIR" --recipe "$RECIPE"

@@ -176,6 +176,7 @@ MESH_GS_MESH = Path.home() / "miniconda3" / "envs" / "dn-splatter-probe" / "bin"
 MESH_FORK_REPO = Path.home() / "tools" / "dn-splatter-probe" / "dn-splatter"
 MESH_DIRNAME = "_mesh"                    # per-job artifact dir (sibling of _health)
 MESH_VRAM_MB = 8_000                      # checkpoint load + per-camera RGB-D renders
+MESH_FT_VRAM_MB = 16_000                  # DN fine-tune = real training (3k iters)
 # Civil contours lane: the cdt engine's OWN venv runs survey_to_surface (TIN +
 # contours on standards-resolved office layers) — splatlab never imports cdt.
 CDT_VENV_PYTHON = Path.home() / "projects" / "civil-design-tools" / ".venv" / "bin" / "python"
@@ -4203,11 +4204,21 @@ async def get_splat_preview_file(job_id: str, fmt: Literal["ply", "spz", "web", 
     return FileResponse(str(preview_file), media_type="application/octet-stream", filename=f"{job_id}.{suffix}")
 
 
+class MeshExportBody(BaseModel):
+    # DN fine-tune escalation — the recorded rung for scenes whose vanilla
+    # checkpoint meshes fragmentary (proven to roughly double connectivity).
+    # ~10-15 min of real GPU training vs ~2 min for the plain export, and it
+    # REBUILDS the mesh artifacts (bypasses the idempotency cache).
+    finetune: bool = False
+
+
 @router.post("/jobs/{job_id}/mesh")
-async def generate_splat_mesh(request: Request, job_id: str):
+async def generate_splat_mesh(request: Request, job_id: str, body: MeshExportBody | None = None):
     """Post-hoc splat→mesh export for a COMPLETED job (Digital Twin kernel):
-    champion TSDF recipe on the existing checkpoint, no retraining. Idempotent —
-    an existing mesh.ply short-circuits (delete _mesh/ to force a redo)."""
+    champion TSDF recipe on the existing checkpoint. Idempotent — an existing
+    mesh.ply short-circuits — EXCEPT with finetune=true, which deliberately
+    rebuilds via the DN escalation rung."""
+    body = body or MeshExportBody()
     require_heavy_work_admitted()
     if not _safe_job_id(job_id):
         raise HTTPException(status_code=404, detail="Splat job not found")
@@ -4239,6 +4250,8 @@ async def generate_splat_mesh(request: Request, job_id: str):
         raise HTTPException(status_code=409, detail=f"A mesh export is already running for {job_id}.")
     await export_lock.acquire()
     command = ["bash", str(MESH_RUNNER), str(config_path), str(mesh_dir)]
+    if body.finetune:
+        command = ["env", "MESH_FINETUNE=1", *command]
     try:
         require_heavy_work_admitted()
         exported = False
@@ -4246,8 +4259,9 @@ async def generate_splat_mesh(request: Request, job_id: str):
         async def operation() -> tuple[int, bytes, bytes]:
             nonlocal exported
             # Another process may have finished this while we waited for the GPU
-            # lease. Treat mesh export as idempotent, like preview export.
-            if mesh_file.is_file():
+            # lease. Treat mesh export as idempotent, like preview export —
+            # unless the caller explicitly asked for the fine-tune rebuild.
+            if mesh_file.is_file() and not body.finetune:
                 return 0, b"", b""
             exported = True
             return await _run_capture_subprocess(command)
@@ -4256,7 +4270,7 @@ async def generate_splat_mesh(request: Request, job_id: str):
             return_code, _stdout, stderr = await gpu_arbiter.run_gpu_operation(
                 lane="splat-mesh",
                 operation_id=job_id,
-                vram_mb=MESH_VRAM_MB,
+                vram_mb=MESH_FT_VRAM_MB if body.finetune else MESH_VRAM_MB,
                 operation=operation,
             )
         except gpu_arbiter.GPUArbiterUnavailable as exc:
@@ -4281,7 +4295,7 @@ async def generate_splat_mesh(request: Request, job_id: str):
             variant="success",
             action="splat.mesh",
             target=meta.get("mode", "3d"),
-            metadata={"job_id": job_id, "mesh_file": str(mesh_file)},
+            metadata={"job_id": job_id, "mesh_file": str(mesh_file), "finetune": body.finetune},
         )
     return {
         "job_id": job_id,
