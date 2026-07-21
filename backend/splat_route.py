@@ -1209,6 +1209,16 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
             if (output_dir / MESH_DIRNAME / "geo" / "ground_points.txt").is_file()
             else None
         ),
+        "sections_url": (
+            f"/api/splat/jobs/{job_id}/geo/export?fmt=sections"
+            if (output_dir / MESH_DIRNAME / "geo" / "sections.png").is_file()
+            else None
+        ),
+        "surface_iso_url": (
+            f"/api/splat/jobs/{job_id}/geo/export?fmt=surface-iso"
+            if (output_dir / MESH_DIRNAME / "geo" / "surface_iso.png").is_file()
+            else None
+        ),
         # Cheap per-scene stats for the gallery card (gaussian count, resolution, images).
         "stats": _scene_stats(job_id, output_dir, meta),
     }

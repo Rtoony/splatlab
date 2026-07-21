@@ -1470,6 +1470,8 @@ function DownloadMenu({ job }: { job: SplatJob }) {
     { url: job.survey_landxml_url, label: "LandXML surface", ext: "xml", hint: "imports as a Civil 3D surface" },
     { url: job.contours_dxf_url, label: "Contours DXF", ext: "dxf", hint: "ground contours · office layers" },
     { url: job.ground_points_url, label: "Ground points", ext: "txt", hint: "PNEZD survey points" },
+    { url: job.sections_url, label: "Sections view", ext: "png", hint: "cross-sections vs scene" },
+    { url: job.surface_iso_url, label: "3D surface view", ext: "png", hint: "isometric ground TIN" },
   ].filter((o) => o.url);
 
   return (

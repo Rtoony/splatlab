@@ -58,6 +58,9 @@ export interface SplatJob {
   // Ground contours (cdt-drawn contour DXF + the PNEZD points behind it).
   contours_dxf_url?: string | null;
   ground_points_url?: string | null;
+  // Standard surface views: cross-sections + isometric TIN (auto receipts).
+  sections_url?: string | null;
+  surface_iso_url?: string | null;
   // Persisted SfM/frame-density params (backend already returns these via the
   // meta spread; declared here so "Promote to full build" can read a scene's
   // own settings instead of falling back to request defaults that could

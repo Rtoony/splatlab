@@ -81,6 +81,11 @@ def _fake_subprocess(fail_step: str | None = None, receipt_ok: bool = True, log:
                 return 1, b"", b"FATAL: no polylines to draw"
             Path(command[3]).write_bytes(b"png")
             return 0, b"", b""
+        if "surface_receipts" in script:
+            out = Path(command[3])
+            (out / "sections.png").write_bytes(b"png")
+            (out / "surface_iso.png").write_bytes(b"png")
+            return 0, b"", b""
         raise AssertionError(f"unexpected subprocess: {command}")
 
     return run
@@ -211,3 +216,29 @@ def test_semantic_step_failure_is_500(client, monkeypatch):
     r = http.post("/api/splat/jobs/splat_c0a701/geo/contours", json={"semantic": True})
     assert r.status_code == 500
     assert "Semantic ground failed" in r.json()["detail"]
+
+
+def test_auto_semantic_when_langfield_exists(client, monkeypatch):
+    """Default body (semantic unset) must pick the semantic path on scenes with
+    a language field — RToony's graded default."""
+    http, outputs = client
+    job_dir = _mk_job(outputs, with_mesh=False, meters_per_unit=0.5, geo=GEO)
+    _add_langfield(job_dir)
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(log=calls))
+    r = http.post("/api/splat/jobs/splat_c0a701/geo/contours", json={})
+    assert r.status_code == 200
+    assert Path(calls[0][1]).name == "semantic_ground.py"
+    assert r.json()["contours"]["params"]["semantic"] is True
+
+
+def test_surface_receipts_in_report_and_served(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job(outputs, meters_per_unit=2.35, geo=GEO)
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess())
+    r = http.post("/api/splat/jobs/splat_c0a701/geo/contours", json={})
+    assert r.status_code == 200
+    assert r.json()["contours"]["surface_receipts"] == ["sections.png", "surface_iso.png"]
+    assert r.json()["sections_url"]
+    for fmt in ("sections", "surface-iso"):
+        assert http.get(f"/api/splat/jobs/splat_c0a701/geo/export?fmt={fmt}").status_code == 200, fmt

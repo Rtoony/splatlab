@@ -33,7 +33,11 @@ torch.load = _patched_load
 DEV = "cuda"
 SIGLIP_CKPT = "google/siglip2-so400m-patch16-384"
 GROUND_QUERIES = ["grass lawn", "dirt ground", "stone pavement", "concrete ground"]
-NEGATIVES = ["object", "things", "stuff", "texture", "surface"]  # LERF canon
+# LERF canonical negatives + vegetation-mass negatives: ground must BEAT hedge,
+# not just generic "stuff" — hedge-base gaussians were creeping into the ground
+# set (section receipt, 2026-07-21) because nothing green competed for them.
+NEGATIVES = ["object", "things", "stuff", "texture", "surface",
+             "green bushes", "hedge", "leafy foliage", "tree canopy"]
 
 
 def main() -> int:

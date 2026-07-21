@@ -67,6 +67,39 @@ def enu_to_grid(
     return out
 
 
+def grid_to_scene(
+    enz: np.ndarray,
+    e0: float,
+    n0: float,
+    unit_factor_m: float,
+    grid_rot_deg: float,
+    scale_factor: float,
+    elev0_units: float,
+    meters_per_unit: float,
+    heading_deg: float,
+    anchor_scene: tuple[float, float],
+) -> np.ndarray:
+    """(N,3) projected-CRS [E, N, Z] -> scene-unit points: the exact inverse of
+    scene_to_enu + enu_to_grid (round-trip unit-tested). Used to place survey
+    products back into the scene frame for receipts/overlays."""
+    h = float(scale_factor) / float(unit_factor_m)
+    ge = (enz[:, 0] - e0) / h
+    gn = (enz[:, 1] - n0) / h
+    g = math.radians(grid_rot_deg)
+    c, s = math.cos(g), math.sin(g)
+    east = ge * c - gn * s
+    north = ge * s + gn * c
+    up = (enz[:, 2] - float(elev0_units)) * float(unit_factor_m)
+    th = math.radians(heading_deg)
+    ct, st = math.cos(th), math.sin(th)
+    sc = float(meters_per_unit)
+    out = np.empty_like(enz)
+    out[:, 0] = (east * ct - north * st) / sc + float(anchor_scene[0])
+    out[:, 1] = (east * st + north * ct) / sc + float(anchor_scene[1])
+    out[:, 2] = up / sc
+    return out
+
+
 def xy_convex_hull(points_xy: np.ndarray) -> np.ndarray:
     """Monotone-chain 2D convex hull, (M,2) CCW without repeated endpoint."""
     pts = np.unique(points_xy[:, :2], axis=0)

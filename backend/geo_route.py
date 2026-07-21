@@ -81,6 +81,7 @@ class GeoExportBody(BaseModel):
 GROUND_EXTRACT_SCRIPT = Path(__file__).resolve().parent / "mesh" / "ground_extract.py"
 CONTOURS_BUILD_SCRIPT = Path(__file__).resolve().parent / "mesh" / "contours_build.py"
 CONTOURS_RECEIPT_SCRIPT = Path(__file__).resolve().parent / "mesh" / "contours_receipt.py"
+SURFACE_RECEIPTS_SCRIPT = Path(__file__).resolve().parent / "mesh" / "surface_receipts.py"
 SEMANTIC_GROUND_SCRIPT = Path(__file__).resolve().parent / "mesh" / "semantic_ground.py"
 SEMANTIC_GROUND_VRAM_MB = 6_000  # checkpoint load + SigLIP 2 text encoder
 
@@ -95,8 +96,10 @@ class ContoursBody(BaseModel):
     tin_faces: bool = False       # also draw the TIN as review linework
     # SEMANTIC ground (P5a): sample ground from language-field gaussians instead
     # of mesh slope — richer, hole-free, vetoes hedge/table contamination, and
-    # needs NO mesh (works on mesh-hostile scenes). Requires a built language field.
-    semantic: bool = False
+    # needs NO mesh (works on mesh-hostile scenes). None = AUTO (RToony's
+    # graded default 2026-07-21): semantic when the scene has a language field,
+    # mesh-slope fallback otherwise. Explicit true demands a language field.
+    semantic: bool | None = None
     semantic_thresh: float = 0.5
 
 
@@ -539,13 +542,14 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
     mesh_file = output_dir / splat_route.MESH_DIRNAME / "mesh.ply"
     gauss_emb = output_dir / splat_route.LANGFIELD_DIRNAME / "gauss_emb.npz"
     splatfacto_config: Path | None = None
-    if body.semantic:
-        if not gauss_emb.is_file():
-            raise HTTPException(
-                status_code=409,
-                detail="Semantic ground needs a built language field — rebuild the scene "
-                "with Language search on (or run the langfield build) first.",
-            )
+    if body.semantic and not gauss_emb.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail="Semantic ground needs a built language field — rebuild the scene "
+            "with Language search on (or run the langfield build) first.",
+        )
+    use_semantic = body.semantic if body.semantic is not None else gauss_emb.is_file()
+    if use_semantic:
         candidates = sorted(
             (output_dir / "processed").rglob("splatfacto/*/config.yml"),
             key=lambda p: p.stat().st_mtime, reverse=True,
@@ -605,7 +609,7 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
             str(splat_route.MESH_ENV_PYTHON), str(GROUND_EXTRACT_SCRIPT),
             str(mesh_file), str(geo_dir), "--params-json", json.dumps(params),
         ]
-        if body.semantic:
+        if use_semantic:
             # Step 0: per-gaussian ground relevancy (langfield env, brief GPU).
             gg = geo_dir / "ground_gaussians.npz"
             params["semantic_thresh"] = body.semantic_thresh
@@ -660,7 +664,8 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
             except Exception as exc:  # a written DXF with an unreadable report is still a failure
                 raise HTTPException(status_code=500, detail=f"Contours report {name} unreadable: {exc}") from exc
 
-        # Receipt is best-effort: a render failure becomes a note, never a 500.
+        report["params"]["semantic"] = use_semantic
+        # Receipts are best-effort: a render failure becomes a note, never a 500.
         rc, _out, stderr = await splat_route._run_capture_subprocess([
             str(splat_route.MESH_ENV_PYTHON), str(CONTOURS_RECEIPT_SCRIPT), str(dxf), str(receipt),
             "--title", f"{job_id} ground contours ({body.minor_ft}/{body.major_ft} ft, EPSG:{body.epsg})",
@@ -669,6 +674,18 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
             report["receipt"] = "contours_receipt.png"
         else:
             report["receipt_error"] = f"receipt render exit {rc}"
+        # RToony's standard surface views (sections + iso, 2026-07-21).
+        sr_cmd = [
+            str(splat_route.MESH_ENV_PYTHON), str(SURFACE_RECEIPTS_SCRIPT),
+            str(pnezd), str(geo_dir), "--params-json", json.dumps(params),
+        ]
+        if mesh_file.is_file():
+            sr_cmd += ["--mesh", str(mesh_file)]
+        rc, _out, stderr = await splat_route._run_capture_subprocess(sr_cmd)
+        if rc == 0 and (geo_dir / "sections.png").is_file():
+            report["surface_receipts"] = ["sections.png", "surface_iso.png"]
+        else:
+            report["surface_receipts_error"] = f"exit {rc}"
         (geo_dir / "contours.json").write_text(json.dumps(report, indent=2))
         splat_route._patch_meta(job_id, contours=report)
 
@@ -681,6 +698,14 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
             f"/api/splat/jobs/{job_id}/geo/export?fmt=contours-receipt"
             if report.get("receipt") else None
         ),
+        "sections_url": (
+            f"/api/splat/jobs/{job_id}/geo/export?fmt=sections"
+            if report.get("surface_receipts") else None
+        ),
+        "surface_iso_url": (
+            f"/api/splat/jobs/{job_id}/geo/export?fmt=surface-iso"
+            if report.get("surface_receipts") else None
+        ),
     }
 
 
@@ -691,6 +716,8 @@ _SURVEY_FILES = {
     "contours": ("contours.dxf", "application/dxf", "contours.dxf"),
     "ground": ("ground_points.txt", "text/plain", "ground_points.pnezd.txt"),
     "contours-receipt": ("contours_receipt.png", "image/png", "contours_receipt.png"),
+    "sections": ("sections.png", "image/png", "sections.png"),
+    "surface-iso": ("surface_iso.png", "image/png", "surface_iso.png"),
 }
 
 

@@ -195,3 +195,15 @@ def test_survey_file_404_before_build(client):
     r = http.get("/api/splat/jobs/splat_9e0001/geo/export?fmt=dxf")
     assert r.status_code == 404
     assert "not built yet" in r.json()["detail"]
+
+
+def test_grid_to_scene_round_trips_the_forward_transform():
+    """grid_to_scene must exactly invert scene_to_enu + enu_to_grid."""
+    pts = np.array([[1.0, 2.0, 0.5], [-3.0, 1.5, -0.2], [0.0, 0.0, 0.0]])
+    kw = dict(e0=6357000.0, n0=1923000.0, unit_factor_m=SF,
+              grid_rot_deg=0.45, scale_factor=0.999977, elev0_units=98.4)
+    fwd = geo_transform.enu_to_grid(
+        geo_transform.scene_to_enu(pts, 2.3537, 35.0, (0.0, 0.0)), **kw)
+    back = geo_transform.grid_to_scene(fwd, meters_per_unit=2.3537, heading_deg=35.0,
+                                       anchor_scene=(0.0, 0.0), **kw)
+    assert np.abs(back - pts).max() < 1e-9
