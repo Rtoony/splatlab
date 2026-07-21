@@ -3,15 +3,19 @@
 # nerfstudio + gsplat). Clone of run_langfield.sh minus the SAM pass — same env
 # hardening so gsplat's JIT never sees the splatops conda CUDA headers.
 set -euo pipefail
-CONFIG="$1"        # nerfstudio checkpoint config.yml
-OUTDIR="$2"        # <job_dir>/_health  (fog.json + receipt webps land here)
-shift 2
+# Containment FIRST, before any arg handling: the re-exec must pass the
+# ORIGINAL "$@" through. A shift before this block silently drops the args on
+# re-exec — never fires from the service (already contained) but killed every
+# standalone run (found 2026-07-21, same bug class as run_mesh.sh's first run).
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$(cd "$HERE/../.." && pwd)/tools/splatlab-compute-gate.sh"
 if ! "$GATE" --is-contained; then
   exec "$GATE" --run "$0" "$@"
 fi
 "$GATE" --check || exit $?
+CONFIG="$1"        # nerfstudio checkpoint config.yml
+OUTDIR="$2"        # <job_dir>/_health  (fog.json + receipt webps land here)
+shift 2
 HF_PY="${SPLAT_HEALTH_PYTHON:-/home/rtoony/miniconda3/envs/langfield-spike/bin/python}"
 
 # The splatlab backend passes its train-stage env (CPATH/LIBRARY_PATH point at the
