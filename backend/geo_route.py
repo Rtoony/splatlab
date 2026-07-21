@@ -51,6 +51,28 @@ GEO_SOURCES = {"map", "exif", "manual"}
 SUGGEST_MAX_IMAGES = 32
 SUGGEST_TOOL_TIMEOUT_S = 60
 
+# ── survey export (Digital Twin kernel P2) ───────────────────────────────────
+# Places the job's _mesh/mesh.ply into a projected CRS (scale + anchor +
+# heading composed with a probe-derived grid calibration) and writes site.dxf /
+# surface.xml (LandXML TIN) / site.geojson into _mesh/geo/. CPU-only, a few
+# seconds — same admission policy as the rest of this lane (no heavy-work
+# gate); runs in the dn-splatter-probe env (open3d + pyproj + ezdxf).
+GEO_EXPORT_SCRIPT = Path(__file__).resolve().parent / "mesh" / "geo_export.py"
+GEO_EXPORT_SUBDIR = "geo"  # under MESH_DIRNAME
+_GEO_EXPORT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _geo_export_lock(job_id: str) -> asyncio.Lock:
+    lock = _GEO_EXPORT_LOCKS.get(job_id)
+    if lock is None:
+        lock = _GEO_EXPORT_LOCKS[job_id] = asyncio.Lock()
+    return lock
+
+
+class GeoExportBody(BaseModel):
+    epsg: int = 2226  # NAD83 / California zone 2, US survey foot — RToony's area
+    max_faces: int = 50_000
+
 
 # ── stored-anchor validation ─────────────────────────────────────────────────
 class GeoAnchorIn(BaseModel):
@@ -391,9 +413,109 @@ def _kml_doc(job_id: str, meta: dict[str, Any]) -> str:
 """
 
 
+def _survey_export_dir(meta: dict[str, Any], job_id: str) -> Path:
+    output_dir = (
+        Path(meta["output_dir"]) if meta.get("output_dir") else splat_route.DEFAULT_3D_ROOT / job_id
+    )
+    return output_dir / splat_route.MESH_DIRNAME / GEO_EXPORT_SUBDIR
+
+
+@router.post("/jobs/{job_id}/geo/export")
+async def build_survey_export(job_id: str, body: GeoExportBody | None = None):
+    """Build the survey export (site.dxf / LandXML surface / site.geojson) from
+    the job's mesh + scale + anchor. Every missing prerequisite is a loud 409
+    with the exact next step — never a silently unscaled or unplaced file."""
+    body = body or GeoExportBody()
+    meta = _require_job_meta(job_id)
+    if not (1000 <= body.epsg <= 999_999):
+        raise HTTPException(status_code=400, detail="epsg must be a plausible EPSG code")
+    if not (100 <= body.max_faces <= 2_000_000):
+        raise HTTPException(status_code=400, detail="max_faces must be within [100, 2000000]")
+    output_dir = (
+        Path(meta["output_dir"]) if meta.get("output_dir") else splat_route.DEFAULT_3D_ROOT / job_id
+    )
+    mesh_file = output_dir / splat_route.MESH_DIRNAME / "mesh.ply"
+    if not mesh_file.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail=f"No mesh for this scene yet — run mesh export first (POST /api/splat/jobs/{job_id}/mesh).",
+        )
+    mpu = meta.get("meters_per_unit")
+    if not mpu:
+        raise HTTPException(
+            status_code=409,
+            detail="Scene scale is uncalibrated — measure a known distance in the viewer "
+            f"and set it (POST /api/splat/jobs/{job_id}/scale) first.",
+        )
+    if not meta.get("geo"):
+        raise HTTPException(
+            status_code=409,
+            detail="Scene has no geo anchor — set one with Locate (map pin or GPS suggest) first.",
+        )
+    if not GEO_EXPORT_SCRIPT.is_file() or not splat_route.MESH_ENV_PYTHON.is_file():
+        raise HTTPException(status_code=400, detail="Survey-export toolchain unavailable.")
+
+    export_dir = _survey_export_dir(meta, job_id)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    params = {
+        "job_id": job_id,
+        "meters_per_unit": mpu,
+        "geo": meta["geo"],
+        "epsg": body.epsg,
+        "max_faces": body.max_faces,
+    }
+    command = [
+        str(splat_route.MESH_ENV_PYTHON),
+        str(GEO_EXPORT_SCRIPT),
+        str(mesh_file),
+        str(export_dir),
+        "--params-json",
+        json.dumps(params),
+    ]
+    lock = _geo_export_lock(job_id)
+    if lock.locked():
+        raise HTTPException(status_code=409, detail=f"A survey export is already running for {job_id}.")
+    async with lock:
+        return_code, _stdout, stderr = await splat_route._run_capture_subprocess(command)
+        report_path = export_dir / "geo_export.json"
+        if return_code != 0 or not report_path.is_file():
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-8:])
+            raise HTTPException(status_code=500, detail=f"Survey export failed (exit {return_code}): {tail}")
+        try:
+            report = json.loads(report_path.read_text())
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Survey export report unreadable: {exc}") from exc
+        splat_route._patch_meta(job_id, geo_export=report)
+    return {
+        "job_id": job_id,
+        "geo_export": report,
+        "dxf_url": f"/api/splat/jobs/{job_id}/geo/export?fmt=dxf",
+        "landxml_url": f"/api/splat/jobs/{job_id}/geo/export?fmt=landxml",
+        "site_geojson_url": f"/api/splat/jobs/{job_id}/geo/export?fmt=site",
+    }
+
+
+_SURVEY_FILES = {
+    "dxf": ("site.dxf", "application/dxf", "site.dxf"),
+    "landxml": ("surface.xml", "application/xml", "surface.landxml.xml"),
+    "site": ("site.geojson", "application/geo+json", "site.geojson"),
+}
+
+
 @router.get("/jobs/{job_id}/geo/export")
 async def export_splat_geo(job_id: str, fmt: str = "geojson"):
     meta = _require_job_meta(job_id)
+    if fmt in _SURVEY_FILES:
+        name, media, download = _SURVEY_FILES[fmt]
+        path = _survey_export_dir(meta, job_id) / name
+        if not path.is_file():
+            raise HTTPException(
+                status_code=404,
+                detail="Survey export not built yet — POST /geo/export with mesh + scale + anchor in place.",
+            )
+        return FileResponse(
+            str(path), media_type=media, filename=f"{job_id}-{download}"
+        )
     if not meta.get("geo"):
         raise HTTPException(status_code=404, detail="scene has no geo anchor yet")
     if fmt == "geojson":
@@ -401,7 +523,7 @@ async def export_splat_geo(job_id: str, fmt: str = "geojson"):
     elif fmt == "kml":
         body, media, ext = _kml_doc(job_id, meta), "application/vnd.google-earth.kml+xml", "kml"
     else:
-        raise HTTPException(status_code=400, detail="fmt must be geojson or kml")
+        raise HTTPException(status_code=400, detail="fmt must be geojson, kml, dxf, landxml, or site")
     return Response(
         content=body,
         media_type=media,

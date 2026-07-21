@@ -1182,6 +1182,18 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
             if (output_dir / MESH_DIRNAME / "mesh.glb").is_file()
             else None
         ),
+        # Survey export (Digital Twin kernel P2): grid-placed CAD deliverables
+        # built from mesh + scale + geo anchor. Report lives in meta["geo_export"].
+        "survey_dxf_url": (
+            f"/api/splat/jobs/{job_id}/geo/export?fmt=dxf"
+            if (output_dir / MESH_DIRNAME / "geo" / "site.dxf").is_file()
+            else None
+        ),
+        "survey_landxml_url": (
+            f"/api/splat/jobs/{job_id}/geo/export?fmt=landxml"
+            if (output_dir / MESH_DIRNAME / "geo" / "surface.xml").is_file()
+            else None
+        ),
         # Cheap per-scene stats for the gallery card (gaussian count, resolution, images).
         "stats": _scene_stats(job_id, output_dir, meta),
     }
