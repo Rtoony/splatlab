@@ -102,3 +102,44 @@ def test_finetune_bypasses_cache_and_prefixes_env(client, monkeypatch):
 
     meta = json.loads((job_dir / "meta.json").read_text())
     assert meta["mesh"]["recipe"]["checkpoint"] == "dn-finetune-3000"
+
+
+def test_finish_builds_twin_glb(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_completed_job(outputs)
+    (job_dir / splat_route.PREVIEW_DIRNAME).mkdir()
+    (job_dir / splat_route.PREVIEW_DIRNAME / "splat.ply").write_bytes(b"ply")
+    calls: list = []
+
+    async def fake_sub(command):
+        calls.append(command)
+        joined = " ".join(str(c) for c in command)
+        assert "twin_finish" in joined
+        mdir = job_dir / splat_route.MESH_DIRNAME
+        (mdir / "twin.glb").write_bytes(b"glb")
+        (mdir / "twin_finish.json").write_text(json.dumps({"faces": 399999, "units": "meters"}))
+        return 0, b"", b""
+
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", fake_sub)
+    r = http.post("/api/splat/jobs/splat_f70001/mesh", json={"finish": True})
+    assert r.status_code == 200
+    assert r.json()["cached"] is True  # mesh itself cached; finish still ran
+    assert len(calls) == 1
+    assert r.json()["twin_glb_url"]
+
+    meta = json.loads((job_dir / "meta.json").read_text())
+    assert meta["mesh"]["twin"]["faces"] == 399999
+    assert http.get("/api/splat/jobs/splat_f70001/mesh/file?fmt=twin").status_code == 200
+
+
+def test_finish_requires_preview_splat(client, monkeypatch):
+    http, outputs = client
+    _mk_completed_job(outputs)
+
+    async def fake_sub(command):
+        raise AssertionError("should not run")
+
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", fake_sub)
+    r = http.post("/api/splat/jobs/splat_f70001/mesh", json={"finish": True})
+    assert r.status_code == 409
+    assert "splat.ply" in r.json()["detail"]

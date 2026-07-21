@@ -1186,6 +1186,12 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
             if (output_dir / MESH_DIRNAME / "mesh.glb").is_file()
             else None
         ),
+        # Finished twin (splat-colored, meters, Y-up — the Blender artifact).
+        "twin_glb_url": (
+            f"/api/splat/jobs/{job_id}/mesh/file?fmt=twin"
+            if (output_dir / MESH_DIRNAME / "twin.glb").is_file()
+            else None
+        ),
         # Survey export (Digital Twin kernel P2): grid-placed CAD deliverables
         # built from mesh + scale + geo anchor. Report lives in meta["geo_export"].
         "survey_dxf_url": (
@@ -4214,12 +4220,18 @@ async def get_splat_preview_file(job_id: str, fmt: Literal["ply", "spz", "web", 
     return FileResponse(str(preview_file), media_type="application/octet-stream", filename=f"{job_id}.{suffix}")
 
 
+TWIN_FINISH_SCRIPT = MESH_DIR / "twin_finish.py"
+
+
 class MeshExportBody(BaseModel):
     # DN fine-tune escalation — the recorded rung for scenes whose vanilla
     # checkpoint meshes fragmentary (proven to roughly double connectivity).
     # ~10-15 min of real GPU training vs ~2 min for the plain export, and it
     # REBUILDS the mesh artifacts (bypasses the idempotency cache).
     finetune: bool = False
+    # Twin finishing stage (Blender-lab WS3, adopted 2026-07-21): splat->mesh
+    # color transfer + decimate + meters/Y-up vertex-colored twin.glb. ~6 s CPU.
+    finish: bool = False
 
 
 @router.post("/jobs/{job_id}/mesh")
@@ -4294,6 +4306,32 @@ async def generate_splat_mesh(request: Request, job_id: str, body: MeshExportBod
         report = _read_mesh_report(output_dir)
         if report is not None:
             _patch_meta(job_id, mesh=report)
+
+        if body.finish:
+            splat_ply = _preview_file_path(output_dir)
+            if not splat_ply.is_file():
+                raise HTTPException(
+                    status_code=409,
+                    detail="Twin finish needs the exported splat.ply — run preview export first.",
+                )
+            finish_cmd = [
+                str(MESH_ENV_PYTHON), str(TWIN_FINISH_SCRIPT),
+                str(mesh_file), str(splat_ply), str(mesh_dir / "twin.glb"),
+            ]
+            mpu = meta.get("meters_per_unit")
+            if mpu:
+                finish_cmd += ["--meters-per-unit", str(mpu)]
+            rc, _out, stderr = await _run_capture_subprocess(finish_cmd)
+            if rc != 0 or not (mesh_dir / "twin.glb").is_file():
+                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                raise HTTPException(status_code=500, detail=f"Twin finish failed (exit {rc}): {tail}")
+            try:
+                twin_report = json.loads((mesh_dir / "twin_finish.json").read_text())
+            except Exception:  # noqa: BLE001
+                twin_report = {}
+            if report is not None:
+                report["twin"] = twin_report
+                _patch_meta(job_id, mesh=report)
     finally:
         export_lock.release()
 
@@ -4314,6 +4352,11 @@ async def generate_splat_mesh(request: Request, job_id: str, body: MeshExportBod
         "mesh_glb_url": (
             f"/api/splat/jobs/{job_id}/mesh/file?fmt=glb"
             if (mesh_dir / "mesh.glb").is_file()
+            else None
+        ),
+        "twin_glb_url": (
+            f"/api/splat/jobs/{job_id}/mesh/file?fmt=twin"
+            if (mesh_dir / "twin.glb").is_file()
             else None
         ),
         "cached": not exported,
@@ -4488,15 +4531,17 @@ async def get_splat_object_file(job_id: str, slug: str, fmt: Literal["splat", "p
 
 
 @router.get("/jobs/{job_id}/mesh/file")
-async def get_splat_mesh_file(job_id: str, fmt: Literal["ply", "glb"] = "ply"):
+async def get_splat_mesh_file(job_id: str, fmt: Literal["ply", "glb", "twin"] = "ply"):
     # Resolved purely from disk so mesh URLs survive service restarts.
     if not _safe_job_id(job_id):
         raise HTTPException(status_code=404, detail="Splat job not found")
-    mesh_file = _job_dir(job_id) / MESH_DIRNAME / f"mesh.{fmt}"
+    name = "twin.glb" if fmt == "twin" else f"mesh.{fmt}"
+    mesh_file = _job_dir(job_id) / MESH_DIRNAME / name
     if not mesh_file.is_file():
         raise HTTPException(status_code=404, detail="Mesh not generated yet")
-    media_type = "model/gltf-binary" if fmt == "glb" else "application/octet-stream"
-    return FileResponse(str(mesh_file), media_type=media_type, filename=f"{job_id}.{fmt}")
+    media_type = "model/gltf-binary" if fmt in ("glb", "twin") else "application/octet-stream"
+    return FileResponse(str(mesh_file), media_type=media_type,
+                        filename=f"{job_id}-{name}" if fmt == "twin" else f"{job_id}.{fmt}")
 
 
 def _langfield_stale_guard(lfdir: Path) -> None:

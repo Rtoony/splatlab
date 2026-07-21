@@ -1466,6 +1466,7 @@ function DownloadMenu({ job }: { job: SplatJob }) {
     { url: job.preview_file_url, label: "Full .ply", ext: "ply", hint: "full quality · for editing" },
     { url: job.mesh_file_url, label: "Mesh .ply", ext: "ply", hint: "triangle mesh · Blender/CAD" },
     { url: job.mesh_glb_url, label: "Mesh .glb", ext: "glb", hint: "triangle mesh · drag into Blender" },
+    { url: job.twin_glb_url, label: "Twin .glb", ext: "glb", hint: "splat-colored · real meters · Blender-ready" },
     { url: job.survey_dxf_url, label: "Site DXF", ext: "dxf", hint: "georeferenced TIN · grid coordinates" },
     { url: job.survey_landxml_url, label: "LandXML surface", ext: "xml", hint: "imports as a Civil 3D surface" },
     { url: job.contours_dxf_url, label: "Contours DXF", ext: "dxf", hint: "ground contours · office layers" },

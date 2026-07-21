@@ -52,6 +52,7 @@ export interface SplatJob {
   mesh_export?: boolean;
   mesh_file_url?: string | null;
   mesh_glb_url?: string | null;
+  twin_glb_url?: string | null;
   // Survey export (mesh + scale + geo anchor → grid-placed CAD deliverables).
   survey_dxf_url?: string | null;
   survey_landxml_url?: string | null;
