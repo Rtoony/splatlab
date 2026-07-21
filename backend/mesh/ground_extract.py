@@ -40,6 +40,10 @@ def main() -> int:
     ap.add_argument("mesh")
     ap.add_argument("out_dir")
     ap.add_argument("--params-json", required=True)
+    ap.add_argument("--ground-gaussians", default=None,
+                    help="ground_gaussians.npz from semantic_ground.py — when given, "
+                         "ground samples come from SEMANTICALLY-ground gaussians "
+                         "(richer + hole-free vs the TSDF mesh, and mesh-optional)")
     args = ap.parse_args()
     p = json.loads(args.params_json)
     geo, mpu, epsg = p["geo"], float(p["meters_per_unit"]), int(p.get("epsg", 2226))
@@ -51,23 +55,45 @@ def main() -> int:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    mesh = o3d.io.read_triangle_mesh(args.mesh)
-    if len(mesh.triangles) == 0:
-        print("FATAL: empty mesh", file=sys.stderr)
-        return 1
-    mesh.compute_triangle_normals()
 
-    verts = np.asarray(mesh.vertices)
-    tris = np.asarray(mesh.triangles)
-    # Everything in ENU meters: slopes and cell sizes mean what they say.
-    enu = scene_to_enu(verts, mpu, geo.get("heading_deg", 0.0), anchor_scene)
-    centroids = enu[tris].mean(axis=1)
-    # Scene->ENU is a rotation about z + uniform scale, so normal z survives.
-    normals_z = np.asarray(mesh.triangle_normals)[:, 2]
-    upward = np.abs(normals_z) >= math.cos(math.radians(max_slope_deg))
-    up_pts = centroids[upward]
+    faces_total = faces_upward = None
+    if args.ground_gaussians:
+        # SEMANTIC source: gaussians the language field reads as ground — the
+        # A/B insight (2026-07-21): raw gaussian centers carry far more usable
+        # structure than the TSDF mesh, and semantics replace the slope filter.
+        g = np.load(args.ground_gaussians)
+        thresh = float(p.get("semantic_thresh", 0.5))
+        keep = g["rel"] >= thresh
+        pts_scene = g["xyz"][keep]
+        if len(pts_scene) < 500:
+            print(f"FATAL: only {len(pts_scene)} ground gaussians at rel>={thresh}", file=sys.stderr)
+            return 1
+        up_pts = scene_to_enu(pts_scene, mpu, geo.get("heading_deg", 0.0), anchor_scene)
+        source = "semantic-gaussians"
+        source_stats = {"gaussians_total": int(len(g["rel"])),
+                        "gaussians_ground": int(keep.sum()),
+                        "semantic_thresh": thresh}
+    else:
+        mesh = o3d.io.read_triangle_mesh(args.mesh)
+        if len(mesh.triangles) == 0:
+            print("FATAL: empty mesh", file=sys.stderr)
+            return 1
+        mesh.compute_triangle_normals()
+
+        verts = np.asarray(mesh.vertices)
+        tris = np.asarray(mesh.triangles)
+        # Everything in ENU meters: slopes and cell sizes mean what they say.
+        enu = scene_to_enu(verts, mpu, geo.get("heading_deg", 0.0), anchor_scene)
+        centroids = enu[tris].mean(axis=1)
+        # Scene->ENU is a rotation about z + uniform scale, so normal z survives.
+        normals_z = np.asarray(mesh.triangle_normals)[:, 2]
+        upward = np.abs(normals_z) >= math.cos(math.radians(max_slope_deg))
+        up_pts = centroids[upward]
+        faces_total, faces_upward = int(len(tris)), int(upward.sum())
+        source = "mesh-slope"
+        source_stats = {}
     if len(up_pts) < 100:
-        print(f"FATAL: only {len(up_pts)} upward-face samples", file=sys.stderr)
+        print(f"FATAL: only {len(up_pts)} ground samples", file=sys.stderr)
         return 1
 
     # Per-cell low-percentile z.
@@ -81,7 +107,7 @@ def main() -> int:
             cells[tuple(keys[k])] = float(np.percentile(z_sorted[s:e], 15))
 
     # 3x3 neighborhood median spike rejection.
-    ground: list[tuple[float, float, float]] = []
+    kept_cells: dict[tuple[int, int], float] = {}
     rejected = 0
     for (i, j), z in cells.items():
         neigh = [cells[(i + di, j + dj)] for di in (-1, 0, 1) for dj in (-1, 0, 1)
@@ -89,7 +115,36 @@ def main() -> int:
         if len(neigh) >= 3 and abs(z - float(np.median(neigh))) > spike_tol_m:
             rejected += 1
             continue
-        ground.append(((i + 0.5) * cell_m, (j + 0.5) * cell_m, z))
+        kept_cells[(i, j)] = z
+
+    # Semantic gaussians include stray far-field false positives with no spatial
+    # coherence (found on garden: scattered background cells made the TIN
+    # interpolate a mountain across the hull). Keep only the largest
+    # 8-connected cell component — the site itself. Mesh-slope input already
+    # has surface coherence, so its graded behavior stays untouched.
+    disconnected_dropped = 0
+    if args.ground_gaussians and kept_cells:
+        unvisited = set(kept_cells)
+        best_comp: set[tuple[int, int]] = set()
+        while unvisited:
+            seed = unvisited.pop()
+            comp = {seed}
+            frontier = [seed]
+            while frontier:
+                ci, cj = frontier.pop()
+                for di in (-1, 0, 1):
+                    for dj in (-1, 0, 1):
+                        nb = (ci + di, cj + dj)
+                        if nb in unvisited:
+                            unvisited.remove(nb)
+                            comp.add(nb)
+                            frontier.append(nb)
+            if len(comp) > len(best_comp):
+                best_comp = comp
+        disconnected_dropped = len(kept_cells) - len(best_comp)
+        kept_cells = {k: kept_cells[k] for k in best_comp}
+
+    ground = [((i + 0.5) * cell_m, (j + 0.5) * cell_m, z) for (i, j), z in kept_cells.items()]
     if len(ground) < 50:
         print(f"FATAL: only {len(ground)} ground cells after filtering", file=sys.stderr)
         return 1
@@ -112,10 +167,13 @@ def main() -> int:
         "epsg": epsg,
         "cell_m": cell_m,
         "max_slope_deg": max_slope_deg,
-        "faces_total": int(len(tris)),
-        "faces_upward": int(upward.sum()),
+        "source": source,
+        **source_stats,
+        "faces_total": faces_total,
+        "faces_upward": faces_upward,
         "cells_with_data": len(cells),
         "cells_spike_rejected": rejected,
+        "cells_disconnected_dropped": disconnected_dropped,
         "ground_points": len(ground),
         "coverage_m2": round(len(ground) * cell_m * cell_m, 2),
         "ground_z_range_m": [round(float(g_enu[:, 2].min()), 3), round(float(g_enu[:, 2].max()), 3)],

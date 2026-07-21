@@ -81,6 +81,8 @@ class GeoExportBody(BaseModel):
 GROUND_EXTRACT_SCRIPT = Path(__file__).resolve().parent / "mesh" / "ground_extract.py"
 CONTOURS_BUILD_SCRIPT = Path(__file__).resolve().parent / "mesh" / "contours_build.py"
 CONTOURS_RECEIPT_SCRIPT = Path(__file__).resolve().parent / "mesh" / "contours_receipt.py"
+SEMANTIC_GROUND_SCRIPT = Path(__file__).resolve().parent / "mesh" / "semantic_ground.py"
+SEMANTIC_GROUND_VRAM_MB = 6_000  # checkpoint load + SigLIP 2 text encoder
 
 
 class ContoursBody(BaseModel):
@@ -91,6 +93,11 @@ class ContoursBody(BaseModel):
     minor_ft: float = 0.5
     major_ft: float = 2.5
     tin_faces: bool = False       # also draw the TIN as review linework
+    # SEMANTIC ground (P5a): sample ground from language-field gaussians instead
+    # of mesh slope — richer, hole-free, vetoes hedge/table contamination, and
+    # needs NO mesh (works on mesh-hostile scenes). Requires a built language field.
+    semantic: bool = False
+    semantic_thresh: float = 0.5
 
 
 # ── stored-anchor validation ─────────────────────────────────────────────────
@@ -530,10 +537,29 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
         Path(meta["output_dir"]) if meta.get("output_dir") else splat_route.DEFAULT_3D_ROOT / job_id
     )
     mesh_file = output_dir / splat_route.MESH_DIRNAME / "mesh.ply"
-    if not mesh_file.is_file():
+    gauss_emb = output_dir / splat_route.LANGFIELD_DIRNAME / "gauss_emb.npz"
+    splatfacto_config: Path | None = None
+    if body.semantic:
+        if not gauss_emb.is_file():
+            raise HTTPException(
+                status_code=409,
+                detail="Semantic ground needs a built language field — rebuild the scene "
+                "with Language search on (or run the langfield build) first.",
+            )
+        candidates = sorted(
+            (output_dir / "processed").rglob("splatfacto/*/config.yml"),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        ) if (output_dir / "processed").is_dir() else []
+        if not candidates:
+            raise HTTPException(status_code=409, detail="No splatfacto checkpoint found for this scene.")
+        splatfacto_config = candidates[0]
+        if not (0.0 < body.semantic_thresh < 1.0):
+            raise HTTPException(status_code=400, detail="semantic_thresh must be in (0, 1)")
+    elif not mesh_file.is_file():
         raise HTTPException(
             status_code=409,
-            detail=f"No mesh for this scene yet — run mesh export first (POST /api/splat/jobs/{job_id}/mesh).",
+            detail=f"No mesh for this scene yet — run mesh export first (POST /api/splat/jobs/{job_id}/mesh), "
+            "or use semantic=true (needs a language field, no mesh).",
         )
     mpu = meta.get("meters_per_unit")
     if not mpu:
@@ -575,10 +601,36 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
     if lock.locked():
         raise HTTPException(status_code=409, detail=f"A survey build is already running for {job_id}.")
     async with lock:
-        rc, _out, stderr = await splat_route._run_capture_subprocess([
+        ground_cmd = [
             str(splat_route.MESH_ENV_PYTHON), str(GROUND_EXTRACT_SCRIPT),
             str(mesh_file), str(geo_dir), "--params-json", json.dumps(params),
-        ])
+        ]
+        if body.semantic:
+            # Step 0: per-gaussian ground relevancy (langfield env, brief GPU).
+            gg = geo_dir / "ground_gaussians.npz"
+            params["semantic_thresh"] = body.semantic_thresh
+            ground_cmd = [*ground_cmd[:5], json.dumps(params), "--ground-gaussians", str(gg)]
+
+            async def sem_operation() -> tuple[int, bytes, bytes]:
+                return await splat_route._run_capture_subprocess([
+                    str(splat_route.LANGFIELD_ENV_PYTHON), str(SEMANTIC_GROUND_SCRIPT),
+                    str(gauss_emb), str(splatfacto_config), str(gg),
+                ])
+
+            try:
+                rc, _out, stderr = await splat_route.gpu_arbiter.run_gpu_operation(
+                    lane="semantic-ground",
+                    operation_id=job_id,
+                    vram_mb=SEMANTIC_GROUND_VRAM_MB,
+                    operation=sem_operation,
+                )
+            except splat_route.gpu_arbiter.GPUArbiterUnavailable as exc:
+                raise HTTPException(status_code=503, detail=f"Semantic ground blocked: {exc}") from exc
+            if rc != 0 or not gg.is_file():
+                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-8:])
+                raise HTTPException(status_code=500, detail=f"Semantic ground failed (exit {rc}): {tail}")
+
+        rc, _out, stderr = await splat_route._run_capture_subprocess(ground_cmd)
         if rc != 0 or not pnezd.is_file():
             tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-8:])
             raise HTTPException(status_code=500, detail=f"Ground extraction failed (exit {rc}): {tail}")

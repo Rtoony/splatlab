@@ -99,8 +99,10 @@ def main() -> int:
         "watertight": bool(mesh.is_watertight()),
         "clusters": int(len(cluster_tris)),
         "lcc_pct": round(float(100 * cluster_tris.max() / len(mesh.triangles)), 2),
-        "bbox_extent_m": [round(float(x), 3) for x in ext],
-        "bbox_extent_robust_m": [round(float(x), 3) for x in (hi - lo)],
+        # RAW SCENE UNITS, not meters — the report has no meters_per_unit.
+        # (Mislabeled "_m" until 2026-07-21; caught by the Blender-lab session.)
+        "bbox_extent_units": [round(float(x), 3) for x in ext],
+        "bbox_extent_robust_units": [round(float(x), 3) for x in (hi - lo)],
         "artifacts": {"ply": "mesh.ply"},
     }
     if args.recipe:

@@ -29,6 +29,11 @@ CDT_RESULT = {"points_imported": 2123, "contours_drawn": 194, "watermarked": Tru
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, Path]:
     outputs = tmp_path / "outputs"
     monkeypatch.setattr(splat_route, "DEFAULT_3D_ROOT", outputs)
+
+    async def fake_gpu(lane, operation_id, vram_mb, operation, **kw):
+        return await operation()
+
+    monkeypatch.setattr(splat_route.gpu_arbiter, "run_gpu_operation", fake_gpu)
     app = FastAPI()
     app.include_router(geo_route.router, prefix="/api/splat")
     return TestClient(app), outputs
@@ -47,9 +52,16 @@ def _mk_job(outputs: Path, job_id: str = "splat_c0a701", with_mesh: bool = True,
     return job_dir
 
 
-def _fake_subprocess(fail_step: str | None = None, receipt_ok: bool = True):
+def _fake_subprocess(fail_step: str | None = None, receipt_ok: bool = True, log: list | None = None):
     async def run(command):
+        if log is not None:
+            log.append(command)
         script = command[1]
+        if "semantic_ground" in script:
+            if fail_step == "semantic":
+                return 1, b"", b"FATAL: row mismatch"
+            Path(command[4]).write_bytes(b"npz")
+            return 0, b"", b""
         if "ground_extract" in script:
             if fail_step == "ground":
                 return 1, b"", b"FATAL: only 3 ground cells after filtering"
@@ -149,3 +161,53 @@ def test_contours_receipt_failure_is_a_note_not_a_failure(client, monkeypatch):
     assert body["receipt_url"] is None
     meta = json.loads((job_dir / "meta.json").read_text())
     assert meta["contours"]["contours"]["contours_drawn"] == 194
+
+
+# ── semantic ground (P5a) ────────────────────────────────────────────────────
+def _add_langfield(job_dir: Path) -> None:
+    lf = job_dir / splat_route.LANGFIELD_DIRNAME
+    lf.mkdir(parents=True)
+    (lf / "gauss_emb.npz").write_bytes(b"npz")
+    cfg = job_dir / "processed" / "splatfacto" / "2026-07-01_000000"
+    cfg.mkdir(parents=True)
+    (cfg / "config.yml").write_text("cfg")
+
+
+def test_semantic_requires_langfield(client):
+    http, outputs = client
+    _mk_job(outputs, meters_per_unit=0.5, geo=GEO)  # mesh present, no langfield
+    r = http.post("/api/splat/jobs/splat_c0a701/geo/contours", json={"semantic": True})
+    assert r.status_code == 409
+    assert "language field" in r.json()["detail"]
+
+
+def test_semantic_needs_no_mesh_and_passes_gaussians(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job(outputs, with_mesh=False, meters_per_unit=0.5, geo=GEO)
+    _add_langfield(job_dir)
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(log=calls))
+
+    r = http.post(
+        "/api/splat/jobs/splat_c0a701/geo/contours",
+        json={"semantic": True, "semantic_thresh": 0.5},
+    )
+    assert r.status_code == 200
+    assert r.json()["contours"]["contours"]["contours_drawn"] == 194
+
+    scripts = [Path(c[1]).name for c in calls]
+    assert scripts[0] == "semantic_ground.py"
+    ground_call = calls[1]
+    assert "--ground-gaussians" in ground_call
+    params = json.loads(ground_call[ground_call.index("--params-json") + 1])
+    assert params["semantic_thresh"] == 0.5
+
+
+def test_semantic_step_failure_is_500(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job(outputs, with_mesh=False, meters_per_unit=0.5, geo=GEO)
+    _add_langfield(job_dir)
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(fail_step="semantic"))
+    r = http.post("/api/splat/jobs/splat_c0a701/geo/contours", json={"semantic": True})
+    assert r.status_code == 500
+    assert "Semantic ground failed" in r.json()["detail"]
