@@ -40,11 +40,17 @@ export TSDF_ALPHA_MIN="${TSDF_ALPHA_MIN:-0.5}"
 
 mkdir -p "$OUTDIR"
 cd "$REPO"
+# Champion defaults (garden-proven); env-overridable because TSDF params are
+# scene-scale-dependent (mesh-trial finding) — large/open scenes may need
+# coarser integration. Overrides are recorded in the report via the recipe blob.
+VOXEL="${MESH_VOXEL_SIZE:-0.015}"
+SDF_TRUNC="${MESH_SDF_TRUNC:-0.045}"
+DEPTH_TRUNC="${MESH_DEPTH_TRUNC:-6}"
 gs-mesh o3dtsdf --load-config "$CONFIG" --output-dir "$OUTDIR" \
-  --voxel-size 0.015 --sdf-truc 0.045 --depth-trunc 6
+  --voxel-size "$VOXEL" --sdf-truc "$SDF_TRUNC" --depth-trunc "$DEPTH_TRUNC"
 
 MESH=$(ls "$OUTDIR"/*_mesh.ply 2>/dev/null | head -1)
 [ -n "$MESH" ] || { echo "FATAL: gs-mesh produced no *_mesh.ply in $OUTDIR" >&2; exit 1; }
 
-RECIPE='{"method":"o3dtsdf","voxel_size":0.015,"sdf_truc":0.045,"depth_trunc":6,"tsdf_alpha_min":0.5,"checkpoint":"vanilla"}'
+RECIPE="{\"method\":\"o3dtsdf\",\"voxel_size\":$VOXEL,\"sdf_truc\":$SDF_TRUNC,\"depth_trunc\":$DEPTH_TRUNC,\"tsdf_alpha_min\":${TSDF_ALPHA_MIN},\"checkpoint\":\"vanilla\"}"
 "$PY" "$HERE/mesh_report.py" "$MESH" "$OUTDIR" --recipe "$RECIPE"
