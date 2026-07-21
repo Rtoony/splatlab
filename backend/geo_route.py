@@ -550,16 +550,29 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
         )
     use_semantic = body.semantic if body.semantic is not None else gauss_emb.is_file()
     if use_semantic:
+        if not (0.0 < body.semantic_thresh < 1.0):
+            raise HTTPException(status_code=400, detail="semantic_thresh must be in (0, 1)")
         candidates = sorted(
             (output_dir / "processed").rglob("splatfacto/*/config.yml"),
             key=lambda p: p.stat().st_mtime, reverse=True,
         ) if (output_dir / "processed").is_dir() else []
+        # Review findings 2026-07-21: AUTO mode must FALL BACK to mesh-slope on
+        # any semantic blocker (pruned processed/, missing toolchain, stale
+        # field) instead of dead-ending; only an EXPLICIT semantic=true is loud.
+        problem = None
         if not candidates:
-            raise HTTPException(status_code=409, detail="No splatfacto checkpoint found for this scene.")
-        splatfacto_config = candidates[0]
-        if not (0.0 < body.semantic_thresh < 1.0):
-            raise HTTPException(status_code=400, detail="semantic_thresh must be in (0, 1)")
-    elif not mesh_file.is_file():
+            problem = "no splatfacto checkpoint under processed/"
+        elif not (SEMANTIC_GROUND_SCRIPT.is_file() and splat_route.LANGFIELD_ENV_PYTHON.is_file()):
+            problem = "semantic toolchain (langfield env) unavailable"
+        elif (output_dir / splat_route.LANGFIELD_DIRNAME / "STALE").is_file():
+            problem = "language field is stale (scene edited after the lift)"
+        if problem:
+            if body.semantic:
+                raise HTTPException(status_code=409, detail=f"Semantic ground unavailable: {problem}.")
+            use_semantic = False
+        else:
+            splatfacto_config = candidates[0]
+    if not use_semantic and not mesh_file.is_file():
         raise HTTPException(
             status_code=409,
             detail=f"No mesh for this scene yet — run mesh export first (POST /api/splat/jobs/{job_id}/mesh), "
@@ -597,21 +610,26 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
         "max_slope_deg": body.max_slope_deg,
         "spike_tol_m": body.spike_tol_m,
     }
-    pnezd = geo_dir / "ground_points.txt"
-    dxf = geo_dir / "contours.dxf"
-    receipt = geo_dir / "contours_receipt.png"
-
     lock = _geo_export_lock(job_id)  # shared with /geo/export: both write _mesh/geo/
     if lock.locked():
         raise HTTPException(status_code=409, detail=f"A survey build is already running for {job_id}.")
     async with lock:
+        # Atomic staging (review finding 2026-07-21): every step writes into
+        # .building/ and artifacts are PROMOTED only after full success, so a
+        # mid-chain failure can never leave a mixed-generation _mesh/geo/.
+        build_dir = geo_dir / ".building"
+        shutil.rmtree(build_dir, ignore_errors=True)
+        build_dir.mkdir(parents=True)
+        pnezd = build_dir / "ground_points.txt"
+        dxf = build_dir / "contours.dxf"
+        receipt = build_dir / "contours_receipt.png"
         ground_cmd = [
             str(splat_route.MESH_ENV_PYTHON), str(GROUND_EXTRACT_SCRIPT),
-            str(mesh_file), str(geo_dir), "--params-json", json.dumps(params),
+            str(mesh_file), str(build_dir), "--params-json", json.dumps(params),
         ]
         if use_semantic:
             # Step 0: per-gaussian ground relevancy (langfield env, brief GPU).
-            gg = geo_dir / "ground_gaussians.npz"
+            gg = build_dir / "ground_gaussians.npz"
             params["semantic_thresh"] = body.semantic_thresh
             ground_cmd = [*ground_cmd[:5], json.dumps(params), "--ground-gaussians", str(gg)]
 
@@ -660,7 +678,7 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
         }
         for name, key in (("ground.json", "ground"), ("contours_result.json", "contours")):
             try:
-                report[key] = json.loads((geo_dir / name).read_text())
+                report[key] = json.loads((build_dir / name).read_text())
             except Exception as exc:  # a written DXF with an unreadable report is still a failure
                 raise HTTPException(status_code=500, detail=f"Contours report {name} unreadable: {exc}") from exc
 
@@ -677,16 +695,20 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
         # RToony's standard surface views (sections + iso, 2026-07-21).
         sr_cmd = [
             str(splat_route.MESH_ENV_PYTHON), str(SURFACE_RECEIPTS_SCRIPT),
-            str(pnezd), str(geo_dir), "--params-json", json.dumps(params),
+            str(pnezd), str(build_dir), "--params-json", json.dumps(params),
         ]
         if mesh_file.is_file():
             sr_cmd += ["--mesh", str(mesh_file)]
         rc, _out, stderr = await splat_route._run_capture_subprocess(sr_cmd)
-        if rc == 0 and (geo_dir / "sections.png").is_file():
+        if rc == 0 and (build_dir / "sections.png").is_file():
             report["surface_receipts"] = ["sections.png", "surface_iso.png"]
         else:
             report["surface_receipts_error"] = f"exit {rc}"
-        (geo_dir / "contours.json").write_text(json.dumps(report, indent=2))
+        (build_dir / "contours.json").write_text(json.dumps(report, indent=2))
+        # PROMOTE: full success only — overwrite prior generation atomically-ish.
+        for f in sorted(build_dir.iterdir()):
+            shutil.move(str(f), str(geo_dir / f.name))
+        shutil.rmtree(build_dir, ignore_errors=True)
         splat_route._patch_meta(job_id, contours=report)
 
     return {

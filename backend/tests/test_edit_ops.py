@@ -728,7 +728,8 @@ def test_semantic_delete_dequantizes_with_worker_headers(
     lf = job_dir / "_langfield"
     lf.mkdir()
     (lf / "gauss_emb.npz").write_bytes(b"stub")
-    (job_dir / "config.yml").write_text("stub: true\n")
+    (job_dir / "processed" / "splatfacto" / "ts").mkdir(parents=True, exist_ok=True)
+    (job_dir / "processed" / "splatfacto" / "ts" / "config.yml").write_text("stub: true\n")
 
     async def fake_has() -> bool:
         return True
@@ -942,7 +943,8 @@ def test_semantic_scores_before_host_lease_then_mutates_inside_it(
     lf = job_dir / "_langfield"
     lf.mkdir()
     (lf / "gauss_emb.npz").write_bytes(b"stub")
-    (job_dir / "config.yml").write_text("stub: true\n")
+    (job_dir / "processed" / "splatfacto" / "ts").mkdir(parents=True, exist_ok=True)
+    (job_dir / "processed" / "splatfacto" / "ts" / "config.yml").write_text("stub: true\n")
     lease_active = False
 
     async def has_endpoint() -> bool:
@@ -996,7 +998,8 @@ def test_semantic_refuses_source_replacement_during_worker_scoring(
     lf = job_dir / "_langfield"
     lf.mkdir()
     (lf / "gauss_emb.npz").write_bytes(b"stub")
-    (job_dir / "config.yml").write_text("stub: true\n")
+    (job_dir / "processed" / "splatfacto" / "ts").mkdir(parents=True, exist_ok=True)
+    (job_dir / "processed" / "splatfacto" / "ts" / "config.yml").write_text("stub: true\n")
 
     async def has_endpoint() -> bool:
         return True

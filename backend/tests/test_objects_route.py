@@ -196,3 +196,54 @@ def test_objects_proxy_chain(client, monkeypatch, tmp_path):
 
     for fmt in ("proxy", "proxy-preview"):
         assert http.get(f"/api/splat/jobs/splat_0b0001/objects/table/file?fmt={fmt}").status_code == 200, fmt
+
+
+def test_query_leading_dash_rejected(client):
+    http, outputs = client
+    _mk_job(outputs)
+    r = http.post("/api/splat/jobs/splat_0b0001/objects", json={"query": "--help"})
+    assert r.status_code == 422
+
+
+def test_stale_langfield_refused(client):
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    (job_dir / splat_route.LANGFIELD_DIRNAME / "STALE").write_text("edited")
+    r = http.post("/api/splat/jobs/splat_0b0001/objects", json={"query": "table"})
+    assert r.status_code == 409
+    assert "stale" in r.json()["detail"].lower()
+
+
+def test_proxy_unavailable_is_preflight_400(client, monkeypatch):
+    """Review fix: TripoSplat-unavailable must fail BEFORE any GPU work."""
+    http, outputs = client
+    _mk_job(outputs)
+    monkeypatch.setattr(splat_route, "_triposplat_availability",
+                        lambda: {"triposplat_available": False, "triposplat_runner": ""})
+
+    async def fake_sub(command):
+        raise AssertionError("no subprocess may run")
+
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", fake_sub)
+    r = http.post("/api/splat/jobs/splat_0b0001/objects", json={"query": "table", "proxy": True})
+    assert r.status_code == 400
+
+
+def test_subset_scratch_cleaned_on_mesh_failure(client, monkeypatch):
+    """Review fix: a failed object-mesh build must not orphan the ~300MB
+    subset checkpoint."""
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls: list = []
+    base_fake = _fake_subprocess(job_dir, calls)
+
+    async def run(command):
+        joined = " ".join(str(c) for c in command)
+        if "run_mesh.sh" in joined:
+            return 1, b"", b"FATAL: gs-mesh crashed"
+        return await base_fake(command)
+
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", run)
+    r = http.post("/api/splat/jobs/splat_0b0001/objects", json={"query": "table"})
+    assert r.status_code == 500
+    assert not (job_dir / splat_route.OBJECTS_DIRNAME / "table" / "subset").exists()

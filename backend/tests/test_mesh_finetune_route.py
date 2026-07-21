@@ -169,3 +169,36 @@ def test_gate_scores_mesh_and_patches_meta(client, monkeypatch):
     meta = json.loads((job_dir / "meta.json").read_text())
     assert meta["mesh"]["gate"]["median_psnr"] == 11.86
     assert "per_cam" not in meta["mesh"]["gate"]  # meta stays lean
+
+
+def test_cached_mesh_without_report_is_a_loud_500(client, monkeypatch):
+    """Review fix: mesh.ply with no mesh.json must 500 with the recovery step,
+    not 200 with meta.mesh silently absent."""
+    http, outputs = client
+    job_dir = _mk_completed_job(outputs, with_mesh=False)
+    mdir = job_dir / splat_route.MESH_DIRNAME
+    (mdir / "mesh.ply").write_bytes(b"ply")  # artifact but NO report
+
+    async def fake_sub(command):
+        raise AssertionError("cached path must not run a subprocess")
+
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", fake_sub)
+    r = http.post("/api/splat/jobs/splat_f70001/mesh")
+    assert r.status_code == 500
+    assert "mesh.json is missing" in r.json()["detail"]
+
+
+def test_find_latest_config_ignores_finetune_configs(tmp_path):
+    """Review fix: only processed/ configs count — a newer ags-mesh finetune
+    config in _mesh/ must never poison later exports."""
+    import os, time
+    job = tmp_path / "job"
+    good = job / "processed" / "splatfacto" / "ts"
+    good.mkdir(parents=True)
+    (good / "config.yml").write_text("good")
+    bad = job / splat_route.MESH_DIRNAME / "finetune" / "scene" / "ags-mesh" / "ft"
+    bad.mkdir(parents=True)
+    (bad / "config.yml").write_text("bad")
+    future = time.time() + 3600
+    os.utime(bad / "config.yml", (future, future))  # newer mtime
+    assert splat_route._find_latest_config(job) == good / "config.yml"

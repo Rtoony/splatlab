@@ -1231,7 +1231,14 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
 
 
 def _find_latest_config(output_dir: Path) -> Path | None:
-    candidates = sorted(output_dir.rglob("config.yml"), key=lambda path: path.stat().st_mtime, reverse=True)
+    """Latest TRAINING config — restricted to processed/. A DN fine-tune leaves
+    an ags-mesh config under _mesh/finetune/ whose newer mtime otherwise poisons
+    every later export/gate/health call with the fine-tuned checkpoint (review
+    finding 2026-07-21; had already bitten splat_716a9122 on disk)."""
+    root = output_dir / "processed"
+    if not root.is_dir():
+        return None
+    candidates = sorted(root.rglob("config.yml"), key=lambda path: path.stat().st_mtime, reverse=True)
     return candidates[0] if candidates else None
 
 
@@ -4269,6 +4276,14 @@ async def generate_splat_mesh(request: Request, job_id: str, body: MeshExportBod
     config_path = _find_latest_config(output_dir)
     if config_path is None:
         raise HTTPException(status_code=404, detail=f"No Nerfstudio config.yml found under {output_dir}")
+    # Preflight EVERY prerequisite before burning GPU time — a finetune+finish
+    # request used to run ~15 min of training and THEN 409 on the missing
+    # splat.ply (review finding 2026-07-21).
+    if body.finish and not _preview_file_path(output_dir).is_file():
+        raise HTTPException(
+            status_code=409,
+            detail="Twin finish needs the exported splat.ply — run preview export first.",
+        )
 
     mesh_dir = output_dir / MESH_DIRNAME
     mesh_dir.mkdir(parents=True, exist_ok=True)
@@ -4311,8 +4326,16 @@ async def generate_splat_mesh(request: Request, job_id: str, body: MeshExportBod
                 detail=f"Mesh export failed (exit {return_code}): {tail}",
             )
         report = _read_mesh_report(output_dir)
-        if report is not None:
-            _patch_meta(job_id, mesh=report)
+        if report is None:
+            # A mesh.ply with no readable report is a half-built artifact set;
+            # continuing silently used to return 200 with no meta.mesh at all
+            # (review finding 2026-07-21). Fail loud with the recovery step.
+            raise HTTPException(
+                status_code=500,
+                detail="mesh.ply exists but mesh.json is missing/unreadable — "
+                f"delete {mesh_dir} and rebuild.",
+            )
+        _patch_meta(job_id, mesh=report)
 
         if body.finish:
             splat_ply = _preview_file_path(output_dir)
@@ -4451,7 +4474,9 @@ _OBJECT_SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 
 class ObjectIsolateBody(BaseModel):
-    query: str = Field(..., min_length=2, max_length=80)
+    # No leading "-": a query like "--help" would otherwise reach argparse in
+    # the isolate subprocess and exit 0 with no artifacts (review finding).
+    query: str = Field(..., min_length=2, max_length=80, pattern=r"^[^\s-]")
     cluster: int = Field(default=0, ge=0, le=5)
     # Graded on the garden table (2026-07-21): 1.6/0.30 captured top + legs +
     # vase; tighter values return just the semantically-named surface.
@@ -4487,6 +4512,9 @@ async def isolate_splat_object(request: Request, job_id: str, body: ObjectIsolat
             status_code=409,
             detail="Object isolation needs a built language field — rebuild the scene with Language search on first.",
         )
+    # A geometry edit after the lift misaligns gauss_emb rows — same refusal the
+    # langfield query routes make (review finding 2026-07-21).
+    _langfield_stale_guard(output_dir / LANGFIELD_DIRNAME)
     candidates = sorted(
         (output_dir / "processed").rglob("splatfacto/*/config.yml"),
         key=lambda p: p.stat().st_mtime, reverse=True,
@@ -4497,6 +4525,10 @@ async def isolate_splat_object(request: Request, job_id: str, body: ObjectIsolat
     if not (OBJECT_ISOLATE_SCRIPT.is_file() and CHECKPOINT_SUBSET_SCRIPT.is_file()
             and LANGFIELD_ENV_PYTHON.is_file() and _mesh_available()):
         raise HTTPException(status_code=400, detail="Object-isolation toolchain unavailable.")
+    # Preflight the proxy lane BEFORE any GPU work — this used to run three
+    # subprocesses and then 400 (review finding 2026-07-21).
+    if body.proxy and not _triposplat_availability()["triposplat_available"]:
+        raise HTTPException(status_code=400, detail="TripoSplat lane unavailable for proxy generation.")
 
     slug = _object_slug(body.query)
     obj_dir = output_dir / OBJECTS_DIRNAME / slug
@@ -4528,48 +4560,50 @@ async def isolate_splat_object(request: Request, job_id: str, body: ObjectIsolat
 
         if body.mesh:
             subset_dir = obj_dir / "subset"
-            rc, out, stderr = await _run_capture_subprocess([
-                str(MESH_ENV_PYTHON), str(CHECKPOINT_SUBSET_SCRIPT),
-                str(config_path), str(subset_dir),
-                "--keep-npz", str(obj_dir / "object_indices.npz"),
-            ])
-            subset_cfg = out.decode().strip().splitlines()[-1] if rc == 0 and out.strip() else ""
-            if rc != 0 or not Path(subset_cfg).is_file():
-                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
-                raise HTTPException(status_code=500, detail=f"Checkpoint subset failed (exit {rc}): {tail}")
-
-            bb = report["bbox_scene"]
-            diag = math.dist(bb["max"], bb["min"])
-            voxel = min(0.015, max(0.003, diag / 220.0))
-
-            async def mesh_operation() -> tuple[int, bytes, bytes]:
-                return await _run_capture_subprocess([
-                    "env", f"MESH_VOXEL_SIZE={voxel:.4f}", f"MESH_SDF_TRUNC={3*voxel:.4f}",
-                    "MESH_MIN_COMPONENT_FRAC=0.05",
-                    "bash", str(MESH_RUNNER), subset_cfg, str(obj_dir / "mesh"),
+            # try/finally: a failed build used to orphan the ~300MB subset
+            # checkpoint (review finding 2026-07-21).
+            try:
+                rc, out, stderr = await _run_capture_subprocess([
+                    str(MESH_ENV_PYTHON), str(CHECKPOINT_SUBSET_SCRIPT),
+                    str(config_path), str(subset_dir),
+                    "--keep-npz", str(obj_dir / "object_indices.npz"),
                 ])
+                subset_cfg = out.decode().strip().splitlines()[-1] if rc == 0 and out.strip() else ""
+                if rc != 0 or not Path(subset_cfg).is_file():
+                    tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                    raise HTTPException(status_code=500, detail=f"Checkpoint subset failed (exit {rc}): {tail}")
 
-            try:
-                rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
-                    lane="object-mesh", operation_id=f"{job_id}:{slug}",
-                    vram_mb=MESH_VRAM_MB, operation=mesh_operation,
-                )
-            except gpu_arbiter.GPUArbiterUnavailable as exc:
-                raise HTTPException(status_code=503, detail=f"Object mesh blocked: {exc}") from exc
-            try:
-                mesh_report = json.loads((obj_dir / "mesh" / "mesh.json").read_text()) if rc == 0 else None
-            except Exception:  # noqa: BLE001 — absent/corrupt report = failed build
-                mesh_report = None
-            if rc != 0 or mesh_report is None:
-                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
-                raise HTTPException(status_code=500, detail=f"Object mesh failed (exit {rc}): {tail}")
-            report["mesh"] = mesh_report
-            report["mesh_voxel"] = voxel
-            shutil.rmtree(subset_dir, ignore_errors=True)  # ~300MB scratch ckpt
+                bb = report["bbox_scene"]
+                diag = math.dist(bb["max"], bb["min"])
+                voxel = min(0.015, max(0.003, diag / 220.0))
+
+                async def mesh_operation() -> tuple[int, bytes, bytes]:
+                    return await _run_capture_subprocess([
+                        "env", f"MESH_VOXEL_SIZE={voxel:.4f}", f"MESH_SDF_TRUNC={3*voxel:.4f}",
+                        "MESH_MIN_COMPONENT_FRAC=0.05",
+                        "bash", str(MESH_RUNNER), subset_cfg, str(obj_dir / "mesh"),
+                    ])
+
+                try:
+                    rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
+                        lane="object-mesh", operation_id=f"{job_id}:{slug}",
+                        vram_mb=MESH_VRAM_MB, operation=mesh_operation,
+                    )
+                except gpu_arbiter.GPUArbiterUnavailable as exc:
+                    raise HTTPException(status_code=503, detail=f"Object mesh blocked: {exc}") from exc
+                try:
+                    mesh_report = json.loads((obj_dir / "mesh" / "mesh.json").read_text()) if rc == 0 else None
+                except Exception:  # noqa: BLE001 — absent/corrupt report = failed build
+                    mesh_report = None
+                if rc != 0 or mesh_report is None:
+                    tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                    raise HTTPException(status_code=500, detail=f"Object mesh failed (exit {rc}): {tail}")
+                report["mesh"] = mesh_report
+                report["mesh_voxel"] = voxel
+            finally:
+                shutil.rmtree(subset_dir, ignore_errors=True)  # ~300MB scratch ckpt
 
         if body.proxy:
-            if not _triposplat_availability()["triposplat_available"]:
-                raise HTTPException(status_code=400, detail="TripoSplat lane unavailable for proxy generation.")
             crop_png = obj_dir / "crop.png"
             rc, _out, stderr = await _run_capture_subprocess([
                 str(MESH_ENV_PYTHON), str(OBJECT_CROP_SCRIPT),

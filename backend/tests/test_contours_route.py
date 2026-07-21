@@ -242,3 +242,35 @@ def test_surface_receipts_in_report_and_served(client, monkeypatch):
     assert r.json()["sections_url"]
     for fmt in ("sections", "surface-iso"):
         assert http.get(f"/api/splat/jobs/splat_c0a701/geo/export?fmt={fmt}").status_code == 200, fmt
+
+
+def test_auto_semantic_falls_back_to_mesh_when_no_checkpoint(client, monkeypatch):
+    """Review fix: AUTO mode with a language field but pruned processed/ must
+    fall back to the mesh-slope path, not 409."""
+    http, outputs = client
+    job_dir = _mk_job(outputs, meters_per_unit=2.35, geo=GEO)  # mesh present
+    lf = job_dir / splat_route.LANGFIELD_DIRNAME
+    lf.mkdir()
+    (lf / "gauss_emb.npz").write_bytes(b"npz")  # langfield but NO processed/
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(log=calls))
+    r = http.post("/api/splat/jobs/splat_c0a701/geo/contours", json={})
+    assert r.status_code == 200
+    assert r.json()["contours"]["params"]["semantic"] is False
+    assert all("semantic_ground" not in " ".join(map(str, c)) for c in calls)
+
+
+def test_contours_failure_preserves_prior_artifacts(client, monkeypatch):
+    """Review fix: a mid-chain failure must never leave mixed-generation
+    artifacts — the prior build survives untouched."""
+    http, outputs = client
+    job_dir = _mk_job(outputs, meters_per_unit=2.35, geo=GEO)
+    geo_dir = job_dir / splat_route.MESH_DIRNAME / "geo"
+    geo_dir.mkdir(parents=True)
+    (geo_dir / "contours.dxf").write_text("OLD GOOD DXF")
+    (geo_dir / "ground_points.txt").write_text("OLD POINTS")
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(fail_step="cdt"))
+    r = http.post("/api/splat/jobs/splat_c0a701/geo/contours", json={})
+    assert r.status_code == 500
+    assert (geo_dir / "contours.dxf").read_text() == "OLD GOOD DXF"
+    assert (geo_dir / "ground_points.txt").read_text() == "OLD POINTS"
