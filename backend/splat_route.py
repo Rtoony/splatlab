@@ -176,6 +176,9 @@ MESH_GS_MESH = Path.home() / "miniconda3" / "envs" / "dn-splatter-probe" / "bin"
 MESH_FORK_REPO = Path.home() / "tools" / "dn-splatter-probe" / "dn-splatter"
 MESH_DIRNAME = "_mesh"                    # per-job artifact dir (sibling of _health)
 MESH_VRAM_MB = 8_000                      # checkpoint load + per-camera RGB-D renders
+# Civil contours lane: the cdt engine's OWN venv runs survey_to_surface (TIN +
+# contours on standards-resolved office layers) — splatlab never imports cdt.
+CDT_VENV_PYTHON = Path.home() / "projects" / "civil-design-tools" / ".venv" / "bin" / "python"
 # ── Rig-constrained 360 SfM (opt-in via sfm_backend="rig") ───────────────────────
 # Root cause of the 360 fog cocoons (probe 2026-07-11, probe-operator-mask/STATUS.md):
 # the legacy fan-out solves each frame's crops as FREE cameras — same-frame centers
@@ -1192,6 +1195,17 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
         "survey_landxml_url": (
             f"/api/splat/jobs/{job_id}/geo/export?fmt=landxml"
             if (output_dir / MESH_DIRNAME / "geo" / "surface.xml").is_file()
+            else None
+        ),
+        # Ground contours (P1): cdt-drawn contour DXF + the PNEZD points behind it.
+        "contours_dxf_url": (
+            f"/api/splat/jobs/{job_id}/geo/export?fmt=contours"
+            if (output_dir / MESH_DIRNAME / "geo" / "contours.dxf").is_file()
+            else None
+        ),
+        "ground_points_url": (
+            f"/api/splat/jobs/{job_id}/geo/export?fmt=ground"
+            if (output_dir / MESH_DIRNAME / "geo" / "ground_points.txt").is_file()
             else None
         ),
         # Cheap per-scene stats for the gallery card (gaussian count, resolution, images).

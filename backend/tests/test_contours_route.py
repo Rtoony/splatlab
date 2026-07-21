@@ -1,0 +1,151 @@
+"""Ground-contours route (Digital Twin kernel P1): the three-step build must
+refuse loudly on missing prerequisites, fail honestly when a step dies, treat
+the receipt as best-effort only, and land its merged report in meta["contours"].
+
+CPU-only: subprocesses are monkeypatched and dispatched by script name; the
+real pipeline is proven by the solidify-probe first-light + standalone runs.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import geo_route  # noqa: E402
+import splat_route  # noqa: E402
+
+GEO = {"lat": 38.44, "lon": -122.71, "alt_m": 30.0, "heading_deg": 0.0, "anchor_scene": [0.0, 0.0]}
+GROUND_REPORT = {"v": 1, "ground_points": 2123, "coverage_m2": 132.7}
+CDT_RESULT = {"points_imported": 2123, "contours_drawn": 194, "watermarked": True, "warnings": []}
+
+
+@pytest.fixture()
+def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, Path]:
+    outputs = tmp_path / "outputs"
+    monkeypatch.setattr(splat_route, "DEFAULT_3D_ROOT", outputs)
+    app = FastAPI()
+    app.include_router(geo_route.router, prefix="/api/splat")
+    return TestClient(app), outputs
+
+
+def _mk_job(outputs: Path, job_id: str = "splat_c0a701", with_mesh: bool = True, **meta_extra) -> Path:
+    job_dir = outputs / job_id
+    job_dir.mkdir(parents=True)
+    (job_dir / "meta.json").write_text(
+        json.dumps({"job_id": job_id, "output_dir": str(job_dir), "status": "completed", **meta_extra})
+    )
+    if with_mesh:
+        mdir = job_dir / splat_route.MESH_DIRNAME
+        mdir.mkdir(parents=True)
+        (mdir / "mesh.ply").write_bytes(b"ply")
+    return job_dir
+
+
+def _fake_subprocess(fail_step: str | None = None, receipt_ok: bool = True):
+    async def run(command):
+        script = command[1]
+        if "ground_extract" in script:
+            if fail_step == "ground":
+                return 1, b"", b"FATAL: only 3 ground cells after filtering"
+            out = Path(command[3])
+            (out / "ground_points.txt").write_text("1,100.0,200.0,50.0,SPLAT-GRND\n")
+            (out / "ground.json").write_text(json.dumps(GROUND_REPORT))
+            return 0, b"", b""
+        if "contours_build" in script:
+            if fail_step == "cdt":
+                return 1, b"", b"RecipeError: contour set is EMPTY"
+            dxf = Path(command[3])
+            dxf.write_text("dxf")
+            (dxf.parent / "contours_result.json").write_text(json.dumps(CDT_RESULT))
+            return 0, b"", b""
+        if "contours_receipt" in script:
+            if not receipt_ok:
+                return 1, b"", b"FATAL: no polylines to draw"
+            Path(command[3]).write_bytes(b"png")
+            return 0, b"", b""
+        raise AssertionError(f"unexpected subprocess: {command}")
+
+    return run
+
+
+def test_contours_requires_mesh(client):
+    http, outputs = client
+    _mk_job(outputs, with_mesh=False, meters_per_unit=2.35, geo=GEO)
+    r = http.post("/api/splat/jobs/splat_c0a701/geo/contours", json={})
+    assert r.status_code == 409
+    assert "mesh export first" in r.json()["detail"]
+
+
+def test_contours_requires_scale_and_anchor(client):
+    http, outputs = client
+    _mk_job(outputs, geo=GEO)
+    r = http.post("/api/splat/jobs/splat_c0a701/geo/contours", json={})
+    assert r.status_code == 409 and "uncalibrated" in r.json()["detail"]
+
+
+def test_contours_rejects_bad_intervals(client):
+    http, outputs = client
+    _mk_job(outputs, meters_per_unit=2.35, geo=GEO)
+    r = http.post("/api/splat/jobs/splat_c0a701/geo/contours", json={"minor_ft": 5.0, "major_ft": 1.0})
+    assert r.status_code == 400
+
+
+def test_contours_success_merges_reports_and_patches_meta(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job(outputs, meters_per_unit=2.35, geo=GEO)
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess())
+
+    r = http.post("/api/splat/jobs/splat_c0a701/geo/contours", json={"minor_ft": 0.5, "major_ft": 2.5})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["contours"]["ground"]["ground_points"] == 2123
+    assert body["contours"]["contours"]["contours_drawn"] == 194
+    assert body["contours"]["receipt"] == "contours_receipt.png"
+    assert body["receipt_url"]
+
+    meta = json.loads((job_dir / "meta.json").read_text())
+    assert meta["contours"]["contours"]["contours_drawn"] == 194
+
+    for fmt in ("contours", "ground", "contours-receipt"):
+        assert http.get(f"/api/splat/jobs/splat_c0a701/geo/export?fmt={fmt}").status_code == 200, fmt
+
+    payload = splat_route._job_payload(meta)
+    assert payload["contours_dxf_url"] == "/api/splat/jobs/splat_c0a701/geo/export?fmt=contours"
+    assert payload["ground_points_url"] == "/api/splat/jobs/splat_c0a701/geo/export?fmt=ground"
+
+
+def test_contours_ground_failure_is_500_no_meta(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job(outputs, meters_per_unit=2.35, geo=GEO)
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(fail_step="ground"))
+    r = http.post("/api/splat/jobs/splat_c0a701/geo/contours", json={})
+    assert r.status_code == 500 and "Ground extraction failed" in r.json()["detail"]
+    assert "contours" not in json.loads((job_dir / "meta.json").read_text())
+
+
+def test_contours_cdt_failure_is_500_with_recipe_error(client, monkeypatch):
+    http, outputs = client
+    _mk_job(outputs, meters_per_unit=2.35, geo=GEO)
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(fail_step="cdt"))
+    r = http.post("/api/splat/jobs/splat_c0a701/geo/contours", json={})
+    assert r.status_code == 500 and "EMPTY" in r.json()["detail"]
+
+
+def test_contours_receipt_failure_is_a_note_not_a_failure(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job(outputs, meters_per_unit=2.35, geo=GEO)
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(receipt_ok=False))
+    r = http.post("/api/splat/jobs/splat_c0a701/geo/contours", json={})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["contours"].get("receipt") is None
+    assert "receipt_error" in body["contours"]
+    assert body["receipt_url"] is None
+    meta = json.loads((job_dir / "meta.json").read_text())
+    assert meta["contours"]["contours"]["contours_drawn"] == 194

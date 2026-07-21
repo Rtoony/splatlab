@@ -74,6 +74,25 @@ class GeoExportBody(BaseModel):
     max_faces: int = 50_000
 
 
+# ── ground contours (Digital Twin kernel P1, productionized 2026-07-21) ──────
+# Three fail-loud steps sharing _mesh/geo/: ground extraction (dn-splatter-probe
+# env) → cdt survey_to_surface (cdt venv — real office contour layers) →
+# best-effort receipt PNG. Proven on garden: 2,123 pts → 194 contours.
+GROUND_EXTRACT_SCRIPT = Path(__file__).resolve().parent / "mesh" / "ground_extract.py"
+CONTOURS_BUILD_SCRIPT = Path(__file__).resolve().parent / "mesh" / "contours_build.py"
+CONTOURS_RECEIPT_SCRIPT = Path(__file__).resolve().parent / "mesh" / "contours_receipt.py"
+
+
+class ContoursBody(BaseModel):
+    epsg: int = 2226
+    cell_m: float = 0.25          # ground-sampling grid (meters); 0.5-1.0 for big sites
+    max_slope_deg: float = 40.0   # steeper faces are not "ground"
+    spike_tol_m: float = 0.5      # 3x3 neighborhood median rejection
+    minor_ft: float = 0.5
+    major_ft: float = 2.5
+    tin_faces: bool = False       # also draw the TIN as review linework
+
+
 # ── stored-anchor validation ─────────────────────────────────────────────────
 class GeoAnchorIn(BaseModel):
     lat: float
@@ -495,10 +514,131 @@ async def build_survey_export(job_id: str, body: GeoExportBody | None = None):
     }
 
 
+@router.post("/jobs/{job_id}/geo/contours")
+async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
+    """Splat mesh -> ground PNEZD points -> cdt TIN + contour DXF on office
+    layers. Same prerequisites and loud-409 contract as /geo/export."""
+    body = body or ContoursBody()
+    meta = _require_job_meta(job_id)
+    if not (1000 <= body.epsg <= 999_999):
+        raise HTTPException(status_code=400, detail="epsg must be a plausible EPSG code")
+    if not (0.05 <= body.cell_m <= 5.0):
+        raise HTTPException(status_code=400, detail="cell_m must be within [0.05, 5.0] meters")
+    if not (0.0 < body.minor_ft <= body.major_ft <= 100.0):
+        raise HTTPException(status_code=400, detail="need 0 < minor_ft <= major_ft <= 100")
+    output_dir = (
+        Path(meta["output_dir"]) if meta.get("output_dir") else splat_route.DEFAULT_3D_ROOT / job_id
+    )
+    mesh_file = output_dir / splat_route.MESH_DIRNAME / "mesh.ply"
+    if not mesh_file.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail=f"No mesh for this scene yet — run mesh export first (POST /api/splat/jobs/{job_id}/mesh).",
+        )
+    mpu = meta.get("meters_per_unit")
+    if not mpu:
+        raise HTTPException(
+            status_code=409,
+            detail="Scene scale is uncalibrated — measure a known distance in the viewer "
+            f"and set it (POST /api/splat/jobs/{job_id}/scale) first.",
+        )
+    if not meta.get("geo"):
+        raise HTTPException(
+            status_code=409,
+            detail="Scene has no geo anchor — set one with Locate (map pin or GPS suggest) first.",
+        )
+    toolchain = (
+        GROUND_EXTRACT_SCRIPT.is_file()
+        and CONTOURS_BUILD_SCRIPT.is_file()
+        and splat_route.MESH_ENV_PYTHON.is_file()
+        and splat_route.CDT_VENV_PYTHON.is_file()
+    )
+    if not toolchain:
+        raise HTTPException(status_code=400, detail="Contours toolchain (mesh env + cdt venv) unavailable.")
+
+    geo_dir = _survey_export_dir(meta, job_id)
+    geo_dir.mkdir(parents=True, exist_ok=True)
+    params = {
+        "job_id": job_id,
+        "meters_per_unit": mpu,
+        "geo": meta["geo"],
+        "epsg": body.epsg,
+        "cell_m": body.cell_m,
+        "max_slope_deg": body.max_slope_deg,
+        "spike_tol_m": body.spike_tol_m,
+    }
+    pnezd = geo_dir / "ground_points.txt"
+    dxf = geo_dir / "contours.dxf"
+    receipt = geo_dir / "contours_receipt.png"
+
+    lock = _geo_export_lock(job_id)  # shared with /geo/export: both write _mesh/geo/
+    if lock.locked():
+        raise HTTPException(status_code=409, detail=f"A survey build is already running for {job_id}.")
+    async with lock:
+        rc, _out, stderr = await splat_route._run_capture_subprocess([
+            str(splat_route.MESH_ENV_PYTHON), str(GROUND_EXTRACT_SCRIPT),
+            str(mesh_file), str(geo_dir), "--params-json", json.dumps(params),
+        ])
+        if rc != 0 or not pnezd.is_file():
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-8:])
+            raise HTTPException(status_code=500, detail=f"Ground extraction failed (exit {rc}): {tail}")
+
+        cdt_cmd = [
+            str(splat_route.CDT_VENV_PYTHON), str(CONTOURS_BUILD_SCRIPT),
+            str(pnezd), str(dxf),
+            "--epsg", str(body.epsg), "--minor", str(body.minor_ft), "--major", str(body.major_ft),
+        ]
+        if body.tin_faces:
+            cdt_cmd.append("--tin-faces")
+        rc, _out, stderr = await splat_route._run_capture_subprocess(cdt_cmd)
+        if rc != 0 or not dxf.is_file():
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-8:])
+            raise HTTPException(status_code=500, detail=f"Contour build failed (exit {rc}): {tail}")
+
+        report: dict[str, Any] = {
+            "v": 1,
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "params": {k: v for k, v in params.items() if k != "geo"} | {
+                "minor_ft": body.minor_ft, "major_ft": body.major_ft, "tin_faces": body.tin_faces,
+            },
+        }
+        for name, key in (("ground.json", "ground"), ("contours_result.json", "contours")):
+            try:
+                report[key] = json.loads((geo_dir / name).read_text())
+            except Exception as exc:  # a written DXF with an unreadable report is still a failure
+                raise HTTPException(status_code=500, detail=f"Contours report {name} unreadable: {exc}") from exc
+
+        # Receipt is best-effort: a render failure becomes a note, never a 500.
+        rc, _out, stderr = await splat_route._run_capture_subprocess([
+            str(splat_route.MESH_ENV_PYTHON), str(CONTOURS_RECEIPT_SCRIPT), str(dxf), str(receipt),
+            "--title", f"{job_id} ground contours ({body.minor_ft}/{body.major_ft} ft, EPSG:{body.epsg})",
+        ])
+        if rc == 0 and receipt.is_file():
+            report["receipt"] = "contours_receipt.png"
+        else:
+            report["receipt_error"] = f"receipt render exit {rc}"
+        (geo_dir / "contours.json").write_text(json.dumps(report, indent=2))
+        splat_route._patch_meta(job_id, contours=report)
+
+    return {
+        "job_id": job_id,
+        "contours": report,
+        "contours_dxf_url": f"/api/splat/jobs/{job_id}/geo/export?fmt=contours",
+        "ground_points_url": f"/api/splat/jobs/{job_id}/geo/export?fmt=ground",
+        "receipt_url": (
+            f"/api/splat/jobs/{job_id}/geo/export?fmt=contours-receipt"
+            if report.get("receipt") else None
+        ),
+    }
+
+
 _SURVEY_FILES = {
     "dxf": ("site.dxf", "application/dxf", "site.dxf"),
     "landxml": ("surface.xml", "application/xml", "surface.landxml.xml"),
     "site": ("site.geojson", "application/geo+json", "site.geojson"),
+    "contours": ("contours.dxf", "application/dxf", "contours.dxf"),
+    "ground": ("ground_points.txt", "text/plain", "ground_points.pnezd.txt"),
+    "contours-receipt": ("contours_receipt.png", "image/png", "contours_receipt.png"),
 }
 
 
