@@ -4320,6 +4320,173 @@ async def generate_splat_mesh(request: Request, job_id: str, body: MeshExportBod
     }
 
 
+OBJECTS_DIRNAME = "_objects"
+OBJECT_ISOLATE_SCRIPT = MESH_DIR / "object_isolate.py"
+CHECKPOINT_SUBSET_SCRIPT = MESH_DIR / "checkpoint_subset.py"
+OBJECT_ISOLATE_VRAM_MB = 6_000
+_OBJECT_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+class ObjectIsolateBody(BaseModel):
+    query: str = Field(..., min_length=2, max_length=80)
+    cluster: int = Field(default=0, ge=0, le=5)
+    # Graded on the garden table (2026-07-21): 1.6/0.30 captured top + legs +
+    # vase; tighter values return just the semantically-named surface.
+    expand: float = Field(default=1.6, ge=1.0, le=3.0)
+    rel_floor: float = Field(default=0.30, gt=0.0, lt=1.0)
+    mesh: bool = True
+
+
+def _object_slug(query: str) -> str:
+    return _OBJECT_SLUG_RE.sub("-", query.lower()).strip("-")[:40] or "object"
+
+
+@router.post("/jobs/{job_id}/objects")
+async def isolate_splat_object(request: Request, job_id: str, body: ObjectIsolateBody):
+    """P5b: name an object -> its gaussians (Blender-ready splat) + a tight
+    fine-voxel mesh of just that object. Needs a built language field."""
+    require_heavy_work_admitted()
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    if meta["status"] != "completed":
+        raise HTTPException(status_code=409, detail=f"Object isolation requires a completed job. Current status: {meta['status']}")
+    output_dir = Path(meta["output_dir"])
+    gauss_emb = output_dir / LANGFIELD_DIRNAME / "gauss_emb.npz"
+    if not gauss_emb.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail="Object isolation needs a built language field — rebuild the scene with Language search on first.",
+        )
+    candidates = sorted(
+        (output_dir / "processed").rglob("splatfacto/*/config.yml"),
+        key=lambda p: p.stat().st_mtime, reverse=True,
+    ) if (output_dir / "processed").is_dir() else []
+    if not candidates:
+        raise HTTPException(status_code=409, detail="No splatfacto checkpoint found for this scene.")
+    config_path = candidates[0]
+    if not (OBJECT_ISOLATE_SCRIPT.is_file() and CHECKPOINT_SUBSET_SCRIPT.is_file()
+            and LANGFIELD_ENV_PYTHON.is_file() and _mesh_available()):
+        raise HTTPException(status_code=400, detail="Object-isolation toolchain unavailable.")
+
+    slug = _object_slug(body.query)
+    obj_dir = output_dir / OBJECTS_DIRNAME / slug
+    obj_dir.mkdir(parents=True, exist_ok=True)
+
+    lock = _mesh_export_lock(job_id)  # one heavy build per job at a time
+    if lock.locked():
+        raise HTTPException(status_code=409, detail=f"A mesh/object build is already running for {job_id}.")
+    async with lock:
+        async def iso_operation() -> tuple[int, bytes, bytes]:
+            return await _run_capture_subprocess([
+                str(LANGFIELD_ENV_PYTHON), str(OBJECT_ISOLATE_SCRIPT),
+                str(gauss_emb), str(config_path), body.query, str(obj_dir),
+                "--cluster", str(body.cluster),
+                "--expand", str(body.expand), "--rel-floor", str(body.rel_floor),
+            ])
+
+        try:
+            rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
+                lane="object-isolate", operation_id=f"{job_id}:{slug}",
+                vram_mb=OBJECT_ISOLATE_VRAM_MB, operation=iso_operation,
+            )
+        except gpu_arbiter.GPUArbiterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"Object isolation blocked: {exc}") from exc
+        if rc != 0 or not (obj_dir / "object.json").is_file():
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+            raise HTTPException(status_code=500, detail=f"Object isolation failed (exit {rc}): {tail}")
+        report = json.loads((obj_dir / "object.json").read_text())
+
+        if body.mesh:
+            subset_dir = obj_dir / "subset"
+            rc, out, stderr = await _run_capture_subprocess([
+                str(MESH_ENV_PYTHON), str(CHECKPOINT_SUBSET_SCRIPT),
+                str(config_path), str(subset_dir),
+                "--keep-npz", str(obj_dir / "object_indices.npz"),
+            ])
+            subset_cfg = out.decode().strip().splitlines()[-1] if rc == 0 and out.strip() else ""
+            if rc != 0 or not Path(subset_cfg).is_file():
+                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                raise HTTPException(status_code=500, detail=f"Checkpoint subset failed (exit {rc}): {tail}")
+
+            bb = report["bbox_scene"]
+            diag = math.dist(bb["max"], bb["min"])
+            voxel = min(0.015, max(0.003, diag / 220.0))
+
+            async def mesh_operation() -> tuple[int, bytes, bytes]:
+                return await _run_capture_subprocess([
+                    "env", f"MESH_VOXEL_SIZE={voxel:.4f}", f"MESH_SDF_TRUNC={3*voxel:.4f}",
+                    "MESH_MIN_COMPONENT_FRAC=0.05",
+                    "bash", str(MESH_RUNNER), subset_cfg, str(obj_dir / "mesh"),
+                ])
+
+            try:
+                rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
+                    lane="object-mesh", operation_id=f"{job_id}:{slug}",
+                    vram_mb=MESH_VRAM_MB, operation=mesh_operation,
+                )
+            except gpu_arbiter.GPUArbiterUnavailable as exc:
+                raise HTTPException(status_code=503, detail=f"Object mesh blocked: {exc}") from exc
+            try:
+                mesh_report = json.loads((obj_dir / "mesh" / "mesh.json").read_text()) if rc == 0 else None
+            except Exception:  # noqa: BLE001 — absent/corrupt report = failed build
+                mesh_report = None
+            if rc != 0 or mesh_report is None:
+                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                raise HTTPException(status_code=500, detail=f"Object mesh failed (exit {rc}): {tail}")
+            report["mesh"] = mesh_report
+            report["mesh_voxel"] = voxel
+            shutil.rmtree(subset_dir, ignore_errors=True)  # ~300MB scratch ckpt
+
+        objects = (_read_meta(job_id) or {}).get("objects") or {}
+        objects[slug] = {k: v for k, v in report.items() if k != "artifacts"} | {
+            "built_at": _utc_now()
+        }
+        _patch_meta(job_id, objects=objects)
+
+    await audit_operator_event(
+        request=request,
+        title="Isolated splat object",
+        description=f"{body.query!r} -> {obj_dir}",
+        variant="success",
+        action="splat.object",
+        target=meta.get("mode", "3d"),
+        metadata={"job_id": job_id, "slug": slug, "query": body.query},
+    )
+    base = f"/api/splat/jobs/{job_id}/objects/{slug}/file"
+    return {
+        "job_id": job_id,
+        "slug": slug,
+        "object": report,
+        "splat_url": f"{base}?fmt=splat",
+        "mesh_ply_url": f"{base}?fmt=ply" if body.mesh else None,
+        "mesh_glb_url": f"{base}?fmt=glb" if body.mesh and (obj_dir / "mesh" / "mesh.glb").is_file() else None,
+        "receipt_url": f"{base}?fmt=receipt" if body.mesh else None,
+    }
+
+
+_OBJECT_FILES = {
+    "splat": ("object.ply", "application/octet-stream"),
+    "ply": ("mesh/mesh.ply", "application/octet-stream"),
+    "glb": ("mesh/mesh.glb", "model/gltf-binary"),
+    "receipt": ("mesh/view_ext0.png", "image/png"),
+}
+
+
+@router.get("/jobs/{job_id}/objects/{slug}/file")
+async def get_splat_object_file(job_id: str, slug: str, fmt: Literal["splat", "ply", "glb", "receipt"] = "splat"):
+    if not _safe_job_id(job_id) or _object_slug(slug) != slug:
+        raise HTTPException(status_code=404, detail="Object not found")
+    rel, media = _OBJECT_FILES[fmt]
+    path = _job_dir(job_id) / OBJECTS_DIRNAME / slug / rel
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Object artifact not built yet")
+    suffix = Path(rel).suffix.lstrip(".")
+    return FileResponse(str(path), media_type=media, filename=f"{job_id}-{slug}.{suffix}")
+
+
 @router.get("/jobs/{job_id}/mesh/file")
 async def get_splat_mesh_file(job_id: str, fmt: Literal["ply", "glb"] = "ply"):
     # Resolved purely from disk so mesh URLs survive service restarts.

@@ -82,6 +82,20 @@ def main() -> int:
     if len(mesh.triangles) == 0:
         print(f"FATAL: exported mesh is empty: {canonical}", file=sys.stderr)
         return 1
+
+    # Optional component cleanup (object meshes, P5b): drop islands smaller
+    # than this fraction of the largest component. Default 0 = off — scene
+    # meshes keep their honest fragments.
+    min_comp_frac = float(os.environ.get("MESH_MIN_COMPONENT_FRAC", "0"))
+    components_dropped = 0
+    if min_comp_frac > 0:
+        idx, ntri, _ = mesh.cluster_connected_triangles()
+        idx, ntri = np.asarray(idx), np.asarray(ntri)
+        keep_ids = np.flatnonzero(ntri >= min_comp_frac * ntri.max())
+        components_dropped = int(len(ntri) - len(keep_ids))
+        mesh.remove_triangles_by_mask(~np.isin(idx, keep_ids))
+        mesh.remove_unreferenced_vertices()
+        o3d.io.write_triangle_mesh(str(canonical), mesh)  # cleaned IS the artifact
     mesh.compute_vertex_normals()
 
     _, cluster_tris, _ = mesh.cluster_connected_triangles()
@@ -105,6 +119,10 @@ def main() -> int:
         "bbox_extent_robust_units": [round(float(x), 3) for x in (hi - lo)],
         "artifacts": {"ply": "mesh.ply"},
     }
+    if min_comp_frac > 0:
+        report["component_cleanup"] = {
+            "min_frac": min_comp_frac, "components_dropped": components_dropped,
+        }
     if args.recipe:
         try:
             report["recipe"] = json.loads(args.recipe)
