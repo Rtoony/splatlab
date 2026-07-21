@@ -63,6 +63,10 @@ def main() -> int:
     n = int(cams.camera_to_worlds.shape[0])
     sel = sorted({int(round(i)) for i in np.linspace(0, n - 1, args.cams)})
 
+    # ONE renderer per process (two segfault), so mixed-size camera sets
+    # (ETH3D DSLR: four calibrations) are normalized: every cam's intrinsics
+    # scale to the first cam's frame; photos resize to match. Sub-0.1% aspect
+    # distortion on ETH3D — fine for a fidelity gate.
     W, H = int(cams.width[sel[0]]), int(cams.height[sel[0]])
     renderer = o3d.visualization.rendering.OffscreenRenderer(W, H)
     mat = o3d.visualization.rendering.MaterialRecord()
@@ -73,12 +77,10 @@ def main() -> int:
     flip = np.diag([1.0, -1.0, -1.0, 1.0])
     per_cam = []
     for ci in sel:
-        if int(cams.width[ci]) != W or int(cams.height[ci]) != H:
-            print(f"FATAL: mixed camera sizes (cam {ci})", file=sys.stderr)
-            return 1
+        kx, ky = W / int(cams.width[ci]), H / int(cams.height[ci])
         intr = o3d.camera.PinholeCameraIntrinsic(
-            W, H, float(cams.fx[ci]), float(cams.fy[ci]),
-            float(cams.cx[ci]), float(cams.cy[ci]),
+            W, H, float(cams.fx[ci]) * kx, float(cams.fy[ci]) * ky,
+            float(cams.cx[ci]) * kx, float(cams.cy[ci]) * ky,
         )
         c2w = np.eye(4)
         c2w[:3, :] = cams.camera_to_worlds[ci].numpy()
