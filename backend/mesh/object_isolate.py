@@ -133,7 +133,8 @@ def main() -> int:
         c = cp.mean(0)
         radius = float(np.linalg.norm(cp - c, axis=1).max())
         matches.append({"focus": c, "radius": radius,
-                        "score": float(wts[m].sum()), "count": int(m.sum())})
+                        "score": float(wts[m].sum()), "count": int(m.sum()),
+                        "bbox_tight": (cp.min(0), cp.max(0))})
     if not matches:
         print(f"FATAL: no cluster with peak relevancy >= 0.58 for {args.query!r}", file=sys.stderr)
         return 1
@@ -175,6 +176,11 @@ def main() -> int:
         "bbox_scene": {
             "min": [round(float(x), 4) for x in obj_xyz.min(0)],
             "max": [round(float(x), 4) for x in obj_xyz.max(0)],
+        },
+        # Cluster-pool bbox: TIGHT (no expansion debris) — use for photo crops.
+        "bbox_tight": {
+            "min": [round(float(x), 4) for x in chosen["bbox_tight"][0]],
+            "max": [round(float(x), 4) for x in chosen["bbox_tight"][1]],
         },
         "artifacts": {"splat": "object.ply", "indices": "object_indices.npz"},
     }

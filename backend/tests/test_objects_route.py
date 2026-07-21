@@ -147,3 +147,52 @@ def test_objects_slug_path_traversal_404(client):
     _mk_job(outputs)
     r = http.get("/api/splat/jobs/splat_0b0001/objects/..%2F..%2Fetc/file?fmt=splat")
     assert r.status_code == 404
+
+
+def test_objects_proxy_chain(client, monkeypatch, tmp_path):
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    monkeypatch.setattr(splat_route, "_triposplat_availability",
+                        lambda: {"triposplat_available": True, "triposplat_runner": "/fake/run.sh"})
+    calls: list = []
+    base_fake = _fake_subprocess(job_dir, calls)
+
+    async def run(command):
+        joined = " ".join(str(c) for c in command)
+        if "object_crop" in joined:
+            calls.append(command)
+            Path(command[4]).write_bytes(b"png")
+            return 0, b"", b""
+        if "/fake/run.sh" in joined:
+            calls.append(command)
+            raw = Path(command[3])
+            raw.mkdir(parents=True, exist_ok=True)
+            (raw / "splat.ply").write_bytes(b"ply")
+            (raw / "thumb.webp").write_bytes(b"webp")
+            return 0, b"", b""
+        if "proxy_register" in joined:
+            calls.append(command)
+            obj_dir = Path(command[4]).parent
+            (obj_dir / "proxy.ply").write_bytes(b"ply")
+            (obj_dir / "proxy.json").write_text(json.dumps({"icp_fitness": 0.91, "total_scale": 0.76}))
+            return 0, b"", b""
+        return await base_fake(command)
+
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", run)
+    r = http.post("/api/splat/jobs/splat_0b0001/objects",
+                  json={"query": "table", "proxy": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["proxy_url"]
+    assert body["proxy_preview_url"]
+    assert body["object"]["proxy"]["icp_fitness"] == 0.91
+
+    obj_dir = job_dir / splat_route.OBJECTS_DIRNAME / "table"
+    assert not (obj_dir / "proxy_raw").exists()      # scratch cleaned
+    assert (obj_dir / "proxy_preview.webp").is_file()
+
+    meta = json.loads((job_dir / "meta.json").read_text())
+    assert meta["objects"]["table"]["proxy"]["total_scale"] == 0.76
+
+    for fmt in ("proxy", "proxy-preview"):
+        assert http.get(f"/api/splat/jobs/splat_0b0001/objects/table/file?fmt={fmt}").status_code == 200, fmt

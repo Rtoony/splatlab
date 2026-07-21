@@ -4405,6 +4405,8 @@ async def generate_splat_mesh(request: Request, job_id: str, body: MeshExportBod
 OBJECTS_DIRNAME = "_objects"
 OBJECT_ISOLATE_SCRIPT = MESH_DIR / "object_isolate.py"
 CHECKPOINT_SUBSET_SCRIPT = MESH_DIR / "checkpoint_subset.py"
+OBJECT_CROP_SCRIPT = MESH_DIR / "object_crop.py"
+PROXY_REGISTER_SCRIPT = MESH_DIR / "proxy_register.py"
 OBJECT_ISOLATE_VRAM_MB = 6_000
 _OBJECT_SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -4417,6 +4419,10 @@ class ObjectIsolateBody(BaseModel):
     expand: float = Field(default=1.6, ge=1.0, le=3.0)
     rel_floor: float = Field(default=0.30, gt=0.0, lt=1.0)
     mesh: bool = True
+    # P5c: generate a CLEAN replacement via TripoSplat from the best photo crop
+    # and ICP-register it at the object's scene pose. Render/VR lane only —
+    # a proxy is plausible, not faithful; never a survey artifact.
+    proxy: bool = False
 
 
 def _object_slug(query: str) -> str:
@@ -4522,6 +4528,54 @@ async def isolate_splat_object(request: Request, job_id: str, body: ObjectIsolat
             report["mesh_voxel"] = voxel
             shutil.rmtree(subset_dir, ignore_errors=True)  # ~300MB scratch ckpt
 
+        if body.proxy:
+            if not _triposplat_availability()["triposplat_available"]:
+                raise HTTPException(status_code=400, detail="TripoSplat lane unavailable for proxy generation.")
+            crop_png = obj_dir / "crop.png"
+            rc, _out, stderr = await _run_capture_subprocess([
+                str(MESH_ENV_PYTHON), str(OBJECT_CROP_SCRIPT),
+                str(config_path), str(obj_dir / "object.json"), str(crop_png),
+            ])
+            if rc != 0 or not crop_png.is_file():
+                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                raise HTTPException(status_code=500, detail=f"Proxy crop failed (exit {rc}): {tail}")
+
+            proxy_raw = obj_dir / "proxy_raw"
+
+            async def gen_operation() -> tuple[int, bytes, bytes]:
+                return await _run_capture_subprocess([
+                    "bash", _triposplat_availability()["triposplat_runner"],
+                    str(crop_png), str(proxy_raw),
+                ])
+
+            try:
+                rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
+                    lane="object-proxy", operation_id=f"{job_id}:{slug}",
+                    vram_mb=TRIPOSPLAT_VRAM_MB, operation=gen_operation,
+                )
+            except gpu_arbiter.GPUArbiterUnavailable as exc:
+                raise HTTPException(status_code=503, detail=f"Proxy generation blocked: {exc}") from exc
+            if rc != 0 or not (proxy_raw / "splat.ply").is_file():
+                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                raise HTTPException(status_code=500, detail=f"Proxy generation failed (exit {rc}): {tail}")
+
+            rc, _out, stderr = await _run_capture_subprocess([
+                str(MESH_ENV_PYTHON), str(PROXY_REGISTER_SCRIPT),
+                str(proxy_raw / "splat.ply"), str(obj_dir / "object.ply"),
+                str(obj_dir / "proxy.ply"),
+            ])
+            if rc != 0 or not (obj_dir / "proxy.ply").is_file():
+                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                raise HTTPException(status_code=500, detail=f"Proxy registration failed (exit {rc}): {tail}")
+            try:
+                report["proxy"] = json.loads((obj_dir / "proxy.json").read_text())
+            except Exception:  # noqa: BLE001
+                report["proxy"] = {}
+            thumb = proxy_raw / "thumb.webp"
+            if thumb.is_file():
+                shutil.move(str(thumb), str(obj_dir / "proxy_preview.webp"))
+            shutil.rmtree(proxy_raw, ignore_errors=True)  # raw ~18MB scratch
+
         objects = (_read_meta(job_id) or {}).get("objects") or {}
         objects[slug] = {k: v for k, v in report.items() if k != "artifacts"} | {
             "built_at": _utc_now()
@@ -4546,6 +4600,11 @@ async def isolate_splat_object(request: Request, job_id: str, body: ObjectIsolat
         "mesh_ply_url": f"{base}?fmt=ply" if body.mesh else None,
         "mesh_glb_url": f"{base}?fmt=glb" if body.mesh and (obj_dir / "mesh" / "mesh.glb").is_file() else None,
         "receipt_url": f"{base}?fmt=receipt" if body.mesh else None,
+        "proxy_url": f"{base}?fmt=proxy" if body.proxy else None,
+        "proxy_preview_url": (
+            f"{base}?fmt=proxy-preview"
+            if body.proxy and (obj_dir / "proxy_preview.webp").is_file() else None
+        ),
     }
 
 
@@ -4554,11 +4613,16 @@ _OBJECT_FILES = {
     "ply": ("mesh/mesh.ply", "application/octet-stream"),
     "glb": ("mesh/mesh.glb", "model/gltf-binary"),
     "receipt": ("mesh/view_ext0.png", "image/png"),
+    "proxy": ("proxy.ply", "application/octet-stream"),
+    "proxy-preview": ("proxy_preview.webp", "image/webp"),
 }
 
 
 @router.get("/jobs/{job_id}/objects/{slug}/file")
-async def get_splat_object_file(job_id: str, slug: str, fmt: Literal["splat", "ply", "glb", "receipt"] = "splat"):
+async def get_splat_object_file(
+    job_id: str, slug: str,
+    fmt: Literal["splat", "ply", "glb", "receipt", "proxy", "proxy-preview"] = "splat",
+):
     if not _safe_job_id(job_id) or _object_slug(slug) != slug:
         raise HTTPException(status_code=404, detail="Object not found")
     rel, media = _OBJECT_FILES[fmt]
