@@ -55,6 +55,9 @@ export interface SplatJob {
   // Survey export (mesh + scale + geo anchor → grid-placed CAD deliverables).
   survey_dxf_url?: string | null;
   survey_landxml_url?: string | null;
+  // Ground contours (cdt-drawn contour DXF + the PNEZD points behind it).
+  contours_dxf_url?: string | null;
+  ground_points_url?: string | null;
   // Persisted SfM/frame-density params (backend already returns these via the
   // meta spread; declared here so "Promote to full build" can read a scene's
   // own settings instead of falling back to request defaults that could
