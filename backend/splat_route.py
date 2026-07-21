@@ -163,6 +163,19 @@ HEALTH_DIR = Path(__file__).resolve().parent / "health"
 HEALTH_RUNNER = HEALTH_DIR / "run_health.sh"
 HEALTH_DIRNAME = "_health"                # per-job artifact dir (sibling of _langfield)
 HEALTH_VRAM_MB = 4_000                    # checkpoint load + 2 rasterizations at 640px
+# ── Splat→mesh export (opt-in, Digital Twin kernel) ──────────────────────────────
+# Champion TSDF recipe from the mesh-trial program (2026-07-10): vanilla splatfacto
+# checkpoint + Open3D TSDF fusion (voxel 0.015 / sdf-trunc 0.045 / depth-trunc 6 /
+# alpha-mask 0.5) — no DN fine-tune needed. Subprocessed into the dn-splatter-probe
+# conda env by absolute path (the langfield pattern: NOTHING added to splatlab's
+# venv). Best-effort stage: a mesh failure never fails the splat job.
+MESH_DIR = Path(__file__).resolve().parent / "mesh"
+MESH_RUNNER = MESH_DIR / "run_mesh.sh"
+MESH_ENV_PYTHON = Path.home() / "miniconda3" / "envs" / "dn-splatter-probe" / "bin" / "python"
+MESH_GS_MESH = Path.home() / "miniconda3" / "envs" / "dn-splatter-probe" / "bin" / "gs-mesh"
+MESH_FORK_REPO = Path.home() / "tools" / "dn-splatter-probe" / "dn-splatter"
+MESH_DIRNAME = "_mesh"                    # per-job artifact dir (sibling of _health)
+MESH_VRAM_MB = 8_000                      # checkpoint load + per-camera RGB-D renders
 # ── Rig-constrained 360 SfM (opt-in via sfm_backend="rig") ───────────────────────
 # Root cause of the 360 fog cocoons (probe 2026-07-11, probe-operator-mask/STATUS.md):
 # the legacy fan-out solves each frame's crops as FREE cameras — same-frame centers
@@ -413,6 +426,10 @@ class SplatTrainRequest(BaseModel):
     # SigLIP 2, training-free lift). Default off → the pipeline is byte-identical.
     # Best-effort: a build failure never fails the splat job.
     language_field: bool = False
+    # OPT-IN: export a triangle mesh after training (Open3D TSDF champion recipe,
+    # the Digital Twin kernel — Blender/CAD/STL downstream). Default off → the
+    # pipeline is byte-identical. Best-effort: a mesh failure never fails the job.
+    mesh_export: bool = False
     # OPT-IN capture mode. "standard" (default) → the pipeline is byte-identical.
     # "sparse" = InstantSplat "Few Photos (AI poses)": force the MASt3R rung with a
     # DENSE pointmap seed + complete scene-graph + low iterations, so a handful of
@@ -479,6 +496,16 @@ def _preview_export_lock(job_id: str) -> asyncio.Lock:
     return lock
 
 
+_MESH_EXPORT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _mesh_export_lock(job_id: str) -> asyncio.Lock:
+    lock = _MESH_EXPORT_LOCKS.get(job_id)
+    if lock is None:
+        lock = _MESH_EXPORT_LOCKS[job_id] = asyncio.Lock()
+    return lock
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -541,6 +568,7 @@ def _new_meta(
         "reroute_count": 0,
         "sfm_reroutes": [],
         "language_field": req.language_field,
+        "mesh_export": req.mesh_export,
         "trim_start_s": req.trim_start_s,
         "trim_duration_s": req.trim_duration_s,
         # Record the ACTUAL engaged capture mode: "sparse" only when the plan starts with
@@ -730,6 +758,26 @@ def _health_available() -> bool:
     return all(Path(p).is_file() for p in (HEALTH_RUNNER, hf_py))
 
 
+def _mesh_available() -> bool:
+    """True iff the splat→mesh toolchain is present: the runner, the
+    dn-splatter-probe env (python + the gs-mesh console script), and the fork
+    repo the env's editable install imports from."""
+    return (
+        MESH_RUNNER.is_file()
+        and MESH_ENV_PYTHON.is_file()
+        and MESH_GS_MESH.is_file()
+        and MESH_FORK_REPO.is_dir()
+    )
+
+
+def _append_mesh_stage(stages: list[str], req: "SplatTrainRequest") -> None:
+    """Append the opt-in splat→mesh export when requested AND the toolchain is
+    present. Called exactly once by _plan_3d_job, before the langfield tail —
+    mesh needs only the nerfstudio checkpoint, like langfield."""
+    if req.mesh_export and _mesh_available():
+        stages.append("mesh")
+
+
 def _append_health_stage(stages: list[str]) -> None:
     """Append the report-only capture-health stage when the toolchain is present
     and the kill-switch (SPLAT_HEALTH_GATE=0) isn't set. Called exactly once by
@@ -849,6 +897,8 @@ def _engine_availability() -> dict:
         **_triposplat_availability(),
         # Language Field (opt-in): SAM 2.1 + SigLIP 2 toolchain present?
         "langfield_available": _langfield_available(),
+        # Splat→mesh export (opt-in): dn-splatter-probe env + gs-mesh present?
+        "mesh_available": _mesh_available(),
         "ffmpeg_available": bool(ffmpeg),
         "ffmpeg_path": ffmpeg,
         # Insta360 .insv auto-stitch needs ffmpeg's v360 filter.
@@ -1120,6 +1170,18 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
             if langfield_built and preview_file.is_file()
             else None
         ),
+        # Opt-in splat→mesh export (Digital Twin kernel): triangle-mesh artifacts
+        # for Blender/CAD/print. The measured report lives in meta["mesh"].
+        "mesh_file_url": (
+            f"/api/splat/jobs/{job_id}/mesh/file"
+            if (output_dir / MESH_DIRNAME / "mesh.ply").is_file()
+            else None
+        ),
+        "mesh_glb_url": (
+            f"/api/splat/jobs/{job_id}/mesh/file?fmt=glb"
+            if (output_dir / MESH_DIRNAME / "mesh.glb").is_file()
+            else None
+        ),
         # Cheap per-scene stats for the gallery card (gaussian count, resolution, images).
         "stats": _scene_stats(job_id, output_dir, meta),
     }
@@ -1128,6 +1190,17 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
 def _find_latest_config(output_dir: Path) -> Path | None:
     candidates = sorted(output_dir.rglob("config.yml"), key=lambda path: path.stat().st_mtime, reverse=True)
     return candidates[0] if candidates else None
+
+
+def _read_mesh_report(output_dir: Path) -> dict[str, Any] | None:
+    """Read the mesh stage's measured report (mesh.json, written by
+    mesh_report.py). None on any problem — callers treat a missing or corrupt
+    report as a failed export, never as success."""
+    try:
+        report = json.loads((output_dir / MESH_DIRNAME / "mesh.json").read_text())
+    except Exception:  # noqa: BLE001 — absent/corrupt report is simply "no report"
+        return None
+    return report if isinstance(report, dict) else None
 
 
 def _find_scene_transforms(output_dir: Path) -> Path | None:
@@ -2402,6 +2475,9 @@ def _plan_3d_job(
         # webopt: lightweight .ply for the shareable web viewer. Best-effort,
         # runs after compress, failure never fails the job.
         stages.append("webopt")
+    # OPT-IN mesh export (Digital Twin kernel): checkpoint-only, like langfield;
+    # runs before it (a couple of minutes vs langfield's ~7).
+    _append_mesh_stage(stages, req)
     # OPT-IN language field, appended OUTSIDE the splat-transform guard (it needs
     # only the nerfstudio checkpoint, not compress/webopt). Runs DEAD LAST; the
     # runner builds its command from the job dir at stage time (like export).
@@ -3081,6 +3157,41 @@ async def _run_pipeline(job: SplatJob) -> None:
                     completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
                     _patch_meta(job.job_id, stages_completed=[*completed, stage])
                 continue
+            elif stage == "mesh":
+                # Best-effort OPT-IN splat→mesh export (Digital Twin kernel):
+                # champion TSDF recipe in the dn-splatter-probe env. The report
+                # (mesh.json, measured metrics only) lands in meta["mesh"]. Same
+                # never-fail contract as health/langfield: the splat is already
+                # done; a mesh failure is bookkeeping, never job state.
+                stage_ok = True
+                try:
+                    config_path = _find_latest_config(job_dir)
+                    if config_path is None or not _mesh_available():
+                        job.log_lines.append("[mesh] skipped (no config or toolchain unavailable).")
+                    else:
+                        mdir = job_dir / MESH_DIRNAME
+                        mdir.mkdir(parents=True, exist_ok=True)
+                        command = ["bash", str(MESH_RUNNER), str(config_path), str(mdir)]
+                        rc = await _run_locked_stage(job, stage, command, MESH_VRAM_MB)
+                        report = _read_mesh_report(job_dir)
+                        if rc == 0 and report is not None:
+                            _patch_meta(job.job_id, mesh=report)
+                            job.log_lines.append(
+                                f"[mesh] exported: {report.get('tris')} triangles, "
+                                f"LCC {report.get('lcc_pct')}%, watertight={report.get('watertight')}."
+                            )
+                        else:
+                            job.log_lines.append("[mesh] export failed; the splat is unaffected.")
+                            _record_stage_failure(job.job_id, stage, f"exit code {rc}")
+                            stage_ok = False
+                except Exception as exc:  # noqa: BLE001 — best-effort: never fail the splat
+                    job.log_lines.append(f"[mesh] skipped (error: {exc}); the splat is unaffected.")
+                    _record_stage_failure(job.job_id, stage, f"error: {exc}")
+                    stage_ok = False
+                if stage_ok:
+                    completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
+                    _patch_meta(job.job_id, stages_completed=[*completed, stage])
+                continue
             elif stage == "process" or stage.startswith("reprocess"):
                 # Registration-quality gate. The process (COLMAP/SfM) stage
                 # extracts frames and solves camera poses; only the registered
@@ -3334,7 +3445,7 @@ def _req_from_meta(meta: dict[str, Any]) -> SplatTrainRequest | None:
     knob is persisted by _new_meta precisely so re-runs can be exact)."""
     keys = ("mode", "input_path", "capture_format", "images_per_equirect",
             "crop_bottom", "num_frames_target", "max_num_iterations", "insv_fov",
-            "sfm_backend", "language_field", "capture_mode", "source_type",
+            "sfm_backend", "language_field", "mesh_export", "capture_mode", "source_type",
             "trim_start_s", "trim_duration_s")
     fields = {k: meta[k] for k in keys if meta.get(k) is not None}
     try:
@@ -4064,6 +4175,111 @@ async def get_splat_preview_file(job_id: str, fmt: Literal["ply", "spz", "web", 
     if not preview_file.is_file():
         raise HTTPException(status_code=404, detail="Preview file not generated yet")
     return FileResponse(str(preview_file), media_type="application/octet-stream", filename=f"{job_id}.{suffix}")
+
+
+@router.post("/jobs/{job_id}/mesh")
+async def generate_splat_mesh(request: Request, job_id: str):
+    """Post-hoc splat→mesh export for a COMPLETED job (Digital Twin kernel):
+    champion TSDF recipe on the existing checkpoint, no retraining. Idempotent —
+    an existing mesh.ply short-circuits (delete _mesh/ to force a redo)."""
+    require_heavy_work_admitted()
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    if meta["status"] != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Mesh export requires a completed job. Current status: {meta['status']}",
+        )
+    if not _mesh_available():
+        raise HTTPException(
+            status_code=400,
+            detail="The splat→mesh toolchain (dn-splatter-probe env) is not available.",
+        )
+
+    output_dir = Path(meta["output_dir"])
+    config_path = _find_latest_config(output_dir)
+    if config_path is None:
+        raise HTTPException(status_code=404, detail=f"No Nerfstudio config.yml found under {output_dir}")
+
+    mesh_dir = output_dir / MESH_DIRNAME
+    mesh_dir.mkdir(parents=True, exist_ok=True)
+    mesh_file = mesh_dir / "mesh.ply"
+
+    export_lock = _mesh_export_lock(job_id)
+    if export_lock.locked():
+        raise HTTPException(status_code=409, detail=f"A mesh export is already running for {job_id}.")
+    await export_lock.acquire()
+    command = ["bash", str(MESH_RUNNER), str(config_path), str(mesh_dir)]
+    try:
+        require_heavy_work_admitted()
+        exported = False
+
+        async def operation() -> tuple[int, bytes, bytes]:
+            nonlocal exported
+            # Another process may have finished this while we waited for the GPU
+            # lease. Treat mesh export as idempotent, like preview export.
+            if mesh_file.is_file():
+                return 0, b"", b""
+            exported = True
+            return await _run_capture_subprocess(command)
+
+        try:
+            return_code, _stdout, stderr = await gpu_arbiter.run_gpu_operation(
+                lane="splat-mesh",
+                operation_id=job_id,
+                vram_mb=MESH_VRAM_MB,
+                operation=operation,
+            )
+        except gpu_arbiter.GPUArbiterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"Mesh export blocked: {exc}") from exc
+        if return_code != 0 or not mesh_file.is_file():
+            tail = "\n".join((stderr.decode("utf-8", errors="replace")).splitlines()[-10:])
+            raise HTTPException(
+                status_code=500,
+                detail=f"Mesh export failed (exit {return_code}): {tail}",
+            )
+        report = _read_mesh_report(output_dir)
+        if report is not None:
+            _patch_meta(job_id, mesh=report)
+    finally:
+        export_lock.release()
+
+    if exported:
+        await audit_operator_event(
+            request=request,
+            title="Exported Splat mesh",
+            description=f"{Path(meta['input_path']).name} -> {mesh_file}",
+            variant="success",
+            action="splat.mesh",
+            target=meta.get("mode", "3d"),
+            metadata={"job_id": job_id, "mesh_file": str(mesh_file)},
+        )
+    return {
+        "job_id": job_id,
+        "mesh": report,
+        "mesh_file_url": f"/api/splat/jobs/{job_id}/mesh/file",
+        "mesh_glb_url": (
+            f"/api/splat/jobs/{job_id}/mesh/file?fmt=glb"
+            if (mesh_dir / "mesh.glb").is_file()
+            else None
+        ),
+        "cached": not exported,
+    }
+
+
+@router.get("/jobs/{job_id}/mesh/file")
+async def get_splat_mesh_file(job_id: str, fmt: Literal["ply", "glb"] = "ply"):
+    # Resolved purely from disk so mesh URLs survive service restarts.
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    mesh_file = _job_dir(job_id) / MESH_DIRNAME / f"mesh.{fmt}"
+    if not mesh_file.is_file():
+        raise HTTPException(status_code=404, detail="Mesh not generated yet")
+    media_type = "model/gltf-binary" if fmt == "glb" else "application/octet-stream"
+    return FileResponse(str(mesh_file), media_type=media_type, filename=f"{job_id}.{fmt}")
 
 
 def _langfield_stale_guard(lfdir: Path) -> None:
