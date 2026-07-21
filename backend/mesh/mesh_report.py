@@ -109,13 +109,33 @@ def main() -> int:
         except json.JSONDecodeError:
             report["recipe_error"] = "unparseable recipe JSON from runner"
 
-    # GLB is a convenience copy (Blender drag-in); PLY stays the artifact of record.
+    # GLB is a convenience copy (Blender drag-in); PLY stays the artifact of
+    # record. Written via trimesh — open3d 0.19's GLB writer emits corrupt
+    # buffer views (found 2026-07-21) — and VERIFIED by readback: a GLB that
+    # doesn't load with the same triangle count is deleted, never shipped.
     try:
+        import trimesh
+
         glb = out_dir / "mesh.glb"
-        if o3d.io.write_triangle_mesh(str(glb), mesh) and glb.is_file():
+        tm = trimesh.Trimesh(
+            vertices=np.asarray(mesh.vertices),
+            faces=np.asarray(mesh.triangles),
+            vertex_colors=(
+                (np.asarray(mesh.vertex_colors) * 255).astype(np.uint8)
+                if mesh.has_vertex_colors()
+                else None
+            ),
+            process=False,
+        )
+        tm.export(str(glb))
+        back = trimesh.load(str(glb), force="mesh")
+        if len(back.faces) == len(tm.faces):
             report["artifacts"]["glb"] = "mesh.glb"
         else:
-            report["glb_error"] = "open3d write_triangle_mesh returned false"
+            glb.unlink(missing_ok=True)
+            report["glb_error"] = (
+                f"readback mismatch ({len(back.faces)} != {len(tm.faces)} faces)"
+            )
     except Exception as exc:  # noqa: BLE001 — convenience artifact, never fatal
         report["glb_error"] = str(exc)
 
