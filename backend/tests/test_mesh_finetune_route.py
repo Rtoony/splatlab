@@ -143,3 +143,29 @@ def test_finish_requires_preview_splat(client, monkeypatch):
     r = http.post("/api/splat/jobs/splat_f70001/mesh", json={"finish": True})
     assert r.status_code == 409
     assert "splat.ply" in r.json()["detail"]
+
+
+def test_gate_scores_mesh_and_patches_meta(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_completed_job(outputs)
+    cfg = job_dir / "processed" / "splatfacto" / "ts"
+    cfg.mkdir(parents=True)
+    (cfg / "config.yml").write_text("cfg")
+    calls: list = []
+
+    async def fake_sub(command):
+        calls.append(command)
+        assert "mesh_gate" in " ".join(str(c) for c in command)
+        (job_dir / splat_route.MESH_DIRNAME / "mesh_gate.json").write_text(json.dumps({
+            "v": 1, "median_coverage": 0.745, "median_psnr": 11.86,
+            "median_ssim": 0.216, "convention": "o3d-unlit", "per_cam": [],
+        }))
+        return 0, b"", b""
+
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", fake_sub)
+    r = http.post("/api/splat/jobs/splat_f70001/mesh", json={"gate": True})
+    assert r.status_code == 200
+    assert len(calls) == 1
+    meta = json.loads((job_dir / "meta.json").read_text())
+    assert meta["mesh"]["gate"]["median_psnr"] == 11.86
+    assert "per_cam" not in meta["mesh"]["gate"]  # meta stays lean

@@ -4221,6 +4221,8 @@ async def get_splat_preview_file(job_id: str, fmt: Literal["ply", "spz", "web", 
 
 
 TWIN_FINISH_SCRIPT = MESH_DIR / "twin_finish.py"
+MESH_GATE_SCRIPT = MESH_DIR / "mesh_gate.py"
+MESH_GATE_VRAM_MB = 4_000  # one EGL offscreen renderer + dataparser (CPU)
 
 
 class MeshExportBody(BaseModel):
@@ -4232,6 +4234,10 @@ class MeshExportBody(BaseModel):
     # Twin finishing stage (Blender-lab WS3, adopted 2026-07-21): splat->mesh
     # color transfer + decimate + meters/Y-up vertex-colored twin.glb. ~6 s CPU.
     finish: bool = False
+    # Mesh-fidelity gate (Blender-lab WS1, adopted 2026-07-21): render the mesh
+    # through 6 train cameras, PSNR/SSIM/coverage vs the real photos. Report
+    # lands in meta.mesh.gate; photo|render strips in _mesh/gate_cam*.jpg.
+    gate: bool = False
 
 
 @router.post("/jobs/{job_id}/mesh")
@@ -4331,6 +4337,39 @@ async def generate_splat_mesh(request: Request, job_id: str, body: MeshExportBod
                 twin_report = {}
             if report is not None:
                 report["twin"] = twin_report
+                _patch_meta(job_id, mesh=report)
+
+        if body.gate:
+            gate_candidates = sorted(
+                (output_dir / "processed").rglob("splatfacto/*/config.yml"),
+                key=lambda p: p.stat().st_mtime, reverse=True,
+            ) if (output_dir / "processed").is_dir() else []
+            if not gate_candidates:
+                raise HTTPException(status_code=409, detail="No splatfacto checkpoint found for the mesh gate.")
+
+            async def gate_operation() -> tuple[int, bytes, bytes]:
+                return await _run_capture_subprocess([
+                    str(MESH_ENV_PYTHON), str(MESH_GATE_SCRIPT),
+                    str(mesh_file), str(gate_candidates[0]), str(mesh_dir),
+                ])
+
+            try:
+                rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
+                    lane="mesh-gate", operation_id=job_id,
+                    vram_mb=MESH_GATE_VRAM_MB, operation=gate_operation,
+                )
+            except gpu_arbiter.GPUArbiterUnavailable as exc:
+                raise HTTPException(status_code=503, detail=f"Mesh gate blocked: {exc}") from exc
+            try:
+                gate_report = json.loads((mesh_dir / "mesh_gate.json").read_text()) if rc == 0 else None
+            except Exception:  # noqa: BLE001
+                gate_report = None
+            if rc != 0 or gate_report is None:
+                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                raise HTTPException(status_code=500, detail=f"Mesh gate failed (exit {rc}): {tail}")
+            if report is not None:
+                report["gate"] = {k: gate_report[k] for k in
+                                  ("median_coverage", "median_psnr", "median_ssim", "convention")}
                 _patch_meta(job_id, mesh=report)
     finally:
         export_lock.release()
