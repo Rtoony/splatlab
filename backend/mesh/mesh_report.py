@@ -127,6 +127,10 @@ def main() -> int:
             ),
             process=False,
         )
+        # glTF is a Y-up format; our scene frame is Z-up. Export rotated
+        # (Z-up -> Y-up) so importers' Y-up->native conversion restores the
+        # true orientation — without this, Blender imports the site on its side.
+        tm.apply_transform(trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0]))
         tm.export(str(glb))
         back = trimesh.load(str(glb), force="mesh")
         if len(back.faces) == len(tm.faces):
