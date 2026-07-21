@@ -48,6 +48,10 @@ export interface SplatJob {
   // scenes (which never carry them) keep deserializing unchanged.
   language_field?: boolean;
   langfield_available?: boolean;
+  // Opt-in splat→mesh export (Digital Twin kernel) — optional for the same reason.
+  mesh_export?: boolean;
+  mesh_file_url?: string | null;
+  mesh_glb_url?: string | null;
   // Persisted SfM/frame-density params (backend already returns these via the
   // meta spread; declared here so "Promote to full build" can read a scene's
   // own settings instead of falling back to request defaults that could
@@ -318,6 +322,7 @@ export interface SplatStatusResponse {
     four_d_engine_ready: boolean;
     // Whether the Language Field toolchain exists on this host (opt-in feature gate).
     langfield_available?: boolean;
+    mesh_available?: boolean;
     [k: string]: unknown;
   };
   compute?: SplatComputeStatus;

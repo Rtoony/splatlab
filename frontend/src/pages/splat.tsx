@@ -36,7 +36,7 @@ import {
 } from "lucide-react";
 
 // ── pipeline metadata ────────────────────────────────────────────────────────
-const STAGE_ORDER = ["stitch", "process", "train", "langfield", "export", "health", "compress", "webopt"];
+const STAGE_ORDER = ["stitch", "process", "train", "langfield", "export", "health", "compress", "webopt", "mesh"];
 const STAGE_HUMAN: Record<string, string> = {
   stitch: "Unwrapping 360 footage",
   process: "Finding camera positions",
@@ -49,6 +49,7 @@ const STAGE_HUMAN: Record<string, string> = {
   health: "Checking capture health",
   compress: "Compressing",
   webopt: "Preparing web viewer",
+  mesh: "Extracting triangle mesh",
 };
 const STAGE_SHORT: Record<string, string> = {
   stitch: "Stitch",
@@ -62,6 +63,7 @@ const STAGE_SHORT: Record<string, string> = {
   health: "Health",
   compress: "Compress",
   webopt: "Web",
+  mesh: "Mesh",
 };
 // An auto-fallback solver's process step is named "reprocess<n>" on the backend so
 // it never collides with the original "process" stage key — label it like Process.
@@ -143,6 +145,8 @@ export default function SplatLabPage() {
   const [showCustom, setShowCustom] = useState(false);
   // Opt-in: build a text-searchable Language Field alongside the scene.
   const [languageField, setLanguageField] = useState(false);
+  // Opt-in: export a triangle mesh (Digital Twin kernel — Blender/CAD/print).
+  const [meshExport, setMeshExport] = useState(false);
   // Safe default: raw .insv evaluations start as a bounded Test Flight. A full
   // capture build now requires the operator to deliberately turn this off.
   const [testFlight, setTestFlight] = useState(true);
@@ -180,6 +184,7 @@ export default function SplatLabPage() {
   const engineReady = Boolean(status?.engines?.ns_train_available && status?.engines?.colmap_available);
   // Whether the Language Field toolchain exists — gates the opt-in toggle.
   const langfieldEngineAvailable = Boolean(status?.engines?.langfield_available);
+  const meshEngineAvailable = Boolean(status?.engines?.mesh_available);
   // Whether the MASt3R toolchain exists — gates the "Few Photos (AI poses)" mode.
   const mast3rEngineAvailable = Boolean(status?.engines?.mast3r_available);
   // Whether the TripoSplat toolchain exists — gates the "Imagine a Splat" mode.
@@ -208,6 +213,7 @@ export default function SplatLabPage() {
       settings: {
         iterations: iters,
         language_field: languageField,
+        mesh_export: meshExport,
         sparse_mode: sparseMode,
         generative_mode: generativeMode,
         test_flight: testFlight,
@@ -218,7 +224,7 @@ export default function SplatLabPage() {
       compute_reason: compute?.reason ?? null,
     });
     return () => setSplatlabFeedbackContext(null);
-  }, [activeJob, completed.length, compute?.enabled, compute?.reason, generativeMode, gpu?.lane, gpu?.locked, iters, jobs, languageField, sparseMode, testFlight, uploaded]);
+  }, [activeJob, completed.length, compute?.enabled, compute?.reason, generativeMode, gpu?.lane, gpu?.locked, iters, jobs, languageField, meshExport, sparseMode, testFlight, uploaded]);
 
   function flash(msg: string, bad = false) {
     setToast({ msg, bad });
@@ -292,6 +298,7 @@ export default function SplatLabPage() {
       // glomap when the rig toolchain is missing on this host.
       sfm_backend: flight && glomapAvailable && !rigAvailable ? "glomap" : undefined,
       language_field: flight ? false : languageField,
+      mesh_export: flight ? false : meshExport,
       // "Few Photos (AI poses)": dense-seed MASt3R sparse-view path (no COLMAP).
       capture_mode: sparseMode && !input.is_insv ? "sparse" : undefined,
       // "Imagine a Splat": single-image generative lane (skips SfM/train entirely).
@@ -319,6 +326,7 @@ export default function SplatLabPage() {
       sfm_backend: job.sfm_backend,
       max_num_iterations: Math.min(MAX_ITERS, Math.round(base * multiplier)),
       language_field: Boolean(job.language_field),
+      mesh_export: Boolean(job.mesh_export),
     });
   }
 
@@ -338,6 +346,7 @@ export default function SplatLabPage() {
       max_num_iterations: job.max_num_iterations || QUALITY.standard.iterations,
       sfm_backend: "glomap",
       language_field: Boolean(job.language_field),
+      mesh_export: Boolean(job.mesh_export),
     });
   }
 
@@ -365,6 +374,7 @@ export default function SplatLabPage() {
       max_num_iterations: iters,
       sfm_backend: job.sfm_backend ?? "glomap",
       language_field: languageField,
+      mesh_export: meshExport,
     });
   }
   const glomapAvailable = Boolean(status?.engines?.glomap_available);
@@ -549,6 +559,36 @@ export default function SplatLabPage() {
                 <span className="mt-0.5 block text-xs text-zinc-400">
                   Build a language field so you can search the finished scene by typing what you’re looking for. Adds
                   some build time.
+                </span>
+              </span>
+            </button>
+          )}
+
+          {meshEngineAvailable && (
+            <button
+              type="button"
+              onClick={() => setMeshExport((v) => !v)}
+              disabled={computeControlsDisabled}
+              className={`mt-3 flex w-full items-start gap-3 rounded-2xl border p-3 text-left transition-all ${
+                meshExport
+                  ? "border-violet-400/40 bg-violet-400/10"
+                  : "border-white/10 bg-white/[0.02] hover:border-violet-500/20"
+              } disabled:cursor-not-allowed disabled:opacity-50`}
+            >
+              <span
+                className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
+                  meshExport ? "border-violet-400 bg-violet-400 text-[#04121a]" : "border-white/20 bg-white/5"
+                }`}
+              >
+                {meshExport && <CheckCircle2 className="h-3.5 w-3.5" />}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="flex items-center gap-1.5 text-sm font-semibold text-white">
+                  <Box className="h-3.5 w-3.5 text-violet-200" /> Triangle mesh (Blender/CAD)
+                </span>
+                <span className="mt-0.5 block text-xs text-zinc-400">
+                  Export a solid triangle mesh of the scene (.ply/.glb) for Blender, CAD, and 3D printing. Adds a
+                  couple of minutes after training.
                 </span>
               </span>
             </button>
@@ -1421,9 +1461,11 @@ function DownloadMenu({ job }: { job: SplatJob }) {
     return () => document.removeEventListener("mousedown", close);
   }, []);
   const opts = [
-    { url: job.preview_web_url, label: "Web .ply", hint: "small · for sharing/viewing" },
-    { url: job.preview_spz_url, label: "Compressed .spz", hint: "smallest · modern viewers" },
-    { url: job.preview_file_url, label: "Full .ply", hint: "full quality · for editing" },
+    { url: job.preview_web_url, label: "Web .ply", ext: "ply", hint: "small · for sharing/viewing" },
+    { url: job.preview_spz_url, label: "Compressed .spz", ext: "spz", hint: "smallest · modern viewers" },
+    { url: job.preview_file_url, label: "Full .ply", ext: "ply", hint: "full quality · for editing" },
+    { url: job.mesh_file_url, label: "Mesh .ply", ext: "ply", hint: "triangle mesh · Blender/CAD" },
+    { url: job.mesh_glb_url, label: "Mesh .glb", ext: "glb", hint: "triangle mesh · drag into Blender" },
   ].filter((o) => o.url);
 
   return (
@@ -1437,7 +1479,7 @@ function DownloadMenu({ job }: { job: SplatJob }) {
             <a
               key={o.label}
               href={o.url!}
-              download={`${job.job_id}.${o.label.includes("spz") ? "spz" : "ply"}`}
+              download={`${job.job_id}.${o.ext}`}
               onClick={() => setOpen(false)}
               className="block px-3 py-2 hover:bg-white/5"
             >
