@@ -10,7 +10,9 @@ quaternions composed with the ICP rotation (wxyz convention).
 Runs in the dn-splatter-probe env.
 
 Usage: proxy_register.py <proxy_splat.ply> <target_object.ply> <out.ply>
+       [--crop-json <crop.json>]
 """
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -18,6 +20,9 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 from plyfile import PlyData, PlyElement
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from provenance import GENERATIVE_TAG  # noqa: E402
 
 
 def _xyz(v):
@@ -53,7 +58,14 @@ def _rot_to_quat_wxyz(R: np.ndarray) -> np.ndarray:
 
 
 def main() -> int:
-    proxy_path, target_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+    ap = argparse.ArgumentParser()
+    ap.add_argument("proxy_path")
+    ap.add_argument("target_path")
+    ap.add_argument("out_path")
+    ap.add_argument("--crop-json", default=None,
+                    help="object_crop.py side-file; cam/box recorded in proxy.json")
+    args = ap.parse_args()
+    proxy_path, target_path, out_path = args.proxy_path, args.target_path, args.out_path
     proxy = PlyData.read(proxy_path)
     target = PlyData.read(target_path)
     pv, tv = proxy["vertex"], target["vertex"]
@@ -98,7 +110,16 @@ def main() -> int:
         q_new = _quat_mul_wxyz(qR[None, :], q)
         for i in range(4):
             data[f"rot_{i}"] = q_new[:, i].astype(np.float32)
-    PlyData([PlyElement.describe(data, "vertex")], text=False).write(out_path)
+    # In-file provenance tag: the doctrine must survive this file leaving the
+    # job tree, so it rides in the PLY header, not just in meta/paths.
+    PlyData([PlyElement.describe(data, "vertex")], text=False,
+            comments=[GENERATIVE_TAG]).write(out_path)
+
+    # Full similarity as one 4x4 (x' = s_total*R2 @ x + t_total): the scene
+    # assembler re-poses proxies from this — scalars alone can't reproduce it.
+    M_total = np.eye(4)
+    M_total[:3, :3] = s_total * R2
+    M_total[:3, 3] = t_total
 
     report = {
         "gaussians": int(len(data)),
@@ -109,7 +130,18 @@ def main() -> int:
         "icp_rotation_deg": round(float(np.degrees(np.arccos(
             np.clip((np.trace(R2) - 1) / 2, -1, 1)))), 2),
         "total_scale": round(s_total, 4),
+        "transform_4x4": [[round(float(v), 8) for v in row] for row in M_total],
+        "provenance": "proxy",
+        "in_file_tag": GENERATIVE_TAG,
     }
+    if args.crop_json:
+        try:
+            crop = json.loads(Path(args.crop_json).read_text())
+            report["crop_camera_id"] = crop.get("cam")
+            report["crop_box"] = crop.get("box")
+        except Exception as exc:  # noqa: BLE001 — crop metadata is auxiliary
+            report["crop_camera_id"] = None
+            report["crop_error"] = str(exc)
     Path(out_path).with_suffix(".json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report))
     return 0

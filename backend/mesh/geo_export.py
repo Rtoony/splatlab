@@ -32,6 +32,7 @@ import open3d as o3d
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from geo_transform import enu_to_grid, scene_to_enu, xy_convex_hull  # noqa: E402
+from provenance import GenerativeInputRefused, assert_not_generative  # noqa: E402
 
 PROBE_DIST_M = 100.0
 
@@ -169,6 +170,11 @@ def main() -> int:
     mesh_path, out_dir = Path(args.mesh), Path(args.out_dir)
     if not mesh_path.is_file():
         return _fail(f"mesh not found: {mesh_path}")
+    # Survey lane: refuse generative geometry (path OR in-file tag), fail-loud.
+    try:
+        assert_not_generative(mesh_path, lane="survey")
+    except GenerativeInputRefused as exc:
+        return _fail(str(exc))
     out_dir.mkdir(parents=True, exist_ok=True)
 
     mesh = o3d.io.read_triangle_mesh(str(mesh_path))

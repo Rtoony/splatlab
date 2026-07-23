@@ -33,6 +33,7 @@ import open3d as o3d
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from geo_export import _crs_calibration  # noqa: E402
 from geo_transform import enu_to_grid, scene_to_enu  # noqa: E402
+from provenance import GenerativeInputRefused, assert_not_generative  # noqa: E402
 
 
 def main() -> int:
@@ -45,6 +46,14 @@ def main() -> int:
                          "ground samples come from SEMANTICALLY-ground gaussians "
                          "(richer + hole-free vs the TSDF mesh, and mesh-optional)")
     args = ap.parse_args()
+    # Survey lane: refuse generative geometry (path OR in-file tag), fail-loud.
+    try:
+        assert_not_generative(args.mesh, lane="survey")
+        if args.ground_gaussians:
+            assert_not_generative(args.ground_gaussians, lane="survey")
+    except GenerativeInputRefused as exc:
+        print(f"FATAL: {exc}", file=sys.stderr)
+        return 1
     p = json.loads(args.params_json)
     geo, mpu, epsg = p["geo"], float(p["meters_per_unit"]), int(p.get("epsg", 2226))
     cell_m = float(p.get("cell_m", 0.25))

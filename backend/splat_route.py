@@ -4632,11 +4632,14 @@ async def isolate_splat_object(request: Request, job_id: str, body: ObjectIsolat
                 tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
                 raise HTTPException(status_code=500, detail=f"Proxy generation failed (exit {rc}): {tail}")
 
-            rc, _out, stderr = await _run_capture_subprocess([
+            register_cmd = [
                 str(MESH_ENV_PYTHON), str(PROXY_REGISTER_SCRIPT),
                 str(proxy_raw / "splat.ply"), str(obj_dir / "object.ply"),
                 str(obj_dir / "proxy.ply"),
-            ])
+            ]
+            if crop_png.with_suffix(".json").is_file():
+                register_cmd += ["--crop-json", str(crop_png.with_suffix(".json"))]
+            rc, _out, stderr = await _run_capture_subprocess(register_cmd)
             if rc != 0 or not (obj_dir / "proxy.ply").is_file():
                 tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
                 raise HTTPException(status_code=500, detail=f"Proxy registration failed (exit {rc}): {tail}")

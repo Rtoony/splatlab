@@ -87,9 +87,13 @@ def main() -> int:
            min(W, int(x1 + mx)), min(H, int(y1 + my)))
     img = Image.open(outputs.image_filenames[ci]).convert("RGB").resize((W, H))
     img.crop(box).save(args.out_png)
-    print(json.dumps({"cam": int(ci), "box": [int(v) for v in box],
-                      "area_frac": round(best["area"], 3),
-                      "fully_in_frame": bool(best["in_frame"])}))
+    crop_report = {"cam": int(ci), "box": [int(v) for v in box],
+                   "area_frac": round(best["area"], 3),
+                   "fully_in_frame": bool(best["in_frame"])}
+    # Side-file: the route discards stdout, but proxy_register/scene assembly
+    # need the chosen camera to reproduce and audit the crop.
+    Path(args.out_png).with_suffix(".json").write_text(json.dumps(crop_report, indent=2))
+    print(json.dumps(crop_report))
     return 0
 
 
