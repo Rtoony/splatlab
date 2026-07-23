@@ -31,6 +31,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import zipfile
 from collections import deque
 from dataclasses import dataclass, field
@@ -171,6 +172,12 @@ HEALTH_VRAM_MB = 4_000                    # checkpoint load + 2 rasterizations a
 # conda env by absolute path (the langfield pattern: NOTHING added to splatlab's
 # venv). Best-effort stage: a mesh failure never fails the splat job.
 MESH_DIR = Path(__file__).resolve().parent / "mesh"
+# scene_manifest.py is pure-stdlib by design, explicitly documented as
+# "importable from the FastAPI venv, worker envs, and gates" — P6f's approve
+# step reuses its validated reader/writer directly rather than re-deriving
+# the STATES/validation logic here.
+sys.path.insert(0, str(MESH_DIR))
+import scene_manifest  # noqa: E402
 MESH_RUNNER = MESH_DIR / "run_mesh.sh"
 MESH_ENV_PYTHON = Path.home() / "miniconda3" / "envs" / "dn-splatter-probe" / "bin" / "python"
 MESH_GS_MESH = Path.home() / "miniconda3" / "envs" / "dn-splatter-probe" / "bin" / "gs-mesh"
@@ -5464,6 +5471,160 @@ async def get_scene_ground_file(job_id: str, fmt: Literal["report", "glb", "top"
         path, media = out_dir / f"receipt_{fmt}.png", "image/png"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Ground mesh artifact not built yet")
+    return FileResponse(str(path), media_type=media, filename=path.name)
+
+
+# ── P6f: scene assembly (with an explicit fidelity dial) ─────────────────────
+# Assembles P6b-e's outputs into one scene.blend/scene.glb. `provenance`
+# (P6a) stays a FACT about what a file is; `mode`/`overrides` here is a
+# separate, new concept -- a selection POLICY applied once at assembly time,
+# choosing which available representation of each object goes into THIS
+# build. Output lives under _regen/ (matches scene_manifest.py's own
+# convention and provenance.py's quarantine-path rule: an assembled scene is
+# a derived, composed render/VR product, never raw survey data, REGARDLESS
+# of how much of it happens to be captured-only in `faithful` mode).
+BLENDER_BIN = Path.home() / "tools" / "blender-4.5.11-linux-x64" / "blender"
+SCENE_ASSEMBLE_SCRIPT = MESH_DIR / "scene_assemble.py"
+BLENDER_ASSEMBLE_SCRIPT = MESH_DIR / "blender_assemble.py"
+REGEN_DIRNAME = "_regen"
+
+
+class SceneAssembleBody(BaseModel):
+    mode: Literal["faithful", "styled"] = "styled"
+    overrides: dict[str, Literal["captured", "proxy"]] = Field(default_factory=dict)
+
+
+@router.post("/jobs/{job_id}/scene/assemble")
+async def scene_assemble(request: Request, job_id: str, body: SceneAssembleBody):
+    """P6f: assemble P6b-e's outputs into one scene.blend/scene.glb, per an
+    explicit fidelity dial (faithful/styled + optional per-slug overrides)
+    instead of an implicit default. A bad element is flagged, never aborts
+    the batch (enforced INSIDE the single headless Blender process, the only
+    place that per-element granularity is possible for this phase). Never
+    auto-approved -- state only becomes "approved" via the separate
+    /scene/assemble/approve call, RToony's own grade of the receipt."""
+    require_heavy_work_admitted()
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    if meta["status"] != "completed":
+        raise HTTPException(status_code=409, detail=f"Scene assembly requires a completed job. Current status: {meta['status']}")
+    output_dir = Path(meta["output_dir"])
+    scene_dir = output_dir / SCENE_DIRNAME
+    if not (scene_dir / "isolated" / "batch_isolate.json").is_file():
+        raise HTTPException(status_code=409, detail="Batch isolation not built yet — POST /scene/isolate first.")
+    if not (BLENDER_BIN.is_file() and SCENE_ASSEMBLE_SCRIPT.is_file()
+            and BLENDER_ASSEMBLE_SCRIPT.is_file() and MESH_ENV_PYTHON.is_file()):
+        raise HTTPException(status_code=400, detail="Scene-assembly toolchain unavailable.")
+
+    out_dir = output_dir / REGEN_DIRNAME
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = out_dir / "scene_manifest.json"
+
+    lock = _mesh_export_lock(job_id)  # one heavy build per job at a time
+    if lock.locked():
+        raise HTTPException(status_code=409, detail=f"A mesh/object/scene build is already running for {job_id}.")
+    async with lock:
+        units_mode = "meters" if meta.get("meters_per_unit") else "scene-units"
+        assemble_cmd = [
+            str(MESH_ENV_PYTHON), str(SCENE_ASSEMBLE_SCRIPT),
+            str(scene_dir), job_id, str(manifest_path),
+            "--mode", body.mode, "--overrides", json.dumps(body.overrides),
+            "--units-mode", units_mode,
+        ]
+        if meta.get("meters_per_unit"):
+            assemble_cmd += ["--meters-per-unit", str(meta["meters_per_unit"])]
+        rc, _out, stderr = await _run_capture_subprocess(assemble_cmd)
+        if rc != 0 or not manifest_path.is_file():
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-8:])
+            raise HTTPException(status_code=422, detail=f"Fidelity-dial resolution failed (exit {rc}): {tail}")
+
+        out_blend = out_dir / "scene.blend"
+        out_glb = out_dir / "scene.glb"
+        blender_cmd = [
+            str(BLENDER_BIN), "--background", "--python", str(BLENDER_ASSEMBLE_SCRIPT), "--",
+            str(manifest_path), str(out_blend), str(out_glb), str(out_dir),
+        ]
+        rc, _out, stderr = await _run_capture_subprocess(blender_cmd)
+        report_path = out_dir / "assemble_report.json"
+        if rc != 0 or not report_path.is_file():
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-10:])
+            raise HTTPException(status_code=500, detail=f"Scene assembly failed (exit {rc}): {tail}")
+        assemble_report = json.loads(report_path.read_text())
+        if not assemble_report["contamination_gate"]["ok"]:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Contamination gate failed: {assemble_report['contamination_gate']['errors']}",
+            )
+
+        manifest = json.loads(manifest_path.read_text())
+        # scene_assemble.py writes state="building" (new_manifest()'s default);
+        # a successful build + passing contamination gate promotes it to
+        # "built" here. Still one step short of "approved" -- that stays a
+        # separate, deliberate call (the one mandatory HITL).
+        manifest["state"] = "built"
+        scene_manifest.write_manifest(manifest_path.parent, manifest)  # re-validates
+        report = {"job_id": job_id, "mode": body.mode, "overrides": body.overrides,
+                  "manifest": manifest, "assemble": assemble_report}
+        (out_dir / "scene.report.json").write_text(json.dumps(report, indent=2))
+
+        fresh_scene_meta = (_read_meta(job_id) or {}).get("scene") or {}
+        _patch_meta(job_id, scene={
+            **fresh_scene_meta,
+            "assemble": {"state": manifest["state"], "n_built": assemble_report["n_built"],
+                        "n_flagged": assemble_report["n_flagged"], "mode": body.mode,
+                        "built_at": _utc_now()},
+        })
+
+    await audit_operator_event(
+        request=request,
+        title="Assembled scene",
+        description=f"{job_id}: {body.mode} mode, {assemble_report['n_built']} elements",
+        variant="success",
+        action="splat.scene_assemble",
+        target=meta.get("mode", "3d"),
+        metadata={"job_id": job_id, "mode": body.mode, "n_built": assemble_report["n_built"]},
+    )
+    return report
+
+
+@router.post("/jobs/{job_id}/scene/assemble/approve")
+async def scene_assemble_approve(request: Request, job_id: str):
+    """The one mandatory HITL the plan specifies: RToony's own grade of the
+    assembly receipt flips state to "approved". Never automatic."""
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    manifest_path = _job_dir(job_id) / REGEN_DIRNAME / "scene_manifest.json"
+    if not manifest_path.is_file():
+        raise HTTPException(status_code=409, detail="No assembled scene to approve — POST /scene/assemble first.")
+    manifest = json.loads(manifest_path.read_text())
+    manifest["state"] = "approved"
+    scene_manifest.write_manifest(manifest_path.parent, manifest)  # re-validates on the way back out
+    await audit_operator_event(
+        request=request, title="Approved assembled scene", description=job_id,
+        variant="success", action="splat.scene_assemble_approve", target="3d",
+        metadata={"job_id": job_id},
+    )
+    return {"job_id": job_id, "state": "approved"}
+
+
+@router.get("/jobs/{job_id}/scene/assemble/file")
+async def get_scene_assemble_file(job_id: str, fmt: Literal["report", "glb", "blend", "manifest"] = "report"):
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    out_dir = _job_dir(job_id) / REGEN_DIRNAME
+    if fmt == "report":
+        path, media = out_dir / "scene.report.json", "application/json"
+    elif fmt == "glb":
+        path, media = out_dir / "scene.glb", "model/gltf-binary"
+    elif fmt == "blend":
+        path, media = out_dir / "scene.blend", "application/octet-stream"
+    else:
+        path, media = out_dir / "scene_manifest.json", "application/json"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Assembled scene artifact not built yet")
     return FileResponse(str(path), media_type=media, filename=path.name)
 
 

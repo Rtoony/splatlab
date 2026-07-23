@@ -1152,6 +1152,79 @@ different tuning knobs (e.g. raising `min_members`) — instances that stop qual
 tree today. Fixing this means deciding what "re-POST with different params" should MEAN (wipe and
 rebuild? keep both? explicit reset endpoint?) — a real product-contract call, not a bug fix.
 
-## P6f NOT STARTED — out of scope for today's approved autonomous-run plan
-Assembly + Blender + contamination gate is the final P6 phase but was explicitly out of scope for
-today (the approved plan stopped at P6e + review + digest). Natural next session.
+## P6f SHIPPED + gate PASSING + LIVE-VERIFIED (2026-07-23 night) — the fidelity dial
+`POST /jobs/{id}/scene/assemble` — the final P6 phase: assembles P6b-e's outputs into one
+`scene.blend`/`scene.glb`. Built around RToony's explicit framing that this tool deliberately
+straddles "digital twin" (perfect fidelity) and "reimagined 3D scenario" (creative AI
+interpretation) — **that choice is now a real, explicit, user-controlled dial, not an implicit
+default**: `mode: "faithful"|"styled"` (default) + an optional `overrides: {slug: "captured"|
+"proxy"}` map layered on top (e.g. "styled scene but keep the hydrant real"). Every element
+records WHY it ended up where it did (`selection: {mode, chosen, available, reason}`) — a
+`faithful`-mode deliberate exclusion and an upstream proxy failure are otherwise indistinguishable
+months later. An override naming an unbuilt/unknown slug is a hard fail (a deliberate creative
+choice, not a best-effort batch op) — live-verified against real garden data before any Blender
+work: `faithful`/`styled`/mixed-override modes all resolved correctly.
+
+**OSS research done first** (RToony asked): Gaussian Grouping (ECCV 2024, Apache-2.0) validates
+the identity-consistent-grouping direction conceptually but needs training-from-scratch in its
+own pipeline, not nerfstudio — not adoptable now, worth remembering if the hydrant-class recall
+problem is ever revisited from scratch. OpenUSD 26.03 (shipped THIS MONTH) added native 3DGS
+support and its `purpose`/variant-set system is architecturally the industry answer to the same
+fidelity duality — but tooling is a converter-script-only, no Blender/glTF-grade ecosystem yet.
+Watch, don't build on, either.
+
+**New**: `backend/mesh/scene_assemble.py` (pure-stdlib fidelity-dial resolution, no GPU/Blender),
+`backend/mesh/blender_assemble.py` (headless build). **Retrofit** (additive): `scene_manifest.py`
+gained an optional `selection` field on `add_element`.
+- **Real bug found and fixed by testing against the actual Blender binary, not assumed**: a
+  vertex-only (zero-face) point-cloud mesh is SILENTLY DROPPED by Blender's own glTF exporter
+  ("Mesh has no primitives and will be omitted") — every splat element would have vanished from
+  `scene.glb` while the script still reported success. Fixed by baking real triangulated geometry
+  (Geometry Nodes Instance-on-Points → tiny cube → Realize Instances) before export instead of
+  relying on a points-only representation.
+- Per-element `try`/`except` lives INSIDE the one headless Blender process (the only place the
+  "kill one instance, scene still completes, element flagged" requirement can be enforced, since
+  the whole manifest builds in one `blender --background` call, unlike P6c/d's one-subprocess-
+  per-element pattern) — **chaos-tested live**: a missing file for one element still produced a
+  complete scene with the other 3 elements built and the bad one flagged with a clear reason.
+- glTF export passes `export_extras=True` explicitly, followed by a **mandatory readback**
+  (independently re-parse the written GLB's own JSON chunk) — same discipline as the P0 GLB fix
+  (a writer that silently corrupts output while returning success). This readback IS the
+  contamination gate: a `captured`/`ground-derived` node must NOT carry the generative tag, every
+  `proxy` node MUST — verified by hand against the real exported GLB, not just the script's own
+  self-report.
+- Resumability = full idempotent rebuild from the manifest, never incremental `.blend` patching
+  (matches how P6b-e are already safe to re-POST; sidesteps Blender's node-name collision
+  suffixing on partial re-imports).
+- The one mandatory HITL stays separate on purpose: `POST /scene/assemble/approve` is the only
+  way `state` becomes `"approved"` — never automatic. Live-verified: build → `state: "built"` →
+  approve call → `state: "approved"`.
+- **Real bug found via the live run, not caught by mocked tests**: the route never actually
+  patched the manifest's `state` from `"building"` to `"built"` after a successful assembly — the
+  unit test's mock had accidentally hardcoded `"built"` directly, papering over the gap. Fixed
+  (route now promotes state explicitly) and the test fixture corrected to write `"building"`
+  (matching the real script's `new_manifest()` default) so the suite itself would catch a
+  regression here going forward.
+- 486 backend tests (18 new across 2 test files). `gate_p6f_assembly.sh` — PASS, including an
+  independent glTF-extras re-verification (not trusting the app's own report).
+- **A/B receipt** (the fidelity dial, literally visible): `faithful` vs `styled` render of garden
+  from the same camera. Honest finding: the quick receipt-render script's first pass used a naive
+  min/max bbox for camera framing and got blown out by far-field background outliers (whole scene
+  reduced to a tiny fleck) — fixed with the same robust-percentile bbox `blender-receipt-views.py`
+  already proved necessary for exactly this. The resulting renders show real, correctly-composed
+  geometry with a genuine (if visually subtle at this render quality) difference between modes —
+  the point-cloud-as-tiny-cubes visualization technique itself is a rough first pass, not tuned
+  for real image quality, and would benefit from more work if a polished render is wanted later.
+  The pipeline correctness (manifest, tags, gates) does not depend on this receipt looking good.
+  Receipt: `~/Downloads/splatlab-p6f-ab-faithful-vs-styled.png`.
+
+**Live-verified on garden end to end**: `styled` mode assembled all 4 elements (background,
+table+proxy, vase+proxy, ground) in ~4s, contamination gate passed, approved. A separate
+`faithful`-mode build (scratch location, not clobbering the approved styled build — the open
+re-run-semantics question from the review is still genuinely open, deliberately not resolved
+here) also assembled cleanly for the A/B comparison.
+
+- **Not done, deliberately**: adding new generative capability (e.g. "place an object that was
+  never captured") — P6f only chooses among representations of what P6b-e already produced. Pure
+  imagination is a future P6x-style capability, kept separate on purpose.
+- This closes out the entire P6 Scene Regeneration Lane (P6a through P6f) as originally scoped.

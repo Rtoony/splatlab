@@ -43,10 +43,16 @@ def new_manifest(job_id: str, units_mode: str, meters_per_unit: float | None) ->
 def add_element(manifest: dict, *, slug: str, provenance: str, files: dict,
                 transform_4x4: list | None = None,
                 registration: dict | None = None,
-                skipped: str | None = None) -> dict:
+                skipped: str | None = None,
+                selection: dict | None = None) -> dict:
+    # selection (P6f, additive/optional): WHY this element ended up with this
+    # provenance in THIS assembly — {"mode": ..., "chosen": ..., "available":
+    # [...], "reason": ...} — distinguishes "faithful mode deliberately
+    # excluded a working proxy" from "the proxy build actually failed
+    # upstream," which look identical without it.
     el = {"slug": slug, "provenance": provenance, "files": files,
           "transform_4x4": transform_4x4, "registration": registration,
-          "skipped": skipped}
+          "skipped": skipped, "selection": selection}
     manifest["elements"].append(el)
     return el
 
