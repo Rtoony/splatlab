@@ -90,6 +90,7 @@ export function SplatViewer({
     let mounted = true;
     let viewer: {
       start: () => void;
+      stop: () => void;
       addSplatScene: (path: string, options?: object) => Promise<unknown>;
       dispose: () => Promise<void>;
     } | null = null;
@@ -133,7 +134,19 @@ export function SplatViewer({
     }
 
     void boot();
+    // The viewer renders continuously forever once started, even for a
+    // static scene nobody's touching. Pause/resume on tab visibility --
+    // cheap (no GPU buffer reload, just start()/stop() on the existing
+    // viewer) and reversible, unlike a full dispose/reboot.
+    function handleVisibility() {
+      const v = viewerRef.current;
+      if (!v) return;
+      if (document.hidden) v.stop();
+      else v.start();
+    }
+    document.addEventListener("visibilitychange", handleVisibility);
     return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
       mounted = false;
       viewerRef.current = null;
       if (viewer) void viewer.dispose();

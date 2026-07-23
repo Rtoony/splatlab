@@ -711,6 +711,11 @@ export function SparkSceneViewer({
     let fpsAccum = 0;
     function animate() {
       raf = requestAnimationFrame(animate);
+      // Chrome/Firefox already throttle a backgrounded tab's RAF to ~1Hz, but
+      // that's still real render work every second, forever, for a scene
+      // nobody's looking at. Skip it outright; resumes instantly on refocus
+      // since the RAF loop itself keeps ticking.
+      if (document.hidden) return;
       const dt = clock.getDelta();
       frames += 1;
       fpsAccum += dt;

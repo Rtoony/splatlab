@@ -1305,3 +1305,25 @@ stage.
   poll.
 - **Deferred, not started**: Phase 2 (Reference CAD/DXF alignment) — scoped in the plan, explicitly
   not picked up until Phase 1 ships and gets real use.
+
+## VIEWER RENDER-LOOP PAUSE-ON-HIDDEN (2026-07-23, RToony live-test feedback)
+
+RToony, testing P6 live at splatlab.roonytoony.dev: reported a suspected "resource hog animation"
+on visiting a scene. Real, confirmed: `viewer.start()` (`@mkkellogg/gaussian-splats-3d`, the
+classic viewer) and the hand-rolled `animate()` loop (`spark-scene-viewer.tsx`, Spark beta) both
+run an unconditional `requestAnimationFrame` loop for as long as `/view/:jobId` stays open — even
+for a 100% static scene nobody's touching. Not a bug (real-time WebGL splat rendering needs a
+continuous loop by nature), but a legitimate, low-risk improvement: browsers already throttle a
+*backgrounded* tab's RAF to ~1Hz, but that's still real render work every second, forever.
+- **Fix**: both viewers now pause on `document.visibilitychange` (`document.hidden`). Classic
+  viewer uses the library's own `start()`/`stop()` pair (confirmed via source read: `stop()` just
+  `cancelAnimationFrame`s the loop, no GPU buffer teardown — cheap, instant resume). Spark beta's
+  own loop checks `document.hidden` at the top of `animate()` and skips the real work (still
+  reschedules RAF so it resumes instantly on refocus).
+- **Not done, deliberately**: true render-on-demand (only re-render when the camera actually
+  moves, foreground-and-idle) — a materially bigger, riskier change (would need to audit every
+  per-frame effect — highlight markers, camera overlay, dimension labels — for hidden
+  continuous-update assumptions). RToony's own framing ("if not, nevermind") didn't call for it;
+  revisit only if the pause-on-hidden fix proves insufficient.
+- Verification: `tsc --noEmit` steady at the 43-error baseline, `npm run build` clean. No backend
+  changes. Not yet live-clicked by RToony (report-and-fix cycle, not yet re-confirmed by him).
