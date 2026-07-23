@@ -991,7 +991,30 @@ must fail against).
   declined an unconfident detection instead of fabricating one. Conservation held (39,525 claimed,
   0 overlap). Receipts: `~/projects/splatcli/outputs/3d/splat_32d926d9/_scene/` (overlay +
   per-instance crops) — RToony's eyeball grade is the next checkpoint per the HITL doctrine.
-- **Next**: P6c — batch isolation + background remainder (loop `object_isolate.py` per confirmed
-  instance, `background.ply` complement). P6d (batch proxy+registration), P6e (ground/environment),
-  P6f (assembly+Blender+contamination gate) follow in order, each behind its own gate/receipt/HITL
-  checkpoint per the approved plan.
+- **P6c SHIPPED + gate PASSING + LIVE-VERIFIED (2026-07-23 night)**: `POST /jobs/{id}/scene/
+  isolate` — materializes P6b's already-determined instances into Blender-ready per-instance
+  `object.ply` + a `background.ply` complement. New `backend/mesh/batch_isolate.py`: reuses
+  P6b's SAM3-lifted membership directly (NOT a re-run of the older per-query DBSCAN
+  `object_isolate.py` clustering — that's exactly the mechanism P6b was built to supersede,
+  proven on the vase case) with first-claim-wins bookkeeping across instances (largest first,
+  P6b's own size-sorted order), and the `write_splat_ply`/`sanity_sum_ok` convention lifted
+  verbatim from the proven `~/tools/langfield-isolate-probe/isolate_export.py`. Never aborts on
+  a thin instance (`SKIPPED:too-few-members-after-dedup`, batch continues). Receipt: a REAL
+  gsplat RGB render with claimed gaussians' opacity zeroed (not a photo overlay) — genuinely
+  shows the scene with instances removed. 446 tests (4 new). `tools/gates/
+  gate_p6c_batch_isolate.sh` — PASS.
+  **Live run on garden**: both instances built clean (table 38,327, vase 1,198, zero overlap,
+  `sanity_sum_ok: true`, 39,525 claimed / 1,287,086 background of 1,326,611 total).
+  ⚠️ **Honest finding from the background-removed receipt**: the ball (never an instance,
+  correctly excluded) stays fully intact, and walls/grass/hedge render clean — but the table
+  leaves a **ghostly translucent disc** rather than a clean hole, and part of the vase structure
+  is still faintly visible. SAM3's tight masks are high-precision but don't claim every gaussian
+  contributing to an object's visual footprint (unlike the old expand-based DBSCAN, which
+  over-captures on purpose) — some residual low-opacity gaussians near the object's location
+  remain. Not a bug; a real limitation to weigh for P6e/P6f (a hole-fill/backdrop-completion
+  probe is already parked in P6x if graded unacceptable). Receipts:
+  `~/Downloads/splatlab-scene-isolate-garden-background*.png`.
+- **Next**: P6d — batch proxy + gated registration (loop unchanged P5c per instance under ONE
+  20GB TripoSplat lease; `SKIPPED:<reason>` degrades to `provenance:captured`, never aborts).
+  P6e (ground/environment), P6f (assembly+Blender+contamination gate) follow in order, each
+  behind its own gate/receipt/HITL checkpoint per the approved plan.

@@ -4981,6 +4981,124 @@ async def get_scene_inventory_file(
     return FileResponse(str(path), media_type=media, filename=path.name)
 
 
+# ── P6c: batch isolation + background remainder ──────────────────────────────
+# Materializes P6b's already-determined instances into Blender-ready splats.
+# Membership comes from P6b (SAM3 lift), not a re-run of the older per-query
+# DBSCAN — that's the mechanism P6b was built to supersede.
+BATCH_ISOLATE_SCRIPT = MESH_DIR / "batch_isolate.py"
+SCENE_ISOLATE_VRAM_MB = 6_000  # checkpoint load + light background-render pass
+_SCENE_ISOLATE_NAME_RE = re.compile(r"[a-z0-9-]{1,40}")
+
+
+class SceneIsolateBody(BaseModel):
+    min_members: int = Field(default=200, ge=1, le=100_000)
+    views: int = Field(default=2, ge=1, le=8)
+
+
+@router.post("/jobs/{job_id}/scene/isolate")
+async def scene_batch_isolate(request: Request, job_id: str, body: SceneIsolateBody):
+    """P6c: claim each P6b instance's gaussians (first-claim-wins across any
+    overlap, largest instance first) into a Blender-ready object.ply, and
+    write background.ply = the true complement. Never aborts on a thin
+    instance — it's recorded SKIPPED and the batch continues."""
+    require_heavy_work_admitted()
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    if meta["status"] != "completed":
+        raise HTTPException(status_code=409, detail=f"Batch isolation requires a completed job. Current status: {meta['status']}")
+    output_dir = Path(meta["output_dir"])
+    scene_dir = output_dir / SCENE_DIRNAME
+    if not (scene_dir / "inventory.json").is_file():
+        raise HTTPException(status_code=409, detail="Scene inventory not built yet — POST /scene/inventory first.")
+    config_path = _find_latest_config(output_dir)
+    if config_path is None:
+        raise HTTPException(status_code=409, detail="No splatfacto checkpoint found for this scene.")
+    if not (BATCH_ISOLATE_SCRIPT.is_file() and LANGFIELD_ENV_PYTHON.is_file()):
+        raise HTTPException(status_code=400, detail="Batch-isolation toolchain unavailable.")
+
+    out_dir = scene_dir / "isolated"
+
+    lock = _mesh_export_lock(job_id)  # one heavy build per job at a time
+    if lock.locked():
+        raise HTTPException(status_code=409, detail=f"A mesh/object/scene build is already running for {job_id}.")
+    async with lock:
+        cmd = [
+            str(LANGFIELD_ENV_PYTHON), str(BATCH_ISOLATE_SCRIPT),
+            str(config_path), str(scene_dir), str(out_dir),
+            "--min-members", str(body.min_members), "--views", str(body.views),
+        ]
+
+        async def isolate_operation() -> tuple[int, bytes, bytes]:
+            return await _run_capture_subprocess(cmd)
+        try:
+            rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
+                lane="scene-isolate", operation_id=job_id,
+                vram_mb=SCENE_ISOLATE_VRAM_MB, operation=isolate_operation,
+            )
+        except gpu_arbiter.GPUArbiterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"Batch isolation blocked: {exc}") from exc
+        if rc != 0 or not (out_dir / "batch_isolate.json").is_file():
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+            raise HTTPException(status_code=500, detail=f"Batch isolation failed (exit {rc}): {tail}")
+
+        report = json.loads((out_dir / "batch_isolate.json").read_text())
+        report["job_id"] = job_id
+        n_built = sum(1 for r in report["instances"] if r["status"] == "built")
+        fresh_scene_meta = (_read_meta(job_id) or {}).get("scene") or {}
+        _patch_meta(job_id, scene={
+            **fresh_scene_meta,
+            "isolate": {
+                "n_built": n_built,
+                "n_skipped": len(report["instances"]) - n_built,
+                "sanity": report["sanity"],
+                "built_at": _utc_now(),
+            },
+        })
+
+    await audit_operator_event(
+        request=request,
+        title="Batch-isolated scene instances",
+        description=f"{job_id}: {n_built} instance(s) built",
+        variant="success",
+        action="splat.scene_isolate",
+        target=meta.get("mode", "3d"),
+        metadata={"job_id": job_id, "n_built": n_built},
+    )
+    return report
+
+
+@router.get("/jobs/{job_id}/scene/isolate/file")
+async def get_scene_isolate_file(
+    job_id: str,
+    fmt: Literal["report", "background", "object", "receipt"] = "report",
+    name: str | None = None,
+):
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    out_dir = _job_dir(job_id) / SCENE_DIRNAME / "isolated"
+    if fmt == "report":
+        path, media = out_dir / "batch_isolate.json", "application/json"
+    elif fmt == "background":
+        path, media = out_dir / "background.ply", "application/octet-stream"
+    elif fmt == "object":
+        if not name or not _SCENE_ISOLATE_NAME_RE.fullmatch(name):
+            raise HTTPException(status_code=404, detail="Instance not found")
+        path, media = out_dir / name / "object.ply", "application/octet-stream"
+    else:  # receipt
+        cams = sorted(out_dir.glob("receipt_background_cam_*.png")) if out_dir.is_dir() else []
+        if name and re.fullmatch(r"\d{3}", name):
+            path = out_dir / f"receipt_background_cam_{name}.png"
+        else:
+            path = cams[0] if cams else None
+        media = "image/png"
+    if not path or not path.is_file():
+        raise HTTPException(status_code=404, detail="Batch-isolation artifact not built yet")
+    return FileResponse(str(path), media_type=media, filename=path.name)
+
+
 @router.get("/jobs/{job_id}/mesh/file")
 async def get_splat_mesh_file(job_id: str, fmt: Literal["ply", "glb", "twin"] = "ply"):
     # Resolved purely from disk so mesh URLs survive service restarts.
