@@ -210,6 +210,15 @@ def main() -> int:
         write_splat_ply(inst_dir / "object.ply", means_np[dedup], fdc_np[dedup],
                         opac_np[dedup], scale_np[dedup], rot_np[dedup])
         np.savez_compressed(inst_dir / "object_indices.npz", indices=dedup)
+        # object_crop.py (P5c, reused as-is by P6d) needs an object.json with a
+        # bbox -- write one from the ACTUAL final claimed points, not P6b's
+        # pre-dedup/pre-expansion bbox.
+        obj_xyz = means_np[dedup]
+        (inst_dir / "object.json").write_text(json.dumps({
+            "query": inst["label"], "artifacts": {"splat": "object.ply", "indices": "object_indices.npz"},
+            "bbox_tight": {"min": [round(float(x), 4) for x in obj_xyz.min(0)],
+                           "max": [round(float(x), 4) for x in obj_xyz.max(0)]},
+        }, indent=2))
         results.append({
             "slug": slug, "label": inst["label"],
             "n_members_original": int(idx.size), "n_overlap_removed": n_overlap_removed,

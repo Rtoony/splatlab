@@ -5112,6 +5112,187 @@ async def get_scene_isolate_file(
     return FileResponse(str(path), media_type=media, filename=path.name)
 
 
+# ── P6d: batch proxy + gated registration ─────────────────────────────────────
+# Loops the unchanged, already-proven P5c crop -> TripoSplat -> ICP-register
+# chain over every P6c-built instance, under ONE shared GPU lease (TripoSplat
+# stays loaded across the whole batch instead of a cold start per instance).
+PROXY_TRIPTYCH_SCRIPT = MESH_DIR / "proxy_triptych.py"
+
+
+class SceneProxyBody(BaseModel):
+    pass  # no knobs for the MVP; proxy_model="trellis2" opt-in is a later addition
+
+
+@router.post("/jobs/{job_id}/scene/proxy")
+async def scene_batch_proxy(request: Request, job_id: str, body: SceneProxyBody):
+    """P6d: TripoSplat-generate + ICP-register a clean proxy for every P6c-built
+    instance. Per-instance SKIPPED:<reason> never aborts the batch -- that
+    instance simply ships without a proxy; its P6c captured object.ply stays
+    valid on its own. Render/VR lane only (in-file generative tag + transform,
+    P6a provenance rails)."""
+    require_heavy_work_admitted()
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    if meta["status"] != "completed":
+        raise HTTPException(status_code=409, detail=f"Batch proxy requires a completed job. Current status: {meta['status']}")
+    output_dir = Path(meta["output_dir"])
+    scene_dir = output_dir / SCENE_DIRNAME
+    isolated_dir = scene_dir / "isolated"
+    isolate_report_path = isolated_dir / "batch_isolate.json"
+    if not isolate_report_path.is_file():
+        raise HTTPException(status_code=409, detail="Batch isolation not built yet — POST /scene/isolate first.")
+    config_path = _find_latest_config(output_dir)
+    if config_path is None:
+        raise HTTPException(status_code=409, detail="No splatfacto checkpoint found for this scene.")
+    if not _triposplat_availability()["triposplat_available"]:
+        raise HTTPException(status_code=400, detail="TripoSplat lane unavailable for proxy generation.")
+    if not (OBJECT_CROP_SCRIPT.is_file() and PROXY_REGISTER_SCRIPT.is_file() and MESH_ENV_PYTHON.is_file()):
+        raise HTTPException(status_code=400, detail="Batch-proxy toolchain unavailable.")
+
+    isolate_report = json.loads(isolate_report_path.read_text())
+    built = [r for r in isolate_report["instances"] if r["status"] == "built"]
+    if not built:
+        raise HTTPException(status_code=409, detail="No built instances to proxy — batch isolation produced none.")
+
+    out_dir = scene_dir / "proxied"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    lock = _mesh_export_lock(job_id)  # one heavy build per job at a time
+    if lock.locked():
+        raise HTTPException(status_code=409, detail=f"A mesh/object/scene build is already running for {job_id}.")
+    async with lock:
+        results: list[dict] = []
+
+        # ── Phase A: crops (CPU, per instance, BEFORE any GPU work) ─────────
+        crop_ok: list[tuple[str, str, Path]] = []
+        for r in built:
+            slug, label = r["slug"], r["label"]
+            obj_dir = isolated_dir / slug
+            inst_out = out_dir / slug
+            inst_out.mkdir(parents=True, exist_ok=True)
+            crop_png = inst_out / "crop.png"
+            rc, _out, stderr = await _run_capture_subprocess([
+                str(MESH_ENV_PYTHON), str(OBJECT_CROP_SCRIPT),
+                str(config_path), str(obj_dir / "object.json"), str(crop_png),
+            ])
+            if rc != 0 or not crop_png.is_file():
+                results.append({"slug": slug, "label": label, "status": "SKIPPED:crop-failed"})
+                continue
+            crop_ok.append((slug, label, crop_png))
+
+        # ── Phase B: TripoSplat generation, ONE shared lease for the batch ──
+        gen_results: dict[str, tuple[int, bytes, Path]] = {}
+        if crop_ok:
+            async def batch_generate() -> dict[str, tuple[int, bytes, Path]]:
+                out: dict[str, tuple[int, bytes, Path]] = {}
+                for slug, _label, crop_png in crop_ok:
+                    proxy_raw = out_dir / slug / "proxy_raw"
+                    rc, _out, stderr = await _run_capture_subprocess([
+                        "bash", _triposplat_availability()["triposplat_runner"],
+                        str(crop_png), str(proxy_raw),
+                    ])
+                    out[slug] = (rc, stderr, proxy_raw)
+                return out
+            try:
+                gen_results = await gpu_arbiter.run_gpu_operation(
+                    lane="scene-proxy", operation_id=job_id,
+                    vram_mb=TRIPOSPLAT_VRAM_MB, operation=batch_generate,
+                )
+            except gpu_arbiter.GPUArbiterUnavailable as exc:
+                raise HTTPException(status_code=503, detail=f"Batch proxy generation blocked: {exc}") from exc
+
+        # ── Phase C: register + triptych receipt (CPU, per instance) ────────
+        for slug, label, crop_png in crop_ok:
+            rc, stderr, proxy_raw = gen_results[slug]
+            if rc != 0 or not (proxy_raw / "splat.ply").is_file():
+                results.append({"slug": slug, "label": label, "status": "SKIPPED:generation-failed"})
+                shutil.rmtree(proxy_raw, ignore_errors=True)
+                continue
+            obj_dir = isolated_dir / slug
+            proxy_ply = out_dir / slug / "proxy.ply"
+            register_cmd = [
+                str(MESH_ENV_PYTHON), str(PROXY_REGISTER_SCRIPT),
+                str(proxy_raw / "splat.ply"), str(obj_dir / "object.ply"), str(proxy_ply),
+                "--crop-json", str(crop_png.with_suffix(".json")),
+            ]
+            rc, _out, stderr = await _run_capture_subprocess(register_cmd)
+            if rc != 0 or not proxy_ply.is_file():
+                results.append({"slug": slug, "label": label, "status": "SKIPPED:registration-failed"})
+                shutil.rmtree(proxy_raw, ignore_errors=True)
+                continue
+            proxy_report = json.loads(proxy_ply.with_suffix(".json").read_text())
+            preview = out_dir / slug / "proxy_preview.webp"
+            thumb = proxy_raw / "thumb.webp"
+            if thumb.is_file():
+                shutil.move(str(thumb), str(preview))
+            shutil.rmtree(proxy_raw, ignore_errors=True)
+
+            triptych = out_dir / slug / "triptych.png"
+            await _run_capture_subprocess([
+                str(MESH_ENV_PYTHON), str(PROXY_TRIPTYCH_SCRIPT),
+                str(obj_dir / "object.ply"), str(proxy_ply), str(crop_png),
+                str(preview), str(triptych),
+            ])  # best-effort receipt; a failure here doesn't undo a good registration
+
+            results.append({
+                "slug": slug, "label": label, "status": "built",
+                "icp_fitness": proxy_report.get("icp_fitness"),
+                "icp_rmse": proxy_report.get("icp_rmse"),
+                "total_scale": proxy_report.get("total_scale"),
+                "transform_4x4": proxy_report.get("transform_4x4"),
+            })
+
+        n_built = sum(1 for r in results if r["status"] == "built")
+        report = {"job_id": job_id, "instances": results, "n_built": n_built,
+                  "n_skipped": len(results) - n_built}
+        (out_dir / "batch_proxy.json").write_text(json.dumps(report, indent=2))
+
+        fresh_scene_meta = (_read_meta(job_id) or {}).get("scene") or {}
+        _patch_meta(job_id, scene={
+            **fresh_scene_meta,
+            "proxy": {"n_built": n_built, "n_skipped": len(results) - n_built, "built_at": _utc_now()},
+        })
+
+    await audit_operator_event(
+        request=request,
+        title="Batch-generated scene proxies",
+        description=f"{job_id}: {n_built} proxy(ies) built",
+        variant="success",
+        action="splat.scene_proxy",
+        target=meta.get("mode", "3d"),
+        metadata={"job_id": job_id, "n_built": n_built},
+    )
+    return report
+
+
+@router.get("/jobs/{job_id}/scene/proxy/file")
+async def get_scene_proxy_file(
+    job_id: str,
+    fmt: Literal["report", "proxy", "preview", "triptych"] = "report",
+    name: str | None = None,
+):
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    out_dir = _job_dir(job_id) / SCENE_DIRNAME / "proxied"
+    if fmt == "report":
+        path, media = out_dir / "batch_proxy.json", "application/json"
+    else:
+        if not name or not _SCENE_ISOLATE_NAME_RE.fullmatch(name):
+            raise HTTPException(status_code=404, detail="Instance not found")
+        if fmt == "proxy":
+            path, media = out_dir / name / "proxy.ply", "application/octet-stream"
+        elif fmt == "preview":
+            path, media = out_dir / name / "proxy_preview.webp", "image/webp"
+        else:  # triptych
+            path, media = out_dir / name / "triptych.png", "image/png"
+    if not path or not path.is_file():
+        raise HTTPException(status_code=404, detail="Batch-proxy artifact not built yet")
+    return FileResponse(str(path), media_type=media, filename=path.name)
+
+
 @router.get("/jobs/{job_id}/mesh/file")
 async def get_splat_mesh_file(job_id: str, fmt: Literal["ply", "glb", "twin"] = "ply"):
     # Resolved purely from disk so mesh URLs survive service restarts.

@@ -1048,3 +1048,37 @@ shipped as opt-in, not a default.**
   20GB TripoSplat lease; `SKIPPED:<reason>` degrades to `provenance:captured`, never aborts).
   P6e (ground/environment), P6f (assembly+Blender+contamination gate) follow in order, each
   behind its own gate/receipt/HITL checkpoint per the approved plan.
+
+## P6d SHIPPED + gate PASSING + LIVE-VERIFIED (2026-07-23, autonomous day session)
+`POST /jobs/{id}/scene/proxy` — loops the unchanged, already-proven P5c crop→TripoSplat→ICP
+chain over every P6c-built instance. New `backend/mesh/proxy_triptych.py` (capture crop |
+generated proxy preview | registered overlay — top+front orthographic scatter, deliberately
+simple matplotlib math over a full perspective render, to stay robust). Route phases: (A)
+crops CPU-only, per instance, before any GPU; (B) TripoSplat generation for ALL instances
+under ONE shared 20GB lease (not one lease per instance); (C) ICP-register + triptych,
+CPU, per instance. Per-instance `SKIPPED:crop-failed|generation-failed|registration-failed`
+never aborts the batch. 453 tests (5 new). `gate_p6d_batch_proxy.sh`: verifies every built
+element carries registration numerics AND the in-file generative PLY tag (P6a provenance
+rails) — PASS.
+⚠️ **Gotcha**: `object_crop.py` needs an `object.json` with a bbox, which P6c's
+`batch_isolate.py` didn't write until this same session — added it (writes bbox from the
+ACTUAL final claimed points, not P6b's pre-dedup bbox). First live P6d attempt on garden
+0-for-2 SKIPPED:crop-failed because `/scene/isolate` hadn't been re-run since that fix landed
+— object.json genuinely didn't exist on disk yet. Re-ran P6c, then P6d succeeded. Lesson:
+after ANY change to a script another phase's route depends on, re-run the UPSTREAM phase
+before testing the downstream one, not just restart the service.
+**Live-verified on garden**: both instances built, **icp_fitness 1.0 on both** (table
+rmse 0.0232, vase rmse 0.0099). Triptych receipts show real, informative signal: the
+table's proxy is a near-perfect top-down silhouette match (thin captured-blue rim visible
+at the disc edge) with minor leg-shape difference in the front view; the vase's captured
+point cloud is visibly more diffuse/scattered than its clean regenerated proxy (consistent
+with recall-expand's high candidate-acceptance rate on that instance, noted honestly, not
+hidden). Also honestly notable: TripoSplat regenerates whatever the crop photo shows, so
+the "table" proxy includes the vase sitting on it too (crops include visible context, not
+just the tightly-masked object) — a real characteristic of crop-based generation worth
+knowing before P6f assembly. Receipts: `~/Downloads/splatlab-p6d-proxy-triptych-*.png`.
+- **Next**: P6e — ground + environment (`semantic_ground.py` wired into the scene lane,
+  persisted `ground_gaussians.npz` → TIN → `ground_mesh.glb`). Then P6f (assembly + Blender +
+  contamination gate). A comprehensive multi-agent adversarial review pass over everything
+  shipped today (hybrid recall-expand, P6d) plus a fresh look at P6a-c is still queued before
+  end of day, per the approved autonomous-run plan.
