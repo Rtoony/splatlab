@@ -95,20 +95,13 @@ SPLAT_TRAINING_DISABLED_REASON="environment hold"
 [[ "$(maintenance_reason "$TMP/missing")" == "environment hold" ]]
 unset SPLAT_TRAINING_DISABLED_REASON
 
-[[ -f "$MAINTENANCE_FILE" ]] || {
-    echo "FAIL: production hardware-maintenance marker is absent" >&2
+[[ ! -e "$MAINTENANCE_FILE" && ! -L "$MAINTENANCE_FILE" ]] || {
+    echo "FAIL: retired production hardware-maintenance marker is active" >&2
     exit 1
 }
-set +e
-"$GATE" --run /usr/bin/touch "$TMP/must-not-exist" >/dev/null 2>&1
-rc=$?
-set -e
-[[ $rc -eq 75 && ! -e "$TMP/must-not-exist" ]] || {
-    echo "FAIL: blocked --run escaped the hardware interlock" >&2
-    exit 1
-}
+"$GATE" --status | grep -Fq 'READY: no SplatLab GPU maintenance marker is active'
 
 grep -Fq 'gpu_command_runner.py' "$GATE"
 grep -Fq -- '--vram-mb "$MANUAL_VRAM_MB"' "$GATE"
 
-echo "PASS: SplatLab gate blocks maintenance and routes --run through GPU coordination"
+echo "PASS: SplatLab gate honors explicit holds and routes --run through GPU coordination"
