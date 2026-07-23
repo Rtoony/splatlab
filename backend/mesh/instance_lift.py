@@ -46,9 +46,8 @@ from gsplat import rasterization                              # noqa: E402
 
 DEV = "cuda"
 
-
-def _slug(noun: str) -> str:
-    return "".join(c if c.isalnum() else "-" for c in noun.lower()).strip("-")[:40] or "thing"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from slugify import slug as _slug                                           # noqa: E402
 
 
 def main() -> int:

@@ -138,6 +138,13 @@ def test_scene_ground_full_build(client, monkeypatch):
     assert "--meters-per-unit" in finish_call
     assert "2.35" in [str(x) for x in finish_call]
 
+    # Review finding 2026-07-23: the posted tuning knobs must actually reach
+    # ground_mesh_build.py's argv, not silently fall back to defaults.
+    build_call = [str(x) for x in next(
+        c for c in calls if "ground_mesh_build" in " ".join(str(x) for x in c))]
+    assert "--semantic-thresh" in build_call and "0.6" in build_call
+    assert "--cell-units" in build_call and "0.02" in build_call
+
     meta = json.loads((job_dir / "meta.json").read_text())
     assert meta["scene"]["ground"]["ground_points"] == 875
 

@@ -152,6 +152,28 @@ def test_scene_isolate_recall_expand_passes_flags(client, monkeypatch):
     assert str(lf / "gauss_emb.npz") in joined
 
 
+def test_scene_isolate_recall_expand_stale_langfield_refused_before_gpu(client, monkeypatch):
+    """Review finding 2026-07-23: recall_expand consumes gauss_emb.npz for its
+    relevancy floor but skipped the staleness preflight every other
+    gauss_emb-consuming route runs -- a passing is_file() check doesn't mean
+    the lift still matches the current checkpoint. Must 409 before any
+    subprocess/GPU work, not fail deep inside batch_isolate.py."""
+    http, outputs = client
+    job_dir = _mk_job_with_inventory(outputs)
+    lf = job_dir / splat_route.LANGFIELD_DIRNAME
+    lf.mkdir()
+    (lf / "gauss_emb.npz").write_bytes(b"npz")
+    (lf / "STALE").write_text("edited after the lift")
+
+    async def unreachable(command):
+        raise AssertionError(f"no subprocess may run: {command}")
+
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", unreachable)
+    r = http.post("/api/splat/jobs/splat_0b0003/scene/isolate", json={"recall_expand": True})
+    assert r.status_code == 409
+    assert "stale" in r.json()["detail"].lower()
+
+
 def test_scene_isolate_object_path_traversal_404(client):
     http, outputs = client
     _mk_job_with_inventory(outputs)

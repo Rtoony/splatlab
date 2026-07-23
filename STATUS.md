@@ -1103,7 +1103,55 @@ colored ground (green grass, tan pavement patch) in a real, irregular garden-bou
 shape. Honest finding: one small pyramidal spike artifact visible near center in the
 oblique view — a likely single outlier cell the spike-rejection pass didn't catch: noted,
 not chased further (timeboxed). Receipts: `~/Downloads/splatlab-p6e-ground-*.png`.
-- **Next**: P6f — assembly + Blender + contamination gate (final P6 phase). Per the
-  approved autonomous-run plan, a comprehensive multi-agent adversarial review pass over
-  everything shipped today (hybrid recall-expand, P6d, P6e) plus a fresh look at P6a-c
-  comes before end-of-day, ahead of or alongside P6f depending on remaining time budget.
+
+## COMPREHENSIVE REVIEW + FIX WAVE (2026-07-23, autonomous day session, 44-agent workflow)
+5 parallel reviewers (correctness/security/resource-safety/test-quality/doctrine) over the full
+`840b121..HEAD` diff (P6a close-out through P6e, 3,644 lines) → adversarial refute-by-default
+verification (3 lenses per finding). **13/13 raw findings survived verification** — all real.
+9 fixed this session (low-risk, well-scoped, matched "never break working things"); 4 left for
+RToony's call (design-decision territory: DELETE/reset semantics for `/scene/*` artifact trees).
+
+**Fixed:**
+- **`scene_inventory` (P6b) now merges `meta["scene"]` instead of overwriting it** — this is the
+  ONE route users are told to re-POST (the documented HITL correction flow), and it was silently
+  erasing `isolate`/`proxy`/`ground` summaries every re-call even though the on-disk artifacts
+  stayed untouched. **Live-verified on garden**: re-POSTing `/scene/inventory` gave `inventory` a
+  fresh `built_at` while `isolate`/`proxy`/`ground` kept their original timestamps and data intact.
+- `scene_inventory`'s `_work` scratch (frames/masks, can be multi-GB) now cleans up on EVERY exit
+  (try/finally), not just the two success paths — every failure branch used to orphan it.
+- `SceneInventoryBody.nouns: []` (explicit "there's nothing here") no longer collapses to the
+  `None`/absent case and silently re-triggers Qwen3-VL + langfield auto-sourcing.
+- `scene_inventory`'s zero-things short-circuit now still calls `audit_operator_event` — it used
+  to return from inside the lock before reaching the audit call, silently dropping the record of
+  a real GPU-time operation from the audit trail.
+- `scene/isolate`'s `recall_expand=true` path now runs `_langfield_stale_guard()` before spending
+  any GPU lease (it only checked `gauss_emb.is_file()`, which is true even when STALE) — restores
+  the exact "preflight before any GPU work" doctrine this same diff's own comments cite as already
+  fixed elsewhere, that `recall_expand` had quietly reintroduced.
+- `scene/isolate`'s GPU-lease budget bumps to 10GB when `recall_expand=true` (was flat 6GB, didn't
+  account for the extra SigLIP2 model load the flag adds on top of the checkpoint+render pass).
+- **New `backend/mesh/slugify.py`** — the ONE noun→slug function, replacing two
+  character-for-character-identical copies in `scene_sam3_masks.py`/`instance_lift.py` (pinned
+  behavior-identical via a direct comparison test). **New slug-collision guard in
+  `noun_consolidate.py`** (`dedupe_slugs`): two nouns differing only in punctuation (e.g. "Fire
+  Hydrant" / "Fire-Hydrant") used to both reduce to slug `fire-hydrant` and silently clobber each
+  other's SAM3 masks/instance files across a noun boundary — now the second is vetoed with a clear
+  reason instead.
+- `proxy_triptych.py`'s `_overlay_tmp.png` scratch file now cleans up on every exit (try/finally)
+  instead of only after a fully successful run.
+- Test-quality gaps closed: the ground route's `semantic_thresh`/`cell_units` now assert they
+  reach `ground_mesh_build.py`'s argv (previously untested — a field-rename bug would've passed
+  the whole suite); added coverage for the fail-soft `_langfield_worker_inventory() -> None` path
+  STATUS.md already documented happening in production.
+- 468 backend tests (up from 458; 10 new, all 5 gates re-verified PASS after a live re-run).
+
+**Left for RToony (design-decision territory, not silently decided):** none of `/scene/isolate`,
+`/scene/proxy`, or `/scene/ground` clear their prior output directory before a re-run with
+different tuning knobs (e.g. raising `min_members`) — instances that stop qualifying leave stale
+`object.ply`/proxy artifacts on disk indefinitely. No DELETE/reset route exists for any `/scene/*`
+tree today. Fixing this means deciding what "re-POST with different params" should MEAN (wipe and
+rebuild? keep both? explicit reset endpoint?) — a real product-contract call, not a bug fix.
+
+## P6f NOT STARTED — out of scope for today's approved autonomous-run plan
+Assembly + Blender + contamination gate is the final P6 phase but was explicitly out of scope for
+today (the approved plan stopped at P6e + review + digest). Natural next session.

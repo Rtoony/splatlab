@@ -47,24 +47,28 @@ def main() -> int:
     fig.savefig(overlay_path, bbox_inches="tight", dpi=110)
     plt.close(fig)
 
-    panels = []
-    for p in (crop_png, preview_webp, overlay_path):
-        if p.is_file():
-            panels.append(Image.open(p).convert("RGB"))
-    if not panels:
-        print("FATAL: no panels available for triptych", file=sys.stderr)
-        return 1
+    # try/finally (review finding 2026-07-23): a bad crop/preview panel used
+    # to raise before the unlink below ever ran, leaking _overlay_tmp.png.
+    try:
+        panels = []
+        for p in (crop_png, preview_webp, overlay_path):
+            if p.is_file():
+                panels.append(Image.open(p).convert("RGB"))
+        if not panels:
+            print("FATAL: no panels available for triptych", file=sys.stderr)
+            return 1
 
-    h = 360
-    resized = [im.resize((int(im.width * h / im.height), h)) for im in panels]
-    total_w = sum(im.width for im in resized) + 10 * (len(resized) - 1)
-    canvas = Image.new("RGB", (total_w, h), "white")
-    x = 0
-    for im in resized:
-        canvas.paste(im, (x, 0))
-        x += im.width + 10
-    canvas.save(out_png)
-    overlay_path.unlink(missing_ok=True)
+        h = 360
+        resized = [im.resize((int(im.width * h / im.height), h)) for im in panels]
+        total_w = sum(im.width for im in resized) + 10 * (len(resized) - 1)
+        canvas = Image.new("RGB", (total_w, h), "white")
+        x = 0
+        for im in resized:
+            canvas.paste(im, (x, 0))
+            x += im.width + 10
+        canvas.save(out_png)
+    finally:
+        overlay_path.unlink(missing_ok=True)
     print(f"TRIPTYCH_DONE -> {out_png}")
     return 0
 

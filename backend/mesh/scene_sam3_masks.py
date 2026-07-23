@@ -42,9 +42,8 @@ from sam3.train.transforms.basic_for_api import (                           # no
     ComposeAPI, RandomResizeAPI, ToTensorAPI, NormalizeAPI)
 from sam3.eval.postprocessors import PostProcessImage                       # noqa: E402
 
-
-def _slug(noun: str) -> str:
-    return "".join(c if c.isalnum() else "-" for c in noun.lower()).strip("-")[:40] or "thing"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from slugify import slug as _slug                                           # noqa: E402
 
 
 def as_numpy(t):

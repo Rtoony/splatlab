@@ -13,6 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mesh"))
 import noun_consolidate as nc  # noqa: E402
+import slugify  # noqa: E402
 
 
 def test_module_has_no_module_level_torch_binding():
@@ -65,3 +66,40 @@ def test_consolidate_splits_stuff_from_things(monkeypatch):
     assert report["things"] == ["fire hydrant"]
     assert report["stuff"] == ["grass lawn"]
     assert report["cleaned_count"] == 2
+
+
+def test_slugify_matches_the_two_implementations_it_replaced():
+    # Review finding 2026-07-23: scene_sam3_masks.py and instance_lift.py
+    # each had their own character-for-character-identical _slug() before
+    # this shared module replaced both — pin the exact algorithm (per-char
+    # substitution, NOT a collapsing regex) so on-disk slugs never shift.
+    assert slugify.slug("fire hydrant") == "fire-hydrant"
+    assert slugify.slug("Fire  Hydrant") == "fire--hydrant"  # two spaces -> two dashes
+    assert slugify.slug("!!!") == "thing"
+    assert slugify.slug("") == "thing"
+    assert slugify.slug("a" * 50) == "a" * 40
+
+
+def test_dedupe_slugs_drops_collisions_first_kept_wins():
+    # The exact collision the review found: punctuation-only differences
+    # reduce to the same slug ("fire-hydrant") and would otherwise let
+    # scene_sam3_masks.py/instance_lift.py silently clobber each other's
+    # per-instance files across a noun boundary.
+    kept, collisions = nc.dedupe_slugs(["Fire Hydrant", "Fire-Hydrant", "Flower Vase"])
+    assert kept == ["Fire Hydrant", "Flower Vase"]
+    assert collisions == [{"noun": "Fire-Hydrant", "slug": "fire-hydrant", "collides_with": "Fire Hydrant"}]
+
+
+def test_dedupe_slugs_no_collision_is_a_no_op():
+    kept, collisions = nc.dedupe_slugs(["fire hydrant", "flower vase"])
+    assert kept == ["fire hydrant", "flower vase"]
+    assert collisions == []
+
+
+def test_consolidate_wires_slug_dedupe_into_things(monkeypatch):
+    monkeypatch.setattr(nc, "siglip_dedupe", lambda nouns, thresh: (nouns, {}))
+    report = nc.consolidate(
+        ["Fire Hydrant", "Fire-Hydrant"], max_nouns=10, dedup_thresh=0.85,
+    )
+    assert report["things"] == ["Fire Hydrant"]
+    assert len(report["slug_collisions"]) == 1

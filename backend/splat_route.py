@@ -4832,126 +4832,145 @@ async def scene_inventory(request: Request, job_id: str, body: SceneInventoryBod
     if lock.locked():
         raise HTTPException(status_code=409, detail=f"A mesh/object/scene build is already running for {job_id}.")
     async with lock:
-        async def views_operation() -> tuple[int, bytes, bytes]:
-            return await _run_capture_subprocess([
-                str(LANGFIELD_ENV_PYTHON), str(SCENE_VIEWS_SCRIPT),
-                str(config_path), str(workdir), str(body.views),
-            ])
+        # Review finding 2026-07-23: every failure branch below used to leave
+        # _work (frames/masks, can be multi-GB) orphaned on disk — a
+        # try/finally guarantees cleanup on every exit, not just the two
+        # success paths.
         try:
-            rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
-                lane="scene-views", operation_id=job_id,
-                vram_mb=SCENE_VIEWS_VRAM_MB, operation=views_operation,
-            )
-        except gpu_arbiter.GPUArbiterUnavailable as exc:
-            raise HTTPException(status_code=503, detail=f"Scene view export blocked: {exc}") from exc
-        if rc != 0 or not (workdir / "views.json").is_file():
-            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
-            raise HTTPException(status_code=500, detail=f"Scene view export failed (exit {rc}): {tail}")
+            async def views_operation() -> tuple[int, bytes, bytes]:
+                return await _run_capture_subprocess([
+                    str(LANGFIELD_ENV_PYTHON), str(SCENE_VIEWS_SCRIPT),
+                    str(config_path), str(workdir), str(body.views),
+                ])
+            try:
+                rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
+                    lane="scene-views", operation_id=job_id,
+                    vram_mb=SCENE_VIEWS_VRAM_MB, operation=views_operation,
+                )
+            except gpu_arbiter.GPUArbiterUnavailable as exc:
+                raise HTTPException(status_code=503, detail=f"Scene view export blocked: {exc}") from exc
+            if rc != 0 or not (workdir / "views.json").is_file():
+                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                raise HTTPException(status_code=500, detail=f"Scene view export failed (exit {rc}): {tail}")
 
-        vetoed_sourcing: list[dict] = []
-        if body.nouns:
-            raw_nouns = list(body.nouns)
-        else:
-            frame_paths = sorted((workdir / "frames").glob("cam_*.png"))
-            vl_nouns = await _qwen_vl_nouns(frame_paths)
-            lf_result = await _langfield_worker_inventory(str(config_path), str(output_dir / LANGFIELD_DIRNAME))
-            lf_nouns = [item.get("label", "") for item in (lf_result or {}).get("items", []) if item.get("label")]
-            raw_nouns = vl_nouns + lf_nouns
+            vetoed_sourcing: list[dict] = []
+            # is not None (review finding 2026-07-23): an explicit {"nouns": []}
+            # — "I reviewed the scene, there's nothing here" — must NOT fall
+            # through to auto-sourcing; only the field being absent should.
+            if body.nouns is not None:
+                raw_nouns = list(body.nouns)
+            else:
+                frame_paths = sorted((workdir / "frames").glob("cam_*.png"))
+                vl_nouns = await _qwen_vl_nouns(frame_paths)
+                lf_result = await _langfield_worker_inventory(str(config_path), str(output_dir / LANGFIELD_DIRNAME))
+                lf_nouns = [item.get("label", "") for item in (lf_result or {}).get("items", []) if item.get("label")]
+                raw_nouns = vl_nouns + lf_nouns
             if not raw_nouns:
-                vetoed_sourcing.append({"noun": None, "reason": "Qwen3-VL and langfield vocab both returned nothing"})
+                reason = ("explicit empty nouns override" if body.nouns is not None
+                         else "Qwen3-VL and langfield vocab both returned nothing")
+                vetoed_sourcing.append({"noun": None, "reason": reason})
 
-        raw_path = workdir / "raw_nouns.json"
-        raw_path.write_text(json.dumps(raw_nouns))
-        nouns_path = workdir / "nouns.json"
-        rc, _out, stderr = await _run_capture_subprocess([
-            str(LANGFIELD_ENV_PYTHON), str(NOUN_CONSOLIDATE_SCRIPT),
-            str(raw_path), str(nouns_path), "--max-nouns", str(body.max_nouns),
-        ])
-        if rc != 0:
-            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
-            raise HTTPException(status_code=500, detail=f"Noun consolidation failed (exit {rc}): {tail}")
-        consolidated = json.loads(nouns_path.read_text())
-        things = consolidated["things"]
-        vetoed_stuff = [
-            {"noun": n, "reason": "classified as ground/vegetation (stuff), not a proxy candidate"}
-            for n in consolidated["stuff"]
-        ]
-
-        if not things:
-            report = {
-                "job_id": job_id, "things": [], "instances": [],
-                "vetoed": vetoed_sourcing + vetoed_stuff,
-                "consolidated": consolidated,
-            }
-            (scene_dir / "inventory.json").write_text(json.dumps(report, indent=2))
-            shutil.rmtree(workdir, ignore_errors=True)
-            _patch_meta(job_id, scene={"inventory": {"n_instances": 0, "built_at": _utc_now()}})
-            return report
-
-        things_path = workdir / "things.json"
-        things_path.write_text(json.dumps(things))
-
-        async def sam3_operation() -> tuple[int, bytes, bytes]:
-            return await _run_capture_subprocess([
-                str(SAM3_ENV_PYTHON), str(SCENE_SAM3_SCRIPT), str(workdir), str(things_path),
+            raw_path = workdir / "raw_nouns.json"
+            raw_path.write_text(json.dumps(raw_nouns))
+            nouns_path = workdir / "nouns.json"
+            rc, _out, stderr = await _run_capture_subprocess([
+                str(LANGFIELD_ENV_PYTHON), str(NOUN_CONSOLIDATE_SCRIPT),
+                str(raw_path), str(nouns_path), "--max-nouns", str(body.max_nouns),
             ])
-        try:
-            rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
-                lane="scene-sam3", operation_id=job_id,
-                vram_mb=SAM3_VRAM_MB, operation=sam3_operation,
-            )
-        except gpu_arbiter.GPUArbiterUnavailable as exc:
-            raise HTTPException(status_code=503, detail=f"Scene SAM3 masking blocked: {exc}") from exc
-        if rc != 0:
-            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
-            raise HTTPException(status_code=500, detail=f"Scene SAM3 masking failed (exit {rc}): {tail}")
+            if rc != 0:
+                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                raise HTTPException(status_code=500, detail=f"Noun consolidation failed (exit {rc}): {tail}")
+            consolidated = json.loads(nouns_path.read_text())
+            things = consolidated["things"]
+            vetoed_stuff = [
+                {"noun": n, "reason": "classified as ground/vegetation (stuff), not a proxy candidate"}
+                for n in consolidated["stuff"]
+            ] + [
+                {"noun": c["noun"], "reason": f"slug collision with {c['collides_with']!r} (both -> {c['slug']!r})"}
+                for c in consolidated.get("slug_collisions", [])
+            ]
 
-        ref_dir = output_dir / OBJECTS_DIRNAME if body.ref_regression else None
-        lift_cmd = [
-            str(LANGFIELD_ENV_PYTHON), str(INSTANCE_LIFT_SCRIPT),
-            str(config_path), str(workdir), str(things_path), str(scene_dir),
-            "--min-views", str(body.min_views), "--vote-frac", str(body.vote_frac),
-        ]
-        if ref_dir and ref_dir.is_dir():
-            lift_cmd += ["--ref-dir", str(ref_dir)]
+            if things:
+                things_path = workdir / "things.json"
+                things_path.write_text(json.dumps(things))
 
-        async def lift_operation() -> tuple[int, bytes, bytes]:
-            return await _run_capture_subprocess(lift_cmd)
-        try:
-            rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
-                lane="scene-lift", operation_id=job_id,
-                vram_mb=SCENE_LIFT_VRAM_MB, operation=lift_operation,
-            )
-        except gpu_arbiter.GPUArbiterUnavailable as exc:
-            raise HTTPException(status_code=503, detail=f"Scene lift blocked: {exc}") from exc
-        if rc != 0 or not (scene_dir / "instances.json").is_file():
-            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
-            raise HTTPException(status_code=500, detail=f"Scene lift failed (exit {rc}): {tail}")
+                async def sam3_operation() -> tuple[int, bytes, bytes]:
+                    return await _run_capture_subprocess([
+                        str(SAM3_ENV_PYTHON), str(SCENE_SAM3_SCRIPT), str(workdir), str(things_path),
+                    ])
+                try:
+                    rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
+                        lane="scene-sam3", operation_id=job_id,
+                        vram_mb=SAM3_VRAM_MB, operation=sam3_operation,
+                    )
+                except gpu_arbiter.GPUArbiterUnavailable as exc:
+                    raise HTTPException(status_code=503, detail=f"Scene SAM3 masking blocked: {exc}") from exc
+                if rc != 0:
+                    tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                    raise HTTPException(status_code=500, detail=f"Scene SAM3 masking failed (exit {rc}): {tail}")
 
-        lift_report = json.loads((scene_dir / "instances.json").read_text())
-        lift_report["vetoed"] = vetoed_sourcing + vetoed_stuff + lift_report.get("vetoed", [])
-        lift_report["consolidated"] = consolidated
-        lift_report["job_id"] = job_id
-        (scene_dir / "inventory.json").write_text(json.dumps(lift_report, indent=2))
-        shutil.rmtree(workdir, ignore_errors=True)  # frames/masks scratch, can be multi-GB
+                ref_dir = output_dir / OBJECTS_DIRNAME if body.ref_regression else None
+                lift_cmd = [
+                    str(LANGFIELD_ENV_PYTHON), str(INSTANCE_LIFT_SCRIPT),
+                    str(config_path), str(workdir), str(things_path), str(scene_dir),
+                    "--min-views", str(body.min_views), "--vote-frac", str(body.vote_frac),
+                ]
+                if ref_dir and ref_dir.is_dir():
+                    lift_cmd += ["--ref-dir", str(ref_dir)]
 
-        _patch_meta(job_id, scene={"inventory": {
-            "n_instances": len(lift_report["instances"]),
-            "n_vetoed": len(lift_report["vetoed"]),
-            "conservation": lift_report.get("conservation"),
-            "built_at": _utc_now(),
-        }})
+                async def lift_operation() -> tuple[int, bytes, bytes]:
+                    return await _run_capture_subprocess(lift_cmd)
+                try:
+                    rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
+                        lane="scene-lift", operation_id=job_id,
+                        vram_mb=SCENE_LIFT_VRAM_MB, operation=lift_operation,
+                    )
+                except gpu_arbiter.GPUArbiterUnavailable as exc:
+                    raise HTTPException(status_code=503, detail=f"Scene lift blocked: {exc}") from exc
+                if rc != 0 or not (scene_dir / "instances.json").is_file():
+                    tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                    raise HTTPException(status_code=500, detail=f"Scene lift failed (exit {rc}): {tail}")
 
+                report = json.loads((scene_dir / "instances.json").read_text())
+                report["vetoed"] = vetoed_sourcing + vetoed_stuff + report.get("vetoed", [])
+            else:
+                report = {"things": [], "instances": [], "vetoed": vetoed_sourcing + vetoed_stuff}
+
+            report["job_id"] = job_id
+            report["consolidated"] = consolidated
+            (scene_dir / "inventory.json").write_text(json.dumps(report, indent=2))
+
+            # Merge, don't replace (review finding 2026-07-23): P6c/P6d/P6e
+            # each merge into meta["scene"] the same way — this route is the
+            # one users are explicitly told to re-POST (the HITL correction
+            # flow), so a wholesale overwrite silently erased their isolate/
+            # proxy/ground summaries every time.
+            fresh_scene_meta = (_read_meta(job_id) or {}).get("scene") or {}
+            _patch_meta(job_id, scene={
+                **fresh_scene_meta,
+                "inventory": {
+                    "n_instances": len(report["instances"]),
+                    "n_vetoed": len(report["vetoed"]),
+                    "conservation": report.get("conservation"),
+                    "built_at": _utc_now(),
+                },
+            })
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)  # frames/masks scratch, can be multi-GB
+
+    # Moved outside the old early-return (review finding 2026-07-23): a
+    # 0-things result still ran a real GPU render and deserves an audit
+    # record, same as every other exit of this route.
     await audit_operator_event(
         request=request,
         title="Built scene instance inventory",
-        description=f"{job_id}: {len(lift_report['instances'])} instance(s)",
+        description=f"{job_id}: {len(report['instances'])} instance(s)",
         variant="success",
         action="splat.scene_inventory",
         target=meta.get("mode", "3d"),
-        metadata={"job_id": job_id, "n_instances": len(lift_report["instances"])},
+        metadata={"job_id": job_id, "n_instances": len(report["instances"])},
     )
-    return lift_report
+    return report
 
 
 @router.get("/jobs/{job_id}/scene/inventory/file")
@@ -4987,6 +5006,10 @@ async def get_scene_inventory_file(
 # DBSCAN — that's the mechanism P6b was built to supersede.
 BATCH_ISOLATE_SCRIPT = MESH_DIR / "batch_isolate.py"
 SCENE_ISOLATE_VRAM_MB = 6_000  # checkpoint load + light background-render pass
+# --recall-expand additionally loads a full SigLIP2 model (same combination as
+# SEMANTIC_GROUND_VRAM_MB's checkpoint+SigLIP2 budget) on top of that render
+# pass — review finding 2026-07-23: the base budget under-reserved for it.
+SCENE_ISOLATE_RECALL_EXPAND_VRAM_MB = 10_000
 _SCENE_ISOLATE_NAME_RE = re.compile(r"[a-z0-9-]{1,40}")
 
 
@@ -5026,8 +5049,15 @@ async def scene_batch_isolate(request: Request, job_id: str, body: SceneIsolateB
     if not (BATCH_ISOLATE_SCRIPT.is_file() and LANGFIELD_ENV_PYTHON.is_file()):
         raise HTTPException(status_code=400, detail="Batch-isolation toolchain unavailable.")
     gauss_emb = output_dir / LANGFIELD_DIRNAME / "gauss_emb.npz"
-    if body.recall_expand and not gauss_emb.is_file():
-        raise HTTPException(status_code=409, detail="recall_expand needs a built language field.")
+    if body.recall_expand:
+        if not gauss_emb.is_file():
+            raise HTTPException(status_code=409, detail="recall_expand needs a built language field.")
+        # Review finding 2026-07-23: recall_expand consumes gauss_emb.npz for
+        # its relevancy floor, same as every other gauss_emb-consuming route —
+        # it needs the SAME upfront staleness preflight (a passing
+        # `is_file()` check doesn't mean the lift still matches the current
+        # checkpoint), not a GPU-lease spent before finding out.
+        _langfield_stale_guard(output_dir / LANGFIELD_DIRNAME)
 
     out_dir = scene_dir / "isolated"
 
@@ -5049,7 +5079,8 @@ async def scene_batch_isolate(request: Request, job_id: str, body: SceneIsolateB
         try:
             rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
                 lane="scene-isolate", operation_id=job_id,
-                vram_mb=SCENE_ISOLATE_VRAM_MB, operation=isolate_operation,
+                vram_mb=SCENE_ISOLATE_RECALL_EXPAND_VRAM_MB if body.recall_expand else SCENE_ISOLATE_VRAM_MB,
+                operation=isolate_operation,
             )
         except gpu_arbiter.GPUArbiterUnavailable as exc:
             raise HTTPException(status_code=503, detail=f"Batch isolation blocked: {exc}") from exc

@@ -181,6 +181,29 @@ def test_scene_inventory_auto_sourcing_merges_vl_and_langfield(client, monkeypat
     assert seen_raw["nouns"] == ["fire hydrant", "ground disc"]
 
 
+def test_scene_inventory_auto_sourcing_fail_soft_when_langfield_worker_down(client, monkeypatch):
+    """Review finding 2026-07-23: STATUS.md records this happening in
+    production (langfield worker inactive) -- _langfield_worker_inventory
+    returning None must fall back to VL-only sourcing, not 500."""
+    http, outputs = client
+    _mk_job(outputs)
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(calls))
+
+    async def fake_vl(frame_paths):
+        return ["fire hydrant"]
+
+    async def worker_down(config_path, lfdir):
+        return None
+
+    monkeypatch.setattr(splat_route, "_qwen_vl_nouns", fake_vl)
+    monkeypatch.setattr(splat_route, "_langfield_worker_inventory", worker_down)
+
+    r = http.post("/api/splat/jobs/splat_0b0002/scene/inventory", json={})
+    assert r.status_code == 200
+    assert len(r.json()["instances"]) == 1
+
+
 def test_scene_inventory_all_stuff_short_circuits_before_sam3(client, monkeypatch):
     http, outputs = client
     job_dir = _mk_job(outputs)
@@ -200,6 +223,113 @@ def test_scene_inventory_all_stuff_short_circuits_before_sam3(client, monkeypatc
 
     meta = json.loads((job_dir / "meta.json").read_text())
     assert meta["scene"]["inventory"]["n_instances"] == 0
+
+
+def test_scene_inventory_merges_scene_meta_not_overwrites(client, monkeypatch):
+    """Review finding 2026-07-23: this is the route users are told to
+    re-POST (HITL correction) -- it must not erase isolate/proxy/ground
+    summaries a prior P6c/P6d/P6e run already wrote into meta["scene"]."""
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    meta = json.loads((job_dir / "meta.json").read_text())
+    meta["scene"] = {"isolate": {"n_built": 2}, "proxy": {"n_built": 1}, "ground": {"ground_points": 900}}
+    (job_dir / "meta.json").write_text(json.dumps(meta))
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(calls))
+
+    r = http.post("/api/splat/jobs/splat_0b0002/scene/inventory", json={"nouns": ["fire hydrant"]})
+    assert r.status_code == 200
+
+    meta = json.loads((job_dir / "meta.json").read_text())
+    assert meta["scene"]["isolate"]["n_built"] == 2
+    assert meta["scene"]["proxy"]["n_built"] == 1
+    assert meta["scene"]["ground"]["ground_points"] == 900
+    assert meta["scene"]["inventory"]["n_instances"] == 1
+
+
+def test_scene_inventory_explicit_empty_nouns_does_not_autosource(client, monkeypatch):
+    """Review finding 2026-07-23: {"nouns": []} ("I reviewed the scene,
+    there's nothing here") must not collapse to the None/absent-field case
+    and re-trigger Qwen3-VL + langfield auto-sourcing."""
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess",
+                        _fake_subprocess(calls, things=(), stuff=()))
+
+    async def unreachable(*a, **kw):
+        raise AssertionError("auto-sourcing must not run for an explicit empty nouns list")
+
+    monkeypatch.setattr(splat_route, "_qwen_vl_nouns", unreachable)
+    monkeypatch.setattr(splat_route, "_langfield_worker_inventory", unreachable)
+
+    r = http.post("/api/splat/jobs/splat_0b0002/scene/inventory", json={"nouns": []})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["instances"] == []
+    assert any(v["reason"] == "explicit empty nouns override" for v in body["vetoed"])
+
+
+def test_scene_inventory_cleans_work_on_mid_pipeline_failure(client, monkeypatch):
+    """Review finding 2026-07-23: every failure branch used to leave _work
+    (frames/masks, can be multi-GB) orphaned; only the two success paths
+    cleaned up."""
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+
+    async def fake_sub(command):
+        joined = " ".join(str(c) for c in command)
+        if "sam3_doctor" in joined:
+            return 0, b"sam3_doctor: healthy", b""
+        if "scene_views" in joined:
+            workdir = Path(command[3])
+            (workdir / "frames").mkdir(parents=True, exist_ok=True)
+            (workdir / "views.json").write_text(json.dumps(
+                {"cam_indices": [0], "W": 640, "H": 480, "n_train": 49}))
+            return 0, b"", b""
+        if "noun_consolidate" in joined:
+            nouns_path = Path(command[3])
+            nouns_path.write_text(json.dumps(
+                {"raw_count": 1, "cleaned_count": 1, "dedup_map": {}, "things": ["x"], "stuff": []}))
+            return 0, b"", b""
+        if "scene_sam3_masks" in joined:
+            return 1, b"", b"FATAL: CUDA OOM"
+        raise AssertionError(f"unexpected subprocess: {command}")
+
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", fake_sub)
+    r = http.post("/api/splat/jobs/splat_0b0002/scene/inventory", json={"nouns": ["x"]})
+    assert r.status_code == 500
+    assert not (job_dir / splat_route.SCENE_DIRNAME / "_work").exists()
+
+
+def test_scene_inventory_slug_collision_vetoed_not_clobbered(client, monkeypatch):
+    """Review finding 2026-07-23: two nouns differing only in punctuation
+    reduce to the same slug downstream; noun_consolidate's slug-collision
+    guard must drop the second before it reaches SAM3/lift, not silently
+    let them clobber each other's files."""
+    http, outputs = client
+    _mk_job(outputs)
+    calls: list = []
+
+    async def fake_sub(command):
+        joined = " ".join(str(c) for c in command)
+        if "noun_consolidate" in joined:
+            # Real script behavior: both "Fire Hydrant" and "Fire-Hydrant"
+            # collide on slug "fire-hydrant" -- only the first survives.
+            nouns_path = Path(command[3])
+            nouns_path.write_text(json.dumps({
+                "raw_count": 2, "cleaned_count": 2, "dedup_map": {}, "things": ["Fire Hydrant"], "stuff": [],
+                "slug_collisions": [{"noun": "Fire-Hydrant", "slug": "fire-hydrant", "collides_with": "Fire Hydrant"}],
+            }))
+            return 0, b"", b""
+        return await _fake_subprocess(calls, things=("Fire Hydrant",))(command)
+
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", fake_sub)
+    r = http.post("/api/splat/jobs/splat_0b0002/scene/inventory",
+                  json={"nouns": ["Fire Hydrant", "Fire-Hydrant"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert any("slug collision" in v["reason"] for v in body["vetoed"])
 
 
 def test_scene_inventory_sam3_unhealthy_is_preflight_400(client, monkeypatch):

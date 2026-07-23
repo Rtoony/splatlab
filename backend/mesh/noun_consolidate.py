@@ -19,6 +19,9 @@ import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from slugify import slug  # noqa: E402
+
 # Ground/vegetation/background classes: P5a's semantic_ground.py already owns
 # these (GROUND_QUERIES there). A scene-inventory "thing" candidate that names
 # one of these is stuff, not an object — never a proxy candidate. Curated list
@@ -96,6 +99,26 @@ def siglip_dedupe(nouns: list[str], thresh: float) -> tuple[list[str], dict[str,
     return kept, dropped
 
 
+def dedupe_slugs(things: list[str]) -> tuple[list[str], list[dict]]:
+    """Downstream (scene_sam3_masks.py, instance_lift.py) key every noun's
+    masks/instance files by slug(noun) — two things that reduce to the same
+    slug (review finding 2026-07-23: e.g. "Fire Hydrant" and "Fire-Hydrant")
+    would silently clobber each other's files. siglip_dedupe only catches
+    near-duplicates PROBABILISTICALLY; this is the mechanical backstop.
+    First-kept-wins, order-preserving."""
+    seen: dict[str, str] = {}
+    kept: list[str] = []
+    collisions: list[dict] = []
+    for n in things:
+        s = slug(n)
+        if s in seen:
+            collisions.append({"noun": n, "slug": s, "collides_with": seen[s]})
+            continue
+        seen[s] = n
+        kept.append(n)
+    return kept, collisions
+
+
 def consolidate(raw: list[str], max_nouns: int, dedup_thresh: float) -> dict:
     cleaned = clean_nouns(raw, max_nouns * 3)  # dedupe/split before the cap
     kept, dup_map = siglip_dedupe(cleaned, dedup_thresh) if cleaned else ([], {})
@@ -103,12 +126,14 @@ def consolidate(raw: list[str], max_nouns: int, dedup_thresh: float) -> dict:
     things, stuff = [], []
     for n in kept:
         (stuff if classify_stuff(n) else things).append(n)
+    things, slug_collisions = dedupe_slugs(things)
     return {
         "raw_count": len(raw),
         "cleaned_count": len(cleaned),
         "dedup_map": dup_map,
         "things": things,
         "stuff": stuff,
+        "slug_collisions": slug_collisions,
     }
 
 
