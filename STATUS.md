@@ -1228,3 +1228,80 @@ here) also assembled cleanly for the A/B comparison.
   never captured") — P6f only chooses among representations of what P6b-e already produced. Pure
   imagination is a future P6x-style capability, kept separate on purpose.
 - This closes out the entire P6 Scene Regeneration Lane (P6a through P6f) as originally scoped.
+
+## P6 CONTROL PANEL (GUI) SHIPPED (2026-07-23, RToony /plan: "word salad" -> GUI-first plan)
+
+RToony: "the central space to control and understand what tools we are making is important for
+my ongoing understanding and future reference" — P6a-f had been REST-only all day (six endpoints,
+zero frontend). This closes that gap: a full front-end control panel for the whole scene-regen
+lane, no backend changes (all six routes/reports were already exactly what the UI needed).
+
+**New**: `frontend/src/components/scene-regen.tsx` (`SceneRegenModal`) — a lazy-loaded full-screen
+modal mirroring `geo-locate.tsx`'s exact mount pattern (`job`/`onClose` props, `lazy(() =>
+import(...))` + `<Suspense>` in `splat-view.tsx`). Six `useMutation`s (inventory/isolate/proxy/
+ground/assemble/approve) live in the modal shell and share one `busy` flag that disables every
+trigger across all five stage tabs at once — lifted to the parent (not per-panel) specifically so
+`busy` survives switching tabs mid-build. A NEW tab strip, not `StageRail` — deliberate, matches
+the plan's reasoning: `StageRail` is contractually tied to one job's auto-advancing single-process
+`stage` field; P6 is six independently-triggered, freely re-runnable endpoints with no unifying
+stage.
+- **Data model**: `SplatSceneSummary` (+5 detail-report interfaces) added to `contracts.ts`,
+  5 `fetchScene*()` GETs added to `api.ts` (`.../file?fmt=report` convention, matching every other
+  scene-file route already shipped). Each panel prefers its own mutation's just-returned report
+  over the polled GET (`mutation.data ?? reportQuery.data`) — shows the real result immediately
+  instead of waiting on the `["status"]` poll to update `job.scene` before the on-demand query
+  even enables. Caught live: without this, the Assemble panel's Approve button stayed wrongly
+  disabled right after a passing build.
+- **Live-verified the entire API contract layer against garden** (curl + `PORTAL_TOKEN`, not
+  guessed from source reading alone — no interactive browser tool available in this environment,
+  so this is the strongest verification achievable here; the app's own login-cookie auth is what
+  the real browser uses for both JSON and `<img>` tag requests, same as the existing thumbnail
+  pattern already in production). All 5 `fmt=report` GETs, all 6 image/model file endpoints (crop,
+  overlay, isolate receipt, proxy triptych, ground top/oblique, assemble glb/blend) returned real
+  200s with correct content-types against garden's actual P6a-f output.
+- **Two real, if minor, type inaccuracies found by that live check and fixed**: (1)
+  `SceneIsolateReport.job_id` was declared required but the GET path (which serves
+  `batch_isolate.json` verbatim — `batch_isolate.py` never stamps it with `job_id`, only the POST
+  route's in-memory response does) never actually has it; now `job_id?: string`. (2)
+  `SceneInventoryInstance.regression` can be wire-`null` (not just absent) for an instance with no
+  reference match — the panel's truthiness check (`inst.regression && ...`) already handled `null`
+  correctly at runtime, but the type now says so honestly (`| null`).
+- **Fidelity-dial UI**: segmented `faithful`/`styled` control + a per-object override table (one
+  row per isolate-built instance; proxy option disabled+tooltipped with its skip reason when no
+  proxy was built for that slug) — lifted to the modal shell so it survives tab switches, per plan.
+  After a build, each row also shows its live `selection.reason` from the manifest. Approve gate
+  is its own visually-separated bordered block (amber "not approved yet" vs. emerald "approved"),
+  matching the one-mandatory-HITL doctrine P6f was built to enforce.
+- **Staleness banner**: no server-side cascade invalidation exists (re-running inventory doesn't
+  mark isolate/proxy/ground/assemble stale) — the UI is the only place that catches it, by
+  comparing `built_at` across `job.scene.*`. Live-verified this actually fires correctly: garden's
+  real data has `inventory.built_at` (14:31) newer than `isolate.built_at` (13:37) from an
+  in-session re-run earlier today, and the Isolate panel correctly shows "Built from an earlier
+  inventory — re-run isolate…".
+- **Gallery integration**: `SceneCard` gets one more badge (amber "scene assembled" for
+  `state:"built"`, emerald "scene approved" for `"approved"`); `DownloadMenu` gets `Scene .glb`/
+  `Scene .blend` entries gated on `state==="approved"` specifically (not `"built"`) — surfacing an
+  unapproved draft as a top-level gallery download would quietly defeat the one mandatory HITL
+  gate. A preview download of the built-but-unapproved GLB/blend stays inside the Assemble panel.
+- Error surface bypasses `api.ts`'s `apiRequest()` (which throws the raw response body, often
+  FastAPI's `{"detail": "..."}` JSON) in favor of a local `postJSON()` that parses `.detail` —
+  matches `spark-scene-viewer.tsx`'s existing precedent. The three known 409/503 causes
+  (`require_heavy_work_admitted()`'s maintenance/backup interlock, `_mesh_export_lock`'s "already
+  running", and each route's own prerequisite check) already write distinct, human-readable
+  `detail` strings server-side — no client-side remapping needed, just don't mangle them into a
+  JSON blob.
+- **Verification**: `npx tsc --noEmit` — exactly 43 errors both before and after, none in the new
+  files (matches the established pre-existing baseline). `npm run build` clean (one transient
+  esbuild crash mid-session from the same session-scope task-pressure class already diagnosed for
+  `gate_p6a_scene_rails.sh` earlier today — not a code issue, retry succeeded with identical output
+  hashes). 486 backend tests still pass (confirm-untouched baseline; no backend changes this pass).
+  Live API-contract verification against garden as described above. **Not done**: an actual
+  interactive-browser click-through — no browser automation tool is available in this environment,
+  so DOM rendering/interaction itself is unverified beyond the build succeeding and the contract
+  layer matching exactly. RToony should click through it once against garden before trusting it.
+- **Accepted for v1, not fixed**: no progress signal for the multi-minute blocking POSTs (proxy
+  especially) — an indeterminate spinner + "don't close this tab" copy, honestly, per plan. A
+  refreshed/closed tab mid-request can't distinguish "still running" from "crashed" until the next
+  poll.
+- **Deferred, not started**: Phase 2 (Reference CAD/DXF alignment) — scoped in the plan, explicitly
+  not picked up until Phase 1 ships and gets real use.

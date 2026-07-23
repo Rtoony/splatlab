@@ -159,6 +159,163 @@ export interface SplatJob {
       enforced?: boolean;
     };
   } | null;
+  // P6 scene-regen lane: small, poll-safe per-stage summaries merged into
+  // meta["scene"] by each POST /scene/* route. Absent until a stage has run;
+  // each sub-key absent until THAT stage has run. Full per-stage detail
+  // (instances/receipts/etc.) is fetched on demand via the matching
+  // fetchScene*() call, same reasoning as langfield inventory.
+  scene?: SplatSceneSummary;
+}
+
+// meta["scene"] (P6a-P6f). Each key is written by its own route and merged,
+// never replaced (review finding 2026-07-23 fixed a real merge bug) — so any
+// subset can be present depending on which stages have run.
+export interface SplatSceneSummary {
+  inventory?: {
+    n_instances: number;
+    n_vetoed: number;
+    conservation?: unknown;
+    built_at: string;
+  };
+  isolate?: {
+    n_built: number;
+    n_skipped: number;
+    sanity: { n_gaussians: number; n_claimed: number; n_background: number; sanity_sum_ok: boolean };
+    built_at: string;
+  };
+  proxy?: {
+    n_built: number;
+    n_skipped: number;
+    built_at: string;
+  };
+  ground?: {
+    ground_points: number | null;
+    triangles: number | null;
+    built_at: string;
+  };
+  assemble?: {
+    state: "building" | "built" | "approved";
+    n_built: number;
+    n_flagged: number;
+    mode: "faithful" | "styled";
+    built_at: string;
+  };
+}
+
+// P6b instance inventory (GET /jobs/{id}/scene/inventory/file?fmt=report).
+export interface SceneInventoryInstance {
+  id: string;
+  label: string;
+  slug: string;
+  n_members: number;
+  n_views: number;
+  views_seen: number[];
+  vote_threshold: number;
+  mean_score: number;
+  centroid_scene: [number, number, number];
+  bbox_tight_scene: { min: [number, number, number]; max: [number, number, number] };
+  best_view: number | null;
+  best_view_box: [number, number, number, number] | null;
+  // Present only when this instance overlaps a known P5b _objects/ reference
+  // by >5% IoU — informative only, never gates anything.
+  regression?: Record<string, { iou: number; recall: number; precision: number }> | null;
+}
+
+export interface SceneInventoryReport {
+  job_id: string;
+  things: string[];
+  instances: SceneInventoryInstance[];
+  // Nouns that never became an instance — stuff-classified, slug-collided,
+  // or SAM3 found nothing — each with a human-readable reason.
+  vetoed: { noun: string | null; reason: string }[];
+  conservation?: unknown;
+  consolidated?: unknown;
+}
+
+// P6c batch isolation (GET /jobs/{id}/scene/isolate/file?fmt=report).
+export interface SceneIsolateInstance {
+  slug: string;
+  label: string;
+  status: "built" | "SKIPPED:indices-file-missing" | "SKIPPED:too-few-members-after-dedup";
+  n_members_original?: number;
+  n_overlap_removed?: number;
+  n_members_final?: number;
+  recall_expand?: { candidates_n: number; kept_n: number } | null;
+}
+
+export interface SceneIsolateReport {
+  // Absent on the GET (fmt=report serves batch_isolate.json verbatim, which
+  // batch_isolate.py never stamps with job_id) -- present on the raw POST
+  // response (the route adds it in-memory before returning). Confirmed live
+  // against garden 2026-07-23.
+  job_id?: string;
+  n_gaussians: number;
+  recall_expand: boolean;
+  instances: SceneIsolateInstance[];
+  sanity: { n_gaussians: number; n_claimed: number; n_background: number; sanity_sum_ok: boolean };
+}
+
+// P6d batch proxy (GET /jobs/{id}/scene/proxy/file?fmt=report).
+export interface SceneProxyInstance {
+  slug: string;
+  label: string;
+  status: "built" | "SKIPPED:crop-failed" | "SKIPPED:generation-failed" | "SKIPPED:registration-failed";
+  icp_fitness?: number | null;
+  icp_rmse?: number | null;
+  total_scale?: number | null;
+  transform_4x4?: number[][] | null;
+}
+
+export interface SceneProxyReport {
+  job_id: string;
+  instances: SceneProxyInstance[];
+  n_built: number;
+  n_skipped: number;
+}
+
+// P6e ground mesh (GET /jobs/{id}/scene/ground/file?fmt=report).
+export interface SceneGroundReport {
+  job_id: string;
+  ground_points: number;
+  triangles: number;
+  finish?: Record<string, unknown>;
+}
+
+// P6f assembled scene manifest element (mirrors scene_assemble.py's dict).
+export interface SceneAssembleElement {
+  slug: string;
+  provenance: "captured" | "proxy" | "ground-derived";
+  files: Record<string, string>;
+  transform_4x4?: number[][] | null;
+  registration?: { icp_fitness?: number | null; icp_rmse?: number | null; total_scale?: number | null } | null;
+  selection: {
+    mode: "faithful" | "styled";
+    chosen: string;
+    available: string[];
+    reason: string;
+    label?: string;
+  };
+}
+
+// P6f scene assembly (GET /jobs/{id}/scene/assemble/file?fmt=report).
+export interface SceneAssembleReport {
+  job_id: string;
+  mode: "faithful" | "styled";
+  overrides: Record<string, "captured" | "proxy">;
+  manifest: {
+    state: "building" | "built" | "approved";
+    elements: SceneAssembleElement[];
+    [key: string]: unknown;
+  };
+  assemble: {
+    n_elements_total: number;
+    n_built: number;
+    built: string[];
+    n_flagged: number;
+    flagged: string[];
+    contamination_gate: { ok: boolean; errors: string[] };
+    seconds: number;
+  };
 }
 
 // Tier-0 upload-time capture screen (POST /api/splat/precheck). Advisory-only:

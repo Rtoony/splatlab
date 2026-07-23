@@ -17,6 +17,8 @@ import { SparkSceneViewer } from "@/components/spark-scene-viewer";
 
 // Locate-in-the-world map modal — lazy so Leaflet only ships when opened.
 const GeoLocateModal = lazy(() => import("@/components/geo-locate"));
+// P6 Control Panel — lazy so the scene-regen UI only ships when opened.
+const SceneRegenModal = lazy(() => import("@/components/scene-regen"));
 
 // Distinct colors handed out to toggled inventory objects (stable per item index).
 const HL_PALETTE = ["#22d3ee", "#f59e0b", "#a78bfa", "#34d399", "#f472b6", "#60a5fa", "#fb7185", "#facc15", "#4ade80", "#c084fc"];
@@ -50,6 +52,7 @@ export default function SplatViewPage() {
   // fly-to until the full 2.4 port. Sticky per browser.
   const [sparkBeta, setSparkBeta] = useState(() => localStorage.getItem("splatlab.sparkBeta") === "1");
   const [geoOpen, setGeoOpen] = useState(false);
+  const [sceneRegenOpen, setSceneRegenOpen] = useState(false);
   function toggleSparkBeta() {
     setSparkBeta((v) => {
       localStorage.setItem("splatlab.sparkBeta", v ? "0" : "1");
@@ -234,6 +237,18 @@ export default function SplatViewPage() {
           {job && viewUrl && (
             <Button
               type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setSceneRegenOpen(true)}
+              title="Enumerate, isolate, proxy, and reassemble this scene's objects — the P6 control panel"
+              className={job.scene?.assemble ? "border-cyan-300/40 text-cyan-200" : ""}
+            >
+              <Layers className="h-3.5 w-3.5" /> Scene
+            </Button>
+          )}
+          {job && viewUrl && (
+            <Button
+              type="button"
               variant={sparkBeta ? "primary" : "outline"}
               size="sm"
               onClick={toggleSparkBeta}
@@ -405,6 +420,11 @@ export default function SplatViewPage() {
       {geoOpen && job && (
         <Suspense fallback={null}>
           <GeoLocateModal job={job} onClose={() => setGeoOpen(false)} />
+        </Suspense>
+      )}
+      {sceneRegenOpen && job && (
+        <Suspense fallback={null}>
+          <SceneRegenModal job={job} onClose={() => setSceneRegenOpen(false)} />
         </Suspense>
       )}
     </div>

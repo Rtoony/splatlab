@@ -33,6 +33,8 @@ import {
   UploadCloud,
   Wand2,
   X,
+  Layers,
+  ShieldCheck,
 } from "lucide-react";
 
 // ── pipeline metadata ────────────────────────────────────────────────────────
@@ -1375,6 +1377,21 @@ function SceneCard({
                 ) : null;
               })()
             )}
+            {job.scene?.assemble?.state === "approved" ? (
+              <span
+                title="Scene reassembly approved — scene.glb/scene.blend available in the download menu"
+                className="flex items-center gap-0.5 rounded bg-emerald-400/20 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-200 backdrop-blur-sm"
+              >
+                <ShieldCheck className="h-3 w-3" /> scene approved
+              </span>
+            ) : job.scene?.assemble?.state === "built" ? (
+              <span
+                title="Scene reassembled but not yet approved — open Scene in the viewer to review and approve"
+                className="flex items-center gap-0.5 rounded bg-amber-400/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-200 backdrop-blur-sm"
+              >
+                <Layers className="h-3 w-3" /> scene assembled
+              </span>
+            ) : null}
           </span>
           {job.source_type === "generative-image" ? (
             <span
@@ -1473,6 +1490,17 @@ function DownloadMenu({ job }: { job: SplatJob }) {
     { url: job.ground_points_url, label: "Ground points", ext: "txt", hint: "PNEZD survey points" },
     { url: job.sections_url, label: "Sections view", ext: "png", hint: "cross-sections vs scene" },
     { url: job.surface_iso_url, label: "3D surface view", ext: "png", hint: "isometric ground TIN" },
+    // Only the APPROVED build — the one mandatory HITL gate P6f exists to
+    // enforce. An unapproved draft stays inside the Scene panel's own
+    // preview-download links, never surfaced here.
+    {
+      url: job.scene?.assemble?.state === "approved" ? `/api/splat/jobs/${job.job_id}/scene/assemble/file?fmt=glb` : null,
+      label: "Scene .glb", ext: "glb", hint: "reassembled scene · fidelity dial · approved",
+    },
+    {
+      url: job.scene?.assemble?.state === "approved" ? `/api/splat/jobs/${job.job_id}/scene/assemble/file?fmt=blend` : null,
+      label: "Scene .blend", ext: "blend", hint: "reassembled scene · Blender-native",
+    },
   ].filter((o) => o.url);
 
   return (

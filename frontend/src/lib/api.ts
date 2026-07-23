@@ -1,4 +1,13 @@
-import type { LangfieldInventoryResult, LangfieldQueryResult, SplatCamerasResponse } from "@/lib/contracts";
+import type {
+  LangfieldInventoryResult,
+  LangfieldQueryResult,
+  SceneAssembleReport,
+  SceneGroundReport,
+  SceneInventoryReport,
+  SceneIsolateReport,
+  SceneProxyReport,
+  SplatCamerasResponse,
+} from "@/lib/contracts";
 import { recordFailedApiCall } from "@/lib/feedback-context";
 
 // Same-origin fetch helper. The splatlab backend proxies /api/* to the portal
@@ -42,4 +51,27 @@ export function fetchLangfieldInventory(jobId: string): Promise<LangfieldInvento
 
 export function fetchSplatCameras(jobId: string, limit = 500): Promise<SplatCamerasResponse> {
   return apiRequest<SplatCamerasResponse>(`/api/splat/jobs/${jobId}/cameras?limit=${limit}`);
+}
+
+// P6 scene-regen lane: on-demand detail reports behind each stage's poll-safe
+// meta["scene"] summary (SplatSceneSummary). Same fmt=report convention every
+// scene/* file route shares.
+export function fetchSceneInventory(jobId: string): Promise<SceneInventoryReport> {
+  return apiRequest<SceneInventoryReport>(`/api/splat/jobs/${jobId}/scene/inventory/file?fmt=report`);
+}
+
+export function fetchSceneIsolate(jobId: string): Promise<SceneIsolateReport> {
+  return apiRequest<SceneIsolateReport>(`/api/splat/jobs/${jobId}/scene/isolate/file?fmt=report`);
+}
+
+export function fetchSceneProxy(jobId: string): Promise<SceneProxyReport> {
+  return apiRequest<SceneProxyReport>(`/api/splat/jobs/${jobId}/scene/proxy/file?fmt=report`);
+}
+
+export function fetchSceneGround(jobId: string): Promise<SceneGroundReport> {
+  return apiRequest<SceneGroundReport>(`/api/splat/jobs/${jobId}/scene/ground/file?fmt=report`);
+}
+
+export function fetchSceneAssemble(jobId: string): Promise<SceneAssembleReport> {
+  return apiRequest<SceneAssembleReport>(`/api/splat/jobs/${jobId}/scene/assemble/file?fmt=report`);
 }
