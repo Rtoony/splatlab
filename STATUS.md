@@ -898,3 +898,76 @@ deliberately NOT behind require_heavy_work_admitted, same policy as /scale).
 - Backlog ideas (NOT started): compass/north arrow in the 3D viewer once located;
   geo-anchored DXF/LandXML export (ties into the deferred survey-export gap);
   batch-locate from a GPS-tagged capture at upload time.
+
+## DIGITAL TWIN KERNEL — P0 through P6a (2026-07-21/22, backfilled 07-22)
+Splat → simplified/georeferenced solids kernel; plan `~/.claude/plans/fuzzy-foraging-moore.md`
+(approved 07-21). This entry condenses P0–P5 (all shipped+deployed 07-21) and closes out P6a
+(07-22) — full detail lives in memory `digital-twin-kernel-program-2026-07-21.md` and
+`~/reports/2026-07-21-twin-kernel-day-digest.md`; this is the durable on-repo summary that was
+previously missing.
+
+- **P0 (e3ad59d/a76202b)**: opt-in `mesh` stage, `POST /jobs/{id}/mesh` — champion TSDF recipe
+  (`gs-mesh o3dtsdf --voxel-size 0.015 --sdf-trunc 0.045 --depth-trunc 6`, `TSDF_ALPHA_MIN=0.5`)
+  ported from `dn-splatter-probe`. Garden reproduces 78.81% LCC.
+- **P1 (30a3550/a2cc5d4)**: `POST /jobs/{id}/geo/contours` — ground extraction (Track C) → cdt
+  `survey_to_surface` → real EX-CONT-MJR/MNR-layer contours. Semantic ground filter (P5a,
+  174f498/bb9af02) via langfield relevancy; section/ISO receipts auto-generated.
+  **GLB gotcha (658718f)**: open3d 0.19 `write_triangle_mesh(.glb)` silently corrupts + returns
+  True — mesh_report.py writes GLB via trimesh + mandatory readback now.
+- **P2 (4cc6705/d66f9e0)**: `POST /jobs/{id}/geo/export` — probe-derived grid calibration (never
+  trust convergence-sign conventions, measure instead) → site.dxf / surface.xml (LandXML) /
+  site.geojson.
+- **P3**: blender-mcp wired (official ahujasid upstream) — Blender 4.5.11 LTS installed
+  separately (system 4.0.2 can't GPU-render Blackwell/5090). Cockpit launcher `blender-cockpit`.
+- **P5b/P5c (9edda81/b4c7891)**: `POST /jobs/{id}/objects {"query": "..."}` — name an object,
+  get isolated splat + mesh + a TripoSplat-generated proxy ICP-registered onto it. Proven on the
+  garden table (icp_fitness 1.0) and, 07-21 field capture, RToony's **fire hydrant**
+  (Santa Rosa, 49 Canon T3i CR2s, all 9 stages green from one POST, object mesh 100% LCC).
+- **WS1/WS2 gates (215630d/2fb5ad7)**: `mesh_gate.py` (PSNR/SSIM/coverage vs source photos) +
+  `mesh_completeness.py` (solid-gaussian distances) — quality receipts, not narrative.
+- **Fix wave (3c9a90b)**: 14 confirmed findings from a 22-agent autonomous review closed in one
+  commit (config-poisoning, guard hoisting, cached-mesh 500s, subset-ckpt leaks, stale-langfield
+  guard, atomic contour staging). 407 tests at close.
+- **ETH3D validation (840b121 + solidify-probe)**: laser-truth harness proves render-health gates
+  (fog/acc) CANNOT certify mesh geometry — courtyard splat HEALTHY yet mesh vs laser = 130-171cm
+  median error (sparse-view regime). Track B (depth-regularized extractors) blocked on a
+  dn-splatter fork `--load-depths` compat bug — needs a proper fork-compat pass, not inline
+  patches. Garden-class dense captures (RToony's actual capture spec) are a different, better
+  regime.
+
+### P6 — Scene Regeneration Lane (SAM3/TRELLIS-class), opened 07-22
+Plan `~/.claude/plans/snazzy-gathering-dahl.md` (approved 07-22): enumerate + batch-isolate +
+batch-proxy + assemble a FULL scene (not just one named object), all-local (SAM 3 + optional
+TRELLIS.2). Doctrine: regenerated scenes are plausible-not-faithful — render/VR lane only,
+mechanically enforced (quarantine dir + manifest + in-file tags + a refusal gate the survey lane
+must fail against).
+
+- **Step 0 de-risk spike: PROVEN, GO for P6b** (`~/tools/scene-regen-spike/STATUS.md`). The one
+  algorithmic bet — SAM 3 text-prompted masks lift cleanly to per-gaussian instance sets via the
+  existing PASS-B depth-gated lift + cross-view majority vote — holds with recipe
+  `--min-views 2 --vote-frac 0.3`. Garden "table"/"flower vase" both PASS (vase lift actually
+  *fixes* a known P5b langfield-query miss). Hydrant misses the pre-registered IoU floor
+  (0.4994 vs 0.5) but root-caused as **reference contamination** (P5b's spatial expansion swept
+  in ground-disc/shadow debris the SAM mask correctly excludes), not a lift failure — precision
+  vs the reference = 1.000.
+- **P6a SHIPPED + gate CLOSED (bdce4d3, then closed out same evening)**: `backend/mesh/
+  provenance.py` (stdlib-only tag + quarantine rules + fail-loud survey-refusal, importable from
+  every env), `proxy_register.py` retrofit (writes `transform_4x4` + `crop_camera_id` +
+  `crop_box` + in-file PLY tag — needs `--crop-json` from `object_crop.py`'s new crop.json
+  side-file), `scene_manifest.py` (schema + atomic writer + fail-loud validator), `sam3_doctor.py`
+  preflight, `tools/gates/gate_p6a_scene_rails.sh`. 427 backend tests (20 new).
+  ⚠️ **Gotcha**: the commit landed while `splatlab.service` was already running (started 16:49,
+  commit at 20:13) — `proxy_register.py`/`object_crop.py` picked up the new code immediately
+  (subprocess-invoked, read fresh each call) but `splat_route.py`'s new `--crop-json` wiring did
+  NOT take effect until `splatlab-safe-restart` ran (it's imported once at process start). A
+  post-commit rebuild without the restart silently produced a proxy.json missing
+  `crop_camera_id` — always restart after a `splat_route.py`-touching deploy, not just when the
+  gate says so.
+  **Runtime close-out**: pinned `splat_513e89171d` (hydrant) + `splat_32d926d9` (garden) as
+  scene-lane sources; restarted the service; rebuilt the hydrant `fire-hydrant` proxy (icp_fitness
+  held at 1.0, `crop_camera_id: 8`). `bash tools/gates/gate_p6a_scene_rails.sh` → **GATE_P6A: PASS**
+  (8/8 checks) — first real structural receipt that P6a actually holds, not just compiles.
+- **Next**: P6b — instance inventory (`POST /jobs/{id}/scene/inventory`, Qwen3-VL nouns ∪
+  langfield vocab → SAM3 all-instances masks → PASS-B lift+vote → `instances.json`), per the
+  approved plan's full spec. P6c–P6f (batch isolate, batch proxy, ground, assembly+Blender) each
+  wait on their own gate/receipt/HITL checkpoint in order.
