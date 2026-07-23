@@ -5293,6 +5293,149 @@ async def get_scene_proxy_file(
     return FileResponse(str(path), media_type=media, filename=path.name)
 
 
+# ── P6e: ground + environment ─────────────────────────────────────────────────
+# Real captured ground gaussians -> a scene-unit TIN -> splat-colored Y-up GLB.
+# Render/VR lane only (provenance:ground-derived) -- deliberately NOT the survey
+# lane (POST /geo/contours, ground_extract.py), which needs a real CRS + geo
+# anchor this scene may not have. Background stays the captured splat; no
+# generative sky/wall fill in this pass.
+SCENE_SEMANTIC_GROUND_SCRIPT = MESH_DIR / "semantic_ground.py"
+GROUND_MESH_BUILD_SCRIPT = MESH_DIR / "ground_mesh_build.py"
+GROUND_MESH_RECEIPT_SCRIPT = MESH_DIR / "ground_mesh_receipt.py"
+SCENE_GROUND_VRAM_MB = 6_000  # checkpoint load + SigLIP2 text encoder
+
+
+class SceneGroundBody(BaseModel):
+    semantic_thresh: float = Field(default=0.5, gt=0.0, lt=1.0)
+    cell_units: float = Field(default=0.03, gt=0.0)
+
+
+@router.post("/jobs/{job_id}/scene/ground")
+async def scene_ground(request: Request, job_id: str, body: SceneGroundBody):
+    """P6e: real captured ground gaussians -> a scene-unit TIN -> a splat-colored
+    Y-up GLB. Loud fail below the ground-coverage floor (never a silent empty
+    mesh) — that's a real scene-content limitation, not toolchain unavailable."""
+    require_heavy_work_admitted()
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    if meta["status"] != "completed":
+        raise HTTPException(status_code=409, detail=f"Ground build requires a completed job. Current status: {meta['status']}")
+    output_dir = Path(meta["output_dir"])
+    gauss_emb = output_dir / LANGFIELD_DIRNAME / "gauss_emb.npz"
+    if not gauss_emb.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail="Ground build needs a built language field — rebuild the scene with Language search on first.",
+        )
+    _langfield_stale_guard(output_dir / LANGFIELD_DIRNAME)
+    config_path = _find_latest_config(output_dir)
+    if config_path is None:
+        raise HTTPException(status_code=409, detail="No splatfacto checkpoint found for this scene.")
+    color_splat = output_dir / "_preview" / "splat.ply"
+    if not color_splat.is_file():
+        raise HTTPException(status_code=409, detail="No exported scene splat.ply available for coloring.")
+    if not (SCENE_SEMANTIC_GROUND_SCRIPT.is_file() and GROUND_MESH_BUILD_SCRIPT.is_file()
+            and TWIN_FINISH_SCRIPT.is_file() and LANGFIELD_ENV_PYTHON.is_file()
+            and MESH_ENV_PYTHON.is_file()):
+        raise HTTPException(status_code=400, detail="Ground-build toolchain unavailable.")
+
+    scene_dir = output_dir / SCENE_DIRNAME
+    out_dir = scene_dir / "ground"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    lock = _mesh_export_lock(job_id)  # one heavy build per job at a time
+    if lock.locked():
+        raise HTTPException(status_code=409, detail=f"A mesh/object/scene build is already running for {job_id}.")
+    async with lock:
+        gg = out_dir / "ground_gaussians.npz"
+
+        async def sem_operation() -> tuple[int, bytes, bytes]:
+            return await _run_capture_subprocess([
+                str(LANGFIELD_ENV_PYTHON), str(SCENE_SEMANTIC_GROUND_SCRIPT),
+                str(gauss_emb), str(config_path), str(gg),
+            ])
+        try:
+            rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
+                lane="scene-ground", operation_id=job_id,
+                vram_mb=SCENE_GROUND_VRAM_MB, operation=sem_operation,
+            )
+        except gpu_arbiter.GPUArbiterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"Semantic ground blocked: {exc}") from exc
+        if rc != 0 or not gg.is_file():
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+            raise HTTPException(status_code=500, detail=f"Semantic ground failed (exit {rc}): {tail}")
+
+        rc, _out, stderr = await _run_capture_subprocess([
+            str(MESH_ENV_PYTHON), str(GROUND_MESH_BUILD_SCRIPT), str(gg), str(out_dir),
+            "--semantic-thresh", str(body.semantic_thresh), "--cell-units", str(body.cell_units),
+        ])
+        if rc != 0 or not (out_dir / "ground_mesh_raw.ply").is_file():
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-8:])
+            raise HTTPException(status_code=500, detail=f"Ground mesh build failed (exit {rc}): {tail}")
+
+        ground_glb = out_dir / "ground_mesh.glb"
+        mpu = meta.get("meters_per_unit")
+        finish_cmd = [
+            str(MESH_ENV_PYTHON), str(TWIN_FINISH_SCRIPT),
+            str(out_dir / "ground_mesh_raw.ply"), str(color_splat), str(ground_glb),
+        ]
+        if mpu:
+            finish_cmd += ["--meters-per-unit", str(mpu)]
+        rc, _out, stderr = await _run_capture_subprocess(finish_cmd)
+        if rc != 0 or not ground_glb.is_file():
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+            raise HTTPException(status_code=500, detail=f"Ground mesh coloring failed (exit {rc}): {tail}")
+
+        await _run_capture_subprocess([  # receipt is best-effort
+            str(MESH_ENV_PYTHON), str(GROUND_MESH_RECEIPT_SCRIPT), str(ground_glb), str(out_dir),
+        ])
+
+        build_report = json.loads((out_dir / "ground_mesh_build.json").read_text())
+        finish_report = (
+            json.loads((out_dir / "twin_finish.json").read_text())
+            if (out_dir / "twin_finish.json").is_file() else {}
+        )
+        report = {"job_id": job_id, **build_report, "finish": finish_report}
+        (out_dir / "ground.report.json").write_text(json.dumps(report, indent=2))
+
+        fresh_scene_meta = (_read_meta(job_id) or {}).get("scene") or {}
+        _patch_meta(job_id, scene={
+            **fresh_scene_meta,
+            "ground": {"ground_points": build_report.get("ground_points"),
+                      "triangles": build_report.get("triangles"), "built_at": _utc_now()},
+        })
+
+    await audit_operator_event(
+        request=request,
+        title="Built scene ground mesh",
+        description=f"{job_id}: {build_report.get('ground_points')} ground points",
+        variant="success",
+        action="splat.scene_ground",
+        target=meta.get("mode", "3d"),
+        metadata={"job_id": job_id},
+    )
+    return report
+
+
+@router.get("/jobs/{job_id}/scene/ground/file")
+async def get_scene_ground_file(job_id: str, fmt: Literal["report", "glb", "top", "oblique"] = "report"):
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    out_dir = _job_dir(job_id) / SCENE_DIRNAME / "ground"
+    if fmt == "report":
+        path, media = out_dir / "ground.report.json", "application/json"
+    elif fmt == "glb":
+        path, media = out_dir / "ground_mesh.glb", "model/gltf-binary"
+    else:
+        path, media = out_dir / f"receipt_{fmt}.png", "image/png"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Ground mesh artifact not built yet")
+    return FileResponse(str(path), media_type=media, filename=path.name)
+
+
 @router.get("/jobs/{job_id}/mesh/file")
 async def get_splat_mesh_file(job_id: str, fmt: Literal["ply", "glb", "twin"] = "ply"):
     # Resolved purely from disk so mesh URLs survive service restarts.

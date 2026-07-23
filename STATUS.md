@@ -1082,3 +1082,28 @@ knowing before P6f assembly. Receipts: `~/Downloads/splatlab-p6d-proxy-triptych-
   contamination gate). A comprehensive multi-agent adversarial review pass over everything
   shipped today (hybrid recall-expand, P6d) plus a fresh look at P6a-c is still queued before
   end of day, per the approved autonomous-run plan.
+
+## P6e SHIPPED + gate PASSING + LIVE-VERIFIED (2026-07-23, autonomous day session)
+`POST /jobs/{id}/scene/ground` — real captured ground gaussians → a scene-unit TIN →
+splat-colored Y-up GLB. Render/VR lane only (`provenance:ground-derived`), deliberately NOT
+the survey lane (`POST /geo/contours`/`ground_extract.py`, which needs a real CRS + geo
+anchor this scene doesn't have — garden has scale but no anchor). New: `backend/mesh/
+ground_mesh_build.py` (reuses `ground_extract.py`'s proven cell-bin + 15th-percentile-z +
+spike-rejection + largest-connected-component algorithm VERBATIM, just staying in scene
+units instead of transforming to ENU/CRS — no geo/scale requirement at all), `backend/
+mesh/ground_mesh_receipt.py` (top+oblique renders, same Open3D EGL `OffscreenRenderer`
+pattern as `mesh_report.py`, `defaultUnlit` shader to read the GLB's baked vertex colors).
+Reused as-is: `semantic_ground.py` (already wired for P5a/geo_route, langfield-spike env),
+`twin_finish.py` (6-NN color transfer from the scene's existing `_preview/splat.ply` — no
+new export needed). 458 tests (5 new). `gate_p6e_ground.sh` — PASS.
+**Live-verified on garden, worked cleanly first try** (no debugging detour, unlike P6d):
+8,578 ground points, 17,139 triangles, real extent 9.25m × 11.51m footprint (0.95m
+vertical range — correctly flat terrain). Receipts show genuinely legible, correctly
+colored ground (green grass, tan pavement patch) in a real, irregular garden-boundary
+shape. Honest finding: one small pyramidal spike artifact visible near center in the
+oblique view — a likely single outlier cell the spike-rejection pass didn't catch: noted,
+not chased further (timeboxed). Receipts: `~/Downloads/splatlab-p6e-ground-*.png`.
+- **Next**: P6f — assembly + Blender + contamination gate (final P6 phase). Per the
+  approved autonomous-run plan, a comprehensive multi-agent adversarial review pass over
+  everything shipped today (hybrid recall-expand, P6d, P6e) plus a fresh look at P6a-c
+  comes before end-of-day, ahead of or alongside P6f depending on remaining time budget.
