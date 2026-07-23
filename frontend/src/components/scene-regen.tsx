@@ -280,32 +280,34 @@ export default function SceneRegenModal({ job, onClose }: { job: SplatJob; onClo
         </div>
 
         <div className="flex-1 overflow-y-auto p-4">
-          {activeStage === "inventory" && (
-            <InventoryPanel jobId={jobId} scene={scene} busy={busy} mutation={inventoryMutation} openLightbox={setLightbox} />
-          )}
-          {activeStage === "isolate" && (
-            <IsolatePanel jobId={jobId} scene={scene} busy={busy} mutation={isolateMutation} openLightbox={setLightbox} />
-          )}
-          {activeStage === "proxy" && (
-            <ProxyPanel jobId={jobId} scene={scene} busy={busy} mutation={proxyMutation} openLightbox={setLightbox} />
-          )}
-          {activeStage === "ground" && (
-            <GroundPanel jobId={jobId} scene={scene} busy={busy} mutation={groundMutation} openLightbox={setLightbox} />
-          )}
-          {activeStage === "assemble" && (
-            <AssemblePanel
-              jobId={jobId}
-              scene={scene}
-              busy={busy}
-              assembleMutation={assembleMutation}
-              approveMutation={approveMutation}
-              fidelityMode={fidelityMode}
-              setFidelityMode={setFidelityMode}
-              overrides={overrides}
-              setOverrides={setOverrides}
-              openLightbox={setLightbox}
-            />
-          )}
+          <div className="mx-auto max-w-4xl">
+            {activeStage === "inventory" && (
+              <InventoryPanel jobId={jobId} scene={scene} busy={busy} mutation={inventoryMutation} openLightbox={setLightbox} />
+            )}
+            {activeStage === "isolate" && (
+              <IsolatePanel jobId={jobId} scene={scene} busy={busy} mutation={isolateMutation} openLightbox={setLightbox} />
+            )}
+            {activeStage === "proxy" && (
+              <ProxyPanel jobId={jobId} scene={scene} busy={busy} mutation={proxyMutation} openLightbox={setLightbox} />
+            )}
+            {activeStage === "ground" && (
+              <GroundPanel jobId={jobId} scene={scene} busy={busy} mutation={groundMutation} openLightbox={setLightbox} />
+            )}
+            {activeStage === "assemble" && (
+              <AssemblePanel
+                jobId={jobId}
+                scene={scene}
+                busy={busy}
+                assembleMutation={assembleMutation}
+                approveMutation={approveMutation}
+                fidelityMode={fidelityMode}
+                setFidelityMode={setFidelityMode}
+                overrides={overrides}
+                setOverrides={setOverrides}
+                openLightbox={setLightbox}
+              />
+            )}
+          </div>
         </div>
       </div>
       {lightbox && <ReceiptLightbox src={lightbox} onClose={() => setLightbox(null)} />}
