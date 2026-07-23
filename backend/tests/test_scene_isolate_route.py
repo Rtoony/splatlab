@@ -125,6 +125,33 @@ def test_scene_isolate_full_build(client, monkeypatch):
         assert resp.status_code == 200, fmt
 
 
+def test_scene_isolate_recall_expand_requires_langfield(client):
+    http, outputs = client
+    _mk_job_with_inventory(outputs)  # no _langfield dir
+    r = http.post("/api/splat/jobs/splat_0b0003/scene/isolate", json={"recall_expand": True})
+    assert r.status_code == 409
+    assert "language field" in r.json()["detail"].lower()
+
+
+def test_scene_isolate_recall_expand_passes_flags(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job_with_inventory(outputs)
+    lf = job_dir / splat_route.LANGFIELD_DIRNAME
+    lf.mkdir()
+    (lf / "gauss_emb.npz").write_bytes(b"npz")
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(calls))
+
+    r = http.post("/api/splat/jobs/splat_0b0003/scene/isolate",
+                  json={"recall_expand": True, "dilation_mult": 15.0, "rel_floor": 0.25})
+    assert r.status_code == 200
+    joined = " ".join(str(c) for c in calls[0])
+    assert "--recall-expand" in joined
+    assert "--dilation-mult 15.0" in joined
+    assert "--rel-floor 0.25" in joined
+    assert str(lf / "gauss_emb.npz") in joined
+
+
 def test_scene_isolate_object_path_traversal_404(client):
     http, outputs = client
     _mk_job_with_inventory(outputs)

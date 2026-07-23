@@ -33,6 +33,11 @@ assert len(built) >= 1, 'no instances built'
   check "garden background.ply present" test -f "$GARDEN/_scene/isolated/background.ply"
   check "garden background-removed receipt present" bash -c \
     "ls '$GARDEN/_scene/isolated'/receipt_background_cam_*.png >/dev/null 2>&1"
+  check "recall_expand flag recorded in report" python3 -c "
+import json
+r = json.load(open('$REPORT'))
+assert 'recall_expand' in r, 'batch_isolate.py predates the recall_expand field'
+"
 else
   say "SKIP" "batch_isolate.json not built yet (run POST /jobs/{id}/scene/isolate first)"
 fi

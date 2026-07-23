@@ -4993,6 +4993,13 @@ _SCENE_ISOLATE_NAME_RE = re.compile(r"[a-z0-9-]{1,40}")
 class SceneIsolateBody(BaseModel):
     min_members: int = Field(default=200, ge=1, le=100_000)
     views: int = Field(default=2, ge=1, le=8)
+    # hybrid-recall-probe (2026-07-23): SAM3-core + spatially-bounded relevancy-gated
+    # expansion. PROVEN to reduce ghost-disc residue on garden-class (multi-object,
+    # well-covered) scenes; PROVEN INSUFFICIENT on hydrant-class (tight, dense,
+    # single-object close-up) scenes. Opt-in on purpose, not a default.
+    recall_expand: bool = False
+    dilation_mult: float = Field(default=10.0, gt=0.0, le=100.0)
+    rel_floor: float = Field(default=0.30, gt=0.0, lt=1.0)
 
 
 @router.post("/jobs/{job_id}/scene/isolate")
@@ -5018,6 +5025,9 @@ async def scene_batch_isolate(request: Request, job_id: str, body: SceneIsolateB
         raise HTTPException(status_code=409, detail="No splatfacto checkpoint found for this scene.")
     if not (BATCH_ISOLATE_SCRIPT.is_file() and LANGFIELD_ENV_PYTHON.is_file()):
         raise HTTPException(status_code=400, detail="Batch-isolation toolchain unavailable.")
+    gauss_emb = output_dir / LANGFIELD_DIRNAME / "gauss_emb.npz"
+    if body.recall_expand and not gauss_emb.is_file():
+        raise HTTPException(status_code=409, detail="recall_expand needs a built language field.")
 
     out_dir = scene_dir / "isolated"
 
@@ -5030,6 +5040,9 @@ async def scene_batch_isolate(request: Request, job_id: str, body: SceneIsolateB
             str(config_path), str(scene_dir), str(out_dir),
             "--min-members", str(body.min_members), "--views", str(body.views),
         ]
+        if body.recall_expand:
+            cmd += ["--recall-expand", "--gauss-emb", str(gauss_emb),
+                   "--dilation-mult", str(body.dilation_mult), "--rel-floor", str(body.rel_floor)]
 
         async def isolate_operation() -> tuple[int, bytes, bytes]:
             return await _run_capture_subprocess(cmd)

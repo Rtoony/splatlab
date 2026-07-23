@@ -1014,6 +1014,36 @@ must fail against).
   remain. Not a bug; a real limitation to weigh for P6e/P6f (a hole-fill/backdrop-completion
   probe is already parked in P6x if graded unacceptable). Receipts:
   `~/Downloads/splatlab-scene-isolate-garden-background*.png`.
+
+## HYBRID RECALL-EXPANSION — `--recall-expand` on batch_isolate.py (2026-07-23, autonomous day session)
+RToony's question after seeing the ghost-disc finding: combine SAM3's precision with the
+older DBSCAN+expand approach's recall? Probed in `~/tools/hybrid-recall-probe/` (full
+writeup + both scene-class verdicts there). **Answer: yes, but scene-class-dependent —
+shipped as opt-in, not a default.**
+- **Mechanism**: SAM3 core (trusted identity) → KDTree radius query around the core's own
+  members (shell dilation, radius = `dilation_mult` × the scene's typical nearest-neighbor
+  spacing — scale-invariant, not object-size-based) → kept only if SigLIP relevancy to the
+  instance's own label clears `rel_floor` (reuses `gauss_emb.npz`, no model reload for the
+  lookup). Reuses `object_isolate.py`'s proven relevancy math.
+- **PROVEN on garden** (multi-object, 971 dense views): `dilation_mult=10, rel_floor=0.30`
+  — table core 38,327→41,273 (+7.7%), the large translucent ghost disc from the original
+  P6c run substantially cleared; grass/pavement/hedge/ball stayed clean (no debris pulled
+  in). Live-verified through the production route (`{"recall_expand": true}`), receipts:
+  `~/Downloads/splatlab-p6c-recall-expand-garden-final*.png`.
+- **PROVEN INSUFFICIENT on hydrant** (single-object, 49 tight close-up photos): core-only
+  removal (14,295 members) left the hydrant visually almost fully intact; `dilation_mult=10`
+  barely moved it (verified NOT a code bug — opacity zeroing measurably applied, `opac.sum()`
+  dropped by 11,236.8). A tight close-up capture has far more locally-redundant/overlapping
+  gaussians contributing to an object's visual mass than either SAM3's mask or a modest
+  dilation reaches — a deeper, different problem than garden's ghost-disc, left unsolved
+  and explicitly flagged rather than force-fit.
+- **Separate honest finding (garden vase)**: the dried flower/frond sticking out of the vase
+  was never claimed by SAM3's "flower vase" core at all (a masking-granularity question, not
+  a recall-expansion bug) — stays visible in both before/after as real background content.
+- Shipped: `batch_isolate.py --recall-expand --gauss-emb <path> [--dilation-mult 10]
+  [--rel-floor 0.30]`; route body `{"recall_expand": bool, "dilation_mult": float,
+  "rel_floor": float}` on `POST /scene/isolate` (needs a built language field). 448 tests
+  (2 new). `gate_p6c_batch_isolate.sh` extended, still PASS.
 - **Next**: P6d — batch proxy + gated registration (loop unchanged P5c per instance under ONE
   20GB TripoSplat lease; `SKIPPED:<reason>` degrades to `provenance:captured`, never aborts).
   P6e (ground/environment), P6f (assembly+Blender+contamination gate) follow in order, each

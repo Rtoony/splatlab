@@ -11,10 +11,24 @@ the write_splat_ply convention from object_isolate.py / the proven
 langfield-isolate-probe/isolate_export.py (same "sanity_sum_ok" accounting:
 claimed + background == total, exactly once each).
 
+Optional --recall-expand (hybrid-recall-probe, 2026-07-23, RToony's question
+"combine SAM3 precision with DBSCAN-expand recall?"): SAM3's tight core is
+high-precision but incomplete-recall, leaving translucent "ghost" residue in
+the background render. This step expands each core by a small, scale-invariant
+spatial shell (KDTree radius = a few typical nearest-neighbor spacings, NOT a
+fraction of the object's own size) kept only where SigLIP relevancy to the
+instance's own label clears a floor (reuses object_isolate.py's relevancy math
++ the scene's existing gauss_emb.npz -- no model reload for the lookup itself).
+PROVEN to meaningfully reduce ghost residue on garden-class (multi-object,
+well-covered) scenes; PROVEN INSUFFICIENT on hydrant-class (tight, dense,
+single-object close-up) scenes -- see ~/tools/hybrid-recall-probe/STATUS.md.
+Opt-in and scene-class-dependent on purpose; not a default.
+
 Runs in the langfield-spike env.
 
 Usage: batch_isolate.py <config.yml> <scene_dir> <out_dir>
        [--min-members 200] [--views 2]
+       [--recall-expand --gauss-emb <path> [--dilation-mult 10] [--rel-floor 0.30]]
 """
 import argparse
 import json
@@ -23,6 +37,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.spatial import cKDTree
 
 _orig_load = torch.load
 
@@ -42,6 +57,7 @@ DEV = "cuda"
 PLY_FIELDS = ["x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity",
               "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"]
 SH_C0 = 0.28209479177387814  # SH0 -> diffuse RGB, standard 3DGS constant
+RELEVANCY_NEGATIVES = ["object", "things", "stuff", "texture", "surface"]  # LERF canon
 
 
 def write_splat_ply(path: Path, xyz, f_dc, opacity, scale, rot) -> None:
@@ -63,6 +79,15 @@ def write_splat_ply(path: Path, xyz, f_dc, opacity, scale, rot) -> None:
         fh.write(rows.tobytes())
 
 
+def typical_spacing(means_np: np.ndarray, tree: cKDTree, sample: int = 5000) -> float:
+    """Median nearest-neighbor distance over a random sample -- a
+    scale-invariant "one gaussian width" estimate for this scene."""
+    n = means_np.shape[0]
+    idx = np.random.default_rng(0).choice(n, size=min(sample, n), replace=False)
+    d, _ = tree.query(means_np[idx], k=2)  # k=1 is self (d=0)
+    return float(np.median(d[:, 1]))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("config", type=Path)
@@ -70,8 +95,20 @@ def main() -> int:
     ap.add_argument("out_dir", type=Path)
     ap.add_argument("--min-members", type=int, default=200)
     ap.add_argument("--views", type=int, default=2)
+    ap.add_argument("--recall-expand", action="store_true",
+                    help="hybrid SAM3-core + spatially-bounded relevancy-gated expansion "
+                         "(proven on garden-class scenes, NOT sufficient for tight/dense "
+                         "single-object captures -- see hybrid-recall-probe/STATUS.md)")
+    ap.add_argument("--gauss-emb", type=Path, default=None,
+                    help="required with --recall-expand")
+    ap.add_argument("--dilation-mult", type=float, default=10.0)
+    ap.add_argument("--rel-floor", type=float, default=0.30)
     args = ap.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    if args.recall_expand and not (args.gauss_emb and args.gauss_emb.is_file()):
+        print("FATAL: --recall-expand requires --gauss-emb pointing at a real file",
+              file=sys.stderr)
+        return 1
 
     inventory = json.loads((args.scene_dir / "inventory.json").read_text())
     instances = inventory.get("instances", [])  # already size-sorted desc by P6b
@@ -86,6 +123,54 @@ def main() -> int:
     scale_np = m.scales.detach().cpu().numpy()
     rot_np = m.quats.detach().cpu().numpy()
 
+    rel_cache: dict[str, np.ndarray] = {}
+    spatial_tree = None
+    dilation_radius = None
+    if args.recall_expand:
+        import torch as _torch
+        from transformers import AutoModel, AutoProcessor
+
+        spatial_tree = cKDTree(means_np)
+        dilation_radius = args.dilation_mult * typical_spacing(means_np, spatial_tree)
+        print(f"[batch-isolate] recall-expand ON: dilation radius={dilation_radius:.5f} "
+              f"({args.dilation_mult}x typical spacing)", flush=True)
+
+        d = np.load(args.gauss_emb)
+        feat = _torch.tensor(d["gauss_emb"]).float().to(DEV)
+        seen = d["seen"].astype(bool)
+        if feat.shape[0] != N:
+            print(f"FATAL: gauss_emb rows ({feat.shape[0]}) != checkpoint gaussians ({N}) "
+                  "-- stale lift, refusing", file=sys.stderr)
+            return 1
+
+        siglip = AutoModel.from_pretrained(
+            "google/siglip2-so400m-patch16-384", dtype=_torch.float16, attn_implementation="sdpa"
+        ).to(DEV).eval()
+        proc = AutoProcessor.from_pretrained("google/siglip2-so400m-patch16-384")
+
+        @_torch.no_grad()
+        def text_emb(prompts):
+            inp = proc(text=list(prompts), padding="max_length", max_length=64,
+                       truncation=True, return_tensors="pt").to(DEV)
+            e = siglip.get_text_features(**inp).pooler_output
+            return _torch.nn.functional.normalize(e.float(), dim=-1)
+
+        neg = text_emb(RELEVANCY_NEGATIVES)
+
+        def relevancy_for(label: str) -> np.ndarray:
+            if label in rel_cache:
+                return rel_cache[label]
+            q = text_emb([label])
+            with _torch.no_grad():
+                sim_q = (feat @ q.T).squeeze(-1)
+                sim_n = feat @ neg.T
+                pair = _torch.stack([sim_q[:, None].expand(-1, sim_n.shape[1]), sim_n], dim=-1)
+                rel = _torch.softmax(pair * 10.0, dim=-1)[..., 0].min(dim=1).values
+            rel[~_torch.tensor(seen, device=DEV)] = 0.0
+            rel_np = rel.cpu().numpy()
+            rel_cache[label] = rel_np
+            return rel_np
+
     claimed = np.zeros(N, dtype=bool)
     results = []
     for inst in instances:
@@ -95,14 +180,28 @@ def main() -> int:
             results.append({"slug": slug, "label": inst["label"],
                             "status": "SKIPPED:indices-file-missing"})
             continue
-        idx = np.load(npz_path)["indices"]
+        core = np.unique(np.load(npz_path)["indices"])
+        idx = core
+        expand_stats = None
+        if args.recall_expand:
+            core_mask = np.zeros(N, dtype=bool)
+            core_mask[core] = True
+            neighbor_sets = spatial_tree.query_ball_point(means_np[core], r=dilation_radius)
+            candidates = np.unique(np.concatenate(
+                [np.asarray(s, dtype=np.int64) for s in neighbor_sets])) if len(neighbor_sets) else core
+            candidates = candidates[~core_mask[candidates]]
+            rel_np = relevancy_for(inst["label"])
+            kept = candidates[rel_np[candidates] >= args.rel_floor]
+            idx = np.union1d(core, kept)
+            expand_stats = {"candidates_n": int(candidates.size), "kept_n": int(kept.size)}
+
         dedup = idx[~claimed[idx]]  # first-claim-wins: larger instances went first
         n_overlap_removed = int(idx.size - dedup.size)
         if dedup.size < args.min_members:
             results.append({
                 "slug": slug, "label": inst["label"],
                 "n_members_original": int(idx.size), "n_overlap_removed": n_overlap_removed,
-                "status": "SKIPPED:too-few-members-after-dedup",
+                "recall_expand": expand_stats, "status": "SKIPPED:too-few-members-after-dedup",
             })
             continue
         claimed[dedup] = True
@@ -114,7 +213,7 @@ def main() -> int:
         results.append({
             "slug": slug, "label": inst["label"],
             "n_members_original": int(idx.size), "n_overlap_removed": n_overlap_removed,
-            "n_members_final": int(dedup.size), "status": "built",
+            "n_members_final": int(dedup.size), "recall_expand": expand_stats, "status": "built",
         })
 
     background_mask = ~claimed
@@ -164,7 +263,8 @@ def main() -> int:
     except Exception as e:                            # receipt is best-effort
         print(f"[batch-isolate] receipt render failed (non-fatal): {e}", flush=True)
 
-    report = {"n_gaussians": N, "instances": results, "sanity": sanity}
+    report = {"n_gaussians": N, "recall_expand": bool(args.recall_expand),
+              "instances": results, "sanity": sanity}
     (args.out_dir / "batch_isolate.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report))
     return 0
