@@ -967,7 +967,31 @@ must fail against).
   scene-lane sources; restarted the service; rebuilt the hydrant `fire-hydrant` proxy (icp_fitness
   held at 1.0, `crop_camera_id: 8`). `bash tools/gates/gate_p6a_scene_rails.sh` → **GATE_P6A: PASS**
   (8/8 checks) — first real structural receipt that P6a actually holds, not just compiles.
-- **Next**: P6b — instance inventory (`POST /jobs/{id}/scene/inventory`, Qwen3-VL nouns ∪
-  langfield vocab → SAM3 all-instances masks → PASS-B lift+vote → `instances.json`), per the
-  approved plan's full spec. P6c–P6f (batch isolate, batch proxy, ground, assembly+Blender) each
-  wait on their own gate/receipt/HITL checkpoint in order.
+- **P6b SHIPPED + gate PASSING + LIVE-VERIFIED (2026-07-22 night)**: `POST /jobs/{id}/scene/
+  inventory` — enumerates every object in a scene, not just one named query. New:
+  `backend/mesh/scene_views.py` (K evenly-spaced views, adapted from the spike's select_views.py),
+  `backend/mesh/noun_consolidate.py` (clean/dedupe candidate nouns via SigLIP-cosine + curated
+  STUFF_TERMS ground/vegetation split — pure-stdlib classify_stuff/clean_nouns, heavy SigLIP import
+  isolated inside siglip_dedupe() so the module imports with zero ML deps), `backend/mesh/
+  scene_sam3_masks.py` (one SAM3 model load, loops every "thing" noun × view), `backend/mesh/
+  instance_lift.py` (the productionized multi-noun PASS-B lift+vote, conservation bookkeeping,
+  optional regression vs known `_objects/*/object_indices.npz`, receipts). Route mirrors `/objects`
+  (lock, arbiter lanes `scene-views`/`scene-sam3`/`scene-lift`, 409 contracts, sam3_doctor preflight
+  BEFORE any GPU work). `nouns` body field is an explicit override that skips Qwen3-VL/langfield
+  auto-sourcing entirely — the cheap HITL safety valve. Real captured gaussians only, no generative
+  tag needed (P6d proxies are where that applies). 442 tests (15 new). `tools/gates/
+  gate_p6b_instance_inventory.sh` — PASS.
+  **Live run on garden (`splat_32d926d9`, auto-sourced, no explicit nouns)**: Qwen3-VL proposed
+  "round wooden table", "flower vase", "blue ball" (langfield-vocab worker was inactive this run —
+  fail-soft, VL-only sourcing). Table: 38,327 members, 8/8 views, regression IoU 0.7656 vs the
+  known reference (recall 0.8115/precision 0.9312) — matches the Step 0 spike's 0.764. **Flower
+  vase: 1,198 members — EXACT match to the Step 0 spike's number**, strong cross-validation that
+  production faithfully reproduces the proven mechanism. "Blue ball" (a real object under the
+  table, confirmed in the crop receipt) correctly VETOED rather than hallucinated — SAM3/lift
+  declined an unconfident detection instead of fabricating one. Conservation held (39,525 claimed,
+  0 overlap). Receipts: `~/projects/splatcli/outputs/3d/splat_32d926d9/_scene/` (overlay +
+  per-instance crops) — RToony's eyeball grade is the next checkpoint per the HITL doctrine.
+- **Next**: P6c — batch isolation + background remainder (loop `object_isolate.py` per confirmed
+  instance, `background.ply` complement). P6d (batch proxy+registration), P6e (ground/environment),
+  P6f (assembly+Blender+contamination gate) follow in order, each behind its own gate/receipt/HITL
+  checkpoint per the approved plan.

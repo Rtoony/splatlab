@@ -20,6 +20,7 @@ The 4D pipeline is deferred until the 3D path is validated end-to-end.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -4707,6 +4708,277 @@ async def get_splat_object_file(
         raise HTTPException(status_code=404, detail="Object artifact not built yet")
     suffix = Path(rel).suffix.lstrip(".")
     return FileResponse(str(path), media_type=media, filename=f"{job_id}-{slug}.{suffix}")
+
+
+# ── P6b: scene instance inventory (SAM3/TRELLIS-class scene regeneration) ────────
+# Enumerates EVERY distinct object in a scene, not just one named query — the
+# P5b/P5c isolate->proxy pipeline generalized across the whole capture. Real
+# captured gaussians only (no generation), so no provenance tag on the outputs;
+# quarantine/tagging is a P6d (proxy) concern. Mechanism proven in the Step 0
+# de-risk spike (~/tools/scene-regen-spike/STATUS.md, 2026-07-22): SAM 3
+# text-prompted masks lift cleanly via the existing PASS-B depth-gated
+# projection + cross-view majority vote, recipe --min-views 2 --vote-frac 0.3.
+SCENE_DIRNAME = "_scene"
+SAM3_ENV_PYTHON = Path.home() / "miniconda3" / "envs" / "sam3" / "bin" / "python"
+SCENE_VIEWS_SCRIPT = MESH_DIR / "scene_views.py"
+NOUN_CONSOLIDATE_SCRIPT = MESH_DIR / "noun_consolidate.py"
+SCENE_SAM3_SCRIPT = MESH_DIR / "scene_sam3_masks.py"
+INSTANCE_LIFT_SCRIPT = MESH_DIR / "instance_lift.py"
+SAM3_DOCTOR_SCRIPT = MESH_DIR / "sam3_doctor.py"
+SCENE_VIEWS_VRAM_MB = 6_000     # checkpoint load, same class as object-isolate
+SAM3_VRAM_MB = 10_000           # SAM 3.1 multiplex checkpoint + working set (spike-measured class)
+SCENE_LIFT_VRAM_MB = 6_000      # checkpoint load + per-view rasterizations
+QWEN_VL_MODEL = "qwen3-vl:8b"
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+_NOUNS_JSON_RE = re.compile(r"\[.*\]", re.S)
+
+
+async def _qwen_vl_nouns(frame_paths: list[Path]) -> list[str]:
+    """Ask the local Qwen3-VL for distinct physical object nouns visible across
+    these frames. keep_alive:0 unloads it immediately after — this is an
+    occasional call, not a resident service. Best-effort: any failure returns
+    [] and the caller falls back to the langfield vocab alone."""
+    if not frame_paths:
+        return []
+    images = [base64.b64encode(p.read_bytes()).decode("ascii") for p in frame_paths]
+    prompt = (
+        "List the distinct physical objects visible across these photos of one "
+        "scene. Reply with ONLY a JSON array of short noun phrases (2-4 words "
+        "each), no duplicates, no ground/sky/background/vegetation entries, "
+        'e.g. ["round wooden table", "flower vase"].'
+    )
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=2.0)) as client:
+            resp = await client.post(f"{OLLAMA_URL}/api/chat", json={
+                "model": QWEN_VL_MODEL,
+                "messages": [{"role": "user", "content": prompt, "images": images}],
+                "stream": False,
+                "keep_alive": 0,
+            })
+        if resp.status_code != 200:
+            return []
+        text = resp.json().get("message", {}).get("content", "")
+    except Exception:
+        return []
+    match = _NOUNS_JSON_RE.search(text)
+    if not match:
+        return []
+    try:
+        nouns = json.loads(match.group(0))
+    except Exception:
+        return []
+    return [str(n) for n in nouns if isinstance(n, str)]
+
+
+class SceneInventoryBody(BaseModel):
+    # Explicit override — skips Qwen3-VL + langfield-vocab auto-sourcing
+    # entirely. The cheap safety valve for the "contact sheet published for
+    # optional edit" HITL posture: re-POST with a corrected list.
+    nouns: list[str] | None = None
+    max_nouns: int = Field(default=12, ge=1, le=24)
+    views: int = Field(default=8, ge=4, le=16)
+    # Step 0 spike-proven recipe (2026-07-22): min-views 2 kills single-view
+    # ghosts, vote-frac 0.3 recovers backside gaussians.
+    min_views: int = Field(default=2, ge=1, le=8)
+    vote_frac: float = Field(default=0.3, gt=0.0, lt=1.0)
+    ref_regression: bool = True  # informative IoU vs known _objects/*/object_indices.npz
+
+
+@router.post("/jobs/{job_id}/scene/inventory")
+async def scene_inventory(request: Request, job_id: str, body: SceneInventoryBody):
+    """P6b: name every object in the scene at once. Qwen3-VL nouns from ~8
+    renders (unioned with the langfield vocab, deduped) -> SAM 3 all-instances
+    masks per noun -> PASS-B lift + majority vote -> instances.json. HITL
+    posture: rule-driven auto-approve — this builds and returns the contact
+    sheet; RToony reviews async and can re-POST with an explicit `nouns` list
+    to override."""
+    require_heavy_work_admitted()
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    if meta["status"] != "completed":
+        raise HTTPException(status_code=409, detail=f"Scene inventory requires a completed job. Current status: {meta['status']}")
+    output_dir = Path(meta["output_dir"])
+    gauss_emb = output_dir / LANGFIELD_DIRNAME / "gauss_emb.npz"
+    if not gauss_emb.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail="Scene inventory needs a built language field — rebuild the scene with Language search on first.",
+        )
+    _langfield_stale_guard(output_dir / LANGFIELD_DIRNAME)
+    config_path = _find_latest_config(output_dir)
+    if config_path is None:
+        raise HTTPException(status_code=409, detail="No splatfacto checkpoint found for this scene.")
+    if not (SCENE_VIEWS_SCRIPT.is_file() and SCENE_SAM3_SCRIPT.is_file()
+            and INSTANCE_LIFT_SCRIPT.is_file() and NOUN_CONSOLIDATE_SCRIPT.is_file()
+            and LANGFIELD_ENV_PYTHON.is_file() and SAM3_ENV_PYTHON.is_file()):
+        raise HTTPException(status_code=400, detail="Scene-inventory toolchain unavailable.")
+    # Preflight BEFORE any GPU work (same doctrine as the proxy-lane preflight —
+    # review finding 2026-07-21: used to run three subprocesses and then 400).
+    rc, _out, stderr = await _run_capture_subprocess([str(SAM3_ENV_PYTHON), str(SAM3_DOCTOR_SCRIPT)])
+    if rc != 0:
+        tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+        raise HTTPException(status_code=400, detail=f"SAM 3 toolchain unhealthy: {tail}")
+
+    scene_dir = output_dir / SCENE_DIRNAME
+    scene_dir.mkdir(parents=True, exist_ok=True)
+    workdir = scene_dir / "_work"
+    workdir.mkdir(exist_ok=True)
+
+    lock = _mesh_export_lock(job_id)  # one heavy build per job at a time
+    if lock.locked():
+        raise HTTPException(status_code=409, detail=f"A mesh/object/scene build is already running for {job_id}.")
+    async with lock:
+        async def views_operation() -> tuple[int, bytes, bytes]:
+            return await _run_capture_subprocess([
+                str(LANGFIELD_ENV_PYTHON), str(SCENE_VIEWS_SCRIPT),
+                str(config_path), str(workdir), str(body.views),
+            ])
+        try:
+            rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
+                lane="scene-views", operation_id=job_id,
+                vram_mb=SCENE_VIEWS_VRAM_MB, operation=views_operation,
+            )
+        except gpu_arbiter.GPUArbiterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"Scene view export blocked: {exc}") from exc
+        if rc != 0 or not (workdir / "views.json").is_file():
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+            raise HTTPException(status_code=500, detail=f"Scene view export failed (exit {rc}): {tail}")
+
+        vetoed_sourcing: list[dict] = []
+        if body.nouns:
+            raw_nouns = list(body.nouns)
+        else:
+            frame_paths = sorted((workdir / "frames").glob("cam_*.png"))
+            vl_nouns = await _qwen_vl_nouns(frame_paths)
+            lf_result = await _langfield_worker_inventory(str(config_path), str(output_dir / LANGFIELD_DIRNAME))
+            lf_nouns = [item.get("label", "") for item in (lf_result or {}).get("items", []) if item.get("label")]
+            raw_nouns = vl_nouns + lf_nouns
+            if not raw_nouns:
+                vetoed_sourcing.append({"noun": None, "reason": "Qwen3-VL and langfield vocab both returned nothing"})
+
+        raw_path = workdir / "raw_nouns.json"
+        raw_path.write_text(json.dumps(raw_nouns))
+        nouns_path = workdir / "nouns.json"
+        rc, _out, stderr = await _run_capture_subprocess([
+            str(LANGFIELD_ENV_PYTHON), str(NOUN_CONSOLIDATE_SCRIPT),
+            str(raw_path), str(nouns_path), "--max-nouns", str(body.max_nouns),
+        ])
+        if rc != 0:
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+            raise HTTPException(status_code=500, detail=f"Noun consolidation failed (exit {rc}): {tail}")
+        consolidated = json.loads(nouns_path.read_text())
+        things = consolidated["things"]
+        vetoed_stuff = [
+            {"noun": n, "reason": "classified as ground/vegetation (stuff), not a proxy candidate"}
+            for n in consolidated["stuff"]
+        ]
+
+        if not things:
+            report = {
+                "job_id": job_id, "things": [], "instances": [],
+                "vetoed": vetoed_sourcing + vetoed_stuff,
+                "consolidated": consolidated,
+            }
+            (scene_dir / "inventory.json").write_text(json.dumps(report, indent=2))
+            shutil.rmtree(workdir, ignore_errors=True)
+            _patch_meta(job_id, scene={"inventory": {"n_instances": 0, "built_at": _utc_now()}})
+            return report
+
+        things_path = workdir / "things.json"
+        things_path.write_text(json.dumps(things))
+
+        async def sam3_operation() -> tuple[int, bytes, bytes]:
+            return await _run_capture_subprocess([
+                str(SAM3_ENV_PYTHON), str(SCENE_SAM3_SCRIPT), str(workdir), str(things_path),
+            ])
+        try:
+            rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
+                lane="scene-sam3", operation_id=job_id,
+                vram_mb=SAM3_VRAM_MB, operation=sam3_operation,
+            )
+        except gpu_arbiter.GPUArbiterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"Scene SAM3 masking blocked: {exc}") from exc
+        if rc != 0:
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+            raise HTTPException(status_code=500, detail=f"Scene SAM3 masking failed (exit {rc}): {tail}")
+
+        ref_dir = output_dir / OBJECTS_DIRNAME if body.ref_regression else None
+        lift_cmd = [
+            str(LANGFIELD_ENV_PYTHON), str(INSTANCE_LIFT_SCRIPT),
+            str(config_path), str(workdir), str(things_path), str(scene_dir),
+            "--min-views", str(body.min_views), "--vote-frac", str(body.vote_frac),
+        ]
+        if ref_dir and ref_dir.is_dir():
+            lift_cmd += ["--ref-dir", str(ref_dir)]
+
+        async def lift_operation() -> tuple[int, bytes, bytes]:
+            return await _run_capture_subprocess(lift_cmd)
+        try:
+            rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
+                lane="scene-lift", operation_id=job_id,
+                vram_mb=SCENE_LIFT_VRAM_MB, operation=lift_operation,
+            )
+        except gpu_arbiter.GPUArbiterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"Scene lift blocked: {exc}") from exc
+        if rc != 0 or not (scene_dir / "instances.json").is_file():
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+            raise HTTPException(status_code=500, detail=f"Scene lift failed (exit {rc}): {tail}")
+
+        lift_report = json.loads((scene_dir / "instances.json").read_text())
+        lift_report["vetoed"] = vetoed_sourcing + vetoed_stuff + lift_report.get("vetoed", [])
+        lift_report["consolidated"] = consolidated
+        lift_report["job_id"] = job_id
+        (scene_dir / "inventory.json").write_text(json.dumps(lift_report, indent=2))
+        shutil.rmtree(workdir, ignore_errors=True)  # frames/masks scratch, can be multi-GB
+
+        _patch_meta(job_id, scene={"inventory": {
+            "n_instances": len(lift_report["instances"]),
+            "n_vetoed": len(lift_report["vetoed"]),
+            "conservation": lift_report.get("conservation"),
+            "built_at": _utc_now(),
+        }})
+
+    await audit_operator_event(
+        request=request,
+        title="Built scene instance inventory",
+        description=f"{job_id}: {len(lift_report['instances'])} instance(s)",
+        variant="success",
+        action="splat.scene_inventory",
+        target=meta.get("mode", "3d"),
+        metadata={"job_id": job_id, "n_instances": len(lift_report["instances"])},
+    )
+    return lift_report
+
+
+@router.get("/jobs/{job_id}/scene/inventory/file")
+async def get_scene_inventory_file(
+    job_id: str,
+    fmt: Literal["report", "overlay", "crop"] = "report",
+    name: str | None = None,
+):
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    scene_dir = _job_dir(job_id) / SCENE_DIRNAME
+    if fmt == "report":
+        path, media = scene_dir / "inventory.json", "application/json"
+    elif fmt == "crop":
+        if not name or not re.fullmatch(r"[a-z0-9-]{1,40}", name):
+            raise HTTPException(status_code=404, detail="Instance not found")
+        path, media = scene_dir / f"crop_{name}.png", "image/png"
+    else:  # overlay
+        cams = sorted(scene_dir.glob("receipt_overlay_cam_*.png"))
+        if name and re.fullmatch(r"\d{3}", name):
+            path = scene_dir / f"receipt_overlay_cam_{name}.png"
+        else:
+            path = cams[0] if cams else None
+        media = "image/png"
+    if not path or not path.is_file():
+        raise HTTPException(status_code=404, detail="Scene inventory artifact not built yet")
+    return FileResponse(str(path), media_type=media, filename=path.name)
 
 
 @router.get("/jobs/{job_id}/mesh/file")
