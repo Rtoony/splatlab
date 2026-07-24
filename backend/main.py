@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import splat_route  # noqa: E402  (imports gpu_arbiter + operator_audit from this dir)
 import edit_ops  # noqa: E402  (scene editing: snapshots, splat-transform ops, semantic edits, merge)
 import geo_route  # noqa: E402  (locate-in-the-world: geo anchor, map footprint, GPS suggest, exports)
+import dimensions_route  # noqa: E402  (survey dimensions: pure-stdlib manifest CRUD, no GPU/ML)
 import feedback  # noqa: E402  (small SQLite-backed in-app feedback loop)
 import thumb as thumbgen  # noqa: E402  (scene thumbnail generator)
 
@@ -168,6 +169,9 @@ app.include_router(edit_ops.router, prefix="/api/splat", dependencies=[Depends(r
 
 # Locate-in-the-world (metadata + CPU-only footprint renders; never GPU-gated).
 app.include_router(geo_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
+
+# Survey dimensions (pure metadata CRUD; never GPU-gated).
+app.include_router(dimensions_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
 
 # Feedback is Splatlab-native runtime data, also gated by the same signed cookie.
 app.include_router(feedback.router, dependencies=[Depends(require_auth)])

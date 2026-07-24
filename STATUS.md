@@ -1386,3 +1386,48 @@ this and was already shipped/proven on two other routes — it had just never be
   `finish_target_faces` formula; no 2DGS/SuGaR/MILo reconstruction swap (stays a documented future
   "watch" item). The actual dense-capture field test (250-500 photos, real subject) is RToony's own
   hands-on work — not scripted here.
+
+## PRESENTATION TOOLKIT PHASE 1 SHIPPED (2026-07-24, RToony /plan) — crop-sphere + dimensions
+
+RToony wants to turn SplatLab into something that produces real, shareable files: named the Spark
+tools (Locate/Add dimension/Paint), an official site-section generator, a radius-sphere crop to
+discard poorly-captured surrounding context, and a direct "am I asking too much?" about
+semantic-driven mesh smoothing. Researched, planned as 3 phases; this ships Phase 1.
+
+**Correction found by reading the code**: "Locate" isn't a Spark tool (it's the pre-existing
+`GeoLocateModal`, unrelated). Of the two real Spark tools, Paint was already fully complete
+(server-persisted). Add Dimension was fully functional but session-only (`sessionStorage`) — the
+one real gap.
+
+- **Crop-sphere tool** — the backend was already 100% done: `edit_ops.py`'s `CropSphereOp` maps
+  directly onto `splat-transform -S`, whose own docs say exactly what was asked: "Remove Gaussians
+  outside sphere." Zero backend changes. New UI in `spark-scene-viewer.tsx`: click-to-place center
+  (reuses `raycastAt()`), a red wireframe sphere gizmo, a live "N of M splats would be removed"
+  count computed client-side via `PackedSplats.forEachSplat` (debounced 120ms) and fed into the
+  same overlay-tint machinery Paint already uses, a two-step confirm (reusing the in-file
+  `recalibrateArmed` idiom), POST to the already-tested `/edit/apply`, and a minimal "Undo crop"
+  button against `/edit/revert` using the apply response's `version_before`.
+- **Real bug found and fixed as part of this work**: the mesh-load effect was keyed only on the
+  preview URL string, which never changes after an edit even though the file on disk does — the
+  viewer would keep showing stale geometry after a crop. Fixed with a `reloadNonce` query param
+  bumped on every apply/revert.
+- **Server-persisted dimensions**: new `backend/dimensions_route.py` (pure stdlib, no numpy —
+  confirmed the main backend's own venv has neither, matching `edit_ops.py`'s documented
+  constraint), mirroring `geo_route.py`'s "small CPU-only feature + own router" shape rather than
+  `langfield_overrides.py` (wrong process, numpy/index-file id scheme this data doesn't need).
+  `GET/POST/DELETE /jobs/{id}/dimensions` + `.../export?fmt=csv|json`. POST is a client-id-keyed
+  upsert (not server-assigned) so drag-to-move reuses the same route. `dimensions.json` at the job
+  root. Frontend: sessionStorage kept only as an instant-restore/offline fallback, server is
+  authoritative; inline CSV download link next to "delete all," shipped now (not deferred) since
+  it's what actually answers "generate a file I can share" for this tool.
+- **Verified**: 499 backend tests pass (490 baseline + 9 new for `dimensions_route.py`). `tsc
+  --noEmit` steady at the 43-error baseline, `npm run build` clean. Live: full dimensions
+  CRUD+export round-trip via curl against the real hydrant job (add → list → CSV export with
+  correct computed length → delete → confirm empty); confirmed the deployed bundle contains the
+  new crop/dimensions strings at the exact served asset hash.
+- **Not yet done**: an actual interactive click-through in a real browser (no browser automation
+  tool available in this environment — same limitation as the P6 GUI phase). RToony should try
+  placing/dragging dimensions across a refresh (proves server persistence) and running a real crop
+  (proves the reload-nonce fix + undo) before trusting this fully.
+- **Phase 2 (site sections) and Phase 3 (curvature-adaptive smoothing) not started** — fully
+  scoped in the approved plan, queued next.

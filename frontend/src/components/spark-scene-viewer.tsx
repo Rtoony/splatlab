@@ -17,7 +17,7 @@ import {
 } from "@/lib/spark-heatmap";
 import type { SplatJob } from "@/lib/contracts";
 import { Button, SectionLabel } from "@/components/ui";
-import { Loader2, Paintbrush, Plus, Ruler, Trash2, Undo2, X } from "lucide-react";
+import { Download, Loader2, Paintbrush, Plus, Ruler, Scissors, Trash2, Undo2, X } from "lucide-react";
 
 // SPARK BETA viewer for the /view page — the Wave-2 cutover surface.
 // - Multi-query language overlay: up to 4 simultaneous text searches, one
@@ -25,8 +25,12 @@ import { Loader2, Paintbrush, Plus, Ruler, Trash2, Undo2, X } from "lucide-react
 //   composited by a mode-baked dyno modifier (tint ramp / highlight on
 //   natural / isolate / spotlight) with a live legend.
 // - Survey dimensions: any number of two-point measurements, draggable
-//   endpoints, floating labels, sessionStorage persistence per scene, and
-//   known-length scale calibration stored on the scene (meters_per_unit).
+//   endpoints, floating labels, server-persisted per scene (dimensions.json,
+//   sessionStorage as an offline fallback only), known-length scale
+//   calibration stored on the scene (meters_per_unit), CSV export.
+// - Crop to sphere: pick a center + radius, permanently discard every splat
+//   outside it (POST /edit/apply -> splat-transform -S, already-proven
+//   backend, this is pure UI wiring). Snapshot-versioned; undoable.
 
 const INITIAL_CAMERA_POSITION = new THREE.Vector3(0, -3, 1.4);
 const INITIAL_CAMERA_LOOK_AT = new THREE.Vector3(0, 0, 0.2);
@@ -108,9 +112,14 @@ export function SparkSceneViewer({
   computeReason?: string;
   onViewerError?: (message: string) => void;
 }) {
+  // Bumped after every crop apply/revert: the preview URL string doesn't
+  // otherwise change even though the file on disk did, so the mesh-load
+  // effect (keyed on `url` below) would never re-run and the viewer would
+  // keep showing stale pre-edit geometry.
+  const [reloadNonce, setReloadNonce] = useState(0);
   // Langfield scenes MUST load langweb: relevancy rows are exported-ply order
   // and langweb preserves it; web.ply is decimated + reordered.
-  const url = `/api/splat/jobs/${job.job_id}/preview/file?fmt=${job.langfield_available ? "langweb" : "web"}`;
+  const url = `/api/splat/jobs/${job.job_id}/preview/file?fmt=${job.langfield_available ? "langweb" : "web"}&v=${reloadNonce}`;
   const dimsStorageKey = `splatlab.dims.${job.job_id}`;
 
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -180,6 +189,27 @@ export function SparkSceneViewer({
   const [scaleError, setScaleError] = useState<string | null>(null);
   const [recalibrateArmed, setRecalibrateArmed] = useState(false);
 
+  // crop to sphere (destructive, snapshot-versioned server-side already)
+  const cropModeRef = useRef(false);
+  const cropGroupRef = useRef<THREE.Group | null>(null);
+  const redrawCropRef = useRef<() => void>(() => {});
+  const cropCenterRef = useRef<[number, number, number] | null>(null);
+  const cropRadiusRef = useRef(0.5);
+  const cropPreviewTimeoutRef = useRef<number | null>(null);
+  const [cropMode, setCropMode] = useState(false);
+  const [cropCenter, setCropCenter] = useState<[number, number, number] | null>(null);
+  const [cropRadius, setCropRadius] = useState(0.5);
+  const [cropRemovedCount, setCropRemovedCount] = useState<number | null>(null);
+  const [cropConfirmArmed, setCropConfirmArmed] = useState(false);
+  const [cropBusy, setCropBusy] = useState(false);
+  const [cropError, setCropError] = useState<string | null>(null);
+  const [cropLastVersion, setCropLastVersion] = useState<number | null>(null);
+  const [cropUndoBusy, setCropUndoBusy] = useState(false);
+  // Set right after a successful crop iff this scene had a language field at
+  // that moment — `job.langfield_available` (poll-derived) doesn't flip when
+  // the backend marks the field STALE, so it can't be used to detect this.
+  const [cropMadeStale, setCropMadeStale] = useState(false);
+
   useEffect(() => {
     if (!recalibrateArmed) return;
     const t = window.setTimeout(() => setRecalibrateArmed(false), 3000);
@@ -187,16 +217,26 @@ export function SparkSceneViewer({
   }, [recalibrateArmed]);
 
   useEffect(() => {
+    if (!cropConfirmArmed) return;
+    const t = window.setTimeout(() => setCropConfirmArmed(false), 4000);
+    return () => window.clearTimeout(t);
+  }, [cropConfirmArmed]);
+
+  useEffect(() => {
     measureArmRef.current = measureArm;
     if (!measureArm) {
       pendingPointRef.current = null;
       setHasPending(false);
     }
+    if (measureArm) setCropMode(false); // one click-owner at a time
   }, [measureArm]);
 
   useEffect(() => {
     paintModeRef.current = paintMode;
-    if (paintMode) setMeasureArm(false); // one click-owner at a time
+    if (paintMode) {
+      setMeasureArm(false); // one click-owner at a time
+      setCropMode(false);
+    }
     setPaintError(null); // never carry a stale error across a mode flip
     setPaintNeedsForce(false);
     // entering/leaving paint swaps the modifier (selection preview <-> queries)
@@ -205,10 +245,37 @@ export function SparkSceneViewer({
   }, [paintMode]);
 
   useEffect(() => {
+    cropModeRef.current = cropMode;
+    if (cropMode) {
+      setMeasureArm(false); // one click-owner at a time
+      setPaintMode(false);
+    } else {
+      cropCenterRef.current = null;
+      setCropCenter(null);
+      setCropRemovedCount(null);
+      setCropConfirmArmed(false);
+    }
+    setCropError(null); // never carry a stale error across a mode flip
+    redrawCropRef.current();
+    refreshModifierRef.current();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cropMode]);
+
+  useEffect(() => {
+    cropRadiusRef.current = cropRadius;
+    redrawCropRef.current();
+    scheduleCropPreview();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cropRadius]);
+
+  useEffect(() => {
     brushRadiusRef.current = brushRadius;
   }, [brushRadius]);
 
-  // ---- dims persistence -------------------------------------------------
+  // ---- dims persistence ---------------------------------------------------
+  // Server is authoritative (dimensions.json on the job); sessionStorage is
+  // kept only as a best-effort offline cache/fallback, never the source of
+  // truth — costs nothing extra since the write calls already existed here.
   function syncDims(next: Dim[]) {
     dimsRef.current = next;
     setDims([...next]);
@@ -220,12 +287,42 @@ export function SparkSceneViewer({
     redrawDimsRef.current();
   }
 
+  async function postDimension(d: Dim) {
+    try {
+      await fetch(`/api/splat/jobs/${job.job_id}/dimensions`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: String(d.id), a: d.a, b: d.b }),
+      });
+    } catch {
+      /* best-effort — sessionStorage already has this dim locally */
+    }
+  }
+
+  async function deleteDimensionServer(id: number) {
+    try {
+      await fetch(`/api/splat/jobs/${job.job_id}/dimensions/${id}`, { method: "DELETE", credentials: "same-origin" });
+    } catch {
+      /* best-effort */
+    }
+  }
+
   function deleteDim(id: number) {
     syncDims(dimsRef.current.filter((d) => d.id !== id));
+    void deleteDimensionServer(id);
     if (calibDimId === id) {
       setCalibDimId(null);
       setRecalibrateArmed(false);
     }
+  }
+
+  function deleteAllDims() {
+    const prev = dimsRef.current;
+    syncDims([]);
+    setCalibDimId(null);
+    setRecalibrateArmed(false);
+    for (const d of prev) void deleteDimensionServer(d.id);
   }
 
   // ---- overlay (multi-query heatmap) -------------------------------------
@@ -284,10 +381,68 @@ export function SparkSceneViewer({
   }
 
   function refreshModifier() {
-    if (paintModeRef.current && selSetRef.current.size > 0) previewSelection();
+    if (cropModeRef.current && cropCenterRef.current) previewCropRemoval();
+    else if (paintModeRef.current && selSetRef.current.size > 0) previewSelection();
     else rebuildOverlay(channelsRef.current, mode, rampName);
   }
   refreshModifierRef.current = refreshModifier;
+
+  // ---- crop to sphere -----------------------------------------------------
+  // Tints every splat OUTSIDE the sphere red — exactly what "Apply crop" is
+  // about to permanently delete (splat-transform -S: "remove outside").
+  // Reuses the same overlay machinery as previewSelection(), just computed
+  // from live geometry instead of a stored Set.
+  function previewCropRemoval() {
+    const mesh = meshRef.current;
+    const center = cropCenterRef.current;
+    const packed = mesh?.packedSplats;
+    if (!mesh || !center || !packed) return;
+    const numSplats = packed.numSplats ?? 0;
+    if (numSplats === 0) return;
+    const r2 = cropRadiusRef.current * cropRadiusRef.current;
+    const [cx, cy, cz] = center;
+    const bytes = new Uint8Array(numSplats);
+    let removed = 0;
+    packed.forEachSplat((i, c) => {
+      const dx = c.x - cx;
+      const dy = c.y - cy;
+      const dz = c.z - cz;
+      if (dx * dx + dy * dy + dz * dz > r2) {
+        bytes[i] = 255;
+        removed += 1;
+      }
+    });
+    setCropRemovedCount(removed);
+    const scalarArray = new RgbaArray({ array: packChannelsRgba([bytes], numSplats), count: numSplats });
+    mesh.worldModifier = buildOverlayModifier({
+      scalarArray,
+      channelCount: 1,
+      channelColors: [[0.97, 0.44, 0.44]], // to-be-removed red
+      channelEnabled: [dyno.dynoBool(true)],
+      mode: "highlight",
+      ramp: rampName,
+      channelCutoffs: [dyno.dynoFloat(0.5)],
+    });
+    mesh.updateGenerator();
+  }
+
+  // Debounced: recomputing over every splat on each slider tick/drag frame
+  // would be wasteful — settle briefly before the (still cheap, one-pass)
+  // count + overlay rebuild runs.
+  function scheduleCropPreview() {
+    if (cropPreviewTimeoutRef.current !== null) window.clearTimeout(cropPreviewTimeoutRef.current);
+    cropPreviewTimeoutRef.current = window.setTimeout(() => {
+      cropPreviewTimeoutRef.current = null;
+      if (cropModeRef.current && cropCenterRef.current) previewCropRemoval();
+    }, 120);
+  }
+
+  function setCropCenterFromHit(p: [number, number, number]) {
+    cropCenterRef.current = p;
+    setCropCenter(p);
+    redrawCropRef.current();
+    scheduleCropPreview();
+  }
 
   async function strokeAt(p: THREE.Vector3) {
     setStrokeBusy(true);
@@ -565,6 +720,67 @@ export function SparkSceneViewer({
     }
   }
 
+  // ---- crop to sphere: apply / undo ---------------------------------------
+  async function applyCrop() {
+    const center = cropCenterRef.current;
+    if (!center) return;
+    setCropConfirmArmed(false);
+    setCropBusy(true);
+    setCropError(null);
+    try {
+      const resp = await fetch(`/api/splat/jobs/${job.job_id}/edit/apply`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ops: [{ type: "crop_sphere", center, radius: cropRadiusRef.current }],
+        }),
+      });
+      if (!resp.ok) {
+        const detail = String(
+          ((await resp.json().catch(() => null)) as { detail?: string } | null)?.detail ?? `HTTP ${resp.status}`,
+        );
+        throw new Error(detail);
+      }
+      const data = (await resp.json()) as { version_before: number };
+      setCropLastVersion(data.version_before);
+      setCropMadeStale(job.langfield_available ?? false);
+      setCropMode(false);
+      setReloadNonce((n) => n + 1);
+    } catch (cause) {
+      setCropError(cause instanceof Error ? cause.message : "Crop failed.");
+    } finally {
+      setCropBusy(false);
+    }
+  }
+
+  async function undoCrop() {
+    if (cropLastVersion === null) return;
+    setCropUndoBusy(true);
+    setCropError(null);
+    try {
+      const resp = await fetch(`/api/splat/jobs/${job.job_id}/edit/revert`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version: cropLastVersion }),
+      });
+      if (!resp.ok) {
+        const detail = String(
+          ((await resp.json().catch(() => null)) as { detail?: string } | null)?.detail ?? `HTTP ${resp.status}`,
+        );
+        throw new Error(detail);
+      }
+      setCropLastVersion(null);
+      setCropMadeStale(false);
+      setReloadNonce((n) => n + 1);
+    } catch (cause) {
+      setCropError(cause instanceof Error ? cause.message : "Undo failed.");
+    } finally {
+      setCropUndoBusy(false);
+    }
+  }
+
   // ---- three.js scene ------------------------------------------------------
   useEffect(() => {
     const container = containerRef.current;
@@ -620,7 +836,10 @@ export function SparkSceneViewer({
     scene.add(dimGroup);
     dimGroupRef.current = dimGroup;
 
-    // restore this scene's dimensions from the session
+    // Restore this scene's dimensions: sessionStorage first (instant, no
+    // network wait), then the server (authoritative) once it responds —
+    // avoids an empty-then-populated flash on a fast reload while still
+    // ending up correct if the two ever disagree (e.g. a different device).
     try {
       const saved = sessionStorage.getItem(dimsStorageKey);
       if (saved) {
@@ -633,6 +852,29 @@ export function SparkSceneViewer({
     } catch {
       /* corrupted storage — start empty */
     }
+    fetch(`/api/splat/jobs/${job.job_id}/dimensions`, { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { dimensions?: { id: string; a: number[]; b: number[] }[] } | null) => {
+        if (disposed || !data?.dimensions) return;
+        const restored: Dim[] = data.dimensions
+          .filter((d) => Array.isArray(d.a) && Array.isArray(d.b))
+          .map((d) => ({
+            id: Number(d.id) || Date.now(),
+            a: d.a as [number, number, number],
+            b: d.b as [number, number, number],
+          }));
+        dimsRef.current = restored;
+        setDims([...restored]);
+        try {
+          sessionStorage.setItem(dimsStorageKey, JSON.stringify(restored));
+        } catch {
+          /* ignore */
+        }
+        redrawDimsRef.current();
+      })
+      .catch(() => {
+        /* server unreachable — keep whatever the sessionStorage restore gave us */
+      });
 
     function redrawDims() {
       const group = dimGroupRef.current;
@@ -669,6 +911,32 @@ export function SparkSceneViewer({
     }
     redrawDimsRef.current = redrawDims;
     redrawDims();
+
+    const cropGroup = new THREE.Group();
+    scene.add(cropGroup);
+    cropGroupRef.current = cropGroup;
+
+    function redrawCrop() {
+      const group = cropGroupRef.current;
+      if (!group) return;
+      group.clear();
+      const center = cropCenterRef.current;
+      if (!center) return;
+      const sphere = new THREE.Mesh(
+        new THREE.SphereGeometry(cropRadiusRef.current, 32, 24),
+        new THREE.MeshBasicMaterial({ color: 0xf87171, wireframe: true, transparent: true, opacity: 0.55 }),
+      );
+      sphere.position.set(...center);
+      group.add(sphere);
+      const marker = new THREE.Mesh(
+        new THREE.SphereGeometry(0.018, 16, 12),
+        new THREE.MeshBasicMaterial({ color: 0xf87171 }),
+      );
+      marker.position.set(...center);
+      group.add(marker);
+    }
+    redrawCropRef.current = redrawCrop;
+    redrawCrop();
 
     function resize() {
       const el = containerRef.current;
@@ -806,6 +1074,7 @@ export function SparkSceneViewer({
     }
     function onPointerUp(e: PointerEvent) {
       if (!drag) return;
+      const draggedId = drag.dimId;
       drag = null;
       controls.enabled = true;
       try {
@@ -821,9 +1090,16 @@ export function SparkSceneViewer({
       } catch {
         /* ignore */
       }
+      const moved = dimsRef.current.find((d) => d.id === draggedId);
+      if (moved) void postDimension(moved);
     }
     function onClick(e: MouseEvent) {
       if (Math.hypot(e.clientX - downX, e.clientY - downY) > 6) return;
+      if (cropModeRef.current) {
+        const hit = raycastAt(e.clientX, e.clientY);
+        if (hit) setCropCenterFromHit([hit.x, hit.y, hit.z]);
+        return;
+      }
       if (paintModeRef.current) {
         const hit = raycastAt(e.clientX, e.clientY);
         if (hit) strokeAtRef.current(hit);
@@ -841,7 +1117,8 @@ export function SparkSceneViewer({
         pendingPointRef.current = null;
         setHasPending(false);
         const id = Date.now();
-        dimsRef.current = [...dimsRef.current, { id, a: pending, b: [hit.x, hit.y, hit.z] }];
+        const newDim: Dim = { id, a: pending, b: [hit.x, hit.y, hit.z] };
+        dimsRef.current = [...dimsRef.current, newDim];
         setDims([...dimsRef.current]);
         try {
           sessionStorage.setItem(dimsStorageKey, JSON.stringify(dimsRef.current));
@@ -849,6 +1126,7 @@ export function SparkSceneViewer({
           /* ignore */
         }
         redrawDims();
+        void postDimension(newDim);
       }
     }
     function onDoubleClick(event: MouseEvent) {
@@ -885,6 +1163,8 @@ export function SparkSceneViewer({
       controlsRef.current = null;
       meshRef.current = null;
       dimGroupRef.current = null;
+      cropGroupRef.current = null;
+      if (cropPreviewTimeoutRef.current !== null) window.clearTimeout(cropPreviewTimeoutRef.current);
       enabledDynosRef.current = [];
       cutoffDynosRef.current = [];
     };
@@ -1197,9 +1477,18 @@ export function SparkSceneViewer({
             <Ruler className="h-3.5 w-3.5" /> {measureArm ? (hasPending ? "Pick 2nd point…" : "Adding…") : "Add dimension"}
           </Button>
           {dims.length > 0 && (
-            <Button type="button" size="sm" variant="outline" onClick={() => syncDims([])} title="Delete all dimensions">
-              <Trash2 className="h-3.5 w-3.5" />
-            </Button>
+            <>
+              <a
+                href={`/api/splat/jobs/${job.job_id}/dimensions/export?fmt=csv`}
+                title="Download all dimensions as a CSV file"
+                className="flex h-8 shrink-0 items-center gap-1 rounded-xl border border-white/15 bg-white/5 px-2 text-[11px] font-semibold text-zinc-200 hover:bg-white/10"
+              >
+                <Download className="h-3.5 w-3.5" /> CSV
+              </a>
+              <Button type="button" size="sm" variant="outline" onClick={deleteAllDims} title="Delete all dimensions">
+                <Trash2 className="h-3.5 w-3.5" />
+              </Button>
+            </>
           )}
         </div>
         {measureArm && (
@@ -1269,6 +1558,90 @@ export function SparkSceneViewer({
               </p>
             )}
           </div>
+        )}
+
+        {!safeMode && (
+          <>
+            <div className="h-px bg-white/10" />
+            <SectionLabel>Crop to sphere</SectionLabel>
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                variant={cropMode ? "primary" : "outline"}
+                onClick={() => setCropMode((v) => !v)}
+                title="Set a sphere around the subject; splats outside it are permanently removed. Undoable."
+              >
+                <Scissors className="h-3.5 w-3.5" /> {cropMode ? "Cropping…" : "Crop to sphere"}
+              </Button>
+              {cropLastVersion !== null && (
+                <Button type="button" size="sm" variant="outline" onClick={() => void undoCrop()} disabled={cropUndoBusy} title="Undo the last crop">
+                  {cropUndoBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Undo2 className="h-3.5 w-3.5" />} Undo crop
+                </Button>
+              )}
+            </div>
+            {cropMode && (
+              <>
+                <p className="text-[10px] leading-snug text-zinc-500">
+                  Click the scene to place the sphere's center. Drag the radius slider to size it — everything
+                  shown red will be permanently removed.
+                </p>
+                <div className="flex items-center gap-2">
+                  <span className="shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">radius</span>
+                  <input
+                    type="range"
+                    min={0.05}
+                    max={5}
+                    step={0.05}
+                    value={cropRadius}
+                    onChange={(e) => setCropRadius(Number(e.target.value))}
+                    className="w-full"
+                  />
+                  <span className="w-16 shrink-0 text-right text-zinc-400">
+                    {metersPerUnit ? `${(cropRadius * metersPerUnit).toFixed(2)} m` : `${cropRadius.toFixed(2)} u`}
+                  </span>
+                </div>
+                {cropCenter && (
+                  <>
+                    <p className="text-[10px] leading-snug text-zinc-400">
+                      {cropRemovedCount !== null
+                        ? `${cropRemovedCount.toLocaleString()} of ${(splatCount ?? 0).toLocaleString()} splats would be removed (${splatCount ? Math.round((cropRemovedCount / splatCount) * 100) : 0}%).`
+                        : "Counting…"}
+                    </p>
+                    {job.langfield_available && (
+                      <p className="rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5 text-[10px] leading-snug text-amber-100/85">
+                        This scene has a language field. Cropping changes the gaussian count, so search and paint
+                        will stop working until the language field is rebuilt.
+                      </p>
+                    )}
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={cropConfirmArmed ? "primary" : "outline"}
+                      onClick={() => (cropConfirmArmed ? void applyCrop() : setCropConfirmArmed(true))}
+                      disabled={cropBusy}
+                      className={cropConfirmArmed ? "border-red-400/50 bg-red-400/20 text-red-100" : ""}
+                    >
+                      {cropBusy ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : cropConfirmArmed ? (
+                        `Sure? Removes ${(cropRemovedCount ?? 0).toLocaleString()} splats permanently`
+                      ) : (
+                        "Apply crop"
+                      )}
+                    </Button>
+                  </>
+                )}
+              </>
+            )}
+            {cropError && <p className="text-[10px] leading-snug text-rose-300/90">{cropError}</p>}
+            {cropMadeStale && (
+              <p className="text-[10px] leading-snug text-amber-300/90">
+                Language field is stale — the scene was edited after the field was built. Re-run the language
+                field for this scene to search it again.
+              </p>
+            )}
+          </>
         )}
       </div>
 
