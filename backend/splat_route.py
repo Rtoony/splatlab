@@ -2859,8 +2859,13 @@ def _recapture_guidance(ctx: dict[str, Any] | None) -> str:
     if ctx and ctx.get("subcommand") == "images":
         return (
             "For photo captures: shoot a deliberate orbit — 20-40 photos "
-            "circling the subject, each overlapping the last by about 70%, "
-            "with good light and no motion blur."
+            "circling the subject for a typical scene, each overlapping the "
+            "last by about 70%, with good light and no motion blur. A small, "
+            "tightly-bounded single object (roughly hydrant-sized or "
+            "smaller) benefits from far denser coverage — aim for 250-500 "
+            "photos for that scale (stage them directly under "
+            "splatcli/inputs/<name>/ and launch via input_path — a capture "
+            "that dense will likely exceed the 2GB web-upload limit)."
         )
     return (
         "Recapture with slow, heavily-overlapping sweeps of a smaller area."
@@ -4495,6 +4500,20 @@ class ObjectIsolateBody(BaseModel):
     # and ICP-register it at the object's scene pose. Render/VR lane only —
     # a proxy is plausible, not faithful; never a survey artifact.
     proxy: bool = False
+    # Twin finish (WS3, reused from /mesh and /scene/ground): splat->mesh
+    # color transfer + decimate + Y-up vertex-colored GLB. The fire-hydrant
+    # field proof (49 photos) already gets a 100% LCC, fully-connected raw
+    # mesh -- the gap this closes is that a raw object mesh ships with ZERO
+    # color and ZERO decimation (89,990 tris for the hydrant). A denser
+    # recapture (5-10x photos) targets finer surface detail and more robust
+    # isolation, not "fixing" a broken result -- this stage is what turns
+    # either capture into an actually simplistic, colored Blender asset.
+    finish: bool = False
+    # 400k (twin_finish.py's own default, sized for whole scenes) would never
+    # even trigger decimation on an object-scale mesh -- 10k against the
+    # hydrant's 89,990 raw tris is a ~9x reduction, in the conventional
+    # low/mid-poly hero-prop range (5k-20k), not a "PS2" reduction (~500-2k).
+    finish_target_faces: int = Field(default=10_000, ge=1_000, le=100_000)
 
 
 def _object_slug(query: str) -> str:
@@ -4537,6 +4556,8 @@ async def isolate_splat_object(request: Request, job_id: str, body: ObjectIsolat
     # subprocesses and then 400 (review finding 2026-07-21).
     if body.proxy and not _triposplat_availability()["triposplat_available"]:
         raise HTTPException(status_code=400, detail="TripoSplat lane unavailable for proxy generation.")
+    if body.finish and not body.mesh:
+        raise HTTPException(status_code=400, detail="Twin finish requires mesh=True.")
 
     slug = _object_slug(body.query)
     obj_dir = output_dir / OBJECTS_DIRNAME / slug
@@ -4611,6 +4632,32 @@ async def isolate_splat_object(request: Request, job_id: str, body: ObjectIsolat
             finally:
                 shutil.rmtree(subset_dir, ignore_errors=True)  # ~300MB scratch ckpt
 
+        if body.mesh and body.finish:
+            mesh_ply = obj_dir / "mesh" / "mesh.ply"
+            twin_glb = obj_dir / "mesh" / "twin.glb"
+            finish_cmd = [
+                str(MESH_ENV_PYTHON), str(TWIN_FINISH_SCRIPT),
+                str(mesh_ply), str(obj_dir / "object.ply"), str(twin_glb),
+                "--target-faces", str(body.finish_target_faces),
+            ]
+            mpu = meta.get("meters_per_unit")
+            if mpu:
+                finish_cmd += ["--meters-per-unit", str(mpu)]
+            rc, _out, stderr = await _run_capture_subprocess(finish_cmd)
+            if rc != 0 or not twin_glb.is_file():
+                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                raise HTTPException(status_code=500, detail=f"Object twin finish failed (exit {rc}): {tail}")
+            try:
+                report["twin"] = json.loads((obj_dir / "mesh" / "twin_finish.json").read_text())
+            except Exception:  # noqa: BLE001
+                report["twin"] = {}
+            # Best-effort colored receipts — ground_mesh_receipt.py is already
+            # fully generic on any Y-up vertex-colored GLB (takes glb+out_dir,
+            # computes its own bbox from vertex percentiles, no scene coupling).
+            await _run_capture_subprocess([
+                str(MESH_ENV_PYTHON), str(GROUND_MESH_RECEIPT_SCRIPT), str(twin_glb), str(obj_dir / "mesh"),
+            ])
+
         if body.proxy:
             crop_png = obj_dir / "crop.png"
             rc, _out, stderr = await _run_capture_subprocess([
@@ -4684,6 +4731,10 @@ async def isolate_splat_object(request: Request, job_id: str, body: ObjectIsolat
         "mesh_ply_url": f"{base}?fmt=ply" if body.mesh else None,
         "mesh_glb_url": f"{base}?fmt=glb" if body.mesh and (obj_dir / "mesh" / "mesh.glb").is_file() else None,
         "receipt_url": f"{base}?fmt=receipt" if body.mesh else None,
+        "twin_glb_url": (
+            f"{base}?fmt=twin"
+            if body.mesh and body.finish and (obj_dir / "mesh" / "twin.glb").is_file() else None
+        ),
         "proxy_url": f"{base}?fmt=proxy" if body.proxy else None,
         "proxy_preview_url": (
             f"{base}?fmt=proxy-preview"
@@ -4697,6 +4748,9 @@ _OBJECT_FILES = {
     "ply": ("mesh/mesh.ply", "application/octet-stream"),
     "glb": ("mesh/mesh.glb", "model/gltf-binary"),
     "receipt": ("mesh/view_ext0.png", "image/png"),
+    "twin": ("mesh/twin.glb", "model/gltf-binary"),
+    "twin-top": ("mesh/receipt_top.png", "image/png"),
+    "twin-oblique": ("mesh/receipt_oblique.png", "image/png"),
     "proxy": ("proxy.ply", "application/octet-stream"),
     "proxy-preview": ("proxy_preview.webp", "image/webp"),
 }
@@ -4705,7 +4759,7 @@ _OBJECT_FILES = {
 @router.get("/jobs/{job_id}/objects/{slug}/file")
 async def get_splat_object_file(
     job_id: str, slug: str,
-    fmt: Literal["splat", "ply", "glb", "receipt", "proxy", "proxy-preview"] = "splat",
+    fmt: Literal["splat", "ply", "glb", "receipt", "twin", "twin-top", "twin-oblique", "proxy", "proxy-preview"] = "splat",
 ):
     if not _safe_job_id(job_id) or _object_slug(slug) != slug:
         raise HTTPException(status_code=404, detail="Object not found")

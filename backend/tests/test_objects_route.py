@@ -25,6 +25,9 @@ OBJ_REPORT = {
 }
 MESH_REPORT = {"v": 1, "tris": 109232, "lcc_pct": 99.1,
                "recipe": {"checkpoint": "vanilla"}, "artifacts": {"ply": "mesh.ply"}}
+TWIN_REPORT = {"verts": 6919, "faces": 10000, "solid_gaussians": 19659,
+               "units": "scene-units (uncalibrated)", "extent": [0.47, 0.47, 0.47],
+               "glb_bytes": 231708, "seconds": 0.7}
 
 
 @pytest.fixture()
@@ -88,6 +91,16 @@ def _fake_subprocess(job_dir: Path, calls: list):
             (mesh_dir / "mesh.glb").write_bytes(b"glb")
             (mesh_dir / "view_ext0.png").write_bytes(b"png")
             (mesh_dir / "mesh.json").write_text(json.dumps(MESH_REPORT))
+            return 0, b"", b""
+        if "twin_finish" in joined:
+            twin_glb = Path(command[4])
+            twin_glb.write_bytes(b"glb")
+            (twin_glb.parent / "twin_finish.json").write_text(json.dumps(TWIN_REPORT))
+            return 0, b"", b""
+        if "ground_mesh_receipt" in joined:
+            recv_dir = Path(command[3])
+            (recv_dir / "receipt_top.png").write_bytes(b"png")
+            (recv_dir / "receipt_oblique.png").write_bytes(b"png")
             return 0, b"", b""
         raise AssertionError(f"unexpected subprocess: {command}")
 
@@ -247,3 +260,76 @@ def test_subset_scratch_cleaned_on_mesh_failure(client, monkeypatch):
     r = http.post("/api/splat/jobs/splat_0b0001/objects", json={"query": "table"})
     assert r.status_code == 500
     assert not (job_dir / splat_route.OBJECTS_DIRNAME / "table" / "subset").exists()
+
+
+def test_objects_finish_builds_twin_glb(client, monkeypatch):
+    """Real hydrant proof (2026-07-23, direct twin_finish.py smoke test):
+    89,990 raw tris -> 10,000 decimated + colored. This proves the route
+    wiring calls it correctly with the OBJECT'S OWN object.ply, not any
+    whole-scene splat path."""
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(job_dir, calls))
+
+    r = http.post("/api/splat/jobs/splat_0b0001/objects",
+                  json={"query": "table", "finish": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["twin_glb_url"]
+    assert body["object"]["twin"]["faces"] == 10000
+
+    finish_call = [str(c) for c in next(c for c in calls if "twin_finish" in " ".join(str(x) for x in c))]
+    assert "--target-faces" in finish_call and "10000" in finish_call
+    obj_dir = job_dir / splat_route.OBJECTS_DIRNAME / "table"
+    assert str(obj_dir / "object.ply") in finish_call  # scoped to THIS object, not a scene splat
+    assert str(obj_dir / "mesh" / "mesh.ply") in finish_call
+
+    meta = json.loads((job_dir / "meta.json").read_text())
+    assert meta["objects"]["table"]["twin"]["faces"] == 10000
+
+    for fmt in ("twin", "twin-top", "twin-oblique"):
+        assert http.get(f"/api/splat/jobs/splat_0b0001/objects/table/file?fmt={fmt}").status_code == 200, fmt
+
+
+def test_objects_finish_requires_mesh(client):
+    http, outputs = client
+    _mk_job(outputs)
+    r = http.post("/api/splat/jobs/splat_0b0001/objects",
+                  json={"query": "table", "mesh": False, "finish": True})
+    assert r.status_code == 400
+
+
+def test_objects_finish_target_faces_override(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(job_dir, calls))
+    r = http.post("/api/splat/jobs/splat_0b0001/objects",
+                  json={"query": "table", "finish": True, "finish_target_faces": 25000})
+    assert r.status_code == 200
+    finish_call = [str(c) for c in next(c for c in calls if "twin_finish" in " ".join(str(x) for x in c))]
+    assert "25000" in finish_call
+
+
+def test_objects_finish_failure_is_loud_500(client, monkeypatch):
+    """A failed finish must not roll back the already-succeeded raw mesh
+    artifacts -- they were a complete, valid build on their own."""
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls: list = []
+    base_fake = _fake_subprocess(job_dir, calls)
+
+    async def run(command):
+        joined = " ".join(str(c) for c in command)
+        if "twin_finish" in joined:
+            return 1, b"", b"FATAL: pymeshlab decimation crashed"
+        return await base_fake(command)
+
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", run)
+    r = http.post("/api/splat/jobs/splat_0b0001/objects",
+                  json={"query": "table", "finish": True})
+    assert r.status_code == 500
+    obj_dir = job_dir / splat_route.OBJECTS_DIRNAME / "table"
+    assert (obj_dir / "mesh" / "mesh.glb").is_file()
+    assert (obj_dir / "mesh" / "mesh.json").is_file()

@@ -1327,3 +1327,62 @@ continuous loop by nature), but a legitimate, low-risk improvement: browsers alr
   revisit only if the pause-on-hidden fix proves insufficient.
 - Verification: `tsc --noEmit` steady at the 43-error baseline, `npm run build` clean. No backend
   changes. Not yet live-clicked by RToony (report-and-fix cycle, not yet re-confirmed by him).
+
+## OBJECT-LANE TWIN FINISH SHIPPED + LIVE-VERIFIED (2026-07-23 night, RToony /plan)
+
+RToony wants to shoot small bounded objects (hydrant-class, ~5'×5') with 5-10x denser coverage
+(250-500 photos vs the field-proof's 49) and get back "decent yet reduced voxel/3d face... more
+recent and better detailed" — a clean, colored, art-directable Blender mesh, not a raw scan dump
+and explicitly not the "PS2 graphics" blocky low-poly he first floated. Direct code + live-artifact
+inspection found the geometry side (P5b `/objects` isolation → TSDF mesh) was already excellent
+(hydrant: 100% LCC, fully connected) — the actual gap was entirely on the finishing side: the raw
+object mesh shipped with **zero decimation and only pale TSDF-baked color** (confirmed: `mesh_
+report.py`'s own `defaultLit`+sun-light receipt already shows faint color from TSDF integration
+itself — "zero color" in the plan was slightly imprecise; "pale, unenhanced color" is accurate,
+matching `twin_finish.py`'s own docstring). `twin_finish.py` (WS3 — 6-NN gaussian color transfer +
+pymeshlab quadric decimation + Y-up vertex-colored GLB + mandatory readback) already solves exactly
+this and was already shipped/proven on two other routes — it had just never been wired into
+`/objects`.
+
+- **New `ObjectIsolateBody` fields**: `finish: bool = False`, `finish_target_faces: int = 10_000`
+  (1k-100k range, request-overridable). Color source is the object's OWN `object.ply` (not the
+  whole-scene splat) — verified field-for-field compatible with `twin_finish.py`'s loader
+  (`object_isolate.py` writes raw/pre-activation `f_dc`/`opacity`, matching what the loader
+  decodes itself) — scoped, ~140x less data to KDTree-index than the whole scene, and structurally
+  guarantees no background-gaussian color leak at boundary vertices.
+- New block in `POST /jobs/{id}/objects`, after the existing mesh block: runs `twin_finish.py`
+  (`mesh.ply` + `object.ply` → `mesh/twin.glb`), then best-effort colored receipts via
+  `ground_mesh_receipt.py` reused **unmodified** (already fully generic on any Y-up vertex-colored
+  GLB). New `_OBJECT_FILES` entries (`twin`/`twin-top`/`twin-oblique`) + `twin_glb_url` in the
+  response. No changes needed to `twin_finish.py`, `object_isolate.py`, `checkpoint_subset.py`, or
+  `mesh_report.py` — confirmed the subset-checkpoint's `finally: shutil.rmtree` cleanup (which runs
+  before the new block) is a non-issue since `twin_finish.py` never touches the checkpoint, only
+  plain mesh/splat file paths that already exist and are never deleted.
+- **`finish_target_faces` default 10,000**: the scene-level 400k default would never even trigger
+  decimation on an ~90k-tri object (silently a no-op) — 10k is a ~9x reduction against the
+  hydrant's real 89,990 raw tris, in the conventional low/mid-poly hero-prop range, not a "PS2"
+  cut (~500-2k) or a near-lossless pass-through.
+- **Capture-density guidance**: extended the one existing, already-firing `_recapture_guidance()`
+  photo-orbit string with a dense-single-object recommendation (250-500 photos, stage via
+  `splatcli/inputs/<name>/` + `input_path` to skip the 2GB web-upload cap) — deliberately NOT a new
+  precheck heuristic (Tier-0 has zero access to real-world scale pre-SfM; a wrong auto-fired
+  advisory costs more trust than it's worth, per the metric-trust doctrine).
+- **Verified**: smoke-tested `twin_finish.py` directly against the hydrant's real on-disk artifacts
+  BEFORE touching any route code (cheapest possible proof of the one real risk) — exit 0, 89,990
+  raw tris → exactly 10,000, genuine color (per-channel std ~46, confirmed programmatically, not
+  eyeballed). 490 backend tests pass (486 baseline + 4 new: builds twin.glb with the right args/
+  object.ply scoping, `finish=True` without `mesh` is a loud 400, `finish_target_faces` override
+  lands in the command, a finish failure is a loud 500 that leaves the already-succeeded raw mesh
+  artifacts intact). **Live end-to-end regression** against the real hydrant job through the actual
+  GPU pipeline (`splatlab-safe-restart` deployed, 0 active jobs first): re-isolated + re-meshed +
+  finished, numbers matched the smoke test exactly (6,919 verts / 10,000 faces / 19,659 solid
+  gaussians / 231,708 GLB bytes), all three new file endpoints 200, `meta.json["objects"]
+  ["fire-hydrant"]["twin"]` populated correctly. Receipts + both GLBs copied to `~/Downloads/
+  splatlab-hydrant-twin*`/`splatlab-hydrant-raw-mesh.glb` for RToony's own Blender eyeball —
+  the actual "does this look good" call is his, not scriptable.
+- **Not done, deliberately** (per plan): no `mesh_gate.py` PSNR/SSIM wiring for objects (would be
+  structurally misleading — scores against full uncropped photos, dominated by background pixels
+  an object mesh never claims); no photo-count heuristic in precheck; no size-adaptive
+  `finish_target_faces` formula; no 2DGS/SuGaR/MILo reconstruction swap (stays a documented future
+  "watch" item). The actual dense-capture field test (250-500 photos, real subject) is RToony's own
+  hands-on work — not scripted here.
