@@ -1476,5 +1476,65 @@ API directly.
 - **Not yet done**: an actual interactive click-through in a real browser (no browser automation
   tool available in this environment). RToony should try the "Sections" button on a scene that
   already has scale + a real Locate anchor set.
-- **Phase 3 (curvature-adaptive mesh smoothing) not started** — fully scoped in the approved
-  plan, queued next.
+
+## PRESENTATION TOOLKIT PHASE 3 SHIPPED (2026-07-24) — curvature-adaptive mesh smoothing
+
+The concrete, ship-now answer to "am I asking too much?" about semantic-driven surface smoothing.
+Dedicated research this session found the semantic version (SAM-mask-driven region-specific mesh
+edits) is real published work (Häne et al. 2017, PlanarGS NeurIPS 2025, MagicRoad July 2025) but
+never shipped as a general, robust feature — the hard part is multi-view-consistent 2D→3D label
+fusion, not labeling. The mature, no-semantics-needed answer: curvature-adaptive mesh denoising,
+already one filter call away in `pymeshlab`, already a `twin_finish.py` dependency.
+
+- **Filter**: `apply_coord_two_steps_smoothing`, confirmed directly against the installed
+  pymeshlab (2025.7.post1) parameter surface. Feature-adaptive (`normalthr` degree threshold
+  excludes sharp face-pairs from normal-averaging, so rims/bolt heads stay crisp) and
+  shrink-resistant by construction (fits vertex positions to the smoothed normal field rather than
+  averaging neighbor positions — the actual mechanism that makes plain Laplacian shrivel a mesh,
+  which is why plain Laplacian was rejected). Defaults: `smooth_iterations=2`,
+  `smooth_feature_deg=40°` (tighter than pymeshlab's own 60° default).
+- **Pipeline-order bug caught by the mandated pre-wiring smoke test, not by RToony**: the approved
+  plan called for smoothing AFTER decimation (cheaper, fewer verts). Built exactly as planned, then
+  smoke-tested `twin_finish.py --smooth` against the real hydrant `mesh.ply`/`object.ply` per this
+  session's own "smoke-test the real subprocess call before wiring the route" discipline — the
+  rendered receipt showed clearly WORSE results than unsmoothed: blocky, faceted, crumpled patches.
+  Root cause: `apply_coord_two_steps_smoothing` fits positions to a locally-averaged normal field,
+  which needs enough face resolution to express a smoothly-varying field — the already-decimated
+  10k-face mesh didn't have it. Fixed by reversing the order: smooth the full-resolution raw mesh
+  (~47k verts/90k tris) first, then decimate the now-clean surface. Concrete before/after on the
+  same hydrant mesh: surface-area change vs. the unsmoothed baseline went from **-6.47% (faceted,
+  bad)** in the wrong order to **-3.56% (clean noise removal)** in the corrected order; verts/faces
+  and extent stayed effectively unchanged in both. `transfer_attributes_per_vertex` (color
+  re-projection from the pristine mesh-0 source) now fires whenever EITHER smoothing or decimation
+  moved a vertex, not only on decimation.
+- **Route wiring scoped to `/objects {"finish": true}` only, this pass** — not `/mesh` or
+  `/scene/ground`. This is the one lane with a real, proven smoke-test artifact (the hydrant), and
+  a single global feature-angle threshold is a safer bet on one isolated object than across a
+  heterogeneous scene. `ObjectIsolateBody` gained `smooth`/`smooth_iterations`/
+  `smooth_feature_deg`; `finish_cmd` in the `/objects` route passes them through as `--smooth
+  --smooth-iterations N --smooth-feature-deg D` when requested. The script-level change is shared
+  and cheap to extend to `/mesh`/`/scene/ground` later — a mechanical follow-up, not a redesign.
+- **Verified**: 510 backend tests pass (508 baseline + 2 new wiring-correctness tests in
+  `test_objects_route.py` — assert `--smooth`/`--smooth-iterations`/`--smooth-feature-deg` appear
+  correctly when requested and are absent when not; the smoothing algorithm itself is proven by the
+  hand-run smoke test above, not re-proven in the mocked-subprocess unit test). **Live end-to-end**:
+  `POST /objects {"query": "fire hydrant", "mesh": true, "finish": true, "smooth": true,
+  "smooth_iterations": 2, "smooth_feature_deg": 40.0}` against the real hydrant job through the
+  full GPU pipeline (re-isolation + re-mesh + finish+smooth, 45.9s) returned
+  `twin.smoothing: {"applied": true, "iterations": 2, "feature_deg": 40.0}`, verts=6921,
+  faces=10000, extent=[0.47,0.47,0.47] — matching the smoke test exactly (reproducible). Pulled the
+  live-route-produced GLB and both twin receipts (`fmt=twin`, `twin-top`, `twin-oblique` all 200
+  OK) and visually confirmed: smooth cylindrical hydrant body, nozzle caps and rim edges still
+  crisp, no faceting. Copied to `~/Downloads/splatlab-hydrant-twin-smoothed.glb` +
+  `-oblique.png`/`-top.png`.
+- **Not yet done**: RToony's own Blender/eyeball call on whether the smoothing defaults
+  (2 iterations, 40°) look right on other object shapes beyond the hydrant — this was the one
+  planned verification step explicitly deferred to his own hands-on judgment, same as the finish-
+  stage verification earlier this session.
+- **Explicitly deferred, not attempted**: semantic-mask-driven region-specific smoothing (genuine
+  open research problem per this session's research, not a near-term deliverable) and RANSAC
+  plane/cylinder primitive-fitting (mature for planes, confirmed unreliable for cylinders even in
+  established libraries — directly relevant to the hydrant, so deliberately not attempted). Both
+  remain documented "watch" items.
+
+**All 3 phases of the Presentation & Editing Toolkit plan are now shipped.**

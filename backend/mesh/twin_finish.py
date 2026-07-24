@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Twin finishing stage (adopted from the Blender-lab WS3 findings, 2026-07-21):
-splat->mesh COLOR TRANSFER + decimate + real-world-scale Y-up GLB.
+splat->mesh COLOR TRANSFER + decimate + optional smoothing + real-world-scale
+Y-up GLB.
 
 The TSDF mesh's own colors are pale/washed; the splat's solid gaussians carry
 the real material colors. This transfers them (6-NN inverse-distance blend),
@@ -12,8 +13,21 @@ Judged by SSIM + eyeball, not PSNR (lab finding: PSNR rewards TSDF blur).
 xatlas UVs deliberately skipped — chart generation does not converge on
 fragmented TSDF meshes (lab finding, >1 h runs killed).
 
+Optional --smooth (2026-07-24): TSDF fusion leaves genuinely flat/cylindrical
+real-world surfaces bumpy with reconstruction noise. pymeshlab's
+apply_coord_two_steps_smoothing is curvature/feature-ADAPTIVE, not uniform —
+it excludes face-pairs whose normal deviation exceeds --smooth-feature-deg
+from the normal-averaging step, then fits vertex positions to the (locally)
+smoothed normal field. That position-fit-to-normal-field mechanism is also
+what makes it shrink-resistant, unlike plain Laplacian smoothing (which
+averages neighbor POSITIONS directly and visibly shrivels a mesh) — plain
+Laplacian was deliberately rejected for that reason. No semantic labels
+needed: a genuinely complex/organic surface simply never has the locally
+continuous normal field this filter looks for, so it's self-gating.
+
 Usage: twin_finish.py <mesh.ply> <splat.ply> <out.glb>
        [--meters-per-unit MPU] [--target-faces 400000]
+       [--smooth] [--smooth-iterations 2] [--smooth-feature-deg 40.0]
 """
 import argparse
 import json
@@ -47,6 +61,9 @@ def main() -> int:
     ap.add_argument("out_glb")
     ap.add_argument("--meters-per-unit", type=float, default=None)
     ap.add_argument("--target-faces", type=int, default=400_000)
+    ap.add_argument("--smooth", action="store_true")
+    ap.add_argument("--smooth-iterations", type=int, default=2)
+    ap.add_argument("--smooth-feature-deg", type=float, default=40.0)
     args = ap.parse_args()
     t0 = time.time()
     out_glb = Path(args.out_glb)
@@ -76,11 +93,35 @@ def main() -> int:
     ms.add_mesh(src)          # id 0: full-res colored source
     ms.add_mesh(src)          # id 1: working copy to decimate
     ms.set_current_mesh(1)
+    positions_changed = False
+    if args.smooth:
+        # BEFORE decimation, not after — live-tested both orders on the real
+        # hydrant mesh (2026-07-24) and smoothing the ALREADY-DECIMATED 10k-
+        # face mesh produced visibly WORSE results: blocky, faceted, crumpled
+        # patches instead of genuine curves. apply_coord_two_steps_smoothing
+        # fits vertex positions to a locally-averaged normal field, which
+        # needs enough face resolution to express a smoothly-varying field in
+        # the first place — a coarse post-decimation mesh doesn't have that.
+        # Smoothing the full-resolution raw mesh first, then decimating the
+        # now-clean surface, is both the technically correct order and closer
+        # to standard denoise-then-simplify practice.
+        ms.apply_coord_two_steps_smoothing(
+            stepsmoothnum=args.smooth_iterations, normalthr=args.smooth_feature_deg,
+        )
+        positions_changed = True
     if ms.current_mesh().face_number() > args.target_faces:
         ms.meshing_decimation_quadric_edge_collapse(
             targetfacenum=args.target_faces, preservenormal=True,
             preserveboundary=True, autoclean=True,
         )
+        positions_changed = True
+    if positions_changed:
+        # Re-samples color from mesh 0 (pristine full-res, UNSMOOTHED) at
+        # whatever positions mesh 1 now has — needed whenever EITHER step
+        # moved a vertex, not only on decimation. Smoothing moves vertices
+        # only slightly off the original surface (a local normal re-fit, not
+        # a collapse), so nearest-surface-point color transfer from the
+        # pristine source still resolves correctly.
         ms.transfer_attributes_per_vertex(sourcemesh=0, targetmesh=1, colortransfer=True)
     m = ms.current_mesh()
     verts = m.vertex_matrix().astype(np.float32)
@@ -104,6 +145,10 @@ def main() -> int:
         "extent": [round(float(x), 2) for x in back.extents],
         "glb_bytes": out_glb.stat().st_size,
         "seconds": round(time.time() - t0, 1),
+        "smoothing": (
+            {"applied": True, "iterations": args.smooth_iterations, "feature_deg": args.smooth_feature_deg}
+            if args.smooth else {"applied": False}
+        ),
     }
     (out_glb.parent / "twin_finish.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report))

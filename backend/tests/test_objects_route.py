@@ -312,6 +312,35 @@ def test_objects_finish_target_faces_override(client, monkeypatch):
     assert "25000" in finish_call
 
 
+def test_objects_finish_smooths_when_requested(client, monkeypatch):
+    """Wiring-correctness only -- the smoothing algorithm itself (pipeline
+    order, curvature-adaptiveness) is live-verified against the real hydrant
+    mesh, recorded in STATUS.md, not re-proven here."""
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(job_dir, calls))
+    r = http.post("/api/splat/jobs/splat_0b0001/objects",
+                  json={"query": "table", "finish": True, "smooth": True,
+                        "smooth_iterations": 3, "smooth_feature_deg": 35.0})
+    assert r.status_code == 200
+    finish_call = [str(c) for c in next(c for c in calls if "twin_finish" in " ".join(str(x) for x in c))]
+    assert "--smooth" in finish_call
+    assert "--smooth-iterations" in finish_call and "3" in finish_call
+    assert "--smooth-feature-deg" in finish_call and "35.0" in finish_call
+
+
+def test_objects_finish_no_smooth_flags_when_not_requested(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(job_dir, calls))
+    r = http.post("/api/splat/jobs/splat_0b0001/objects", json={"query": "table", "finish": True})
+    assert r.status_code == 200
+    finish_call = [str(c) for c in next(c for c in calls if "twin_finish" in " ".join(str(x) for x in c))]
+    assert "--smooth" not in finish_call
+
+
 def test_objects_finish_failure_is_loud_500(client, monkeypatch):
     """A failed finish must not roll back the already-succeeded raw mesh
     artifacts -- they were a complete, valid build on their own."""

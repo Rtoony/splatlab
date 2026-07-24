@@ -4514,6 +4514,18 @@ class ObjectIsolateBody(BaseModel):
     # hydrant's 89,990 raw tris is a ~9x reduction, in the conventional
     # low/mid-poly hero-prop range (5k-20k), not a "PS2" reduction (~500-2k).
     finish_target_faces: int = Field(default=10_000, ge=1_000, le=100_000)
+    # Curvature-adaptive smoothing (2026-07-24): TSDF fusion leaves genuinely
+    # flat/cylindrical real-world surfaces bumpy with reconstruction noise.
+    # twin_finish.py's --smooth (pymeshlab apply_coord_two_steps_smoothing)
+    # excludes sharp face-pairs from its normal-averaging step, so it smooths
+    # noise while protecting genuine detail (bolt heads, cap rims) -- no
+    # semantic labels needed, self-gating on local normal continuity. Only
+    # this route gets it this pass (not /mesh or /scene/ground): it's the one
+    # lane with a real, live-verified smoke-test proof (the hydrant) --
+    # extending to whole-scene meshes is a cheap follow-up once that's used.
+    smooth: bool = False
+    smooth_iterations: int = Field(default=2, ge=1, le=10)
+    smooth_feature_deg: float = Field(default=40.0, ge=5.0, le=90.0)
 
 
 def _object_slug(query: str) -> str:
@@ -4643,6 +4655,12 @@ async def isolate_splat_object(request: Request, job_id: str, body: ObjectIsolat
             mpu = meta.get("meters_per_unit")
             if mpu:
                 finish_cmd += ["--meters-per-unit", str(mpu)]
+            if body.smooth:
+                finish_cmd += [
+                    "--smooth",
+                    "--smooth-iterations", str(body.smooth_iterations),
+                    "--smooth-feature-deg", str(body.smooth_feature_deg),
+                ]
             rc, _out, stderr = await _run_capture_subprocess(finish_cmd)
             if rc != 0 or not twin_glb.is_file():
                 tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
