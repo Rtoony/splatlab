@@ -86,14 +86,15 @@ SEMANTIC_GROUND_SCRIPT = Path(__file__).resolve().parent / "mesh" / "semantic_gr
 SEMANTIC_GROUND_VRAM_MB = 6_000  # checkpoint load + SigLIP 2 text encoder
 
 
-class ContoursBody(BaseModel):
+class GroundSampleParams(BaseModel):
+    """Shared ground-sampling knobs — the part of /geo/contours' request body
+    that /geo/sections also needs (both ultimately just call ground_extract.py
+    via _extract_ground_points). Factored out so the two routes can't drift
+    out of sync on field names/defaults."""
     epsg: int = 2226
     cell_m: float = 0.25          # ground-sampling grid (meters); 0.5-1.0 for big sites
     max_slope_deg: float = 40.0   # steeper faces are not "ground"
     spike_tol_m: float = 0.5      # 3x3 neighborhood median rejection
-    minor_ft: float = 0.5
-    major_ft: float = 2.5
-    tin_faces: bool = False       # also draw the TIN as review linework
     # SEMANTIC ground (P5a): sample ground from language-field gaussians instead
     # of mesh slope — richer, hole-free, vetoes hedge/table contamination, and
     # needs NO mesh (works on mesh-hostile scenes). None = AUTO (RToony's
@@ -101,6 +102,19 @@ class ContoursBody(BaseModel):
     # mesh-slope fallback otherwise. Explicit true demands a language field.
     semantic: bool | None = None
     semantic_thresh: float = 0.5
+
+
+class ContoursBody(GroundSampleParams):
+    minor_ft: float = 0.5
+    major_ft: float = 2.5
+    tin_faces: bool = False       # also draw the TIN as review linework
+
+
+class SiteSectionsBody(GroundSampleParams):
+    """Same ground sampling as /geo/contours, no contour-line-specific
+    fields — the section/iso algorithm itself (surface_receipts.py) is v1
+    fixed: two auto-picked principal-axis sections, no caller-configurable
+    swath/orientation/camera-angle knobs yet."""
 
 
 # ── stored-anchor validation ─────────────────────────────────────────────────
@@ -524,22 +538,21 @@ async def build_survey_export(job_id: str, body: GeoExportBody | None = None):
     }
 
 
-@router.post("/jobs/{job_id}/geo/contours")
-async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
-    """Splat mesh -> ground PNEZD points -> cdt TIN + contour DXF on office
-    layers. Same prerequisites and loud-409 contract as /geo/export."""
-    body = body or ContoursBody()
-    meta = _require_job_meta(job_id)
-    if not (1000 <= body.epsg <= 999_999):
-        raise HTTPException(status_code=400, detail="epsg must be a plausible EPSG code")
-    if not (0.05 <= body.cell_m <= 5.0):
-        raise HTTPException(status_code=400, detail="cell_m must be within [0.05, 5.0] meters")
-    if not (0.0 < body.minor_ft <= body.major_ft <= 100.0):
-        raise HTTPException(status_code=400, detail="need 0 < minor_ft <= major_ft <= 100")
-    output_dir = (
-        Path(meta["output_dir"]) if meta.get("output_dir") else splat_route.DEFAULT_3D_ROOT / job_id
-    )
-    mesh_file = output_dir / splat_route.MESH_DIRNAME / "mesh.ply"
+async def _extract_ground_points(
+    job_id: str,
+    meta: dict[str, Any],
+    output_dir: Path,
+    mesh_file: Path,
+    body: GroundSampleParams,
+    build_dir: Path,
+) -> tuple[Path, bool, dict[str, Any], dict[str, Any]]:
+    """Runs the semantic AUTO/fallback decision + ground_extract.py subprocess
+    (optionally preceded by the semantic-ground GPU step). Shared by
+    /geo/contours and /geo/sections so this decision tree can't drift out of
+    sync between the two routes. Raises HTTPException on any failure (loud,
+    same contract both callers already had). Returns
+    (ground_points.txt path, use_semantic, params used, ground.json report).
+    """
     gauss_emb = output_dir / splat_route.LANGFIELD_DIRNAME / "gauss_emb.npz"
     splatfacto_config: Path | None = None
     if body.semantic and not gauss_emb.is_file():
@@ -578,6 +591,75 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
             detail=f"No mesh for this scene yet — run mesh export first (POST /api/splat/jobs/{job_id}/mesh), "
             "or use semantic=true (needs a language field, no mesh).",
         )
+
+    params: dict[str, Any] = {
+        "job_id": job_id,
+        "meters_per_unit": meta["meters_per_unit"],
+        "geo": meta["geo"],
+        "epsg": body.epsg,
+        "cell_m": body.cell_m,
+        "max_slope_deg": body.max_slope_deg,
+        "spike_tol_m": body.spike_tol_m,
+    }
+    pnezd = build_dir / "ground_points.txt"
+    ground_cmd = [
+        str(splat_route.MESH_ENV_PYTHON), str(GROUND_EXTRACT_SCRIPT),
+        str(mesh_file), str(build_dir), "--params-json", json.dumps(params),
+    ]
+    if use_semantic:
+        # Step 0: per-gaussian ground relevancy (langfield env, brief GPU).
+        gg = build_dir / "ground_gaussians.npz"
+        params["semantic_thresh"] = body.semantic_thresh
+        ground_cmd = [*ground_cmd[:5], json.dumps(params), "--ground-gaussians", str(gg)]
+
+        async def sem_operation() -> tuple[int, bytes, bytes]:
+            return await splat_route._run_capture_subprocess([
+                str(splat_route.LANGFIELD_ENV_PYTHON), str(SEMANTIC_GROUND_SCRIPT),
+                str(gauss_emb), str(splatfacto_config), str(gg),
+            ])
+
+        try:
+            rc, _out, stderr = await splat_route.gpu_arbiter.run_gpu_operation(
+                lane="semantic-ground",
+                operation_id=job_id,
+                vram_mb=SEMANTIC_GROUND_VRAM_MB,
+                operation=sem_operation,
+            )
+        except splat_route.gpu_arbiter.GPUArbiterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"Semantic ground blocked: {exc}") from exc
+        if rc != 0 or not gg.is_file():
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-8:])
+            raise HTTPException(status_code=500, detail=f"Semantic ground failed (exit {rc}): {tail}")
+
+    rc, _out, stderr = await splat_route._run_capture_subprocess(ground_cmd)
+    if rc != 0 or not pnezd.is_file():
+        tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-8:])
+        raise HTTPException(status_code=500, detail=f"Ground extraction failed (exit {rc}): {tail}")
+
+    try:
+        ground_report = json.loads((build_dir / "ground.json").read_text())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Ground report ground.json unreadable: {exc}") from exc
+
+    return pnezd, use_semantic, params, ground_report
+
+
+@router.post("/jobs/{job_id}/geo/contours")
+async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
+    """Splat mesh -> ground PNEZD points -> cdt TIN + contour DXF on office
+    layers. Same prerequisites and loud-409 contract as /geo/export."""
+    body = body or ContoursBody()
+    meta = _require_job_meta(job_id)
+    if not (1000 <= body.epsg <= 999_999):
+        raise HTTPException(status_code=400, detail="epsg must be a plausible EPSG code")
+    if not (0.05 <= body.cell_m <= 5.0):
+        raise HTTPException(status_code=400, detail="cell_m must be within [0.05, 5.0] meters")
+    if not (0.0 < body.minor_ft <= body.major_ft <= 100.0):
+        raise HTTPException(status_code=400, detail="need 0 < minor_ft <= major_ft <= 100")
+    output_dir = (
+        Path(meta["output_dir"]) if meta.get("output_dir") else splat_route.DEFAULT_3D_ROOT / job_id
+    )
+    mesh_file = output_dir / splat_route.MESH_DIRNAME / "mesh.ply"
     mpu = meta.get("meters_per_unit")
     if not mpu:
         raise HTTPException(
@@ -601,16 +683,7 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
 
     geo_dir = _survey_export_dir(meta, job_id)
     geo_dir.mkdir(parents=True, exist_ok=True)
-    params = {
-        "job_id": job_id,
-        "meters_per_unit": mpu,
-        "geo": meta["geo"],
-        "epsg": body.epsg,
-        "cell_m": body.cell_m,
-        "max_slope_deg": body.max_slope_deg,
-        "spike_tol_m": body.spike_tol_m,
-    }
-    lock = _geo_export_lock(job_id)  # shared with /geo/export: both write _mesh/geo/
+    lock = _geo_export_lock(job_id)  # shared with /geo/export and /geo/sections: all write _mesh/geo/
     if lock.locked():
         raise HTTPException(status_code=409, detail=f"A survey build is already running for {job_id}.")
     async with lock:
@@ -620,42 +693,12 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
         build_dir = geo_dir / ".building"
         shutil.rmtree(build_dir, ignore_errors=True)
         build_dir.mkdir(parents=True)
-        pnezd = build_dir / "ground_points.txt"
         dxf = build_dir / "contours.dxf"
         receipt = build_dir / "contours_receipt.png"
-        ground_cmd = [
-            str(splat_route.MESH_ENV_PYTHON), str(GROUND_EXTRACT_SCRIPT),
-            str(mesh_file), str(build_dir), "--params-json", json.dumps(params),
-        ]
-        if use_semantic:
-            # Step 0: per-gaussian ground relevancy (langfield env, brief GPU).
-            gg = build_dir / "ground_gaussians.npz"
-            params["semantic_thresh"] = body.semantic_thresh
-            ground_cmd = [*ground_cmd[:5], json.dumps(params), "--ground-gaussians", str(gg)]
 
-            async def sem_operation() -> tuple[int, bytes, bytes]:
-                return await splat_route._run_capture_subprocess([
-                    str(splat_route.LANGFIELD_ENV_PYTHON), str(SEMANTIC_GROUND_SCRIPT),
-                    str(gauss_emb), str(splatfacto_config), str(gg),
-                ])
-
-            try:
-                rc, _out, stderr = await splat_route.gpu_arbiter.run_gpu_operation(
-                    lane="semantic-ground",
-                    operation_id=job_id,
-                    vram_mb=SEMANTIC_GROUND_VRAM_MB,
-                    operation=sem_operation,
-                )
-            except splat_route.gpu_arbiter.GPUArbiterUnavailable as exc:
-                raise HTTPException(status_code=503, detail=f"Semantic ground blocked: {exc}") from exc
-            if rc != 0 or not gg.is_file():
-                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-8:])
-                raise HTTPException(status_code=500, detail=f"Semantic ground failed (exit {rc}): {tail}")
-
-        rc, _out, stderr = await splat_route._run_capture_subprocess(ground_cmd)
-        if rc != 0 or not pnezd.is_file():
-            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-8:])
-            raise HTTPException(status_code=500, detail=f"Ground extraction failed (exit {rc}): {tail}")
+        pnezd, use_semantic, params, ground_report = await _extract_ground_points(
+            job_id, meta, output_dir, mesh_file, body, build_dir,
+        )
 
         cdt_cmd = [
             str(splat_route.CDT_VENV_PYTHON), str(CONTOURS_BUILD_SCRIPT),
@@ -676,11 +719,11 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
                 "minor_ft": body.minor_ft, "major_ft": body.major_ft, "tin_faces": body.tin_faces,
             },
         }
-        for name, key in (("ground.json", "ground"), ("contours_result.json", "contours")):
-            try:
-                report[key] = json.loads((build_dir / name).read_text())
-            except Exception as exc:  # a written DXF with an unreadable report is still a failure
-                raise HTTPException(status_code=500, detail=f"Contours report {name} unreadable: {exc}") from exc
+        report["ground"] = ground_report
+        try:
+            report["contours"] = json.loads((build_dir / "contours_result.json").read_text())
+        except Exception as exc:  # a written DXF with an unreadable report is still a failure
+            raise HTTPException(status_code=500, detail=f"Contours report contours_result.json unreadable: {exc}") from exc
 
         report["params"]["semantic"] = use_semantic
         # Receipts are best-effort: a render failure becomes a note, never a 500.
@@ -728,6 +771,98 @@ async def build_ground_contours(job_id: str, body: ContoursBody | None = None):
             f"/api/splat/jobs/{job_id}/geo/export?fmt=surface-iso"
             if report.get("surface_receipts") else None
         ),
+    }
+
+
+@router.post("/jobs/{job_id}/geo/sections")
+async def build_site_sections(job_id: str, body: SiteSectionsBody | None = None):
+    """Two principal-axis cross-sections + an isometric TIN render — the
+    quick "give me a picture" tool, distinct from the full /geo/contours
+    CAD/DXF survey pipeline. Only needs ground-extract + surface_receipts.py
+    (no CDT venv, no DXF authoring) — a narrower toolchain and a narrower
+    failure surface than /geo/contours. Shares _mesh/geo/ + its lock with
+    /geo/export and /geo/contours; running this before or after either
+    doesn't disturb the other's own artifacts (each promotes only the files
+    it just produced). Unlike /geo/contours (where these images are a bonus
+    on top of the DXF), a surface_receipts.py failure here is loud — it's
+    the entire deliverable of this route."""
+    body = body or SiteSectionsBody()
+    meta = _require_job_meta(job_id)
+    if not (1000 <= body.epsg <= 999_999):
+        raise HTTPException(status_code=400, detail="epsg must be a plausible EPSG code")
+    if not (0.05 <= body.cell_m <= 5.0):
+        raise HTTPException(status_code=400, detail="cell_m must be within [0.05, 5.0] meters")
+    output_dir = (
+        Path(meta["output_dir"]) if meta.get("output_dir") else splat_route.DEFAULT_3D_ROOT / job_id
+    )
+    mesh_file = output_dir / splat_route.MESH_DIRNAME / "mesh.ply"
+    mpu = meta.get("meters_per_unit")
+    if not mpu:
+        raise HTTPException(
+            status_code=409,
+            detail="Scene scale is uncalibrated — measure a known distance in the viewer "
+            f"and set it (POST /api/splat/jobs/{job_id}/scale) first.",
+        )
+    if not meta.get("geo"):
+        raise HTTPException(
+            status_code=409,
+            detail="Scene has no geo anchor — set one with Locate (map pin or GPS suggest) first.",
+        )
+    if not (
+        GROUND_EXTRACT_SCRIPT.is_file()
+        and SURFACE_RECEIPTS_SCRIPT.is_file()
+        and splat_route.MESH_ENV_PYTHON.is_file()
+    ):
+        raise HTTPException(status_code=400, detail="Site-sections toolchain (mesh env) unavailable.")
+
+    geo_dir = _survey_export_dir(meta, job_id)
+    geo_dir.mkdir(parents=True, exist_ok=True)
+    lock = _geo_export_lock(job_id)  # shared with /geo/export and /geo/contours: all write _mesh/geo/
+    if lock.locked():
+        raise HTTPException(status_code=409, detail=f"A survey build is already running for {job_id}.")
+    async with lock:
+        # Own staging subdir (contours uses .building/) — harmless either way
+        # since the shared lock already rules out a concurrent run for this
+        # job, but keeps a crash-before-cleanup dir identifiable by route.
+        build_dir = geo_dir / ".building-sections"
+        shutil.rmtree(build_dir, ignore_errors=True)
+        build_dir.mkdir(parents=True)
+
+        pnezd, use_semantic, params, ground_report = await _extract_ground_points(
+            job_id, meta, output_dir, mesh_file, body, build_dir,
+        )
+
+        sr_cmd = [
+            str(splat_route.MESH_ENV_PYTHON), str(SURFACE_RECEIPTS_SCRIPT),
+            str(pnezd), str(build_dir), "--params-json", json.dumps(params),
+        ]
+        if mesh_file.is_file():
+            sr_cmd += ["--mesh", str(mesh_file)]
+        rc, _out, stderr = await splat_route._run_capture_subprocess(sr_cmd)
+        if rc != 0 or not (build_dir / "sections.png").is_file():
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-8:])
+            raise HTTPException(status_code=500, detail=f"Site sections failed (exit {rc}): {tail}")
+
+        report: dict[str, Any] = {
+            "v": 1,
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "params": {k: v for k, v in params.items() if k != "geo"},
+            "ground": ground_report,
+        }
+        report["params"]["semantic"] = use_semantic
+        (build_dir / "site_sections.json").write_text(json.dumps(report, indent=2))
+        # PROMOTE: full success only — overwrite prior generation atomically-ish.
+        for f in sorted(build_dir.iterdir()):
+            shutil.move(str(f), str(geo_dir / f.name))
+        shutil.rmtree(build_dir, ignore_errors=True)
+        splat_route._patch_meta(job_id, site_sections=report)
+
+    return {
+        "job_id": job_id,
+        "site_sections": report,
+        "sections_url": f"/api/splat/jobs/{job_id}/geo/export?fmt=sections",
+        "surface_iso_url": f"/api/splat/jobs/{job_id}/geo/export?fmt=surface-iso",
+        "ground_points_url": f"/api/splat/jobs/{job_id}/geo/export?fmt=ground",
     }
 
 

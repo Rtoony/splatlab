@@ -12,11 +12,13 @@ import type {
 } from "@/lib/contracts";
 import { SplatViewer, type ViewerCameraNodeTarget, type ViewerCameraViewTarget, type ViewerHighlight, type ViewerOverlay } from "@/components/splat-viewer";
 import { Button, Card, Input, SectionLabel } from "@/components/ui";
-import { ArrowLeft, Camera, ChevronDown, ChevronUp, Compass, Crosshair, Download, Eye, EyeOff, Layers, Loader2, MapPin, Orbit, RotateCcw, Search, SlidersHorizontal, Sparkles, X } from "lucide-react";
+import { ArrowLeft, Camera, ChevronDown, ChevronUp, Compass, Crosshair, Download, Eye, EyeOff, Layers, Loader2, MapPin, Mountain, Orbit, RotateCcw, Search, SlidersHorizontal, Sparkles, X } from "lucide-react";
 import { SparkSceneViewer } from "@/components/spark-scene-viewer";
 
 // Locate-in-the-world map modal — lazy so Leaflet only ships when opened.
 const GeoLocateModal = lazy(() => import("@/components/geo-locate"));
+// Site sections — lazy, its own small on-demand tool.
+const SiteSectionsModal = lazy(() => import("@/components/site-sections"));
 // P6 Control Panel — lazy so the scene-regen UI only ships when opened.
 const SceneRegenModal = lazy(() => import("@/components/scene-regen"));
 
@@ -52,6 +54,7 @@ export default function SplatViewPage() {
   // fly-to until the full 2.4 port. Sticky per browser.
   const [sparkBeta, setSparkBeta] = useState(() => localStorage.getItem("splatlab.sparkBeta") === "1");
   const [geoOpen, setGeoOpen] = useState(false);
+  const [sectionsOpen, setSectionsOpen] = useState(false);
   const [sceneRegenOpen, setSceneRegenOpen] = useState(false);
   function toggleSparkBeta() {
     setSparkBeta((v) => {
@@ -232,6 +235,18 @@ export default function SplatViewPage() {
               className={job.geo ? "border-emerald-300/40 text-emerald-200" : ""}
             >
               <MapPin className="h-3.5 w-3.5" /> {job.geo ? "Located" : "Locate"}
+            </Button>
+          )}
+          {job && viewUrl && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setSectionsOpen(true)}
+              title="Generate cross-section + isometric TIN images of this site"
+              className={job.sections_url ? "border-emerald-300/40 text-emerald-200" : ""}
+            >
+              <Mountain className="h-3.5 w-3.5" /> Sections
             </Button>
           )}
           {job && viewUrl && (
@@ -420,6 +435,11 @@ export default function SplatViewPage() {
       {geoOpen && job && (
         <Suspense fallback={null}>
           <GeoLocateModal job={job} onClose={() => setGeoOpen(false)} />
+        </Suspense>
+      )}
+      {sectionsOpen && job && (
+        <Suspense fallback={null}>
+          <SiteSectionsModal job={job} onClose={() => setSectionsOpen(false)} />
         </Suspense>
       )}
       {sceneRegenOpen && job && (

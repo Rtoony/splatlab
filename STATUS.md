@@ -1431,3 +1431,50 @@ one real gap.
   (proves the reload-nonce fix + undo) before trusting this fully.
 - **Phase 2 (site sections) and Phase 3 (curvature-adaptive smoothing) not started** — fully
   scoped in the approved plan, queued next.
+
+## PRESENTATION TOOLKIT PHASE 2 SHIPPED (2026-07-24) — official on-demand site sections
+
+Closes the "make site sections an official tool" ask. Previously `surface_receipts.py` (two
+principal-axis cross-sections + an isometric ground TIN) only ran as an always-on, best-effort
+tail step buried inside the much heavier `/geo/contours` CAD/DXF pipeline, with zero frontend
+trigger — the only UI was a passive download link that appeared IF someone had already called the
+API directly.
+
+- **`GroundSampleParams` refactor** in `geo_route.py`: factored `ContoursBody`'s shared
+  ground-sampling fields (epsg/cell_m/max_slope_deg/spike_tol_m/semantic/semantic_thresh) into a
+  base class, backward-compatible (all 35 pre-existing `test_contours_route.py` +
+  `test_geo_route.py` tests pass unchanged, proving it). Extracted the semantic-AUTO-fallback
+  decision tree + ground_extract.py subprocess call (previously inline in `build_ground_contours`)
+  into a shared `_extract_ground_points()` helper, so the two routes that both need it
+  (`/geo/contours` and the new `/geo/sections`) can't drift out of sync.
+- **New `POST /jobs/{id}/geo/sections`**: a genuinely lighter route — only needs ground-extract +
+  `surface_receipts.py` (no CDT venv, no DXF authoring), sharing `_mesh/geo/` and its lock with
+  `/geo/export`/`/geo/contours` but promoting only the files it just produced (verified: running
+  either route after the other leaves the other's exclusive files — `contours.dxf` etc. —
+  untouched). Unlike `/geo/contours` (where these images are a best-effort bonus on top of the
+  DXF), a `surface_receipts.py` failure here is a loud 500 — it's this route's entire deliverable.
+  v1 keeps the existing fixed "two auto-picked principal-axis sections + two iso angles"
+  algorithm — no new tunable knobs, matching this project's "ship the baseline" pattern.
+- **Frontend**: extracted `ReceiptLightbox` out of `scene-regen.tsx` into its own shared
+  `receipt-lightbox.tsx` (mechanical, its props were already fully generic) so both it and the
+  new modal use the same component. New small single-purpose `site-sections.tsx` modal — one
+  trigger button, two result thumbnails, the shared lightbox — deliberately NOT folded into
+  `GeoLocateModal` (scoped to map/anchor concerns) or `SceneRegenModal` (a different lane, P6
+  object decomposition). New "Sections" header button in `splat-view.tsx` between Locate and
+  Scene, same visibility/styling convention as its siblings.
+- **Verified**: 508 backend tests pass (499 baseline + 9 new for `test_sections_route.py`). `tsc
+  --noEmit` steady at the 43-error baseline, `npm run build` clean (new `site-sections`/
+  `receipt-lightbox` lazy chunks). **Live end-to-end, not just mocked**: set a temporary synthetic
+  geo anchor on garden (already had scale+mesh+langfield, just missing an anchor), ran the real
+  route — 260,036 ground gaussians identified out of 1,326,611 total, 1,065 ground points, ~29s —
+  pulled the actual rendered PNG and visually confirmed it: the garden table's silhouette is
+  clearly recognizable and the ground TIN correctly traces the real terrain including the
+  pedestal notch. Cleared the synthetic anchor afterward (the real generated images were left in
+  place — legitimate artifacts, not test scaffolding). Confirmed the deployed bundle serves the
+  new code at the live asset hash. Receipts copied to `~/Downloads/splatlab-garden-sections.png` /
+  `splatlab-garden-surface-iso.png`.
+- **Not yet done**: an actual interactive click-through in a real browser (no browser automation
+  tool available in this environment). RToony should try the "Sections" button on a scene that
+  already has scale + a real Locate anchor set.
+- **Phase 3 (curvature-adaptive mesh smoothing) not started** — fully scoped in the approved
+  plan, queued next.

@@ -26,6 +26,7 @@ import type {
   SplatSceneSummary,
 } from "@/lib/contracts";
 import { Button, Card, Input, SectionLabel } from "@/components/ui";
+import ReceiptLightbox from "@/components/receipt-lightbox";
 import {
   AlertTriangle,
   Boxes,
@@ -113,57 +114,6 @@ function StaleNote({ text }: { text: string | null }) {
     <p className="flex items-start gap-1.5 rounded-lg border border-amber-400/25 bg-amber-400/10 px-2.5 py-2 text-xs leading-snug text-amber-200">
       <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {text}
     </p>
-  );
-}
-
-// ── shared receipt lightbox ────────────────────────────────────────────────
-function ReceiptLightbox({
-  src,
-  onClose,
-  onPrev,
-  onNext,
-}: {
-  src: string;
-  onClose: () => void;
-  onPrev?: () => void;
-  onNext?: () => void;
-}) {
-  return (
-    <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/85 p-6"
-      onClick={onClose}
-      onKeyDown={(e) => e.key === "Escape" && onClose()}
-      role="presentation"
-    >
-      <button type="button" onClick={onClose} className="absolute right-5 top-5 rounded-full bg-black/40 p-2 text-zinc-200 hover:bg-black/70" title="Close (Esc)">
-        <X className="h-5 w-5" />
-      </button>
-      {onPrev && (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onPrev();
-          }}
-          className="absolute left-5 rounded-full bg-black/40 p-2 text-zinc-200 hover:bg-black/70"
-        >
-          <ChevronLeft className="h-5 w-5" />
-        </button>
-      )}
-      <img src={src} alt="" className="max-h-[85vh] max-w-[85vw] rounded-xl object-contain" onClick={(e) => e.stopPropagation()} />
-      {onNext && (
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onNext();
-          }}
-          className="absolute right-5 rounded-full bg-black/40 p-2 text-zinc-200 hover:bg-black/70"
-        >
-          <ChevronRight className="h-5 w-5" />
-        </button>
-      )}
-    </div>
   );
 }
 
