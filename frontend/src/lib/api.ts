@@ -19,6 +19,9 @@ import type {
   SplatExportBuildRequest,
   SplatMeshBuildRequest,
   SplatMeshBuildResponse,
+  SplatObjectIsolateRequest,
+  SplatObjectIsolateResponse,
+  SplatObjectListing,
   SplatSemanticEditRequest,
   SplatSemanticEditResponse,
   SplatExportManifest,
@@ -159,6 +162,22 @@ export function buildSplatMesh(jobId: string, request: SplatMeshBuildRequest): P
 // office layers. Loud 409s for missing scale calibration / geo anchor.
 export function buildGroundContours(jobId: string, request: SplatContoursRequest): Promise<SplatContoursResponse> {
   return postJSON<SplatContoursResponse>(`/api/splat/jobs/${jobId}/geo/contours`, request);
+}
+
+// Enumerate every built object for a scene (object.json receipts + an
+// on-disk files{} map). Cheap read-only scan.
+export function fetchSplatObjects(jobId: string): Promise<SplatObjectListing> {
+  return apiRequest<SplatObjectListing>(`/api/splat/jobs/${jobId}/objects`);
+}
+
+// Multi-minute GPU build: language-field isolation + optional per-object
+// mesh/twin finish/proxy. Loud 409s: missing/stale language field, another
+// mesh/object build already running for the job.
+export function isolateSplatObject(
+  jobId: string,
+  request: SplatObjectIsolateRequest,
+): Promise<SplatObjectIsolateResponse> {
+  return postJSON<SplatObjectIsolateResponse>(`/api/splat/jobs/${jobId}/objects`, request);
 }
 
 // Apply 1-32 destructive edit ops in pipeline order. The backend snapshots

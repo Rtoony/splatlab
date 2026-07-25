@@ -14,6 +14,7 @@ import { SplatViewer, type ViewerCameraNodeTarget, type ViewerCameraPose, type V
 import { Button, Card, DropdownItem, DropdownMenu, DropdownSeparator, Input, SectionLabel, Tabs, TabsList, TabsTrigger } from "@/components/ui";
 import { EditLane } from "@/components/workspace/edit-lane";
 import { ExportLane } from "@/components/workspace/export-lane";
+import { ObjectsPanel } from "@/components/workspace/objects-panel";
 import { ArrowLeft, Boxes, Camera, ChevronDown, ChevronUp, Crosshair, Eye, EyeOff, Layers, Loader2, MapPin, MoreHorizontal, Mountain, Orbit, PackageOpen, RotateCcw, Ruler, Search, SlidersHorizontal, Sparkles, Wrench, X } from "lucide-react";
 import { SparkSceneViewer } from "@/components/spark-scene-viewer";
 
@@ -521,41 +522,7 @@ export default function SplatViewPage() {
           <aside className="absolute bottom-0 right-0 top-0 z-30 w-[24rem] max-w-full overflow-y-auto border-l border-white/10 bg-surface/95 backdrop-blur-md">
             {mode === "edit" && <EditLane job={job} onEdited={handleLaneEdited} />}
             {mode === "export" && <ExportLane job={job} />}
-            {mode === "objects" && (
-              <div className="space-y-4 p-4">
-                <div className="flex items-center gap-2">
-                  <Boxes className="h-4 w-4 text-cyan-300" />
-                  <SectionLabel>Objects</SectionLabel>
-                </div>
-                <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-3">
-                  <p className="text-sm font-semibold text-zinc-100">Scene decomposition (P6)</p>
-                  <p className="mt-1 text-xs leading-relaxed text-zinc-400">
-                    Enumerate every object in the scene, isolate them from the background, build proxies,
-                    extract the ground, and reassemble — with an approval gate before anything ships.
-                  </p>
-                  {/* Object tools are langfield-gated server-side — say WHICH
-                      reason applies instead of letting the routes 409/422. */}
-                  {job.langfield_stale ? (
-                    <p className="mt-2 rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5 text-[11px] leading-snug text-amber-100/85">
-                      Language field is stale (the scene was edited after it was built) — object tools need a
-                      matching field. Re-run this scene with Language search on to rebuild it (retrains the scene).
-                    </p>
-                  ) : !job.langfield_available ? (
-                    <p className="mt-2 rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5 text-[11px] leading-snug text-amber-100/85">
-                      No language field built for this scene — object tools need one. Re-run this scene with
-                      Language search on to build it (retrains the scene).
-                    </p>
-                  ) : null}
-                  <Button size="sm" className="mt-2 w-full" onClick={() => setSceneRegenOpen(true)}>
-                    <Layers className="h-3.5 w-3.5" /> Open Scene panel
-                  </Button>
-                </div>
-                <p className="text-[11px] leading-relaxed text-zinc-600">
-                  Coming next: name an object ("the fire hydrant") and get back its isolated splat, mesh, and a
-                  colored Blender-ready twin — the single-object lane is already built server-side.
-                </p>
-              </div>
-            )}
+            {mode === "objects" && <ObjectsPanel job={job} onOpenScenePanel={() => setSceneRegenOpen(true)} />}
           </aside>
         )}
       </main>

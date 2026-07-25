@@ -301,6 +301,89 @@ export interface SplatContoursResponse {
   surface_iso_url: string | null;
 }
 
+// ── Objects lane (single-object isolation, splat_route.py P5b/P5c) ──────────
+// Shapes mirrored from source 2026-07-25: ObjectIsolateBody (~line 4501),
+// _OBJECT_FILES (~4776), the objects listing route, and object_isolate.py's
+// object.json receipt.
+
+export type SplatObjectFileFormat =
+  | "splat"
+  | "ply"
+  | "glb"
+  | "receipt"
+  | "twin"
+  | "twin-top"
+  | "twin-oblique"
+  | "proxy"
+  | "proxy-preview";
+
+// POST /jobs/{id}/objects. Needs a built, non-stale language field (409s
+// otherwise); finish requires mesh (400).
+export interface SplatObjectIsolateRequest {
+  query: string; // 2-80 chars, must not start with whitespace or "-"
+  cluster?: number; // 0-5, default 0 — which candidate cluster to take
+  expand?: number; // 1.0-3.0, default 1.6 (graded on the garden table)
+  rel_floor?: number; // (0,1) exclusive, default 0.30
+  mesh?: boolean; // default true — tight fine-voxel object mesh
+  proxy?: boolean; // default false — TripoSplat clean replacement (render/VR only)
+  finish?: boolean; // default false — twin finish (color + decimate + Y-up GLB)
+  finish_target_faces?: number; // 1000-100000, default 10000 (~hero-prop range)
+  smooth?: boolean; // default false — curvature-adaptive smoothing in the finish
+  smooth_iterations?: number; // 1-10, default 2
+  smooth_feature_deg?: number; // 5-90, default 40
+}
+
+// The object.json isolation receipt (mesh/object_isolate.py). The listing
+// serves it verbatim minus `artifacts`; the POST response's copy may also
+// carry in-memory mesh/twin/proxy sub-reports (object.json on disk does not,
+// so they're absent from later listings of the same object).
+export interface SplatObjectReceipt {
+  query: string;
+  cluster: number;
+  clusters_found: number;
+  pool_members: number; // tight core-cluster members (pre-expansion)
+  expanded_members: number; // final member count after expand/rel_floor
+  expand: number;
+  rel_floor: number;
+  focus_scene: [number, number, number];
+  radius_scene: number;
+  bbox_scene: { min: [number, number, number]; max: [number, number, number] };
+  bbox_tight?: { min: [number, number, number]; max: [number, number, number] };
+  mesh?: Record<string, unknown>;
+  mesh_voxel?: number;
+  twin?: Record<string, unknown>;
+  proxy?: Record<string, unknown>;
+}
+
+// One entry from GET /jobs/{id}/objects: receipt + slug + a files{} map of
+// only the formats whose artifacts exist on disk RIGHT NOW (same per-format
+// URLs the /objects/{slug}/file route serves).
+export interface SplatObjectEntry extends SplatObjectReceipt {
+  slug: string;
+  files: Partial<Record<SplatObjectFileFormat, string>>;
+}
+
+export interface SplatObjectListing {
+  job_id: string;
+  objects: SplatObjectEntry[];
+}
+
+// POST /jobs/{id}/objects response (splat_route.py ~line 4756). The *_url
+// fields reflect what THIS build produced; the listing's files{} map is the
+// durable on-disk truth.
+export interface SplatObjectIsolateResponse {
+  job_id: string;
+  slug: string;
+  object: SplatObjectReceipt;
+  splat_url: string;
+  mesh_ply_url: string | null;
+  mesh_glb_url: string | null;
+  receipt_url: string | null;
+  twin_glb_url: string | null;
+  proxy_url: string | null;
+  proxy_preview_url: string | null;
+}
+
 export interface SplatExportManifest {
   schema: "dev.splatlab.exports/v1";
   job_id: string;
