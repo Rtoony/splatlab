@@ -1844,3 +1844,15 @@ both 0-jobs-verified via splatlab-safe-restart.
 - SuperSplat sw.js/PWA behavior under the new origin unverified until first live open.
 - Multi-level LOD pyramids for streamed-SOG (current fix = single level 0, spatial chunking works).
 - Collision/unreal_bundle have no per-artifact staleness (manifest-level only) — backend follow-up.
+
+### Streamed-SOG fix PROVEN LIVE (2026-07-25 15:37) + throughput truth
+`splat_30b75bc81f` (green-bottle, 289,115 gaussians), forced streamed-SOG at sog_iterations=2
+through the live API post-restart: **status ready** — valid lod-meta.json (1 LOD level, chunk
+tree with bounds), 9 files, 69MB PLY → 6.2MB, served through the relative-chunk route. The lane
+went from instant "Missing lod assignment" crash to working artifacts.
+**Throughput caveat (measured):** that build took ~44 minutes for 289k gaussians at iterations=2
+(single chunk — whole scene fits one extent-16 chunk, so it's one big SOG encode). Extrapolating,
+scenes ≳400k gaussians risk the 60-min CONVERSION_TIMEOUT_S even at low iterations. Streamed-SOG
+is CORRECT now but SLOW — backend follow-ups if it matters: longer timeout for this format, GPU
+SOG (`-g gpu`), or parallel per-chunk encoding. Export Center copy already warns builds can take
+many minutes.
