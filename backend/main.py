@@ -191,15 +191,19 @@ async def splat_thumbnail(job_id: str):
 
 
 # ── self-hosted SuperSplat editor (auth-gated static files) ──────────────────
-@app.get("/supersplat/{path:path}", dependencies=[Depends(require_auth)])
-async def supersplat_static(path: str):
+@app.get("/supersplat/{path:path}")
+async def supersplat_static(path: str, request: Request):
     """Serve the local SuperSplat build. Modeled on the SPA handler below, with
     two deliberate differences: a resolve()+is_relative_to traversal guard (the
     path segment is caller-controlled), and index.html fallback ONLY for the
     bare /supersplat/ root — SuperSplat is an editor SPA, not a router app, so
     a deep path that misses a real file is an honest 404. Query strings
     (?load=...&filename=..., the frontend contract) never reach `path` and are
-    ignored by static serving. FileResponse infers the media type per file."""
+    ignored by static serving. FileResponse infers the media type per file.
+    Auth mirrors the SPA handler (303 to /login), not the API routers' 401 —
+    a human with an expired cookie lands on the login page, not an error body."""
+    if not _authed(request):
+        return RedirectResponse("/login", status_code=303)
     base = SUPERSPLAT_DIST.resolve()
     if path == "":
         index = base / "index.html"

@@ -37,14 +37,19 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     return TestClient(splat_main.app)
 
 
-def test_unauthed_root_is_401(client: TestClient) -> None:
-    resp = client.get("/supersplat/")
-    assert resp.status_code == 401
+def test_unauthed_root_redirects_to_login(client: TestClient) -> None:
+    """Mirrors the SPA handler: a human with an expired cookie gets the login
+    page (303), not a bare 401 error body."""
+    resp = client.get("/supersplat/", follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/login"
     assert INDEX_MARK not in resp.text
 
 
-def test_unauthed_asset_is_401(client: TestClient) -> None:
-    assert client.get("/supersplat/index.js").status_code == 401
+def test_unauthed_asset_redirects_to_login(client: TestClient) -> None:
+    resp = client.get("/supersplat/index.js", follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/login"
 
 
 def test_authed_root_serves_editor_index(client: TestClient) -> None:
@@ -94,9 +99,14 @@ def test_traversal_is_guarded_at_the_handler(client: TestClient) -> None:
     at the handler directly because HTTP clients normalize ../ away before the
     route ever sees it (which would silently test nothing)."""
     # "/etc/hostname" covers the pathlib absolute-join replacement (base / "/x" == "/x").
+    # The handler now takes the request for its 303-to-login auth check — a
+    # minimal authed stub keeps this a direct handler-level exercise.
+    from types import SimpleNamespace
+
+    authed_request = SimpleNamespace(cookies={}, headers={"authorization": f"Bearer {TOKEN}"})
     for attempt in ("../secret.txt", "static/../../secret.txt", "..%2Fsecret.txt/..", "/etc/hostname"):
         with pytest.raises(HTTPException) as exc:
-            asyncio.run(splat_main.supersplat_static(attempt))
+            asyncio.run(splat_main.supersplat_static(attempt, authed_request))
         assert exc.value.status_code == 404
 
 
