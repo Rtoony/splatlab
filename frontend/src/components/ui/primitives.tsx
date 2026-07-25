@@ -45,11 +45,21 @@ export function Button({ className, variant = "primary", size = "md", ...props }
   );
 }
 
-export function Input({ className, ...props }: InputHTMLAttributes<HTMLInputElement>) {
+type InputProps = Omit<InputHTMLAttributes<HTMLInputElement>, "size"> & {
+  /** "xs" is the compact viewer-panel size (replaces the hand-rolled spark inputs). */
+  size?: "xs" | "md";
+};
+
+export function Input({ className, size = "md", ...props }: InputProps) {
+  const sizes = {
+    xs: "h-7 rounded-lg px-2 text-xs",
+    md: "h-9 rounded-xl px-3 text-sm",
+  };
   return (
     <input
       className={cn(
-        "h-9 w-full rounded-xl border border-white/12 bg-white/5 px-3 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-cyan-400/40 focus:outline-none",
+        "w-full border border-white/12 bg-white/5 text-zinc-100 placeholder:text-zinc-500 focus:border-cyan-400/40 focus:outline-none",
+        sizes[size],
         className,
       )}
       {...props}
