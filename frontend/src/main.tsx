@@ -14,6 +14,7 @@ import "@fontsource/space-grotesk/500.css";
 import "@fontsource/space-grotesk/700.css";
 import App from "./App";
 import "./index.css";
+import { ToastProvider, TooltipProvider } from "@/components/ui";
 import { initializeFeedbackTelemetry } from "@/lib/feedback-context";
 
 const queryClient = new QueryClient({
@@ -25,7 +26,11 @@ initializeFeedbackTelemetry();
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <App />
+      <TooltipProvider>
+        <ToastProvider>
+          <App />
+        </ToastProvider>
+      </TooltipProvider>
     </QueryClientProvider>
   </StrictMode>,
 );

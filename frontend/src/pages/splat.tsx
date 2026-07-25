@@ -11,16 +11,14 @@ import type {
   SplatTransfersResponse,
   SplatUploadResult,
 } from "@/lib/contracts";
-import { Badge, Button, Card, SectionLabel } from "@/components/ui";
+import { Badge, Button, Card, SectionLabel, useToast } from "@/components/ui";
 import { SplatViewer } from "@/components/splat-viewer";
 import {
   AlertTriangle,
   Box,
   Camera,
   CheckCircle2,
-  ChevronDown,
   Cpu,
-  Download,
   FolderOpen,
   Loader2,
   MapPin,
@@ -157,7 +155,6 @@ export default function SplatLabPage() {
   const [sparseMode, setSparseMode] = useState(false);
   // Opt-in: "Imagine a Splat" — TripoSplat single-image generative lane.
   const [generativeMode, setGenerativeMode] = useState(false);
-  const [toast, setToast] = useState<{ msg: string; bad?: boolean } | null>(null);
   // Dismissed failed-job notice (by job_id) so a newer failure still shows.
   const [dismissedFailed, setDismissedFailed] = useState<string | null>(null);
 
@@ -229,9 +226,9 @@ export default function SplatLabPage() {
     return () => setSplatlabFeedbackContext(null);
   }, [activeJob, completed.length, compute?.enabled, compute?.reason, generativeMode, gpu?.lane, gpu?.locked, iters, jobs, languageField, meshExport, sparseMode, testFlight, uploaded]);
 
+  const pushToast = useToast();
   function flash(msg: string, bad = false) {
-    setToast({ msg, bad });
-    window.setTimeout(() => setToast(null), 4000);
+    pushToast(msg, bad ? "error" : "info");
   }
 
   const startMutation = useMutation({
@@ -411,16 +408,6 @@ export default function SplatLabPage() {
           </Badge>
         </div>
       </header>
-
-      {toast && (
-        <div
-          className={`mb-4 rounded-xl border px-4 py-2.5 text-sm ${
-            toast.bad ? "border-red-500/30 bg-red-500/10 text-red-200" : "border-cyan-500/30 bg-cyan-500/10 text-cyan-100"
-          }`}
-        >
-          {toast.msg}
-        </div>
-      )}
 
       <ComputeGateBanner compute={compute} />
 
