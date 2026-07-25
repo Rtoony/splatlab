@@ -769,7 +769,6 @@ function AssemblePanel({
   setFidelityMode,
   overrides,
   setOverrides,
-  openLightbox,
 }: {
   jobId: string;
   scene: SplatSceneSummary | undefined;

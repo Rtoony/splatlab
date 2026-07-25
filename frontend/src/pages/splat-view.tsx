@@ -10,7 +10,7 @@ import type {
   SplatJob,
   SplatStatusResponse,
 } from "@/lib/contracts";
-import { SplatViewer, type ViewerCameraNodeTarget, type ViewerCameraViewTarget, type ViewerHighlight, type ViewerOverlay } from "@/components/splat-viewer";
+import { SplatViewer, type ViewerCameraNodeTarget, type ViewerCameraPose, type ViewerCameraViewTarget, type ViewerHighlight, type ViewerOverlay } from "@/components/splat-viewer";
 import { Button, Card, Input, SectionLabel } from "@/components/ui";
 import { ArrowLeft, Camera, ChevronDown, ChevronUp, Compass, Crosshair, Download, Eye, EyeOff, Layers, Loader2, MapPin, Mountain, Orbit, RotateCcw, Search, SlidersHorizontal, Sparkles, X } from "lucide-react";
 import { SparkSceneViewer } from "@/components/spark-scene-viewer";
@@ -86,7 +86,7 @@ export default function SplatViewPage() {
   const [cameraViewTarget, setCameraViewTarget] = useState<ViewerCameraViewTarget>(null);
   const [cameraNodeTarget, setCameraNodeTarget] = useState<ViewerCameraNodeTarget>(null);
 
-  function zoomToCamera(camera: SplatCameraPose) {
+  function zoomToCamera(camera: ViewerCameraPose) {
     setCameraOverlayOn(true);
     setCameraShotsOpen(true);
     setSelectedCameraIndex(camera.index);
@@ -99,7 +99,7 @@ export default function SplatViewPage() {
     }));
   }
 
-  function viewFromCamera(camera: SplatCameraPose) {
+  function viewFromCamera(camera: ViewerCameraPose) {
     setCameraOverlayOn(true);
     setCameraShotsOpen(true);
     setSelectedCameraIndex(camera.index);

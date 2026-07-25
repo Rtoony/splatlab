@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "wouter";
-import { ArrowLeft, MessageSquare, Paperclip, RefreshCw, Save, Search, Send } from "lucide-react";
+import { ArrowLeft, Paperclip, RefreshCw, Save, Search, Send } from "lucide-react";
 import { addFeedbackComment, getFeedback, listFeedback, updateFeedback, uploadFeedbackAttachment } from "@/lib/feedback-api";
 import {
   FEEDBACK_PRIORITIES,
@@ -22,7 +22,6 @@ import { cn } from "@/lib/cn";
 const queueKeys = Object.keys(FEEDBACK_QUEUES) as FeedbackQueueKey[];
 
 export default function FeedbackPage() {
-  const qc = useQueryClient();
   const [queue, setQueue] = useState<FeedbackQueueKey>("active");
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("Any");
@@ -45,7 +44,7 @@ export default function FeedbackPage() {
 
   const { data: items = [], isLoading, isError, refetch, isFetching } = useQuery({
     queryKey: ["feedback"],
-    queryFn: listFeedback,
+    queryFn: () => listFeedback(),
     refetchInterval: 30000,
   });
 

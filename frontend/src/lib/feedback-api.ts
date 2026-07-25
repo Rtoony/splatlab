@@ -29,7 +29,7 @@ export function updateFeedback(id: string | number, payload: UpdateFeedbackPaylo
 }
 
 export function addFeedbackComment(id: string | number, body: string): Promise<FeedbackComment> {
-  return apiRequest<FeedbackItem>(`/api/feedback/${encodeURIComponent(String(id))}/comments`, {
+  return apiRequest<FeedbackComment>(`/api/feedback/${encodeURIComponent(String(id))}/comments`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ body }),
