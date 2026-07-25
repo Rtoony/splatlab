@@ -12,6 +12,7 @@ import type {
 } from "@/lib/contracts";
 import { SplatViewer, type ViewerCameraNodeTarget, type ViewerCameraPose, type ViewerCameraViewTarget, type ViewerHighlight, type ViewerOverlay } from "@/components/splat-viewer";
 import { Button, Card, Input, SectionLabel } from "@/components/ui";
+import { DownloadMenu } from "@/components/gallery/download-menu";
 import { ArrowLeft, Camera, ChevronDown, ChevronUp, Compass, Crosshair, Download, Eye, EyeOff, Layers, Loader2, MapPin, Mountain, Orbit, RotateCcw, Search, SlidersHorizontal, Sparkles, X } from "lucide-react";
 import { SparkSceneViewer } from "@/components/spark-scene-viewer";
 
@@ -297,15 +298,7 @@ export default function SplatViewPage() {
               </Button>
             </>
           )}
-          {job?.preview_file_url && (
-            <a
-              href={job.preview_file_url}
-              download={`${jobId}.ply`}
-              className="flex shrink-0 items-center gap-1.5 rounded-full border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-semibold text-zinc-200 hover:bg-white/10"
-            >
-              <Download className="h-3.5 w-3.5" /> Full-quality .ply
-            </a>
-          )}
+          {job && <DownloadMenu job={job} />}
           {job?.preview_file_url && (
             <a
               href={`/supersplat/?load=${encodeURIComponent(job.preview_file_url)}&filename=${encodeURIComponent(`${jobId}.ply`)}`}
