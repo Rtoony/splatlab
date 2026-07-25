@@ -10,6 +10,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { applyEditOps, fetchEditVersions, revertEdit } from "@/lib/api";
 import { relTime } from "@/lib/format";
 import type { SplatEditApplyResponse, SplatEditOp, SplatJob } from "@/lib/contracts";
+import { SemanticEditPanel } from "@/components/edit/semantic-edit";
 import { Button, Input, SectionLabel, useToast } from "@/components/ui";
 import { Crosshair, ExternalLink, History, Loader2, Move3d, Shrink, Sparkles, Undo2, Wand2, Wrench } from "lucide-react";
 
@@ -427,6 +428,11 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
           </div>
         </div>
       )}
+
+      {/* Semantic edit — text-driven delete/isolate/extract via the language
+          field. Renders its own honest disabled card when the field is
+          missing or stale (polled job flags), so it mounts unconditionally. */}
+      <SemanticEditPanel job={job} onEdited={onEdited} />
 
       {superSplatHref && (
         <a

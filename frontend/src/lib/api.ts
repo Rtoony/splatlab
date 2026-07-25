@@ -12,6 +12,8 @@ import type {
   SplatEditOp,
   SplatEditRevertResponse,
   SplatEditVersionsResponse,
+  SplatSemanticEditRequest,
+  SplatSemanticEditResponse,
   SplatExportManifest,
   SplatUnrealBundle,
 } from "@/lib/contracts";
@@ -127,6 +129,14 @@ async function postEditJSON<T>(path: string, body: unknown): Promise<T> {
 // revertEdit() for single-step undo.
 export function applyEditOps(jobId: string, ops: SplatEditOp[]): Promise<SplatEditApplyResponse> {
   return postEditJSON<SplatEditApplyResponse>(`/api/splat/jobs/${jobId}/edit/apply`, { ops });
+}
+
+// Text-driven edit: delete/isolate rewrite this scene (snapshot-versioned,
+// marks the language field stale); extract copies the match into a NEW
+// derived scene. Failure details worth surfacing verbatim: 409 stale field,
+// 422 no language field / nothing matched, 503 relevancy worker missing.
+export function semanticEdit(jobId: string, req: SplatSemanticEditRequest): Promise<SplatSemanticEditResponse> {
+  return postEditJSON<SplatSemanticEditResponse>(`/api/splat/jobs/${jobId}/edit/semantic`, req);
 }
 
 // Restore a snapshot version (itself snapshotted first, so revert is undoable).

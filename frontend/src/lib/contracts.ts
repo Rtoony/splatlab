@@ -679,6 +679,43 @@ export interface SplatEditRevertResponse {
   job: SplatJob;
 }
 
+// ── Semantic edit (POST /jobs/{id}/edit/semantic) ────────────────────────────
+// Mirrors backend/edit_ops.py SemanticEditRequest exactly (verified against
+// source 2026-07-25): text 1-200 chars, threshold 0..1 (backend default 0.5),
+// mode delete|isolate|extract, optional name (derived-scene title for extract,
+// max 80), cleanup default true (chains a -G floater pass after the row-mask
+// cut — kills boundary halos, but guts legitimately wispy subjects).
+export interface SplatSemanticEditRequest {
+  text: string;
+  threshold: number;
+  mode: "delete" | "isolate" | "extract";
+  name?: string | null;
+  cleanup: boolean;
+}
+
+// semantic_edit response (edit_ops.py ~line 1200/1256). Two shapes by mode:
+// delete/isolate rewrite THIS scene (preview snapshot first → version_before
+// for /edit/revert; language_field_stale flips true and the STALE marker
+// lands on disk), extract builds a NEW derived job (new_job_id) and leaves
+// this scene — and its language field — untouched.
+export interface SplatSemanticEditResponse {
+  ok: boolean;
+  mode: "delete" | "isolate" | "extract";
+  matched: number; // gaussians scoring >= threshold for the query
+  kept: number; // rows kept by the mask (delete: total−matched; isolate/extract: matched)
+  cleanup: boolean;
+  rows_before_cleanup: number; // == kept (pre-cleanup row count)
+  rows_after_cleanup: number | null; // final row count after optional -G pass
+  // delete/isolate only:
+  version_before?: number; // snapshot seq to pass to /edit/revert for undo
+  warnings?: string[]; // derived-artifact regen failures (non-fatal)
+  language_field_stale?: boolean; // always true on the delete/isolate response
+  // extract only:
+  new_job_id?: string;
+  // delete/isolate: the refreshed SOURCE job payload; extract: the NEW derived job.
+  job: SplatJob;
+}
+
 // Snapshot manifest entries from GET /edit/versions (edit_ops.py _snapshot manifest).
 export interface SplatEditVersion {
   seq: number;
