@@ -16,7 +16,7 @@ import {
   type OverlayMode,
 } from "@/lib/spark-heatmap";
 import type { SplatJob } from "@/lib/contracts";
-import { Button, SectionLabel } from "@/components/ui";
+import { Button, Input, SectionLabel } from "@/components/ui";
 import { Download, Loader2, Paintbrush, Plus, Ruler, Scissors, Trash2, Undo2, X } from "lucide-react";
 
 // SPARK BETA viewer for the /view page — the Wave-2 cutover surface.
@@ -1241,12 +1241,13 @@ export function SparkSceneViewer({
                 void addQuery();
               }}
             >
-              <input
+              <Input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder={channels.length >= 4 ? "4 query limit reached" : "Add a search…"}
                 disabled={channels.length >= 4}
-                className="w-full rounded border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-cyan-400/50 focus:outline-none disabled:opacity-50"
+                size="xs"
+                className="disabled:opacity-50"
               />
               <Button type="submit" size="sm" disabled={queryBusy || !query.trim() || channels.length >= 4}>
                 {queryBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
@@ -1381,17 +1382,17 @@ export function SparkSceneViewer({
                 </p>
                 {selCount > 0 && (
                   <div className="space-y-1.5">
-                    <input
+                    <Input
                       value={paintLabel}
                       onChange={(e) => setPaintLabel(e.target.value)}
                       placeholder='Label — anything, e.g. "dad’s corner"'
-                      className="w-full rounded border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-cyan-400/50 focus:outline-none"
+                      size="xs"
                     />
-                    <input
+                    <Input
                       value={paintAliases}
                       onChange={(e) => setPaintAliases(e.target.value)}
                       placeholder="Aliases, comma-separated (optional)"
-                      className="w-full rounded border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-cyan-400/50 focus:outline-none"
+                      size="xs"
                     />
                     {overrides.some((o) => o.label.trim().toLowerCase() === paintLabel.trim().toLowerCase()) && (
                       <p className="text-[10px] leading-snug text-amber-300/90">
@@ -1524,12 +1525,13 @@ export function SparkSceneViewer({
               Calibrate: select a dimension of known length{calibDim ? ` (#${dims.findIndex((d) => d.id === calibDim.id) + 1})` : ""}, enter it, set scale.
             </p>
             <div className="flex items-center gap-1.5">
-              <input
+              <Input
                 value={calibLen}
                 onChange={(e) => setCalibLen(e.target.value)}
                 placeholder="known length"
                 inputMode="decimal"
-                className="w-24 rounded border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100 placeholder:text-zinc-600 focus:border-cyan-400/50 focus:outline-none"
+                size="xs"
+                className="w-24"
               />
               <select
                 value={calibUnit}
