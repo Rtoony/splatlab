@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { dyno, RgbaArray, SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
-import { apiRequest } from "@/lib/api";
+import { apiRequest, applyEditOps, revertEdit } from "@/lib/api";
 import {
   buildOverlayModifier,
   buildTestRelevancy,
@@ -26,7 +26,7 @@ import type {
   ViewerPoint,
 } from "@/components/splat-viewer";
 import { Button, Input, SectionLabel } from "@/components/ui";
-import { Download, Loader2, Paintbrush, Plus, Ruler, Scissors, Trash2, Undo2, X } from "lucide-react";
+import { Box, Download, Loader2, Paintbrush, Plus, Ruler, Scissors, Trash2, Undo2, X } from "lucide-react";
 
 // SPARK BETA viewer for the /view page — the Wave-2 cutover surface.
 // - Multi-query language overlay: up to 4 simultaneous text searches, one
@@ -124,6 +124,7 @@ export function SparkSceneViewer({
   resetViewToken = 0,
   showShortcutLegend = false,
   toolsVisible = true,
+  reloadToken = 0,
   onPickMatch,
   onPickCamera,
 }: {
@@ -150,6 +151,10 @@ export function SparkSceneViewer({
   // the host page's active tab doesn't want it. Overlays/viewer unaffected.
   toolsVisible?: boolean;
   showShortcutLegend?: boolean;
+  // Bump after an EXTERNAL edit (the Edit-lane ops) to make the viewer reload
+  // the splat file — routes into the same reloadNonce/url mechanism the crop
+  // tools already use internally, NOT a second loader.
+  reloadToken?: number;
   onPickMatch?: (i: number) => void;
   onPickCamera?: (camera: ViewerCameraPose) => void;
 }) {
@@ -273,6 +278,35 @@ export function SparkSceneViewer({
   // the backend marks the field STALE, so it can't be used to detect this.
   const [cropMadeStale, setCropMadeStale] = useState(false);
 
+  // crop to box (sibling of crop-to-sphere; same destructive/versioned flow).
+  // Backend semantics: crop_box → splat-transform -B, which KEEPS everything
+  // inside [min,max] and removes everything OUTSIDE — so the red preview
+  // tints the outside, exactly like the sphere tool tints outside its sphere.
+  const boxModeRef = useRef(false);
+  const boxGroupRef = useRef<THREE.Group | null>(null);
+  const redrawBoxRef = useRef<() => void>(() => {});
+  const boxCenterRef = useRef<[number, number, number] | null>(null);
+  const boxExtentsRef = useRef<[number, number, number]>([0.5, 0.5, 0.5]);
+  const boxPreviewTimeoutRef = useRef<number | null>(null);
+  const [boxMode, setBoxMode] = useState(false);
+  const [boxCenter, setBoxCenter] = useState<[number, number, number] | null>(null);
+  // Half-extents per axis: the box spans center ± extent on x/y/z.
+  const [boxExtents, setBoxExtents] = useState<[number, number, number]>([0.5, 0.5, 0.5]);
+  const [boxRemovedCount, setBoxRemovedCount] = useState<number | null>(null);
+  const [boxConfirmArmed, setBoxConfirmArmed] = useState(false);
+  const [boxBusy, setBoxBusy] = useState(false);
+  const [boxError, setBoxError] = useState<string | null>(null);
+  const [boxLastVersion, setBoxLastVersion] = useState<number | null>(null);
+  const [boxUndoBusy, setBoxUndoBusy] = useState(false);
+  const [boxMadeStale, setBoxMadeStale] = useState(false);
+
+  // External-edit reload (Edit lane): reuse the crop tools' exact reload path
+  // — bump reloadNonce so `url` changes and the mesh-load effect re-runs.
+  // Token 0 is the initial mount, never a reload.
+  useEffect(() => {
+    if (reloadToken) setReloadNonce((n) => n + 1);
+  }, [reloadToken]);
+
   useEffect(() => {
     if (!recalibrateArmed) return;
     const t = window.setTimeout(() => setRecalibrateArmed(false), 3000);
@@ -286,12 +320,21 @@ export function SparkSceneViewer({
   }, [cropConfirmArmed]);
 
   useEffect(() => {
+    if (!boxConfirmArmed) return;
+    const t = window.setTimeout(() => setBoxConfirmArmed(false), 4000);
+    return () => window.clearTimeout(t);
+  }, [boxConfirmArmed]);
+
+  useEffect(() => {
     measureArmRef.current = measureArm;
     if (!measureArm) {
       pendingPointRef.current = null;
       setHasPending(false);
     }
-    if (measureArm) setCropMode(false); // one click-owner at a time
+    if (measureArm) {
+      setCropMode(false); // one click-owner at a time
+      setBoxMode(false);
+    }
   }, [measureArm]);
 
   useEffect(() => {
@@ -299,6 +342,7 @@ export function SparkSceneViewer({
     if (paintMode) {
       setMeasureArm(false); // one click-owner at a time
       setCropMode(false);
+      setBoxMode(false);
     }
     setPaintError(null); // never carry a stale error across a mode flip
     setPaintNeedsForce(false);
@@ -312,6 +356,7 @@ export function SparkSceneViewer({
     if (cropMode) {
       setMeasureArm(false); // one click-owner at a time
       setPaintMode(false);
+      setBoxMode(false);
     } else {
       cropCenterRef.current = null;
       setCropCenter(null);
@@ -325,11 +370,36 @@ export function SparkSceneViewer({
   }, [cropMode]);
 
   useEffect(() => {
+    boxModeRef.current = boxMode;
+    if (boxMode) {
+      setMeasureArm(false); // one click-owner at a time
+      setPaintMode(false);
+      setCropMode(false);
+    } else {
+      boxCenterRef.current = null;
+      setBoxCenter(null);
+      setBoxRemovedCount(null);
+      setBoxConfirmArmed(false);
+    }
+    setBoxError(null); // never carry a stale error across a mode flip
+    redrawBoxRef.current();
+    refreshModifierRef.current();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [boxMode]);
+
+  useEffect(() => {
     cropRadiusRef.current = cropRadius;
     redrawCropRef.current();
     scheduleCropPreview();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cropRadius]);
+
+  useEffect(() => {
+    boxExtentsRef.current = boxExtents;
+    redrawBoxRef.current();
+    scheduleBoxPreview();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [boxExtents]);
 
   useEffect(() => {
     brushRadiusRef.current = brushRadius;
@@ -445,37 +515,32 @@ export function SparkSceneViewer({
 
   function refreshModifier() {
     if (cropModeRef.current && cropCenterRef.current) previewCropRemoval();
+    else if (boxModeRef.current && boxCenterRef.current) previewBoxRemoval();
     else if (paintModeRef.current && selSetRef.current.size > 0) previewSelection();
     else rebuildOverlay(channelsRef.current, mode, rampName);
   }
   refreshModifierRef.current = refreshModifier;
 
-  // ---- crop to sphere -----------------------------------------------------
-  // Tints every splat OUTSIDE the sphere red — exactly what "Apply crop" is
-  // about to permanently delete (splat-transform -S: "remove outside").
-  // Reuses the same overlay machinery as previewSelection(), just computed
-  // from live geometry instead of a stored Set.
-  function previewCropRemoval() {
+  // ---- crop preview (shared by sphere + box) ------------------------------
+  // One pass over live geometry tinting every splat `shouldRemove` says goes
+  // red — exactly what "Apply crop" is about to permanently delete — and
+  // returning the removed count (null if the mesh isn't ready). Reuses the
+  // same overlay machinery as previewSelection(), just computed from a
+  // predicate instead of a stored Set.
+  function previewRemoval(shouldRemove: (x: number, y: number, z: number) => boolean): number | null {
     const mesh = meshRef.current;
-    const center = cropCenterRef.current;
     const packed = mesh?.packedSplats;
-    if (!mesh || !center || !packed) return;
+    if (!mesh || !packed) return null;
     const numSplats = packed.numSplats ?? 0;
-    if (numSplats === 0) return;
-    const r2 = cropRadiusRef.current * cropRadiusRef.current;
-    const [cx, cy, cz] = center;
+    if (numSplats === 0) return null;
     const bytes = new Uint8Array(numSplats);
     let removed = 0;
     packed.forEachSplat((i, c) => {
-      const dx = c.x - cx;
-      const dy = c.y - cy;
-      const dz = c.z - cz;
-      if (dx * dx + dy * dy + dz * dz > r2) {
+      if (shouldRemove(c.x, c.y, c.z)) {
         bytes[i] = 255;
         removed += 1;
       }
     });
-    setCropRemovedCount(removed);
     const scalarArray = new RgbaArray({ array: packChannelsRgba([bytes], numSplats), count: numSplats });
     mesh.worldModifier = buildOverlayModifier({
       scalarArray,
@@ -487,6 +552,38 @@ export function SparkSceneViewer({
       channelCutoffs: [dyno.dynoFloat(0.5)],
     });
     mesh.updateGenerator();
+    return removed;
+  }
+
+  // Sphere: crop_sphere → splat-transform -S KEEPS the inside ("remove
+  // outside"), so red = outside the sphere. Same predicate math as the
+  // original inline loop (squared distance vs r²).
+  function previewCropRemoval() {
+    const center = cropCenterRef.current;
+    if (!center) return;
+    const r2 = cropRadiusRef.current * cropRadiusRef.current;
+    const [cx, cy, cz] = center;
+    const removed = previewRemoval((x, y, z) => {
+      const dx = x - cx;
+      const dy = y - cy;
+      const dz = z - cz;
+      return dx * dx + dy * dy + dz * dz > r2;
+    });
+    if (removed !== null) setCropRemovedCount(removed);
+  }
+
+  // Box: crop_box → splat-transform -B KEEPS everything inside [min,max]
+  // ("Remove Gaussians outside box (min, max corners)" — CLI README), so the
+  // red to-be-removed tint covers everything OUTSIDE the box.
+  function previewBoxRemoval() {
+    const center = boxCenterRef.current;
+    if (!center) return;
+    const [cx, cy, cz] = center;
+    const [ex, ey, ez] = boxExtentsRef.current;
+    const removed = previewRemoval(
+      (x, y, z) => Math.abs(x - cx) > ex || Math.abs(y - cy) > ey || Math.abs(z - cz) > ez,
+    );
+    if (removed !== null) setBoxRemovedCount(removed);
   }
 
   // Debounced: recomputing over every splat on each slider tick/drag frame
@@ -500,11 +597,26 @@ export function SparkSceneViewer({
     }, 120);
   }
 
+  function scheduleBoxPreview() {
+    if (boxPreviewTimeoutRef.current !== null) window.clearTimeout(boxPreviewTimeoutRef.current);
+    boxPreviewTimeoutRef.current = window.setTimeout(() => {
+      boxPreviewTimeoutRef.current = null;
+      if (boxModeRef.current && boxCenterRef.current) previewBoxRemoval();
+    }, 120);
+  }
+
   function setCropCenterFromHit(p: [number, number, number]) {
     cropCenterRef.current = p;
     setCropCenter(p);
     redrawCropRef.current();
     scheduleCropPreview();
+  }
+
+  function setBoxCenterFromHit(p: [number, number, number]) {
+    boxCenterRef.current = p;
+    setBoxCenter(p);
+    redrawBoxRef.current();
+    scheduleBoxPreview();
   }
 
   async function strokeAt(p: THREE.Vector3) {
@@ -844,6 +956,49 @@ export function SparkSceneViewer({
     }
   }
 
+  // ---- crop to box: apply / undo -------------------------------------------
+  // Same versioned flow as the sphere, via the typed lib helpers. crop_box
+  // KEEPS what's inside min/max (verified: splat-transform -B "Remove
+  // Gaussians outside box"), so min/max = center ∓/± half-extents.
+  async function applyBoxCrop() {
+    const center = boxCenterRef.current;
+    if (!center) return;
+    setBoxConfirmArmed(false);
+    setBoxBusy(true);
+    setBoxError(null);
+    try {
+      const [cx, cy, cz] = center;
+      const [ex, ey, ez] = boxExtentsRef.current;
+      const resp = await applyEditOps(job.job_id, [
+        { type: "crop_box", min: [cx - ex, cy - ey, cz - ez], max: [cx + ex, cy + ey, cz + ez] },
+      ]);
+      setBoxLastVersion(resp.version_before);
+      setBoxMadeStale(job.langfield_available ?? false);
+      setBoxMode(false);
+      setReloadNonce((n) => n + 1);
+    } catch (cause) {
+      setBoxError(cause instanceof Error ? cause.message : "Crop failed.");
+    } finally {
+      setBoxBusy(false);
+    }
+  }
+
+  async function undoBoxCrop() {
+    if (boxLastVersion === null) return;
+    setBoxUndoBusy(true);
+    setBoxError(null);
+    try {
+      await revertEdit(job.job_id, boxLastVersion);
+      setBoxLastVersion(null);
+      setBoxMadeStale(false);
+      setReloadNonce((n) => n + 1);
+    } catch (cause) {
+      setBoxError(cause instanceof Error ? cause.message : "Undo failed.");
+    } finally {
+      setBoxUndoBusy(false);
+    }
+  }
+
   // ---- three.js scene ------------------------------------------------------
   useEffect(() => {
     const container = containerRef.current;
@@ -1001,6 +1156,33 @@ export function SparkSceneViewer({
     }
     redrawCropRef.current = redrawCrop;
     redrawCrop();
+
+    const boxGroup = new THREE.Group();
+    scene.add(boxGroup);
+    boxGroupRef.current = boxGroup;
+
+    function redrawBox() {
+      const group = boxGroupRef.current;
+      if (!group) return;
+      group.clear();
+      const center = boxCenterRef.current;
+      if (!center) return;
+      const [ex, ey, ez] = boxExtentsRef.current;
+      const box = new THREE.Mesh(
+        new THREE.BoxGeometry(ex * 2, ey * 2, ez * 2),
+        new THREE.MeshBasicMaterial({ color: 0xf87171, wireframe: true, transparent: true, opacity: 0.55 }),
+      );
+      box.position.set(...center);
+      group.add(box);
+      const marker = new THREE.Mesh(
+        new THREE.SphereGeometry(0.018, 16, 12),
+        new THREE.MeshBasicMaterial({ color: 0xf87171 }),
+      );
+      marker.position.set(...center);
+      group.add(marker);
+    }
+    redrawBoxRef.current = redrawBox;
+    redrawBox();
 
     function resize() {
       const el = containerRef.current;
@@ -1164,6 +1346,11 @@ export function SparkSceneViewer({
         if (hit) setCropCenterFromHit([hit.x, hit.y, hit.z]);
         return;
       }
+      if (boxModeRef.current) {
+        const hit = raycastAt(e.clientX, e.clientY);
+        if (hit) setBoxCenterFromHit([hit.x, hit.y, hit.z]);
+        return;
+      }
       if (paintModeRef.current) {
         const hit = raycastAt(e.clientX, e.clientY);
         if (hit) strokeAtRef.current(hit);
@@ -1289,7 +1476,9 @@ export function SparkSceneViewer({
       meshRef.current = null;
       dimGroupRef.current = null;
       cropGroupRef.current = null;
+      boxGroupRef.current = null;
       if (cropPreviewTimeoutRef.current !== null) window.clearTimeout(cropPreviewTimeoutRef.current);
+      if (boxPreviewTimeoutRef.current !== null) window.clearTimeout(boxPreviewTimeoutRef.current);
       enabledDynosRef.current = [];
       cutoffDynosRef.current = [];
     };
@@ -2075,6 +2264,94 @@ export function SparkSceneViewer({
             )}
             {cropError && <p className="text-[10px] leading-snug text-rose-300/90">{cropError}</p>}
             {cropMadeStale && (
+              <p className="text-[10px] leading-snug text-amber-300/90">
+                Language field is stale — the scene was edited after the field was built. Re-run the language
+                field for this scene to search it again.
+              </p>
+            )}
+
+            <div className="h-px bg-white/10" />
+            <SectionLabel>Crop to box</SectionLabel>
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                variant={boxMode ? "primary" : "outline"}
+                onClick={() => setBoxMode((v) => !v)}
+                title="Set a box around the subject; splats outside it are permanently removed. Undoable."
+              >
+                <Box className="h-3.5 w-3.5" /> {boxMode ? "Cropping…" : "Crop to box"}
+              </Button>
+              {boxLastVersion !== null && (
+                <Button type="button" size="sm" variant="outline" onClick={() => void undoBoxCrop()} disabled={boxUndoBusy} title="Undo the last box crop">
+                  {boxUndoBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Undo2 className="h-3.5 w-3.5" />} Undo crop
+                </Button>
+              )}
+            </div>
+            {boxMode && (
+              <>
+                <p className="text-[10px] leading-snug text-zinc-500">
+                  Click the scene to place the box's center, then size each side — everything shown red
+                  (outside the box) will be permanently removed.
+                </p>
+                {(["x", "y", "z"] as const).map((axis, ai) => (
+                  <div key={axis} className="flex items-center gap-2">
+                    <span className="w-8 shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">±{axis}</span>
+                    <input
+                      type="range"
+                      min={0.05}
+                      max={5}
+                      step={0.05}
+                      value={boxExtents[ai]}
+                      onChange={(e) =>
+                        setBoxExtents((prev) => {
+                          const next = [...prev] as [number, number, number];
+                          next[ai] = Number(e.target.value);
+                          return next;
+                        })
+                      }
+                      className="w-full"
+                    />
+                    <span className="w-16 shrink-0 text-right text-zinc-400">
+                      {metersPerUnit ? `${(boxExtents[ai] * metersPerUnit).toFixed(2)} m` : `${boxExtents[ai].toFixed(2)} u`}
+                    </span>
+                  </div>
+                ))}
+                {boxCenter && (
+                  <>
+                    <p className="text-[10px] leading-snug text-zinc-400">
+                      {boxRemovedCount !== null
+                        ? `${boxRemovedCount.toLocaleString()} of ${(splatCount ?? 0).toLocaleString()} splats would be removed (${splatCount ? Math.round((boxRemovedCount / splatCount) * 100) : 0}%).`
+                        : "Counting…"}
+                    </p>
+                    {job.langfield_available && (
+                      <p className="rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5 text-[10px] leading-snug text-amber-100/85">
+                        This scene has a language field. Cropping changes the gaussian count, so search and paint
+                        will stop working until the language field is rebuilt.
+                      </p>
+                    )}
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={boxConfirmArmed ? "primary" : "outline"}
+                      onClick={() => (boxConfirmArmed ? void applyBoxCrop() : setBoxConfirmArmed(true))}
+                      disabled={boxBusy}
+                      className={boxConfirmArmed ? "border-red-400/50 bg-red-400/20 text-red-100" : ""}
+                    >
+                      {boxBusy ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : boxConfirmArmed ? (
+                        `Sure? Removes ${(boxRemovedCount ?? 0).toLocaleString()} splats permanently`
+                      ) : (
+                        "Apply crop"
+                      )}
+                    </Button>
+                  </>
+                )}
+              </>
+            )}
+            {boxError && <p className="text-[10px] leading-snug text-rose-300/90">{boxError}</p>}
+            {boxMadeStale && (
               <p className="text-[10px] leading-snug text-amber-300/90">
                 Language field is stale — the scene was edited after the field was built. Re-run the language
                 field for this scene to search it again.

@@ -7,6 +7,9 @@ import type {
   SceneIsolateReport,
   SceneProxyReport,
   SplatCamerasResponse,
+  SplatEditApplyResponse,
+  SplatEditOp,
+  SplatEditRevertResponse,
   SplatExportManifest,
   SplatUnrealBundle,
 } from "@/lib/contracts";
@@ -88,6 +91,38 @@ export function buildPortableExports(jobId: string): Promise<SplatExportManifest
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({}),
   });
+}
+
+// FastAPI-error-aware POST for the edit routes. Their failures (langfield-
+// stale 409, edit-lock 423, GPU-arbiter 503, splat-transform exit != 0) carry
+// a human-readable {detail} string — surface it verbatim, same helper pattern
+// as scene-regen.tsx's postJSON. apiRequest() would throw the raw JSON blob.
+async function postEditJSON<T>(path: string, body: unknown): Promise<T> {
+  const resp = await fetch(path, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const detail = String(
+      ((await resp.json().catch(() => null)) as { detail?: string } | null)?.detail ?? `HTTP ${resp.status}`,
+    );
+    throw new Error(detail);
+  }
+  return (await resp.json()) as T;
+}
+
+// Apply 1-32 destructive edit ops in pipeline order. The backend snapshots
+// _preview/ first (max 5 kept) — pass the returned version_before to
+// revertEdit() for single-step undo.
+export function applyEditOps(jobId: string, ops: SplatEditOp[]): Promise<SplatEditApplyResponse> {
+  return postEditJSON<SplatEditApplyResponse>(`/api/splat/jobs/${jobId}/edit/apply`, { ops });
+}
+
+// Restore a snapshot version (itself snapshotted first, so revert is undoable).
+export function revertEdit(jobId: string, version: number): Promise<SplatEditRevertResponse> {
+  return postEditJSON<SplatEditRevertResponse>(`/api/splat/jobs/${jobId}/edit/revert`, { version });
 }
 
 export function buildUnrealBundle(jobId: string): Promise<SplatUnrealBundle> {

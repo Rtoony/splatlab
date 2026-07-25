@@ -553,6 +553,109 @@ export interface SplatStatusResponse {
   notes: string[];
 }
 
+// ── Native edit ops (POST /jobs/{id}/edit/apply) ─────────────────────────────
+// Mirrors backend/edit_ops.py's pydantic models EXACTLY (discriminated on
+// `type`). Field-name gotchas verified against the backend source 2026-07-25:
+// decimate is `n`/`pct` (NOT count/percent), translate/rotate are scalar
+// x/y/z fields (NOT an offset/degrees vector).
+
+// KEEPS everything inside [min, max]; removes everything outside. Maps to
+// splat-transform `-B min,max` — "Remove Gaussians outside box (min, max
+// corners)" per the CLI's own README.
+export interface SplatCropBoxOp {
+  type: "crop_box";
+  min: [number, number, number];
+  max: [number, number, number];
+}
+
+// KEEPS everything inside the sphere (splat-transform -S: "remove outside").
+export interface SplatCropSphereOp {
+  type: "crop_sphere";
+  center: [number, number, number];
+  radius: number; // > 0
+}
+
+export interface SplatFilterValueOp {
+  type: "filter_value";
+  name: "opacity" | "scale_0" | "scale_1" | "scale_2" | "x" | "y" | "z";
+  min?: number; // at least one of min/max required
+  max?: number;
+}
+
+// All-optional: {} uses the splat-transform CLI defaults. If any of
+// size/op/min is given, ALL THREE must be (backend model_validator).
+export interface SplatFilterFloatersOp {
+  type: "filter_floaters";
+  size?: number;
+  op?: number;
+  min?: number;
+}
+
+export interface SplatFilterClusterOp {
+  type: "filter_cluster";
+  res?: number; // res/op/min all together, or none
+  op?: number;
+  min?: number;
+  seed_pos?: [number, number, number];
+}
+
+// Exactly ONE of n (absolute target count) or pct (percentage of gaussians
+// to KEEP, 0 < pct <= 100 — splat-transform -F "n% to keep a percentage").
+export interface SplatDecimateOp {
+  type: "decimate";
+  n?: number;
+  pct?: number;
+}
+
+export interface SplatTranslateOp {
+  type: "translate";
+  x: number;
+  y: number;
+  z: number;
+}
+
+// Euler degrees per axis, each within ±360.
+export interface SplatRotateOp {
+  type: "rotate";
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface SplatScaleOp {
+  type: "scale";
+  factor: number; // 0 < factor <= 1000
+}
+
+export type SplatEditOp =
+  | SplatCropBoxOp
+  | SplatCropSphereOp
+  | SplatFilterValueOp
+  | SplatFilterFloatersOp
+  | SplatFilterClusterOp
+  | SplatDecimateOp
+  | SplatTranslateOp
+  | SplatRotateOp
+  | SplatScaleOp;
+
+// apply_edit_ops response (edit_ops.py ~line 878). `job` is the refreshed
+// _job_payload — its stats cache is cleared by the edit and recomputed inside
+// this very payload, so job.stats?.gaussians IS the fresh post-edit count.
+export interface SplatEditApplyResponse {
+  ok: boolean;
+  version_before: number; // snapshot seq to pass to /edit/revert for undo
+  warnings: string[];
+  job: SplatJob;
+}
+
+// revert_version response (edit_ops.py ~line 410).
+export interface SplatEditRevertResponse {
+  ok: boolean;
+  reverted_to: number;
+  restored_files: string[];
+  job: SplatJob;
+}
+
 export interface SplatUploadResult {
   path: string;
   name: string;

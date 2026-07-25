@@ -1,5 +1,5 @@
 import { Suspense, lazy, useEffect, useMemo, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useRoute } from "wouter";
 import { apiRequest, fetchLangfieldInventory, fetchSplatCameras, queryLangfield } from "@/lib/api";
 import { setSplatlabFeedbackContext } from "@/lib/feedback-context";
@@ -64,6 +64,15 @@ export default function SplatViewPage() {
   // Workspace mode tab. The viewer never unmounts on tab switch — Edit/Export/
   // Objects render as an overlay lane so the WebGL context and camera survive.
   const [mode, setMode] = useState<"view" | "measure" | "objects" | "edit" | "export">("view");
+  const queryClient = useQueryClient();
+  // Bumped after each successful Edit-lane op: routes into the Spark viewer's
+  // reloadToken prop (same reload path its own crop tools use) and refreshes
+  // the status poll so splat counts/stats update.
+  const [editReloadToken, setEditReloadToken] = useState(0);
+  function handleLaneEdited() {
+    setEditReloadToken((t) => t + 1);
+    void queryClient.invalidateQueries({ queryKey: ["status"] });
+  }
   function toggleSparkBeta() {
     setSparkBeta((v) => {
       localStorage.setItem("splatlab.sparkBeta", v ? "0" : "1");
@@ -405,6 +414,7 @@ export default function SplatViewPage() {
                 cameraNodeTarget={cameraNodeTarget}
                 resetViewToken={resetViewToken}
                 showShortcutLegend={shortcutLegendOpen}
+                reloadToken={editReloadToken}
                 onPickMatch={setActiveIdx}
                 onPickCamera={zoomToCamera}
               />
@@ -501,7 +511,7 @@ export default function SplatViewPage() {
         )}
         {job && viewUrl && (mode === "edit" || mode === "export" || mode === "objects") && (
           <aside className="absolute bottom-0 right-0 top-0 z-30 w-[24rem] max-w-full overflow-y-auto border-l border-white/10 bg-surface/95 backdrop-blur-md">
-            {mode === "edit" && <EditLane job={job} />}
+            {mode === "edit" && <EditLane job={job} onEdited={handleLaneEdited} />}
             {mode === "export" && <ExportLane job={job} />}
             {mode === "objects" && (
               <div className="space-y-4 p-4">
