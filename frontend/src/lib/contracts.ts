@@ -856,6 +856,12 @@ export interface SplatEditApplyResponse {
   job: SplatJob;
 }
 
+// upload_edited_ply response (edit_ops.py POST /jobs/{id}/edit/upload) —
+// apply's shape plus the gaussian count read from the validated PLY header.
+export interface SplatEditUploadResponse extends SplatEditApplyResponse {
+  gaussians: number;
+}
+
 // revert_version response (edit_ops.py ~line 410).
 export interface SplatEditRevertResponse {
   ok: boolean;

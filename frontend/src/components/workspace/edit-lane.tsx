@@ -4,15 +4,16 @@
 // Spark tool panel where click-to-place picking exists). Every apply is
 // snapshot-versioned server-side (max 5 kept) — the shared Undo row reverts
 // to the version_before the last lane edit returned. The SuperSplat escape
-// hatch stays for full manual editing.
-import { useEffect, useState } from "react";
+// hatch stays for full manual editing, and the Import card closes the
+// roundtrip: an externally edited .ply comes back as a versioned edit.
+import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { applyEditOps, fetchEditVersions, revertEdit } from "@/lib/api";
+import { applyEditOps, fetchEditVersions, revertEdit, uploadEditedPly } from "@/lib/api";
 import { relTime } from "@/lib/format";
 import type { SplatEditApplyResponse, SplatEditOp, SplatJob } from "@/lib/contracts";
 import { SemanticEditPanel } from "@/components/edit/semantic-edit";
 import { Button, Input, SectionLabel, useToast } from "@/components/ui";
-import { Crosshair, ExternalLink, History, Loader2, Move3d, Shrink, Sparkles, Undo2, Wand2, Wrench } from "lucide-react";
+import { Crosshair, ExternalLink, History, Loader2, Move3d, Shrink, Sparkles, Undo2, UploadCloud, Wand2, Wrench } from "lucide-react";
 
 // Backend rails (edit_ops.py pydantic models) — pre-validate so the user gets
 // a friendly message instead of a 422 blob.
@@ -20,13 +21,20 @@ const ROTATE_LIMIT = 360;
 const SCALE_MAX = 1000;
 const COORD_BOUND = 1e5;
 
-type PendingOp = "floaters" | "decimate" | "transform" | "undo" | null;
+type PendingOp = "floaters" | "decimate" | "transform" | "import" | "undo" | null;
 
 // "" and "-" mean "not entered" → identity. Anything else must parse.
 function parseField(raw: string, identity: number): number {
   const t = raw.trim();
   if (t === "" || t === "-") return identity;
   return Number(t);
+}
+
+// Canonical splat PLYs run from a few MB to 1GB+ — MB is the honest unit.
+function fmtFileSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
 }
 
 function LangfieldTopologyWarning({ stale }: { stale: boolean }) {
@@ -78,6 +86,12 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
   const [scale, setScale] = useState("");
   const [transformArmed, setTransformArmed] = useState(false);
 
+  // Import edited .ply (SuperSplat roundtrip return leg).
+  const importInputRef = useRef<HTMLInputElement | null>(null);
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importArmed, setImportArmed] = useState(false);
+  const [importPct, setImportPct] = useState<number | null>(null);
+
   useEffect(() => {
     if (!decimateArmed) return;
     const t = window.setTimeout(() => setDecimateArmed(false), 4000);
@@ -89,6 +103,12 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
     const t = window.setTimeout(() => setTransformArmed(false), 4000);
     return () => window.clearTimeout(t);
   }, [transformArmed]);
+
+  useEffect(() => {
+    if (!importArmed) return;
+    const t = window.setTimeout(() => setImportArmed(false), 4000);
+    return () => window.clearTimeout(t);
+  }, [importArmed]);
 
   const gaussians = job.stats?.gaussians ?? null;
   const estRemaining = gaussians !== null ? Math.round((gaussians * keepPct) / 100) : null;
@@ -190,6 +210,51 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
       setError(cause instanceof Error ? cause.message : "Undo failed.");
     } finally {
       setPending(null);
+    }
+  }
+
+  function chooseImportFile(f: File | null) {
+    setImportArmed(false);
+    setError(null);
+    if (!f) {
+      setImportFile(null);
+      return;
+    }
+    // Pre-flight the extension so a wrong pick fails before a 300MB+ upload;
+    // the backend re-validates the actual PLY header regardless.
+    if (!f.name.toLowerCase().endsWith(".ply")) {
+      setImportFile(null);
+      setError(`'${f.name}' is not a .ply file — in SuperSplat use File → Export → PLY.`);
+      return;
+    }
+    setImportFile(f);
+  }
+
+  async function runImport() {
+    const file = importFile;
+    if (!file) return;
+    setPending("import");
+    setError(null);
+    setWarnings([]);
+    setImportPct(0);
+    try {
+      const resp = await uploadEditedPly(job.job_id, file, setImportPct);
+      setLastVersion(resp.version_before);
+      setWarnings(resp.warnings ?? []);
+      setImportFile(null);
+      setImportArmed(false);
+      toast(
+        `Imported ${resp.gaussians.toLocaleString()} splats from ${file.name} · restore point v${resp.version_before} saved`,
+        "success",
+      );
+      void qc.invalidateQueries({ queryKey: ["status"] });
+      void qc.invalidateQueries({ queryKey: ["edit-versions", job.job_id] });
+      onEdited?.();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Import failed.");
+    } finally {
+      setPending(null);
+      setImportPct(null);
     }
   }
 
@@ -434,6 +499,72 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
           missing or stale (polled job flags), so it mounts unconditionally. */}
       <SemanticEditPanel job={job} onEdited={onEdited} />
 
+      {/* Import edited .ply — the return leg of the SuperSplat roundtrip. */}
+      <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-3">
+        <p className="flex items-center gap-1.5 text-sm font-semibold text-zinc-100">
+          <UploadCloud className="h-3.5 w-3.5 text-cyan-200" /> Import edited .ply
+        </p>
+        <p className="mt-1 text-xs leading-relaxed text-zinc-400">
+          Bring an externally edited copy of this scene back as the new canonical splat. Any editor that
+          exports gaussian-splat .ply works — previews and downloads regenerate automatically.
+        </p>
+        <div
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => {
+            e.preventDefault();
+            if (!busy && e.dataTransfer.files[0]) chooseImportFile(e.dataTransfer.files[0]);
+          }}
+          onClick={() => !busy && importInputRef.current?.click()}
+          className={`mt-2 rounded-xl border border-dashed border-white/15 bg-white/[0.02] px-3 py-3 text-center transition-colors ${
+            busy ? "cursor-not-allowed opacity-60" : "cursor-pointer hover:border-cyan-400/40"
+          }`}
+        >
+          <input
+            ref={importInputRef}
+            type="file"
+            accept=".ply"
+            className="hidden"
+            disabled={busy}
+            onChange={(e) => {
+              chooseImportFile(e.target.files?.[0] ?? null);
+              e.target.value = ""; // re-picking the same file must re-fire onChange
+            }}
+          />
+          {pending === "import" ? (
+            <div className="space-y-2">
+              <Loader2 className="mx-auto h-5 w-5 animate-spin text-cyan-300" />
+              {importPct !== null && (
+                <>
+                  <div className="mx-auto h-1.5 w-2/3 overflow-hidden rounded-full bg-white/10">
+                    <div className="h-full bg-cyan-400 transition-all" style={{ width: `${importPct}%` }} />
+                  </div>
+                  <p className="text-[11px] text-zinc-400">Uploading… {importPct}%</p>
+                </>
+              )}
+            </div>
+          ) : importFile ? (
+            <p className="text-xs text-zinc-200">
+              <span className="font-semibold">{importFile.name}</span>
+              <span className="text-zinc-500"> · {fmtFileSize(importFile.size)}</span>
+            </p>
+          ) : (
+            <p className="text-xs text-zinc-500">Drop a .ply here or click to browse</p>
+          )}
+        </div>
+        {importFile && pending !== "import" && (
+          <Button
+            type="button"
+            size="sm"
+            variant={importArmed ? "primary" : "outline"}
+            className={`mt-2 w-full ${importArmed ? "border-red-400/50 bg-red-400/20 text-red-100" : ""}`}
+            onClick={() => (importArmed ? void runImport() : setImportArmed(true))}
+            disabled={busy}
+          >
+            {importArmed ? "Sure? Replaces this scene's splat — a restore point is saved first" : `Import ${importFile.name}`}
+          </Button>
+        )}
+      </div>
+
       {superSplatHref && (
         <a
           href={superSplatHref}
@@ -448,7 +579,8 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
             </span>
             <span className="mt-0.5 block text-xs leading-relaxed text-zinc-400">
               The full manual editor — select with rect/brush/picker, delete gaussians, transform, export. Opens in
-              a new tab with this scene loaded.
+              a new tab with this scene loaded. When you're done in SuperSplat: File → Export → PLY, then drop the
+              file back here.
             </span>
           </span>
         </a>

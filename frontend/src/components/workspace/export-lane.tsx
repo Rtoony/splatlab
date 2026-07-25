@@ -13,10 +13,11 @@
 // own verbatim 409.
 // Real-data receipts baked in (STATUS.md "PROFESSIONALIZATION WAVES 1-3"):
 // CPU SOG at 10 iterations blew the 60-min timeout on a 1.32M-gaussian scene
-// (default LOW + big-scene warning), streamed-SOG hits an upstream
-// splat-transform bug ("Missing lod assignment"), and failed artifacts carry
-// the tool-log tail under `error` (no `reason` on failures) — rendered as a
-// collapsed monospace tail.
+// (default LOW + big-scene warning), streamed-SOG's "Missing lod assignment"
+// failure was OUR lod-meta bug — fixed in e52eb5c but dormant until the
+// backend's scheduled restart — and failed artifacts carry the tool-log tail
+// under `error` (no `reason` on failures) — rendered as a collapsed
+// monospace tail.
 import { useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -469,7 +470,10 @@ function PortableFormatsCard({
           </AmberNote>
         )}
         <Disclosure label="streamed SOG · overwrite">
-          <AmberNote>Streamed SOG is currently unreliable on large scenes (upstream tool bug).</AmberNote>
+          <AmberNote>
+            Streamed SOG requires the latest backend — if builds fail with "Missing lod assignment", the
+            service needs its scheduled restart.
+          </AmberNote>
           <NumField
             label="LOD chunk count (k)"
             hint="32–4096 · thousands of splats per chunk"

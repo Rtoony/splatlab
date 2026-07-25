@@ -15,6 +15,7 @@ import type {
   SplatEditApplyResponse,
   SplatEditOp,
   SplatEditRevertResponse,
+  SplatEditUploadResponse,
   SplatEditVersionsResponse,
   SplatExportBuildRequest,
   SplatMeshBuildRequest,
@@ -193,6 +194,48 @@ export function applyEditOps(jobId: string, ops: SplatEditOp[]): Promise<SplatEd
 // 422 no language field / nothing matched, 503 relevancy worker missing.
 export function semanticEdit(jobId: string, req: SplatSemanticEditRequest): Promise<SplatSemanticEditResponse> {
   return postJSON<SplatSemanticEditResponse>(`/api/splat/jobs/${jobId}/edit/semantic`, req);
+}
+
+// SuperSplat roundtrip: POST an externally-edited canonical .ply back as a
+// first-class edit version (snapshot first, derived artifacts regenerated,
+// language field marked stale). XHR instead of fetch purely for upload
+// progress — same pattern as create/upload-box.tsx. Failures surface the
+// backend {detail} verbatim (400 bad PLY, 409 edit lock, 413 >2GB, 503).
+export function uploadEditedPly(
+  jobId: string,
+  file: File,
+  onProgress?: (pct: number) => void,
+): Promise<SplatEditUploadResponse> {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append("file", file);
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `/api/splat/jobs/${jobId}/edit/upload`);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress?.(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText) as SplatEditUploadResponse);
+        } catch {
+          reject(new Error("Import finished but the server response was unreadable."));
+        }
+        return;
+      }
+      let detail = `HTTP ${xhr.status}`;
+      try {
+        const payload = JSON.parse(xhr.responseText) as { detail?: unknown };
+        if (typeof payload.detail === "string") detail = payload.detail;
+        else if (payload.detail !== undefined) detail = JSON.stringify(payload.detail);
+      } catch {
+        // keep the bare HTTP status fallback
+      }
+      reject(new Error(detail));
+    };
+    xhr.onerror = () => reject(new Error("Import failed — network error before the server answered."));
+    xhr.send(form);
+  });
 }
 
 // Restore a snapshot version (itself snapshotted first, so revert is undoable).
