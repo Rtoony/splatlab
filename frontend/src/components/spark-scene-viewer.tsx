@@ -1833,7 +1833,7 @@ export function SparkSceneViewer({
 
       {/* control panel — top-left column on desktop, bottom drawer under 1024px */}
       {toolsVisible && (
-      <div className="absolute left-3 top-3 z-20 max-h-[calc(100%-1.5rem)] w-80 space-y-3 overflow-y-auto rounded-xl border border-white/10 bg-black/70 p-3 text-xs text-zinc-200 shadow backdrop-blur-md max-lg:bottom-2 max-lg:left-2 max-lg:right-2 max-lg:top-auto max-lg:max-h-[45vh] max-lg:w-auto">
+      <div className="absolute left-3 top-3 z-20 max-h-[calc(100%-1.5rem)] w-80 space-y-3 overflow-y-auto rounded-xl border border-white/10 bg-[#0a0f1a] p-3 text-xs text-zinc-200 shadow max-lg:bottom-2 max-lg:left-2 max-lg:right-2 max-lg:top-auto max-lg:max-h-[45vh] max-lg:w-auto">
         <div className="flex items-center justify-between">
           <span className="font-semibold uppercase tracking-widest text-cyan-300/90">Spark beta</span>
           <span className="text-zinc-400">
