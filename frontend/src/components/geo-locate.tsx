@@ -9,7 +9,7 @@ import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { apiRequest } from "@/lib/api";
 import type { SplatGeoAnchor, SplatGeoFootprint, SplatGeoSuggestion, SplatJob } from "@/lib/contracts";
-import { Button, Card, Input, SectionLabel } from "@/components/ui";
+import { Button, Card, Dialog, Input, SectionLabel } from "@/components/ui";
 import { Compass, Crosshair, Download, ExternalLink, Loader2, MapPin, Save, Search, Trash2, X } from "lucide-react";
 
 const M_PER_DEG_LAT = 111320; // WGS84 meters per degree of latitude (good enough at map-align scale)
@@ -308,8 +308,8 @@ export default function GeoLocateModal({ job, onClose }: { job: SplatJob; onClos
   }, [footprint, mpu]);
 
   return (
-    <div className="fixed inset-0 z-50 flex bg-black/70 backdrop-blur-sm">
-      <div className="relative m-2 flex min-w-0 flex-1 overflow-hidden rounded-2xl border border-white/10 bg-surface sm:m-4">
+    <Dialog open onOpenChange={(open) => !open && onClose()} title="Locate in the world" layout="screen" hideClose>
+      <div className="flex min-h-0 flex-1">
         {/* map */}
         <div ref={mapDivRef} className="h-full min-w-0 flex-1" />
 
@@ -486,6 +486,6 @@ export default function GeoLocateModal({ job, onClose }: { job: SplatJob; onClos
           </div>
         </div>
       </div>
-    </div>
+    </Dialog>
   );
 }
