@@ -1,0 +1,9 @@
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+.vs/
+*.sln
+SplatLabImports/
+Plugins/
+Content/SplatLab/Jobs/

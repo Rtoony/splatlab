@@ -1,0 +1,19 @@
+{
+  "FileVersion": 3,
+  "EngineAssociation": "5.6",
+  "Category": "SplatLab",
+  "Description": "Isolated UE 5.6 staging project for verified SplatLab handoff bundles.",
+  "Modules": [
+    {
+      "Name": "SplatLabUE56",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "Interchange",
+      "Enabled": true
+    }
+  ]
+}

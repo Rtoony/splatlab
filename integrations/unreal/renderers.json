@@ -1,0 +1,101 @@
+{
+  "schema": "dev.splatlab.unreal-renderers/v1",
+  "target": {
+    "engine": "Unreal Engine",
+    "version": "5.6",
+    "platform": "Windows",
+    "rhi": "DirectX 12",
+    "shader_model": "SM6"
+  },
+  "probe_order": [
+    "NanoGS",
+    "MLSLabsRenderer",
+    "UnrealSplat"
+  ],
+  "renderers": [
+    {
+      "id": "NanoGS",
+      "display_name": "Nano Gaussian Splatting",
+      "repository": "https://github.com/TimChen1383/NanoGaussianSplatting",
+      "license": "MIT",
+      "descriptor_names": [
+        "NanoGS.uplugin"
+      ],
+      "supported_engine_versions": [
+        "5.6",
+        "5.7"
+      ],
+      "formats": [
+        "ply"
+      ],
+      "capabilities": [
+        "nanite-style-lod-clusters",
+        "screen-space-error-selection",
+        "frustum-culling",
+        "splat-compaction",
+        "gpu-radix-sort",
+        "visible-splat-budget"
+      ],
+      "limitations": [
+        "transparent-splats-can-ghost-with-tsr",
+        "large-scenes-should-be-spatially-tiled"
+      ],
+      "recommendation": "primary-large-scene-renderer"
+    },
+    {
+      "id": "MLSLabsRenderer",
+      "display_name": "MLSLabs Gaussian Splatting Renderer Lite",
+      "repository": "https://github.com/mlslabs/MLSLabsGaussianSplattingRenderer-UE",
+      "license": "Apache-2.0",
+      "descriptor_names": [
+        "MLSLabsRenderer.uplugin"
+      ],
+      "supported_engine_versions": [
+        "5.5",
+        "5.6",
+        "5.7"
+      ],
+      "formats": [
+        "ply"
+      ],
+      "capabilities": [
+        "static-3dgs",
+        "ply-sequences",
+        "sequencer",
+        "shipping-builds",
+        "multi-gpu-selection"
+      ],
+      "limitations": [
+        "sog-is-advertised-for-the-separate-pro-edition",
+        "release-remains-beta"
+      ],
+      "recommendation": "sequencer-and-shipping-alternative"
+    },
+    {
+      "id": "UnrealSplat",
+      "display_name": "UnrealSplat",
+      "repository": "https://github.com/Ji20/UnrealSplat",
+      "license": "MIT",
+      "descriptor_names": [
+        "UnrealSplat.uplugin"
+      ],
+      "supported_engine_versions": [
+        "5.5"
+      ],
+      "formats": [
+        "ply"
+      ],
+      "capabilities": [
+        "niagara-rendering",
+        "ply-import"
+      ],
+      "limitations": [
+        "ue-5.6-requires-local-compatibility-validation",
+        "practical-scene-size-around-two-million-splats",
+        "incomplete-transform-support",
+        "spherical-harmonics-disabled"
+      ],
+      "recommendation": "compatibility-fallback-only"
+    }
+  ]
+}

@@ -1,0 +1,97 @@
+{
+  "schema": "dev.splatlab.unreal-mcp-policy/v1",
+  "upstream": {
+    "implementation": "ChiR24/Unreal_mcp",
+    "repository": "https://github.com/ChiR24/Unreal_mcp",
+    "license": "MIT",
+    "transport": "streamable-http",
+    "url": "http://127.0.0.1:3000/mcp",
+    "allow_non_loopback": false,
+    "require_capability_token_if_non_loopback": true
+  },
+  "default": "deny",
+  "tools": {
+    "inspect": {
+      "allowed_actions": [
+        "get_project_info",
+        "get_level_info",
+        "get_actors",
+        "get_actor",
+        "get_asset",
+        "get_assets"
+      ],
+      "mutating": false
+    },
+    "manage_asset": {
+      "allowed_actions": [
+        "import_asset"
+      ],
+      "mutating": true,
+      "path_roots": [
+        "/Game/SplatLab/Jobs"
+      ]
+    },
+    "control_actor": {
+      "allowed_actions": [
+        "spawn",
+        "get_transform",
+        "set_transform",
+        "add_tag"
+      ],
+      "mutating": true,
+      "required_tag": "SplatLabManaged"
+    },
+    "control_editor": {
+      "allowed_actions": [
+        "get_viewport",
+        "set_camera",
+        "take_screenshot"
+      ],
+      "mutating": true
+    },
+    "manage_level": {
+      "allowed_actions": [
+        "save_current"
+      ],
+      "mutating": true,
+      "path_roots": [
+        "/Game/SplatLab/Jobs"
+      ]
+    }
+  },
+  "denied_tools": [
+    "system_control",
+    "manage_tools",
+    "manage_blueprint",
+    "manage_geometry",
+    "manage_pcg",
+    "build_environment",
+    "manage_level_structure"
+  ],
+  "denied_actions": [
+    "delete",
+    "duplicate",
+    "execute_python",
+    "execute_console_command",
+    "package",
+    "build",
+    "run_ubt",
+    "rename",
+    "move",
+    "open_url"
+  ],
+  "receipt": {
+    "required_for_mutation": true,
+    "directory": "Saved/SplatLab/Receipts",
+    "fields": [
+      "timestamp",
+      "tool",
+      "action",
+      "arguments_sha256",
+      "result",
+      "project",
+      "level"
+    ]
+  },
+  "note": "This file is a SplatLab contract, not an upstream enforcement feature. Do not connect an autonomous client directly to the broad upstream server until a facade enforces this allowlist."
+}
