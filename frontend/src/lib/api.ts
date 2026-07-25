@@ -10,13 +10,14 @@ import type {
   SplatEditApplyResponse,
   SplatEditOp,
   SplatEditRevertResponse,
+  SplatEditVersionsResponse,
   SplatExportManifest,
   SplatUnrealBundle,
 } from "@/lib/contracts";
 import { recordFailedApiCall } from "@/lib/feedback-context";
 
-// Same-origin fetch helper. The splatlab backend proxies /api/* to the portal
-// splat API with the bearer injected, so the browser only ever sees same-origin.
+// Same-origin fetch helper. splatlab owns /api/splat directly (the portal
+// proxy era ended with Phase 2); the browser only ever sees same-origin.
 export async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const started = performance.now();
   let res: Response;
@@ -123,6 +124,11 @@ export function applyEditOps(jobId: string, ops: SplatEditOp[]): Promise<SplatEd
 // Restore a snapshot version (itself snapshotted first, so revert is undoable).
 export function revertEdit(jobId: string, version: number): Promise<SplatEditRevertResponse> {
   return postEditJSON<SplatEditRevertResponse>(`/api/splat/jobs/${jobId}/edit/revert`, { version });
+}
+
+// List the job's edit restore points (newest-first ordering is the caller's job).
+export function fetchEditVersions(jobId: string): Promise<SplatEditVersionsResponse> {
+  return apiRequest<SplatEditVersionsResponse>(`/api/splat/jobs/${jobId}/edit/versions`);
 }
 
 export function buildUnrealBundle(jobId: string): Promise<SplatUnrealBundle> {

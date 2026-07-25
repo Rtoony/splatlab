@@ -656,6 +656,21 @@ export interface SplatEditRevertResponse {
   job: SplatJob;
 }
 
+// Snapshot manifest entries from GET /edit/versions (edit_ops.py _snapshot manifest).
+export interface SplatEditVersion {
+  seq: number;
+  ts: string;
+  op: string;
+  params?: Record<string, unknown> | null;
+  files?: string[];
+}
+
+export interface SplatEditVersionsResponse {
+  job_id: string;
+  versions: SplatEditVersion[];
+  max_versions: number;
+}
+
 export interface SplatUploadResult {
   path: string;
   name: string;

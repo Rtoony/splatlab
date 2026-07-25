@@ -6,10 +6,12 @@
 // to the version_before the last lane edit returned. The SuperSplat escape
 // hatch stays for full manual editing.
 import { useEffect, useState } from "react";
-import { applyEditOps, revertEdit } from "@/lib/api";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { applyEditOps, fetchEditVersions, revertEdit } from "@/lib/api";
+import { relTime } from "@/lib/format";
 import type { SplatEditApplyResponse, SplatEditOp, SplatJob } from "@/lib/contracts";
 import { Button, Input, SectionLabel, useToast } from "@/components/ui";
-import { Crosshair, ExternalLink, Loader2, Move3d, Shrink, Sparkles, Undo2, Wand2, Wrench } from "lucide-react";
+import { Crosshair, ExternalLink, History, Loader2, Move3d, Shrink, Sparkles, Undo2, Wand2, Wrench } from "lucide-react";
 
 // Backend rails (edit_ops.py pydantic models) — pre-validate so the user gets
 // a friendly message instead of a 422 blob.
@@ -37,6 +39,15 @@ function LangfieldTopologyWarning() {
 
 export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => void }) {
   const toast = useToast();
+  const qc = useQueryClient();
+  // Restore-point timeline (server keeps at most 5 snapshots).
+  const versionsQuery = useQuery({
+    queryKey: ["edit-versions", job.job_id],
+    queryFn: () => fetchEditVersions(job.job_id),
+    staleTime: 5_000,
+  });
+  const [restoreArmed, setRestoreArmed] = useState<number | null>(null);
+  const [restoring, setRestoring] = useState<number | null>(null);
   const [pending, setPending] = useState<PendingOp>(null);
   // Backend {detail} verbatim — the edit routes write human-readable reasons
   // (langfield-stale 409, edit-lock 423, arbiter 503, splat-transform log tail).
@@ -92,6 +103,7 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
       setWarnings(resp.warnings ?? []);
       if (changesTopology && job.langfield_available) setMadeStale(true);
       toast(describe(resp), "success");
+      void qc.invalidateQueries({ queryKey: ["edit-versions", job.job_id] });
       onEdited?.();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Edit failed.");
@@ -169,6 +181,7 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
       setMadeStale(false);
       setWarnings([]);
       toast(`Restored v${resp.reverted_to} (${resp.restored_files.length} files)`, "success");
+      void qc.invalidateQueries({ queryKey: ["edit-versions", job.job_id] });
       onEdited?.();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Undo failed.");
@@ -178,6 +191,23 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
   }
 
   const busy = pending !== null;
+
+  async function restoreVersion(seq: number) {
+    setRestoring(seq);
+    setError(null);
+    try {
+      const resp = await revertEdit(job.job_id, seq);
+      setRestoreArmed(null);
+      setLastVersion(null);
+      toast(`Restored v${resp.reverted_to} (${resp.restored_files.length} files)`, "success");
+      void qc.invalidateQueries({ queryKey: ["edit-versions", job.job_id] });
+      onEdited?.();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Restore failed.");
+    } finally {
+      setRestoring(null);
+    }
+  }
 
   return (
     <div className="space-y-4 p-4">
@@ -363,6 +393,38 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
           scene, preview exactly what gets removed in red, apply with undo.
         </p>
       </div>
+
+      {/* Restore points */}
+      {(versionsQuery.data?.versions.length ?? 0) > 0 && (
+        <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-3">
+          <p className="flex items-center gap-1.5 text-sm font-semibold text-zinc-100">
+            <History className="h-3.5 w-3.5 text-cyan-200" /> Restore points
+          </p>
+          <p className="mt-1 text-xs leading-relaxed text-zinc-400">
+            Every edit saves a snapshot first. Restoring saves your current state as a new restore point, so a
+            restore is itself undoable. {versionsQuery.data?.max_versions ?? 5} max — oldest are dropped.
+          </p>
+          <div className="mt-2 space-y-1.5">
+            {[...(versionsQuery.data?.versions ?? [])].sort((a, b) => b.seq - a.seq).map((v) => (
+              <div key={v.seq} className="flex items-center justify-between gap-2 rounded-lg border border-white/10 bg-white/[0.02] px-2.5 py-1.5">
+                <span className="min-w-0 truncate text-xs text-zinc-300" title={v.params ? JSON.stringify(v.params) : undefined}>
+                  <span className="font-mono font-semibold text-zinc-100">v{v.seq}</span>
+                  <span className="text-zinc-500"> · {v.op} · {relTime(v.ts)}</span>
+                </span>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={restoreArmed === v.seq ? "primary" : "outline"}
+                  disabled={busy || restoring !== null}
+                  onClick={() => (restoreArmed === v.seq ? void restoreVersion(v.seq) : setRestoreArmed(v.seq))}
+                >
+                  {restoring === v.seq ? <Loader2 className="h-3 w-3 animate-spin" /> : restoreArmed === v.seq ? "Sure?" : "Restore"}
+                </Button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {superSplatHref && (
         <a
