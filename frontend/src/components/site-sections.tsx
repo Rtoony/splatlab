@@ -55,7 +55,7 @@ export default function SiteSectionsModal({ job, onClose }: { job: SplatJob; onC
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
-      <div className="relative w-full max-w-lg rounded-2xl border border-white/10 bg-[#05070d]">
+      <div className="relative w-full max-w-lg rounded-2xl border border-white/10 bg-surface">
         <div className="flex items-center justify-between gap-2 border-b border-white/10 px-4 py-3">
           <div className="flex items-center gap-2">
             <Mountain className="h-4 w-4 text-cyan-300" />

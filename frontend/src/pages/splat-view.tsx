@@ -212,11 +212,11 @@ export default function SplatViewPage() {
   }, [activeIdx, activeLabels, cameraNodeTarget, cameraOverlayOn, cameraShotsOpen, cameras, inventoryOpen, job, jobId, result, searchOpen, selectedCameraIndex, shortcutLegendOpen]);
 
   return (
-    <div className="flex h-screen flex-col bg-[#05070d] text-zinc-100">
+    <div className="flex h-screen flex-col bg-surface text-zinc-100">
       <header className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
         <div className="flex min-w-0 items-center gap-3">
           <Link href="/" className="flex shrink-0 items-center gap-1.5 text-xs text-zinc-400 hover:text-zinc-200">
-            <ArrowLeft className="h-4 w-4" /> Splat Lab
+            <ArrowLeft className="h-4 w-4" /> SplatLab
           </Link>
           <span className="text-white/20">/</span>
           <div className="flex min-w-0 items-center gap-2">
@@ -329,7 +329,7 @@ export default function SplatViewPage() {
             <div className="text-center">
               <p className="font-semibold text-zinc-200">Scene not found</p>
               <Link href="/" className="mt-2 inline-block text-cyan-300 hover:underline">
-                Back to Splat Lab
+                Back to SplatLab
               </Link>
             </div>
           </Centered>

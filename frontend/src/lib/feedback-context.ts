@@ -181,7 +181,7 @@ export async function collectFeedbackContext(): Promise<FeedbackContextSnapshot>
     captured_at: new Date().toISOString(),
     route,
     ui_state: {
-      component_label: route.path.startsWith("/view/") ? "Splat viewer" : route.path === "/" ? "Splat Lab gallery" : null,
+      component_label: route.path.startsWith("/view/") ? "Splat viewer" : route.path === "/" ? "SplatLab gallery" : null,
       scroll_x: Math.round(window.scrollX),
       scroll_y: Math.round(window.scrollY),
       splatlab: getSplatlabContext(),

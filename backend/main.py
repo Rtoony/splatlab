@@ -56,7 +56,7 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Splat Lab", lifespan=_lifespan)
+app = FastAPI(title="SplatLab", lifespan=_lifespan)
 _client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0))
 
 
@@ -90,7 +90,7 @@ def _login_html(error: str = "") -> str:
     msg = f'<p class="err">{error}</p>' if error else ""
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Splat Lab — Sign in</title><style>
+<title>SplatLab — Sign in</title><style>
 *{{box-sizing:border-box}}body{{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
 background:radial-gradient(circle at 30% 20%,rgba(34,211,238,.12),transparent 40%),#05070d;
 font-family:ui-sans-serif,system-ui,sans-serif;color:#e4e9f2}}
@@ -107,7 +107,7 @@ background:#22d3ee;color:#04121a;font-weight:700;font-size:14px}}
 font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.28em}}
 </style></head><body><form class="card" method="post" action="/login">
 <div class="brand">◆ Spatial Pipeline</div>
-<h1>Splat Lab</h1><p class="sub">Sign in with your portal token.</p>
+<h1>SplatLab</h1><p class="sub">Sign in with your portal token.</p>
 <input name="portal_token" type="password" placeholder="Portal token" autocomplete="current-password" autofocus required>
 <button type="submit">Enter</button>{msg}</form></body></html>"""
 
@@ -220,4 +220,4 @@ async def spa(full_path: str, request: Request):
     index = DIST / "index.html"
     if index.is_file():
         return FileResponse(str(index))
-    return HTMLResponse("<h1>Splat Lab</h1><p>Frontend not built yet.</p>", status_code=200)
+    return HTMLResponse("<h1>SplatLab</h1><p>Frontend not built yet.</p>", status_code=200)

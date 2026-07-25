@@ -61,11 +61,11 @@ export default function SparkTestPage() {
     : null;
 
   return (
-    <div className="flex h-screen flex-col bg-[#05070d] text-zinc-100">
+    <div className="flex h-screen flex-col bg-surface text-zinc-100">
       <header className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
         <div className="flex min-w-0 items-center gap-3">
           <Link href="/" className="flex shrink-0 items-center gap-1.5 text-xs text-zinc-400 hover:text-zinc-200">
-            <ArrowLeft className="h-4 w-4" /> Splat Lab
+            <ArrowLeft className="h-4 w-4" /> SplatLab
           </Link>
           <span className="text-white/20">/</span>
           <div className="flex min-w-0 items-center gap-2">

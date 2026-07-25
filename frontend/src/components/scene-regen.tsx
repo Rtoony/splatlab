@@ -186,7 +186,7 @@ export default function SceneRegenModal({ job, onClose }: { job: SplatJob; onClo
 
   return (
     <div className="fixed inset-0 z-50 flex bg-black/70 backdrop-blur-sm">
-      <div className="relative m-2 flex min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-white/10 bg-[#05070d] sm:m-4">
+      <div className="relative m-2 flex min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-white/10 bg-surface sm:m-4">
         <div className="flex shrink-0 items-center justify-between gap-2 border-b border-white/10 px-4 py-3">
           <div className="flex min-w-0 items-center gap-2">
             <Layers className="h-4 w-4 shrink-0 text-cyan-300" />
@@ -844,7 +844,7 @@ function AssemblePanel({
                 type="button"
                 onClick={() => setFidelityMode(m)}
                 className={`flex-1 rounded-lg py-1.5 text-xs font-semibold capitalize transition ${
-                  fidelityMode === m ? "bg-cyan-400 text-[#04121a]" : "text-zinc-400 hover:text-zinc-200"
+                  fidelityMode === m ? "bg-cyan-400 text-accent-ink" : "text-zinc-400 hover:text-zinc-200"
                 }`}
               >
                 {m}

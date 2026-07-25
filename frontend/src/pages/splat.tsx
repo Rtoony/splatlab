@@ -392,12 +392,12 @@ export default function SplatLabPage() {
       {/* hero */}
       <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-4">
-          <div className="rounded-[22px] border border-cyan-400/30 bg-cyan-400/10 p-3.5 text-cyan-200">
+          <div className="rounded-2xl border border-cyan-400/30 bg-cyan-400/10 p-3.5 text-cyan-200">
             <Orbit className="h-7 w-7" />
           </div>
           <div>
             <p className="text-[11px] font-bold uppercase tracking-[0.32em] text-cyan-200/80">Spatial Pipeline</p>
-            <h1 className="display text-3xl font-black tracking-tight text-white">Splat Lab</h1>
+            <h1 className="display text-3xl font-black tracking-tight text-white">SplatLab</h1>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -524,7 +524,7 @@ export default function SplatLabPage() {
             >
               <span
                 className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
-                  testFlight ? "border-emerald-400 bg-emerald-400 text-[#04121a]" : "border-white/20 bg-white/5"
+                  testFlight ? "border-emerald-400 bg-emerald-400 text-accent-ink" : "border-white/20 bg-white/5"
                 }`}
               >
                 {testFlight && <CheckCircle2 className="h-3.5 w-3.5" />}
@@ -554,7 +554,7 @@ export default function SplatLabPage() {
             >
               <span
                 className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
-                  languageField ? "border-cyan-400 bg-cyan-400 text-[#04121a]" : "border-white/20 bg-white/5"
+                  languageField ? "border-cyan-400 bg-cyan-400 text-accent-ink" : "border-white/20 bg-white/5"
                 }`}
               >
                 {languageField && <CheckCircle2 className="h-3.5 w-3.5" />}
@@ -584,7 +584,7 @@ export default function SplatLabPage() {
             >
               <span
                 className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
-                  meshExport ? "border-violet-400 bg-violet-400 text-[#04121a]" : "border-white/20 bg-white/5"
+                  meshExport ? "border-violet-400 bg-violet-400 text-accent-ink" : "border-white/20 bg-white/5"
                 }`}
               >
                 {meshExport && <CheckCircle2 className="h-3.5 w-3.5" />}
@@ -614,7 +614,7 @@ export default function SplatLabPage() {
             >
               <span
                 className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
-                  sparseMode ? "border-amber-400 bg-amber-400 text-[#04121a]" : "border-white/20 bg-white/5"
+                  sparseMode ? "border-amber-400 bg-amber-400 text-accent-ink" : "border-white/20 bg-white/5"
                 }`}
               >
                 {sparseMode && <CheckCircle2 className="h-3.5 w-3.5" />}
@@ -644,7 +644,7 @@ export default function SplatLabPage() {
             >
               <span
                 className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-colors ${
-                  generativeMode ? "border-fuchsia-400 bg-fuchsia-400 text-[#04121a]" : "border-white/20 bg-white/5"
+                  generativeMode ? "border-fuchsia-400 bg-fuchsia-400 text-accent-ink" : "border-white/20 bg-white/5"
                 }`}
               >
                 {generativeMode && <CheckCircle2 className="h-3.5 w-3.5" />}

@@ -74,12 +74,12 @@ export default function FeedbackPage() {
   const selected = selectedId ? items.find((item) => String(item.id) === String(selectedId)) ?? null : null;
 
   return (
-    <div className="min-h-screen bg-[#05070d] px-4 py-6 text-zinc-100 sm:px-6">
+    <div className="min-h-screen bg-surface px-4 py-6 text-zinc-100 sm:px-6">
       <div className="mx-auto max-w-7xl">
         <header className="mb-5 flex flex-wrap items-center justify-between gap-3">
           <div>
             <Link href="/" className="mb-2 inline-flex items-center gap-1.5 text-xs text-zinc-400 hover:text-cyan-200">
-              <ArrowLeft className="h-4 w-4" /> Splat Lab
+              <ArrowLeft className="h-4 w-4" /> SplatLab
             </Link>
             <h1 className="display text-3xl font-black tracking-tight text-white">Feedback Loop</h1>
             <p className="mt-1 text-sm text-zinc-400">Triage captured feedback, add notes, and move work through verification.</p>

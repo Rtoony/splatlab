@@ -309,7 +309,7 @@ export default function GeoLocateModal({ job, onClose }: { job: SplatJob; onClos
 
   return (
     <div className="fixed inset-0 z-50 flex bg-black/70 backdrop-blur-sm">
-      <div className="relative m-2 flex min-w-0 flex-1 overflow-hidden rounded-2xl border border-white/10 bg-[#05070d] sm:m-4">
+      <div className="relative m-2 flex min-w-0 flex-1 overflow-hidden rounded-2xl border border-white/10 bg-surface sm:m-4">
         {/* map */}
         <div ref={mapDivRef} className="h-full min-w-0 flex-1" />
 

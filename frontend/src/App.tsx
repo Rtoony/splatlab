@@ -10,7 +10,7 @@ const SparkTestPage = lazy(() => import("@/pages/spark-test"));
 function Loading() {
   return (
     <div className="flex h-screen items-center justify-center text-xs uppercase tracking-[0.3em] text-zinc-600">
-      Loading Splat Lab…
+      Loading SplatLab…
     </div>
   );
 }
@@ -36,7 +36,7 @@ export default function App() {
             <div className="flex h-screen flex-col items-center justify-center gap-3 text-zinc-400">
               <p>Page not found.</p>
               <a href="/" className="text-cyan-300 hover:underline">
-                Back to Splat Lab
+                Back to SplatLab
               </a>
             </div>
           </Route>
