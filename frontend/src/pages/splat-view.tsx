@@ -11,9 +11,10 @@ import type {
   SplatStatusResponse,
 } from "@/lib/contracts";
 import { SplatViewer, type ViewerCameraNodeTarget, type ViewerCameraPose, type ViewerCameraViewTarget, type ViewerHighlight, type ViewerOverlay } from "@/components/splat-viewer";
-import { Button, Card, Input, SectionLabel } from "@/components/ui";
-import { DownloadMenu } from "@/components/gallery/download-menu";
-import { ArrowLeft, Camera, ChevronDown, ChevronUp, Compass, Crosshair, Eye, EyeOff, Layers, Loader2, MapPin, Mountain, Orbit, RotateCcw, Search, SlidersHorizontal, Sparkles, X } from "lucide-react";
+import { Button, Card, DropdownItem, DropdownMenu, DropdownSeparator, Input, SectionLabel, Tabs, TabsList, TabsTrigger } from "@/components/ui";
+import { EditLane } from "@/components/workspace/edit-lane";
+import { ExportLane } from "@/components/workspace/export-lane";
+import { ArrowLeft, Boxes, Camera, ChevronDown, ChevronUp, Crosshair, Eye, EyeOff, Layers, Loader2, MapPin, MoreHorizontal, Mountain, Orbit, PackageOpen, RotateCcw, Ruler, Search, SlidersHorizontal, Sparkles, Wrench, X } from "lucide-react";
 import { SparkSceneViewer } from "@/components/spark-scene-viewer";
 
 // Locate-in-the-world map modal — lazy so Leaflet only ships when opened.
@@ -60,6 +61,9 @@ export default function SplatViewPage() {
   const [geoOpen, setGeoOpen] = useState(false);
   const [sectionsOpen, setSectionsOpen] = useState(false);
   const [sceneRegenOpen, setSceneRegenOpen] = useState(false);
+  // Workspace mode tab. The viewer never unmounts on tab switch — Edit/Export/
+  // Objects render as an overlay lane so the WebGL context and camera survive.
+  const [mode, setMode] = useState<"view" | "measure" | "objects" | "edit" | "export">("view");
   function toggleSparkBeta() {
     setSparkBeta((v) => {
       localStorage.setItem("splatlab.sparkBeta", v ? "0" : "1");
@@ -217,103 +221,148 @@ export default function SplatViewPage() {
 
   return (
     <div className="flex h-screen flex-col bg-surface text-zinc-100">
-      <header className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
-        <div className="flex min-w-0 items-center gap-3">
-          <Link href="/" className="flex shrink-0 items-center gap-1.5 text-xs text-zinc-400 hover:text-zinc-200">
-            <ArrowLeft className="h-4 w-4" /> SplatLab
-          </Link>
-          <span className="text-white/20">/</span>
-          <div className="flex min-w-0 items-center gap-2">
-            <Orbit className="h-4 w-4 shrink-0 text-cyan-300" />
-            <span className="truncate text-sm font-semibold">{title}</span>
-          </div>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          {job && viewUrl && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => setGeoOpen(true)}
-              title={job.geo ? `Located at ${job.geo.lat.toFixed(5)}, ${job.geo.lon.toFixed(5)} — open the map` : "Pin this scene to real-world coordinates on a map"}
-              className={job.geo ? "border-emerald-300/40 text-emerald-200" : ""}
-            >
-              <MapPin className="h-3.5 w-3.5" /> {job.geo ? "Located" : "Locate"}
-            </Button>
-          )}
-          {job && viewUrl && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => setSectionsOpen(true)}
-              title="Generate cross-section + isometric TIN images of this site"
-              className={job.sections_url ? "border-emerald-300/40 text-emerald-200" : ""}
-            >
-              <Mountain className="h-3.5 w-3.5" /> Sections
-            </Button>
-          )}
-          {job && viewUrl && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => setSceneRegenOpen(true)}
-              title="Enumerate, isolate, proxy, and reassemble this scene's objects — the P6 control panel"
-              className={job.scene?.assemble ? "border-cyan-300/40 text-cyan-200" : ""}
-            >
-              <Layers className="h-3.5 w-3.5" /> Scene
-            </Button>
-          )}
-          {job && viewUrl && (
-            <Button
-              type="button"
-              variant={sparkBeta ? "primary" : "outline"}
-              size="sm"
-              onClick={toggleSparkBeta}
-              title="Spark beta viewer: real language heatmap on the splats + measure/scale tools"
-              className={sparkBeta ? "bg-cyan-300 text-zinc-950 hover:bg-cyan-200" : ""}
-            >
-              <Compass className="h-3.5 w-3.5" /> {sparkBeta ? "Spark beta ON" : "Spark beta"}
-            </Button>
-          )}
-          {job && viewUrl && (
-            <>
-              <Button type="button" variant="outline" size="sm" onClick={resetToDefaultView} title="Reset camera and collapse viewer extras">
-                <RotateCcw className="h-3.5 w-3.5" /> Reset
-              </Button>
-              <Button type="button" variant="outline" size="sm" onClick={enableAdvancedView} title="Open advanced search, scene, and camera tools">
-                <SlidersHorizontal className="h-3.5 w-3.5" /> Advanced
-              </Button>
-              <Button
-                type="button"
-                variant={cameraOverlayOn ? "primary" : "outline"}
-                size="sm"
-                onClick={() => {
-                  setCameraOverlayOn((v) => !v);
-                  setCameraShotsOpen((v) => (!cameraOverlayOn ? true : v));
-                }}
-                title={camerasError ? "Camera poses are unavailable for this scene" : "Toggle capture camera locations"}
-                className={cameraOverlayOn ? "bg-amber-300 text-zinc-950 hover:bg-amber-200" : ""}
+      <header className="border-b border-white/10 px-4 pt-3">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-3">
+            <Link href="/" className="flex shrink-0 items-center gap-1.5 text-xs text-zinc-400 hover:text-zinc-200">
+              <ArrowLeft className="h-4 w-4" /> Scenes
+            </Link>
+            <span className="text-white/20">/</span>
+            <div className="flex min-w-0 items-center gap-2">
+              <Orbit className="h-4 w-4 shrink-0 text-cyan-300" />
+              <span className="truncate text-sm font-semibold">{title}</span>
+            </div>
+            {job && (
+              <span
+                className={`hidden shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide sm:inline-flex ${
+                  job.status === "completed"
+                    ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+                    : job.status === "failed"
+                      ? "border-red-500/30 bg-red-500/10 text-red-300"
+                      : "border-cyan-500/30 bg-cyan-500/10 text-cyan-200"
+                }`}
               >
-                {camerasLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Camera className="h-3.5 w-3.5" />}
-                {cameraOverlayOn && cameras ? `${cameras.count}/${cameras.total} cameras` : "Cameras"}
-              </Button>
-            </>
-          )}
-          {job && <DownloadMenu job={job} />}
-          {job?.preview_file_url && (
-            <a
-              href={`/supersplat/?load=${encodeURIComponent(job.preview_file_url)}&filename=${encodeURIComponent(`${jobId}.ply`)}`}
-              target="_blank"
-              rel="noreferrer"
-              title="Open this scene in the SuperSplat editor (select, crop, transform, export)"
-              className="flex shrink-0 items-center gap-1.5 rounded-full border border-white/15 bg-white/5 px-3 py-1.5 text-xs font-semibold text-zinc-200 hover:bg-white/10"
+                {job.status}
+              </span>
+            )}
+          </div>
+          {job && viewUrl && (
+            <DropdownMenu
+              trigger={
+                <button
+                  type="button"
+                  aria-label="Scene actions"
+                  className="rounded-xl border border-white/15 bg-white/5 p-2 text-zinc-300 hover:bg-white/10"
+                >
+                  <MoreHorizontal className="h-4 w-4" />
+                </button>
+              }
             >
-              <Sparkles className="h-3.5 w-3.5" /> Edit in SuperSplat
-            </a>
+              <DropdownItem onSelect={() => setGeoOpen(true)}>
+                {job.geo ? "Located — open map" : "Locate in the world"}
+              </DropdownItem>
+              <DropdownItem onSelect={() => setSectionsOpen(true)}>Site sections</DropdownItem>
+              <DropdownItem onSelect={() => setSceneRegenOpen(true)}>Scene panel (P6)</DropdownItem>
+              <DropdownSeparator />
+              <DropdownItem onSelect={resetToDefaultView}>Reset view</DropdownItem>
+              <DropdownItem onSelect={enableAdvancedView}>Advanced view</DropdownItem>
+              <DropdownSeparator />
+              <DropdownItem onSelect={toggleSparkBeta}>
+                {sparkBeta ? "Switch to classic viewer" : "Switch to Spark viewer"}
+              </DropdownItem>
+              {job.preview_file_url && (
+                <DropdownItem onSelect={() => window.open(job.preview_file_url!, "_blank")}>
+                  Download full-quality .ply
+                </DropdownItem>
+              )}
+              {job.preview_file_url && (
+                <DropdownItem
+                  onSelect={() =>
+                    window.open(
+                      `/supersplat/?load=${encodeURIComponent(job.preview_file_url!)}&filename=${encodeURIComponent(`${jobId}.ply`)}`,
+                      "_blank",
+                    )
+                  }
+                >
+                  Edit in SuperSplat
+                </DropdownItem>
+              )}
+            </DropdownMenu>
           )}
         </div>
+        {job && viewUrl && (
+          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 pb-2">
+            <Tabs value={mode} onValueChange={(v) => setMode(v as typeof mode)}>
+              <TabsList>
+                <TabsTrigger value="view"><Orbit className="h-3.5 w-3.5" /> View</TabsTrigger>
+                <TabsTrigger value="measure"><Ruler className="h-3.5 w-3.5" /> Measure</TabsTrigger>
+                <TabsTrigger value="objects"><Boxes className="h-3.5 w-3.5" /> Objects</TabsTrigger>
+                <TabsTrigger value="edit"><Wrench className="h-3.5 w-3.5" /> Edit</TabsTrigger>
+                <TabsTrigger value="export"><PackageOpen className="h-3.5 w-3.5" /> Export</TabsTrigger>
+              </TabsList>
+            </Tabs>
+            <div className="flex shrink-0 items-center gap-2">
+              {mode === "view" && (
+                <>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setGeoOpen(true)}
+                    title={job.geo ? `Located at ${job.geo.lat.toFixed(5)}, ${job.geo.lon.toFixed(5)} — open the map` : "Pin this scene to real-world coordinates on a map"}
+                    className={job.geo ? "border-emerald-300/40 text-emerald-200" : ""}
+                  >
+                    <MapPin className="h-3.5 w-3.5" /> {job.geo ? "Located" : "Locate"}
+                  </Button>
+                  <Button type="button" variant="outline" size="sm" onClick={resetToDefaultView} title="Reset camera and collapse viewer extras">
+                    <RotateCcw className="h-3.5 w-3.5" /> Reset
+                  </Button>
+                  <Button type="button" variant="outline" size="sm" onClick={enableAdvancedView} title="Open advanced search, scene, and camera tools">
+                    <SlidersHorizontal className="h-3.5 w-3.5" /> Advanced
+                  </Button>
+                  <Button
+                    type="button"
+                    variant={cameraOverlayOn ? "primary" : "outline"}
+                    size="sm"
+                    onClick={() => {
+                      setCameraOverlayOn((v) => !v);
+                      setCameraShotsOpen((v) => (!cameraOverlayOn ? true : v));
+                    }}
+                    title={camerasError ? "Camera poses are unavailable for this scene" : "Toggle capture camera locations"}
+                    className={cameraOverlayOn ? "bg-amber-300 text-zinc-950 hover:bg-amber-200" : ""}
+                  >
+                    {camerasLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Camera className="h-3.5 w-3.5" />}
+                    {cameraOverlayOn && cameras ? `${cameras.count}/${cameras.total} cameras` : "Cameras"}
+                  </Button>
+                </>
+              )}
+              {mode === "measure" && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setSectionsOpen(true)}
+                  title="Generate cross-section + isometric TIN images of this site"
+                  className={job.sections_url ? "border-emerald-300/40 text-emerald-200" : ""}
+                >
+                  <Mountain className="h-3.5 w-3.5" /> Sections
+                </Button>
+              )}
+              {mode === "objects" && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setSceneRegenOpen(true)}
+                  title="Enumerate, isolate, proxy, and reassemble this scene's objects — the P6 control panel"
+                  className={job.scene?.assemble ? "border-cyan-300/40 text-cyan-200" : ""}
+                >
+                  <Layers className="h-3.5 w-3.5" /> Scene panel
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
       </header>
       <main className="relative flex-1 overflow-hidden">
         {isLoading && !job ? (
@@ -344,6 +393,7 @@ export default function SplatViewPage() {
               <SparkSceneViewer
                 key={job.job_id}
                 job={job}
+                toolsVisible={mode === "measure"}
                 safeMode={computeBlocked}
                 computeReason={computeReason}
                 onViewerError={fallBackFromSpark}
@@ -440,6 +490,42 @@ export default function SplatViewPage() {
               />
             )}
           </>
+        )}
+        {job && viewUrl && mode === "measure" && !sparkBeta && (
+          <div className="absolute left-1/2 top-4 z-30 w-full max-w-md -translate-x-1/2 px-4">
+            <Card className="border-cyan-400/30 bg-cyan-950/80 p-3 text-center text-xs text-cyan-100">
+              Measure, heatmap, and crop tools run in the Spark viewer. Switch via the ⋯ menu
+              (or reload without <span className="font-mono">?viewer=classic</span>).
+            </Card>
+          </div>
+        )}
+        {job && viewUrl && (mode === "edit" || mode === "export" || mode === "objects") && (
+          <aside className="absolute bottom-0 right-0 top-0 z-30 w-[24rem] max-w-full overflow-y-auto border-l border-white/10 bg-surface/95 backdrop-blur-md">
+            {mode === "edit" && <EditLane job={job} />}
+            {mode === "export" && <ExportLane job={job} />}
+            {mode === "objects" && (
+              <div className="space-y-4 p-4">
+                <div className="flex items-center gap-2">
+                  <Boxes className="h-4 w-4 text-cyan-300" />
+                  <SectionLabel>Objects</SectionLabel>
+                </div>
+                <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-3">
+                  <p className="text-sm font-semibold text-zinc-100">Scene decomposition (P6)</p>
+                  <p className="mt-1 text-xs leading-relaxed text-zinc-400">
+                    Enumerate every object in the scene, isolate them from the background, build proxies,
+                    extract the ground, and reassemble — with an approval gate before anything ships.
+                  </p>
+                  <Button size="sm" className="mt-2 w-full" onClick={() => setSceneRegenOpen(true)}>
+                    <Layers className="h-3.5 w-3.5" /> Open Scene panel
+                  </Button>
+                </div>
+                <p className="text-[11px] leading-relaxed text-zinc-600">
+                  Coming next: name an object ("the fire hydrant") and get back its isolated splat, mesh, and a
+                  colored Blender-ready twin — the single-object lane is already built server-side.
+                </p>
+              </div>
+            )}
+          </aside>
         )}
       </main>
       {geoOpen && job && (
