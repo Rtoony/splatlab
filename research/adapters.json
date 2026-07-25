@@ -1,0 +1,211 @@
+{
+  "schema": "dev.splatlab.research-adapters/v1",
+  "adapters": [
+    {
+      "id": "mvsanywhere-depth-reg",
+      "source_id": "mvsanywhere",
+      "enabled": false,
+      "execution": "plan-only",
+      "checkout_policy": "outside-splatlab-repository",
+      "root_env_var": "SPLATLAB_RESEARCH_MVSANYWHERE_ROOT",
+      "license_scope": "restricted-research",
+      "resources": {
+        "gpu": true,
+        "compute_gate_required": true,
+        "minimum_vram_mb": 8000,
+        "network_during_run": false
+      },
+      "required_paths": [
+        "LICENSE",
+        "src/mvsanywhere",
+        "src/regsplatfacto"
+      ],
+      "accepts": [
+        "nerfstudio-dataset",
+        "posed-rgb-frames"
+      ],
+      "produces": [
+        "depth-maps",
+        "fused-mesh",
+        "research-only-Gaussian-PLY",
+        "benchmark-receipt"
+      ],
+      "manual_gates": [
+        "weights-present-before-run",
+        "license-acknowledgement",
+        "coordinate-frame-check",
+        "small-dataset-first",
+        "operator-starts-compute-gated-run"
+      ]
+    },
+    {
+      "id": "acezero-pose-recovery",
+      "source_id": "acezero",
+      "enabled": false,
+      "execution": "plan-only",
+      "checkout_policy": "outside-splatlab-repository",
+      "root_env_var": "SPLATLAB_RESEARCH_ACEZERO_ROOT",
+      "license_scope": "restricted-research",
+      "resources": {
+        "gpu": true,
+        "compute_gate_required": true,
+        "minimum_vram_mb": 6000,
+        "network_during_run": false
+      },
+      "required_paths": [
+        "LICENSE",
+        "ace_zero.py"
+      ],
+      "accepts": [
+        "unposed-image-collection",
+        "rgbd-image-collection"
+      ],
+      "produces": [
+        "camera-poses",
+        "sparse-scene-coordinates",
+        "benchmark-receipt"
+      ],
+      "manual_gates": [
+        "disable-runtime-downloads",
+        "weights-present-before-run",
+        "compare-against-COLMAP-failure-case",
+        "operator-starts-compute-gated-run"
+      ]
+    },
+    {
+      "id": "milo-surface-loop",
+      "source_id": "milo",
+      "enabled": false,
+      "execution": "plan-only",
+      "checkout_policy": "outside-splatlab-repository",
+      "root_env_var": "SPLATLAB_RESEARCH_MILO_ROOT",
+      "license_scope": "restricted-research",
+      "resources": {
+        "gpu": true,
+        "compute_gate_required": true,
+        "minimum_vram_mb": 10000,
+        "network_during_run": false
+      },
+      "required_paths": [
+        "LICENSE.md",
+        "milo/train.py",
+        "milo/blender"
+      ],
+      "accepts": [
+        "COLMAP-dataset",
+        "Gaussian-training-cameras"
+      ],
+      "produces": [
+        "research-only-Gaussian-PLY",
+        "surface-mesh",
+        "benchmark-receipt"
+      ],
+      "manual_gates": [
+        "submodule-license-audit",
+        "no-code-copy-into-SplatLab",
+        "small-dataset-first",
+        "operator-starts-compute-gated-run"
+      ]
+    },
+    {
+      "id": "dn-splatter-geometry",
+      "source_id": "dn-splatter",
+      "enabled": false,
+      "execution": "plan-only",
+      "checkout_policy": "outside-splatlab-repository",
+      "root_env_var": "SPLATLAB_RESEARCH_DN_SPLATTER_ROOT",
+      "license_scope": "permissive-evaluation",
+      "resources": {
+        "gpu": true,
+        "compute_gate_required": true,
+        "minimum_vram_mb": 8000,
+        "network_during_run": false
+      },
+      "required_paths": [
+        "LICENSE",
+        "dn_splatter"
+      ],
+      "accepts": [
+        "nerfstudio-dataset",
+        "depth-and-normal-priors"
+      ],
+      "produces": [
+        "Gaussian-PLY",
+        "surface-mesh",
+        "benchmark-receipt"
+      ],
+      "manual_gates": [
+        "depth-weight-license-review",
+        "white-wall-benchmark",
+        "geometry-and-photometric-metrics",
+        "operator-starts-compute-gated-run"
+      ]
+    },
+    {
+      "id": "splatreg-proposal",
+      "source_id": "splatreg",
+      "enabled": false,
+      "execution": "plan-only",
+      "checkout_policy": "outside-splatlab-repository",
+      "root_env_var": "SPLATLAB_RESEARCH_SPLATREG_ROOT",
+      "license_scope": "permissive-evaluation",
+      "resources": {
+        "gpu": false,
+        "compute_gate_required": false,
+        "minimum_vram_mb": 0,
+        "network_during_run": false
+      },
+      "required_paths": [
+        "LICENSE",
+        "splatreg"
+      ],
+      "accepts": [
+        "source-Gaussian-PLY",
+        "target-Gaussian-PLY"
+      ],
+      "produces": [
+        "SE3-or-Sim3-transform-proposal",
+        "overlap-confidence",
+        "benchmark-receipt"
+      ],
+      "manual_gates": [
+        "proposal-only-no-automatic-merge",
+        "operator-visual-preview",
+        "non-overlap-rejection",
+        "reversible-transform-receipt"
+      ]
+    },
+    {
+      "id": "brush-worker",
+      "source_id": "brush",
+      "enabled": false,
+      "execution": "plan-only",
+      "checkout_policy": "outside-splatlab-repository",
+      "root_env_var": "SPLATLAB_RESEARCH_BRUSH_ROOT",
+      "license_scope": "permissive-evaluation",
+      "resources": {
+        "gpu": true,
+        "compute_gate_required": true,
+        "minimum_vram_mb": 8000,
+        "network_during_run": false
+      },
+      "required_paths": [
+        "LICENSE",
+        "Cargo.toml"
+      ],
+      "accepts": [
+        "COLMAP-dataset"
+      ],
+      "produces": [
+        "Gaussian-PLY",
+        "benchmark-receipt"
+      ],
+      "manual_gates": [
+        "pinned-release",
+        "headless-interface-check",
+        "format-round-trip",
+        "operator-starts-compute-gated-run"
+      ]
+    }
+  ]
+}

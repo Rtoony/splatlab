@@ -1,0 +1,286 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://splatlab.local/schemas/research-benchmark-v1.json",
+  "title": "SplatLab research benchmark receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "experiment_id",
+    "created_at",
+    "adapter_id",
+    "scope",
+    "dataset",
+    "implementation",
+    "environment",
+    "configuration",
+    "metrics",
+    "artifacts",
+    "outcome"
+  ],
+  "properties": {
+    "schema": {
+      "const": "dev.splatlab.research-benchmark/v1"
+    },
+    "experiment_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "adapter_id": {
+      "type": "string"
+    },
+    "scope": {
+      "enum": [
+        "production-evaluation",
+        "isolated-research"
+      ]
+    },
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "input_sha256",
+        "capture_type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "input_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "capture_type": {
+          "type": "string"
+        }
+      }
+    },
+    "implementation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "repository",
+        "revision",
+        "dirty"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "upstream",
+            "independent"
+          ]
+        },
+        "repository": {
+          "type": "string",
+          "format": "uri"
+        },
+        "revision": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{40}$"
+        },
+        "dirty": {
+          "type": "boolean"
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os",
+        "python",
+        "gpu",
+        "vram_mb",
+        "dependencies_sha256"
+      ],
+      "properties": {
+        "os": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "python": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "gpu": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "vram_mb": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "dependencies_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "minProperties": 1
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wall_seconds",
+        "peak_ram_mb",
+        "peak_vram_mb",
+        "output",
+        "quality"
+      ],
+      "properties": {
+        "wall_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "peak_ram_mb": {
+          "type": "number",
+          "minimum": 0
+        },
+        "peak_vram_mb": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "output": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "gaussian_count",
+            "bytes"
+          ],
+          "properties": {
+            "gaussian_count": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        },
+        "quality": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "role",
+          "path",
+          "sha256",
+          "bytes"
+        ],
+        "properties": {
+          "role": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "notes"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "pass",
+            "fail",
+            "incomplete"
+          ]
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "properties": {
+              "status": {
+                "const": "pass"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "metrics": {
+            "properties": {
+              "quality": {
+                "minProperties": 1
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "outcome": {
+            "properties": {
+              "notes": {
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    }
+  }
+}
