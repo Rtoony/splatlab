@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Union
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field, model_validator
 
 import gpu_arbiter
@@ -879,6 +879,127 @@ async def apply_edit_ops(job_id: str, req: ApplyOpsRequest, request: Request) ->
         "ok": True,
         "version_before": manifest["seq"],
         "warnings": warnings,
+        "job": splat_route._job_payload(updated_meta),
+    }
+
+
+# =============================================================================
+# 2b. EXTERNAL-EDIT UPLOAD (SuperSplat roundtrip)
+# =============================================================================
+
+
+@router.post("/jobs/{job_id}/edit/upload")
+async def upload_edited_ply(job_id: str, file: UploadFile, request: Request) -> dict[str, Any]:
+    """Ingest an externally-edited canonical PLY (SuperSplat: File → Export →
+    PLY) as a first-class edit version. Same transaction shape as
+    apply_edit_ops with the transform step swapped for the upload: stream to a
+    unique tmp in the job's _preview/ (never buffered in RAM — canonical PLYs
+    run 300MB+), validate the header BEFORE touching any live artifact, then
+    under the per-job edit lock: snapshot (op="upload") → os.replace into
+    _preview/splat.ply → prune → regen derived artifacts → invalidate previews
+    → mark the language field stale (an external editor can delete/reorder
+    rows, so embeddings never line up afterwards)."""
+    splat_route.require_heavy_work_admitted()
+    meta, job_dir = _require_editable_job(job_id)
+
+    filename = (file.filename or "").strip() or "upload.ply"
+    if not filename.lower().endswith(".ply"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{filename}' is not a .ply file — in SuperSplat use File → Export → PLY, then upload that",
+        )
+
+    src_ply = splat_route._preview_file_path(job_dir)
+    tmp_ply = _edit_tmp_path(src_ply)
+
+    try:
+        # Stream to disk in 1MB chunks with the app's standard 2GB cap — the
+        # exact pattern of splat_route.upload_splat_input (413 over the cap).
+        written = 0
+        try:
+            with tmp_ply.open("wb") as fh:
+                while chunk := await file.read(1024 * 1024):
+                    written += len(chunk)
+                    if written > splat_route.MAX_UPLOAD_BYTES:
+                        raise HTTPException(status_code=413, detail="Upload exceeds 2 GB.")
+                    fh.write(chunk)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001 - client disconnects / disk errors
+            raise HTTPException(status_code=500, detail=f"Upload failed: {exc}") from exc
+
+        if written == 0:
+            raise HTTPException(status_code=400, detail=f"'{filename}' is empty — nothing was uploaded")
+
+        # Validate BEFORE snapshotting or replacing anything: reuse the stdlib
+        # header parser (binary_little_endian, vertex-only, fixed-stride).
+        try:
+            hdr = _parse_ply_header(tmp_ply)
+        except ValueError as exc:
+            reason = str(exc).replace(f"{tmp_ply}: ", "")
+            raise HTTPException(
+                status_code=400, detail=f"'{filename}' is not a usable splat PLY: {reason}"
+            ) from exc
+        if hdr.vertex_count <= 0:
+            raise HTTPException(status_code=400, detail=f"'{filename}' declares zero gaussians")
+        expected_size = hdr.header_len + hdr.vertex_count * hdr.row_size
+        if written != expected_size:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{filename}' is truncated or corrupt: {written} bytes on the wire but the header "
+                f"declares {hdr.vertex_count} rows x {hdr.row_size} bytes (+{hdr.header_len} header "
+                f"= {expected_size} bytes)",
+            )
+
+        async with _hold_edit_locks([job_id]):
+            async def transaction() -> tuple[dict[str, Any], list[str]]:
+                snap_dir, manifest, snap_created = _snapshot_preview(
+                    job_dir,
+                    op="upload",
+                    params={"filename": filename, "bytes": written, "gaussians": hdr.vertex_count},
+                )
+                landed = False
+                try:
+                    os.replace(tmp_ply, src_ply)
+                    landed = True
+                    _prune_versions(job_dir)
+                    warnings = await _regen_derived_artifacts(job_dir, coordinated=True)
+                    _invalidate_previews(job_dir)
+                    _mark_langfield_stale(job_dir)
+                    splat_route._patch_meta(job_id, stats=None)
+                    return manifest, warnings
+                except BaseException:
+                    if not landed:
+                        _discard_snapshot(snap_dir, snap_created)
+                    raise
+
+            try:
+                manifest, warnings = await _run_edit_transaction(
+                    needs_gpu=False,
+                    lane_id=job_id,
+                    operation=transaction,
+                )
+            except gpu_arbiter.GPUArbiterUnavailable as exc:
+                raise HTTPException(status_code=503, detail=f"upload coordination failed: {exc}") from exc
+    finally:
+        # No-op after a successful os.replace; covers every refusal/failure
+        # path (bad file, 413, lock 409, arbiter 503) without snapshot churn.
+        tmp_ply.unlink(missing_ok=True)
+
+    await audit_operator_event(
+        request=request,
+        title="Imported edited splat PLY",
+        description=f"{job_id}: {filename} ({hdr.vertex_count} gaussians)",
+        variant="default",
+        action="splat.edit_upload",
+        target="3d",
+    )
+    updated_meta = splat_route._read_meta(job_id) or meta
+    return {
+        "ok": True,
+        "version_before": manifest["seq"],
+        "warnings": warnings,
+        "gaussians": hdr.vertex_count,
         "job": splat_route._job_payload(updated_meta),
     }
 

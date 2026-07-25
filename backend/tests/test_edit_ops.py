@@ -1031,6 +1031,169 @@ def test_semantic_refuses_source_replacement_during_worker_scoring(
     assert edit_ops._list_version_dirs(job_dir) == []
 
 
+# =============================================================================
+# 9. edited-PLY upload roundtrip (POST /jobs/{id}/edit/upload)
+# =============================================================================
+
+
+def _upload_ply_bytes(tmp_path: Path, rows: list[list[float]]) -> bytes:
+    """A tiny valid binary_little_endian PLY payload for multipart uploads."""
+    p = tmp_path / "edited-upload.ply"
+    _write_ply(p, ["x", "y", "z"], rows)
+    return p.read_bytes()
+
+
+def test_upload_happy_path_replaces_splat_and_versions(
+    outputs_root: Path, client: TestClient, stub_transform: Path, tmp_path: Path
+) -> None:
+    job_id = "splat_eeee0001"
+    job_dir = _make_job(outputs_root, job_id)
+    lf = job_dir / "_langfield"
+    lf.mkdir()
+    (lf / "gauss_emb.npz").write_bytes(b"stub")
+    payload = _upload_ply_bytes(tmp_path, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+    resp = client.post(
+        f"/api/splat/jobs/{job_id}/edit/upload",
+        files={"file": ("edited.ply", payload, "application/octet-stream")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["version_before"] == 1
+    assert body["gaussians"] == 2
+    assert body["warnings"] == []
+    assert body["job"]["job_id"] == job_id
+    # canonical PLY replaced byte-for-byte with the uploaded file
+    assert (job_dir / "_preview" / "splat.ply").read_bytes() == payload
+    # snapshot v1 preserves the PRE-upload scene under op="upload"
+    versions = edit_ops._list_version_dirs(job_dir)
+    assert len(versions) == 1
+    vdir, manifest = versions[0]
+    assert manifest["op"] == "upload"
+    assert manifest["params"]["filename"] == "edited.ply"
+    assert manifest["params"]["gaussians"] == 2
+    assert (vdir / "splat.ply").read_bytes() == b"PLYDATA-v0"
+    # derived artifacts regenerated from the new geometry (stub copies in->out)
+    assert (job_dir / "_preview" / "splat.spz").is_file()
+    assert (job_dir / "_preview" / "web.ply").is_file()
+    # an external edit ALWAYS invalidates the language field
+    assert (lf / "STALE").is_file()
+    assert list((job_dir / "_preview").glob("*.edit-tmp")) == []
+
+
+def test_upload_rejects_non_ply_content_nothing_mutated(
+    outputs_root: Path, client: TestClient, stub_transform: Path
+) -> None:
+    job_id = "splat_eeee0002"
+    job_dir = _make_job(outputs_root, job_id)
+    lf = job_dir / "_langfield"
+    lf.mkdir()
+    (lf / "gauss_emb.npz").write_bytes(b"stub")
+
+    resp = client.post(
+        f"/api/splat/jobs/{job_id}/edit/upload",
+        files={"file": ("edited.ply", b"GLB\x02definitely-not-a-ply", "application/octet-stream")},
+    )
+    assert resp.status_code == 400, resp.text
+    detail = resp.json()["detail"]
+    assert "edited.ply" in detail
+    assert "not a usable splat PLY" in detail
+    # nothing mutated, no snapshot left behind, no tmp litter, field untouched
+    assert (job_dir / "_preview" / "splat.ply").read_bytes() == b"PLYDATA-v0"
+    assert edit_ops._list_version_dirs(job_dir) == []
+    assert list((job_dir / "_preview").glob("*.edit-tmp")) == []
+    assert not (lf / "STALE").exists()
+
+
+def test_upload_rejects_wrong_extension(outputs_root: Path, client: TestClient) -> None:
+    job_id = "splat_eeee0003"
+    job_dir = _make_job(outputs_root, job_id)
+    resp = client.post(
+        f"/api/splat/jobs/{job_id}/edit/upload",
+        files={"file": ("scene.spz", b"whatever", "application/octet-stream")},
+    )
+    assert resp.status_code == 400
+    assert ".ply" in resp.json()["detail"]
+    assert (job_dir / "_preview" / "splat.ply").read_bytes() == b"PLYDATA-v0"
+    assert edit_ops._list_version_dirs(job_dir) == []
+
+
+def test_upload_rejects_empty_file(outputs_root: Path, client: TestClient) -> None:
+    job_id = "splat_eeee0004"
+    job_dir = _make_job(outputs_root, job_id)
+    resp = client.post(
+        f"/api/splat/jobs/{job_id}/edit/upload",
+        files={"file": ("edited.ply", b"", "application/octet-stream")},
+    )
+    assert resp.status_code == 400
+    assert "empty" in resp.json()["detail"]
+    assert (job_dir / "_preview" / "splat.ply").read_bytes() == b"PLYDATA-v0"
+    assert edit_ops._list_version_dirs(job_dir) == []
+    assert list((job_dir / "_preview").glob("*.edit-tmp")) == []
+
+
+def test_upload_rejects_truncated_body(
+    outputs_root: Path, client: TestClient, tmp_path: Path
+) -> None:
+    job_id = "splat_eeee0005"
+    job_dir = _make_job(outputs_root, job_id)
+    payload = _upload_ply_bytes(tmp_path, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])[:-5]
+    resp = client.post(
+        f"/api/splat/jobs/{job_id}/edit/upload",
+        files={"file": ("edited.ply", payload, "application/octet-stream")},
+    )
+    assert resp.status_code == 400
+    assert "truncated or corrupt" in resp.json()["detail"]
+    assert (job_dir / "_preview" / "splat.ply").read_bytes() == b"PLYDATA-v0"
+    assert edit_ops._list_version_dirs(job_dir) == []
+    assert list((job_dir / "_preview").glob("*.edit-tmp")) == []
+
+
+def test_upload_oversized_413(
+    outputs_root: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = "splat_eeee0006"
+    job_dir = _make_job(outputs_root, job_id)
+    monkeypatch.setattr(splat_route, "MAX_UPLOAD_BYTES", 16)
+    resp = client.post(
+        f"/api/splat/jobs/{job_id}/edit/upload",
+        files={"file": ("edited.ply", b"x" * 64, "application/octet-stream")},
+    )
+    assert resp.status_code == 413
+    assert "2 GB" in resp.json()["detail"]
+    assert (job_dir / "_preview" / "splat.ply").read_bytes() == b"PLYDATA-v0"
+    assert edit_ops._list_version_dirs(job_dir) == []
+    assert list((job_dir / "_preview").glob("*.edit-tmp")) == []
+
+
+def test_upload_while_edit_in_progress_409(
+    outputs_root: Path, stub_transform: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two overlapping uploads on ONE job: exactly one lands, the other gets the
+    apply path's non-blocking edit-lock 409 (no queueing)."""
+    monkeypatch.setenv("STUB_SLEEP", "0.3")  # slow regen keeps the winner's lock held
+    job_id = "splat_eeee0007"
+    _make_job(outputs_root, job_id)
+    payload = _upload_ply_bytes(tmp_path, [[1.0, 2.0, 3.0]])
+    app = FastAPI()
+    app.include_router(edit_ops.router, prefix="/api/splat")
+
+    async def main() -> tuple[httpx.Response, httpx.Response]:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+            url = f"/api/splat/jobs/{job_id}/edit/upload"
+            files = {"file": ("edited.ply", payload, "application/octet-stream")}
+            r1, r2 = await asyncio.gather(c.post(url, files=files), c.post(url, files=files))
+            return r1, r2
+
+    r1, r2 = asyncio.run(main())
+    statuses = sorted([r1.status_code, r2.status_code])
+    assert statuses == [200, 409], (r1.text, r2.text)
+    loser = r1 if r1.status_code == 409 else r2
+    assert "edit is already in progress" in loser.json()["detail"]
+
+
 def test_merge_holds_host_transaction_through_destination_commit(
     outputs_root: Path,
     client: TestClient,

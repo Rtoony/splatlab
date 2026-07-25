@@ -3,10 +3,10 @@
 Phase 2 of carving Splat Lab out of the Nexus portal: this service now OWNS the
 splat pipeline (splat_route.py, ported from the portal) and coordinates the 5090
 with the portal's TRELLIS lane through a cross-process Redis lock (gpu_arbiter.py).
-/supersplat is still proxied to the portal (SuperSplat editor is mounted there).
+/supersplat is self-hosted: authenticated static serving of a local SuperSplat
+build (SUPERSPLAT_DIST) — the last portal proxy dependency is gone.
 
-Auth: log in with the same PORTAL_TOKEN; a signed cookie gates the app. The
-proxied calls inject the portal bearer server-side (never sent to the browser).
+Auth: log in with the same PORTAL_TOKEN; a signed cookie gates the app.
 """
 from __future__ import annotations
 
@@ -19,11 +19,9 @@ import sys
 import time
 from pathlib import Path
 
-import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.background import BackgroundTask
 
 # Make the ported splat route + its local gpu_arbiter / operator_audit importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -36,11 +34,16 @@ import activity_route  # noqa: E402  (read-only busy-now snapshot: GPU holder + 
 import feedback  # noqa: E402  (small SQLite-backed in-app feedback loop)
 import thumb as thumbgen  # noqa: E402  (scene thumbnail generator)
 
+# Nothing is proxied to the portal anymore; PORTAL_ORIGIN stays because /healthz
+# reports it (operator dashboards read that field — do not remove with the proxy).
 PORTAL_ORIGIN = os.environ.get("SPLATLAB_PORTAL_ORIGIN", "http://127.0.0.1:3300").rstrip("/")
 PORTAL_TOKEN = os.environ.get("PORTAL_TOKEN", "")
 COOKIE = "splatlab_session"
 MAX_AGE = 60 * 60 * 24 * 14  # 14 days
 DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+# Self-hosted SuperSplat editor build (index.html + hashed assets). The frontend
+# contract is the URL shape /supersplat/?load=<preview url>&filename=<name>.
+SUPERSPLAT_DIST = Path(os.environ.get("SUPERSPLAT_DIST", "/home/rtoony/projects/supersplat/dist"))
 
 
 @contextlib.asynccontextmanager
@@ -58,7 +61,6 @@ async def _lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="SplatLab", lifespan=_lifespan)
-_client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0))
 
 
 # ── auth ────────────────────────────────────────────────────────────────────
@@ -141,23 +143,6 @@ async def logout():
     return resp
 
 
-# ── streaming reverse-proxy to the portal splat backend ──────────────────────
-async def _proxy(request: Request, path: str) -> StreamingResponse:
-    url = httpx.URL(f"{PORTAL_ORIGIN}{path}", query=request.url.query.encode("utf-8"))
-    drop = {b"host", b"authorization", b"cookie", b"content-length"}
-    headers = [(k, v) for k, v in request.headers.raw if k.lower() not in drop]
-    headers.append((b"authorization", f"Bearer {PORTAL_TOKEN}".encode()))
-    upstream_req = _client.build_request(request.method, url, headers=headers, content=request.stream())
-    upstream = await _client.send(upstream_req, stream=True)
-    # aiter_raw + original headers keep content-encoding consistent.
-    return StreamingResponse(
-        upstream.aiter_raw(),
-        status_code=upstream.status_code,
-        headers=upstream.headers,
-        background=BackgroundTask(upstream.aclose),
-    )
-
-
 def require_auth(request: Request) -> None:
     if not _authed(request):
         raise HTTPException(status_code=401, detail="unauthorized")
@@ -205,11 +190,32 @@ async def splat_thumbnail(job_id: str):
     return FileResponse(str(thumb), media_type="image/webp")
 
 
-@app.api_route("/supersplat/{path:path}", methods=["GET"])
-async def proxy_supersplat(path: str, request: Request):
-    if not _authed(request):
-        return RedirectResponse("/login", status_code=303)
-    return await _proxy(request, f"/supersplat/{path}")
+# ── self-hosted SuperSplat editor (auth-gated static files) ──────────────────
+@app.get("/supersplat/{path:path}", dependencies=[Depends(require_auth)])
+async def supersplat_static(path: str):
+    """Serve the local SuperSplat build. Modeled on the SPA handler below, with
+    two deliberate differences: a resolve()+is_relative_to traversal guard (the
+    path segment is caller-controlled), and index.html fallback ONLY for the
+    bare /supersplat/ root — SuperSplat is an editor SPA, not a router app, so
+    a deep path that misses a real file is an honest 404. Query strings
+    (?load=...&filename=..., the frontend contract) never reach `path` and are
+    ignored by static serving. FileResponse infers the media type per file."""
+    base = SUPERSPLAT_DIST.resolve()
+    if path == "":
+        index = base / "index.html"
+        if index.is_file():
+            return FileResponse(str(index))
+        raise HTTPException(
+            status_code=404,
+            detail="SuperSplat build not found — set SUPERSPLAT_DIST to a built dist/ directory",
+        )
+    try:
+        target = (base / path).resolve()
+    except OSError:
+        raise HTTPException(status_code=404, detail="not found") from None
+    if not target.is_relative_to(base) or not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(str(target))
 
 
 # ── static SPA ───────────────────────────────────────────────────────────────
