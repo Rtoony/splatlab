@@ -1777,3 +1777,70 @@ backend/*.py change needs a safe-restart to go live — verify with /openapi.jso
 
 Next: wave 4 (Spark feature port + /view workspace tabs), wave 5 (Edit mode), wave 6 (Export
 Center), wave 7 (classic deletion + SuperSplat self-host, restart window 2).
+
+## PROFESSIONALIZATION WAVES 4-7.2 SHIPPED (2026-07-25, same day) — Spark default, workspace tabs, Edit mode, Export Center, SuperSplat self-host
+
+Continues the waves 1-3 section above. All shipped and LIVE; classic-viewer deletion (wave 7.1) is
+the only remaining plan item — gated on RToony's live soak + explicit sign-off.
+
+- **Wave 4.1** (`a4e7acd`): Spark viewer parity port — fly-to, camera-frusta overlay (DOM/SVG
+  screen-projected like classic, so crop/paint picking can't double-fire), zoom-to/view-from-camera,
+  WASD pan + arrow roll (OrbitControls/mkkellogg math mirrored), reset, trimmed shortcut legend.
+  **Spark is now DEFAULT** (absent localStorage key ⇒ Spark; escape hatches: ⋯ menu toggle,
+  `?viewer=classic` (unpersisted), `splatlab.sparkBeta=0`); classic remains the auto error-fallback.
+  NOT click-tested headlessly — fly-to/frusta/WASD feel needs the live soak.
+- **Wave 4.2** (`0b15ed6`): /view is a tabbed workspace — breadcrumb + status badge + one ⋯
+  overflow menu (secondary path for every action, one release); tabs View | Measure | Objects |
+  Edit | Export with per-mode toolbars. Viewer NEVER unmounts on tab switch (lanes overlay it).
+  Spark tool panel = Measure-only via new `toolsVisible` prop; bottom drawer <1024px.
+- **Wave 5.1** (`bdeab5e`): native Edit ops — crop BOX beside crop-sphere (shared predicate
+  `previewRemoval()`, red-tint previews byte-identical for sphere; `-B` KEEPS inside, preview
+  tints outside), floater cleanup / decimate (pct = KEPT) / batched T-R-S transforms in the Edit
+  lane, all armed-confirm + verbatim {detail} errors + version_before undo. New `reloadToken`
+  prop routes lane edits into the existing crop reload nonce (camera resets on reload — inherited).
+- **Wave 5.2** (`00b8814`): restore-point timeline (GET /edit/versions) with per-version armed
+  Restore; restore is itself undoable; 5-cap explained.
+- **Wave 5.3** (`73b6e70` + `22553af`): Backend Batch A (restart window 1, taken 13:5x after
+  0-jobs check): `langfield_stale` in _job_payload (same helper as the 409 guard — can never
+  disagree), GET /api/splat/activity (arbiter holder + per-job lock flags editing/
+  preview_exporting/meshing/exporting; restart-truthful by construction), GET /jobs/{id}/objects
+  listing. Frontend truth layer: useActivity 4s poll, P6-modal "started elsewhere" banner (closes
+  the STATUS.md:1304 gap), polled staleness replaces ALL local made-stale state, amber header
+  badge, distinct "no field built" vs "field stale" gating copy.
+- **Wave 5.4** (`bdff5ef`): semantic edit panel — text → threshold → delete|isolate|extract →
+  armed confirm; real matched counts; extract links the derived scene. Request field is `text`;
+  **extract does NOT mark the field stale** (only delete/isolate do — coded to source after my
+  brief said otherwise). No client-side preview (deliberate scope cut).
+- **Wave 6** (`3d5ab71`, `78d2e54`): Export Center (4 lanes: portable formats w/ knobs — SOG
+  iterations DEFAULTS 2 everywhere incl. the DownloadMenu quick-build that previously posted {}
+  ⇒ backend default 10, the exact config that timed out live; big-scene >5-iter warning; failed
+  chips render the `error` log tail; collision surfaces as top-level manifest key w/ voxel_url +
+  mesh_url — scene.voxel.bin only ships inside the UE bundle; post-hoc mesh + contours triggers
+  with honest prerequisite gating) + Objects panel (GET listing + extract form w/ activity banner).
+- **Backend follow-ups** (`e52eb5c`, `9e3bd31`): streamed-SOG "Missing lod assignment" was OUR
+  bug, not upstream — lod-meta.json output requires LOD-tagged gaussians; `-l 0` injected after
+  the input (repro: backend's exact shape fails in 0.04s, tagged succeeds; regression test pins
+  the command). `/activity` gained the `surveying` flag (geo_route._GEO_EXPORT_LOCKS was the one
+  missed busy-lane).
+- **Wave 7.2** (`20537e6`, `e2940a1`, `020db47`): SuperSplat SELF-HOSTED — authed static serve of
+  `SUPERSPLAT_DIST` (default ~/projects/supersplat/dist) at /supersplat/*, traversal-guarded,
+  303→/login for unauthed humans (020db47 fixed the initial 401); **portal :3300 /supersplat proxy
+  DELETED** (portal can now retire without breaking /view; PORTAL_ORIGIN survives only for
+  healthz). POST /jobs/{id}/edit/upload: streamed multipart ingest of an externally-edited PLY as
+  a first-class edit version (validate header → snapshot op="upload" → replace → regen → mark
+  stale; 400/409/413 paths leave everything untouched). Edit lane "Import edited .ply" card +
+  SuperSplat roundtrip guidance. **Restart window 2 taken + verified live** (303/200/200,
+  edit/upload in openapi, proxy gone). nexus-manifest log entry added.
+
+Tests: 540 → **567 passed / 2 skipped**. eslint 0 errors; tsc clean outside the classic viewer
+(its 9 errors die with wave 7.1). Frontend deploys all dist-swap; two restart windows total,
+both 0-jobs-verified via splatlab-safe-restart.
+
+### Open / gated
+- **Wave 7.1** (classic deletion + `tsc && vite build` gate + vitest smokes): NEEDS RToony's
+  Spark soak verdict + sign-off. Until then `npm run check` stays red by design.
+- Cloudflare ~100MB body cap applies to the new upload roundtrip through the public hostname —
+  big edited PLYs need the LAN/Tailscale origin (same as the create lane).
+- SuperSplat sw.js/PWA behavior under the new origin unverified until first live open.
+- Multi-level LOD pyramids for streamed-SOG (current fix = single level 0, spatial chunking works).
+- Collision/unreal_bundle have no per-artifact staleness (manifest-level only) — backend follow-up.
