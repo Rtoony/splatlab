@@ -1539,6 +1539,145 @@ already one filter call away in `pymeshlab`, already a `twin_finish.py` dependen
 
 **All 3 phases of the Presentation & Editing Toolkit plan are now shipped.**
 
+## AUTORESEARCH MARATHON — 4 workstreams built, real trials run (2026-07-24, RToony /plan)
+
+RToony asked for a 6-8h automated test series using "the karpathy/autoresearch system" to compare
+splat generation, twin-finish simplification, and DXF exports against source photos as ground
+truth. Found RToony already runs a real local implementation of this pattern
+(`~/projects/autoresearch-lab`, `splatlab-mesh-quality` project, 28 prior trials). Built 3 new
+sibling autoresearch-lab projects + extended the existing one. **Actual wall-clock: 1h24m, not
+6-8h** — flagged honestly below, not padded to look like more happened.
+
+- **New `eval_splat_holdout.py`** (`~/tools/dn-splatter-probe/mesh-trial/`): fills a confirmed gap
+  — no held-out-photo eval existed anywhere for the raw Gaussian splat. Uses nerfstudio's own
+  first-party `eval_setup()` + `get_average_eval_image_metrics()` against the 10%-holdout test
+  split nerfstudio already computes and silently discards every training run. Carries the same
+  `torch.load(weights_only=False)` monkeypatch already proven in `mesh_gate.py`.
+- **New `splatlab-splat-holdout` project**: `baseline-30k-reuse`/`fresh-7k`/`fresh-15k`/`fresh-50k`
+  on hydrant + garden. Fresh trials write to an ISOLATED `trials/` dir, never the real job's
+  `processed/splatfacto/` tree (a newer config.yml landing there could silently become "latest" for
+  production lookups — checked and confirmed clean after the run).
+- **New `splatlab-twin-finish-quality` project**: sweeps Phase 3's smoothing params against real
+  photos via `mesh_gate.py` (unchanged) pointed at each trial's `twin.glb`. **Caught and fixed a
+  real bug before any real trial ran**: `twin_finish.py` rotates its GLB output to glTF's Y-up
+  convention (correct for Blender), but `mesh_gate.py`'s cameras expect the scene's native Z-up
+  frame — first smoke test rendered the hydrant sideways. Fixed via `twin_gate_prep.py` (inverts
+  the rotation before scoring only; production `/objects` output is untouched).
+- **New `splatlab-dxf-quality` project**: sweeps `cell_m`/`max_slope_deg`/`spike_tol_m` via the
+  real `ground_extract.py`/`contours_build.py` scripts directly. Set a clearly-labeled TEST geo
+  anchor on garden (`source: manual`, placeholder lat/lon) since it had none — **flagged here for
+  RToony to replace with a real anchor**.
+- **Extended `splatlab-mesh-quality`** with 4 strategies from its own documented "Frontier"
+  backlog (lambda sweep, dn-Poisson+outlier-removal, cropbox-to-reference) — all using stock
+  `gs-mesh` CLI flags, zero `mesh_trial.sh` changes needed.
+- **Incident, self-caught and fixed mid-run**: `lambda-lo-s012` thrashed `scene_5177f8d99a`'s
+  memory envelope under the `splatlab.slice` cgroup (8G swap cap maxed, 83-90% iowait, ~26min
+  negligible progress) — killed by hand, root-caused (forces a fresh full finetune, a combination
+  never exercised on this scene before), scoped the 2 lambda strategies to the other scene, and
+  rebuilt the marathon script to loop per-strategy (was per-project, which hid the stall entirely)
+  with a 1h per-strategy runaway cap. Relaunched clean; finished in 1h24m with zero further issues.
+
+### Real findings (measured, not narrated)
+- **Splat holdout (garden/hydrant, PSNR/SSIM/LPIPS vs real held-out photos)**: existing 30k-iter
+  checkpoints are already near-optimal — garden 30k ssim=0.8426 vs 50k ssim=0.8447 (~flat); hydrant
+  30k ssim=0.6411 vs 50k ssim=0.6381 (no gain). 7k is measurably worse on both (garden 0.7741,
+  hydrant 0.6513 — note hydrant's 7k number is *slightly above* its own 30k baseline, within noise
+  at n=4 eval images). **Validates the current 30k default; no iteration-count win found.**
+- **Twin-finish smoothing (SSIM vs real photos, 3 objects)**: no-smooth baseline scored *highest*
+  (0.069, only `accepted=True`); all smoothed variants scored 0.060-0.069, with more aggressive
+  decimation (5000 faces) hurting most. **This does not contradict Phase 3's shipped defaults** —
+  it measures a different axis. Phase 3's own eyeball check judged geometric cleanliness (less
+  faceting); this metric measures per-pixel photo similarity, which decimation/smoothing can
+  slightly hurt even when the surface looks visually cleaner. Both are real, legitimate, and
+  different questions.
+- **Mesh-quality (TSDF trunc sweep)**: `tsdf-s020-reuse` (looser truncation, 0.20 vs the prior
+  0.12 champion) is the new numeric champion on `scene_5177f8d99a` — 90.92% LCC @ 75% coverage vs
+  the previous 55.3%/74% at trunc=0.12, in this run. **Important honesty check**: pulled the actual
+  receipt renders for both — visually, BOTH are heavily spiky/jagged with TSDF fusion noise from
+  every camera angle tried (top, interior). The LCC×coverage metric confirms "one big connected,
+  room-sized blob," not "a clean, presentable mesh." Neither the old nor new best config produces
+  something visually clean — a real, humbling limitation of the current v4 scoring metric, not
+  a new regression. `scene_98095cb055`'s fragmentation problem remains open (27% LCC even at the
+  new champion config; `cropbox-ref-s012-reuse` didn't fix it either, 0.2732).
+- **DXF ground-sampling**: all 7 param configs produced non-degenerate, audit-clean output (no new
+  warnings beyond the constant "watermarked provisional" flag every trial gets). `cell_m` has a
+  large real effect on point density the score doesn't capture (0.1→10,783 points/615 contours,
+  0.5→631 points/92 contours) — the per-trial score formula only varies with audit-warning count,
+  which didn't change across configs; a real, honestly-noted scoring-design gap for this project.
+
+### Honest gaps / what's NOT done
+- Ran **1h24m of the requested 6-8h** — the infrastructure is real and reusable, but this was a
+  single pass through modest grids, not a deep multi-hour search. Scaling up (larger grids, more
+  seeds per fable5 anti-pattern #6 on single-seed noise, extending `--smooth` to `/mesh`/
+  `/scene/ground`, a semantic-ground axis for W4) is queued, not done.
+- `splatlab-dxf-quality`'s score doesn't discriminate parameter sensitivity (see above) — would
+  need a real stability metric (e.g. contour-length variance across configs), not just audit
+  warnings, to rank ground-sampling settings meaningfully.
+- Pre-existing, unrelated bug found in passing: `nexus-notify --title/--message` (used by both the
+  existing `overnight_runner.sh` and this session's new marathon script, copied verbatim) doesn't
+  match the current `nexus-notify` CLI (Slack-only, positional message, no `--title` flag) — the
+  completion digest silently failed to send. Not fixed (out of scope tonight), flagged here.
+- All 4 autoresearch-lab projects + `generator.py`/`eval_splat_holdout.py`/marathon script changes
+  are uncommitted in `~/projects/autoresearch-lab` (separate repo from splatlab) — not committed,
+  per standing "only commit when asked" — RToony's call on whether/how to commit that repo.
+
+## AUTORESEARCH RUN 2 (2026-07-24, same day, RToony back at the PC) — 1h48m, follow-up strategies
+
+RToony explicitly did NOT want another 6-8h run while he was actively using the PC — asked to scale
+up depth instead of duration, iterate in short bursts, and use the data to plan a longer sustained
+12-24h run for tonight's ~12-24h absence. Added 10 new strategies across all 4 projects, each a
+direct follow-up to Run 1's own findings (not a blind bigger grid). 49 total strategies (up from
+39), finished in 1h48m (vs Run 1's 1h24m) with zero incidents — the per-strategy-loop fix and
+memory-envelope scoping from Run 1 held.
+
+- **W1 truncation curve extended past s020 — numbers climb, but it's still metric-gaming, not a
+  real win.** `tsdf-s024-reuse` (0.6484) and `tsdf-s028-reuse` (0.7432) both now PASS the gate on
+  BOTH scenes (up from s020's 0.4727, pass_rate 0.5 — only one scene passing). Pulled the actual
+  renders for s028 on BOTH scenes before trusting this: **identical spiky, incoherent TSDF fusion
+  noise as every prior "champion," on both `scene_5177f8d99a` and `scene_98095cb055`.** Looser
+  truncation is fusing more noise into one bigger connected blob, satisfying LCC×coverage without
+  producing anything visually usable. The v4 scoring metric (survivor of v1-v3's own documented
+  gaming problems) is itself now gameable by truncation alone — **do not treat any of s020/s024/
+  s028 as real recipe improvements.** Cleanup combined with s020 (`clean10/20-s020-reuse`,
+  0.4727/0.4715) didn't change anything — cleanup doesn't touch this failure mode.
+  scene_98095cb055's fragmentation problem remains genuinely unsolved.
+- **W2 iteration curve now well-bracketed (7k/15k/20k/30k/40k/50k), and the two scenes tell
+  different stories.** Garden (18 held-out images): clean, real diminishing-returns curve —
+  7k=0.7738 → 15k=0.8311 → 20k=0.839 → 30k=0.8426 → 40k=0.8429 → 50k=0.8451. Flattens hard by
+  15-20k; everything past that is a rounding error. Hydrant (4 held-out images): **not
+  monotonic at all** — 0.6529/0.6547/0.6483/0.6411/0.6447/0.6365 across the same iteration range,
+  a ~0.018 spread with no discernible trend. With only 4 eval images this is almost certainly
+  measurement noise, not a real iteration-count effect — can't draw a hydrant-specific conclusion
+  beyond "nothing catastrophic happens across this range." **Actionable**: 15-20k iterations
+  captures nearly all the achievable held-out fidelity on richer captures; the current 30k default
+  isn't wrong, just not obviously necessary either.
+- **W3 smoothing gap is real but tiny, and lighter settings win.** `smooth1-f25-t20000` (1
+  iteration, 25° feature threshold, 20k target faces) scored 0.0693 — the only smoothed variant to
+  beat the no-smooth baseline's 0.0690, driven by a small flower-vase gain (0.049 vs 0.046) with
+  fire-hydrant unchanged and round-wooden-table slightly lower. `smooth2-f15-t10000` tied baseline
+  exactly (0.0690). **This is a noise-level difference at 3 objects, not a strong result** — but
+  directionally, the lightest/most conservative smoothing settings are consistently the ones that
+  don't hurt photo-fidelity, while heavier settings (more iterations, looser feature threshold,
+  smaller target_faces) consistently cost a little. If Phase 3's defaults get revisited, lighter is
+  the supported direction, not heavier.
+- **W4 boundary strategies found real structural effects the score still doesn't capture.**
+  `cellm-xloose` (cell_m=1.0): 184 points / 352 tris / 56 contours — a real, large drop from
+  baseline's 2118/4214/169, genuinely approaching (not yet crossing) a too-sparse-to-trust regime.
+  `spike-xtight` (spike_tol_m=0.1): 1718 points / 3418 tris / 105 contours — also real
+  thinning (~19% fewer points, ~38% fewer contours than baseline), consistent with aggressive spike
+  rejection discarding legitimate terrain variation as false positives. Neither triggered actual
+  degeneracy (0 points, audit failure) — the boundary is further out than tonight's grid reached —
+  but both confirm the score's blindness (still 0.85, identical to baseline) is a real scoring gap,
+  not proof the params don't matter.
+
+**Bottom line for planning the 12-24h overnight run**: the two workstreams worth real overnight
+depth are W2 (splat-holdout — clean, trustworthy, real signal, room for a genuinely thorough sweep
+including the previously-deferred SfM-backend comparison) and a redesigned W1 (the LCC×coverage
+metric itself needs work before more truncation sweeping is worth running — a v5 metric or a
+paired visual-receipt gate should probably be built before spending overnight compute chasing more
+of the same gameable signal). W3's signal is real but small; W4 needs either a real stability
+metric or to just keep pushing boundaries further out.
+
 ## PORTABLE PIPELINE + RESTRICTED BLENDER MCP SHIPPED (2026-07-24) — SPZ/SOG/GLB export, UE 5.6 handoff, research ledger
 
 Delivered: checksummed export manifest + portable-format API (`backend/artifact_manifest.py`,
@@ -1580,3 +1719,61 @@ remains unexercised end-to-end.
 Two unrelated AUTORESEARCH MARATHON/RUN 2 sections landed in this same file from a separate,
 still-in-progress session — left uncommitted on purpose, not swept into this delivery; RToony's call
 on if/how to commit that content separately.
+
+## PROFESSIONALIZATION WAVES 1-3 SHIPPED (2026-07-25) — hygiene, tokens/brand, IA shell + first real export proof
+
+RToony approved the full professionalization plan (~/.claude/plans/dazzling-tumbling-horizon.md —
+7 waves: GUI polish, native Edit mode wiring the existing 9 edit ops, Export Center, Spark
+consolidation, self-hosted SuperSplat roundtrip). Decisions locked: converge on Spark then delete
+classic; native-first editing with SuperSplat as escape hatch; tokens + à-la-carte Radix (no
+shadcn); interleaved quick-wins sequencing. Waves 1-3 shipped today, all frontend deploys via dist
+swap (no restarts except the one noted below):
+
+- **Wave 1.1** (`b0f021b`): all 14 non-classic-viewer tsc errors fixed; flat ESLint
+  (typescript-eslint + react-hooks, compiler-era rules demoted to warn) + Prettier + `npm run
+  check`/`lint`. Remaining 9 tsc errors are all in splat-viewer.tsx (classic — deleted in wave 7);
+  `check` stays red by design until then.
+- **Wave 1.2** (`99d7b6d`): CSS-var design tokens (--surface/--ink/--accent*/--radius-*) mapped
+  into Tailwind; radius drift collapsed to a 3-step scale; @fontsource self-hosted fonts (Google
+  Fonts @import gone); favicon.svg + OG/theme-color; ALL user-visible naming standardized to
+  "SplatLab" (incl. backend login page).
+- **Wave 1.3** (`8b66845`): DownloadMenu extracted to components/gallery/download-menu.tsx and
+  rendered on /view (export parity with home cards) + **first-ever real-data portable export run**
+  (below).
+- **Wave 2.1** (`e64df4c`..`11d8430`): components/ui/ primitive library — Radix Dialog/Tooltip/
+  Tabs/DropdownMenu (radix-ui 1.6.7, React 19 OK) + hand-rolled ToastProvider + Skeleton +
+  EmptyState; all three hand-built modals (site-sections, geo-locate, scene-regen) migrated onto
+  Dialog (focus trap/Escape/aria); app-wide toasts replace the setTimeout div; spark panel inputs
+  unified onto Input size="xs".
+- **Wave 2.2** (`964cd77`, `3826975`): splat.tsx decomposed 1,458→689 lines by pure moves —
+  lib/stage-meta.ts, lib/format.ts, components/create/*, components/jobs/*, components/gallery/*.
+  Extraction verified byte-identical.
+- **Wave 3** (`757f2a2`): AppShell nav (Scenes / New capture / ⋯→Feedback) wraps /, /new,
+  /feedback; pages/splat.tsx DELETED, split into pages/scenes.tsx + pages/new-capture.tsx (query
+  keys unchanged — in-flight jobs survive navigation); route ErrorBoundary, styled 404, first-run
+  EmptyState, skeletons, status-feed Retry card. ⚠️ Behavior note: Promote-to-full-build now always
+  uses fresh-load defaults (standard/no-langfield/no-mesh).
+
+### ⚠️ FOUND LIVE: the 07-24 portable-export delivery was never running
+The service last restarted 07-24 06:04; the export/UE/collision commits landed 18:00 — production
+"Build formats" pointed at routes that didn't exist (SPA catch-all answered 405). Fixed with an
+idle-window `splatlab-safe-restart` (no jobs in flight). **Deploy rule reaffirmed: any
+backend/*.py change needs a safe-restart to go live — verify with /openapi.json, not git log.**
+
+### First real-data export proof (splat_32d926d9, 1.32M gaussians, SH-3)
+- **SPZ v4 ✅** 313MB→30MB in ~30s, sha256 verified against manifest `files[].sha256`.
+- **GLB (KHR_gaussian_splatting) ✅** 317MB, valid glTF-2 header, sha256 verified.
+- **UE 5.6 bundle ✅** built in 22s, 627MB zip, 14 entries (gaussian ply/spz/glb, twin/mesh glb,
+  approved scene.glb/.blend, survey artifacts, receipts), zipfile integrity OK.
+- **SOG ❌ REAL LIMIT**: CPU SOG at default sog_iterations=10 exceeds CONVERSION_TIMEOUT_S (60
+  min) on 1.32M gaussians → `-1 conversion exceeded 3600 seconds`. Wave-6 Export Center must
+  default SOG iterations low / warn on big scenes; consider GPU SOG or a bigger timeout as backend
+  follow-up.
+- **streamed-SOG ❌ UPSTREAM BUG**: splat-transform v2.7.1 `writeLod` throws "Missing lod
+  assignment" with `--lod-chunk-count`/`--lod-chunk-extent` on this scene. Needs a minimal repro +
+  upstream issue (or flag-order fix) before wave 6 exposes the knobs.
+- Manifest gap for the UI: failed artifacts carry the log in `error`, no short `reason` — Export
+  Center should render `error` tail when `reason` is absent.
+
+Next: wave 4 (Spark feature port + /view workspace tabs), wave 5 (Edit mode), wave 6 (Export
+Center), wave 7 (classic deletion + SuperSplat self-host, restart window 2).
