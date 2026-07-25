@@ -1538,3 +1538,45 @@ already one filter call away in `pymeshlab`, already a `twin_finish.py` dependen
   remain documented "watch" items.
 
 **All 3 phases of the Presentation & Editing Toolkit plan are now shipped.**
+
+## PORTABLE PIPELINE + RESTRICTED BLENDER MCP SHIPPED (2026-07-24) — SPZ/SOG/GLB export, UE 5.6 handoff, research ledger
+
+Delivered: checksummed export manifest + portable-format API (`backend/artifact_manifest.py`,
+`backend/export_route.py` 1164 lines — SPZ v4, CPU SOG, streamed SOG, KHR_gaussian_splatting GLB,
+collision, caching, stale-source detection, lock-guarded rebuild), wired into the live app at
+`main.py` (`app.include_router(export_route.router, prefix="/api/splat", ...)`). Frontend DownloadMenu
+(`frontend/src/pages/splat.tsx`) gained a "Portable pipeline" section (Build formats / Package UE 5.6),
+new `SplatExportManifest`/`SplatUnrealBundle` types in `contracts.ts`, new
+`fetchPortableExports`/`buildPortableExports`/`buildUnrealBundle` calls in `api.ts`.
+
+**NEW restricted Blender MCP** (`backend/dcc/blender_mcp_server.py`, port **9877**, `127.0.0.1`
+streamable-http): exactly **8** `@mcp.tool` functions (inspect_job, inspect_blend,
+list_blender_versions, snapshot_blend, toggle_collection, transform_object, restore_blender_version,
+open_blender) — no exec/Python/URL-fetch tool, no arbitrary code execution. Backed by
+`blender_workflow.py`: atomic `.building-` → final staged writes, symlink rejection, env-allowlisted
+subprocesses. **This is a separate, distinct server from the EXISTING general-purpose Blender MCP on
+port 9876** (official `ahujasid/blender-mcp` addon, GUI-attended via `blender-cockpit`, documented
+2026-07-21 P3 COCKPIT). Do not conflate the two: 9876 = general, GUI-attended, full addon surface;
+9877 = restricted, 8-tool, headless, no code exec. Currently a script
+(`integrations/blender/run-mcp.sh`) with its own `.venv` — no systemd unit today; would need a
+`nexus-manifest.json` entry only if later turned into a persistent service (not done now).
+
+Also shipped: `integrations/unreal/` — `bundle_tool.py` (symlink/zip-bomb guarded), verify/stage
+PowerShell scripts, renderer probe table (NanoGS/MLSLabsRenderer/UnrealSplat),
+`docs/portable-interchange.md` (format table + typed `POST /exports` API docs). `research/` ledger
+(`README.md` "What Was Incorporated", `sources.json` with 17 license-reviewed candidates,
+`benchmark.py`/`capability_probe.py` harness).
+
+**Verified independently, not trusted from narrative:** `~/.local/bin/pytest` on the 8 new test files
+→ **64 passed, 2 skipped, 0 failed** (skips are opt-in real-binary smoke tests, correctly not
+exercised in a normal pass). `ruff check` on all new/modified `.py` files: clean. `tsc --noEmit`: 0 new
+errors in the 3 touched frontend files (23 pre-existing errors elsewhere, unrelated). No GPU workload,
+no backend restart, no UE launch/compile occurred during delivery or during this verification pass.
+Windows UE 5.6 target workstation ("Triforce": i7-7700/64GB/RTX 2080 SUPER 8GB, Win10 Pro 22H2)
+confirmed online and hardware-sufficient the same day, but Unreal Engine itself is not yet installed
+there and remote access (SSH/WinRM/RDP) is not yet open — SMB only — so the UE-side half of this kit
+remains unexercised end-to-end.
+
+Two unrelated AUTORESEARCH MARATHON/RUN 2 sections landed in this same file from a separate,
+still-in-progress session — left uncommitted on purpose, not swept into this delivery; RToony's call
+on if/how to commit that content separately.
