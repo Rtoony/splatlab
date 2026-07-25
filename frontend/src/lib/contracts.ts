@@ -200,6 +200,107 @@ export interface SplatUnrealBundle {
   zip?: SplatExportFile | null;
 }
 
+// ── Export Center request/response shapes ────────────────────────────────────
+// Mirrors backend/export_route.py's pydantic models EXACTLY (read from source
+// 2026-07-25). Every field is optional client-side: omitted fields take the
+// backend defaults noted per line.
+
+export type SplatExportFormat = "spz" | "sog" | "streamed-sog" | "gltf";
+
+// POST /jobs/{id}/exports (ExportRequest, export_route.py ~line 52).
+export interface SplatExportBuildRequest {
+  formats?: SplatExportFormat[]; // default: all four, deduped
+  spz_version?: 3 | 4; // default 4
+  // 1-100, backend default 10 — but the UI defaults LOW (2): CPU SOG at 10
+  // iterations exceeded the 60-min conversion timeout on a 1.32M-gaussian
+  // scene in the first live run (STATUS.md 2026-07-25).
+  sog_iterations?: number;
+  lod_chunk_count_k?: number; // 32-4096, default 512 (streamed-SOG only)
+  lod_chunk_extent?: number; // >0, ≤10000, default 16.0 (streamed-SOG only)
+  force_streamed_sog?: boolean; // default false (auto-skip below 1M gaussians)
+  overwrite?: boolean; // default false (current ready artifacts are cached)
+}
+
+// POST /jobs/{id}/collision (CollisionRequest, export_route.py ~line 71).
+export interface SplatCollisionRequest {
+  mode?: "interior" | "exterior" | "raw"; // default "exterior"
+  seed_position?: [number, number, number]; // default [0,0,0]
+  voxel_size?: number; // >0, ≤10, default 0.05 (scene units)
+  opacity_threshold?: number; // 0-1, default 0.1
+  cluster_resolution?: number; // >0, ≤100, default 1.0
+  cluster_opacity?: number; // 0-1, default 0.999
+  cluster_min_contribution?: number; // 0-1, default 0.1
+  fill_size?: number; // >0, ≤100, default 1.6 (external/floor fill)
+  carve?: boolean; // default false
+  carve_height?: number; // >0, ≤20, default 1.6
+  carve_radius?: number; // >0, ≤10, default 0.2
+  mesh_style?: "smooth" | "faces"; // default "smooth"
+}
+
+// manifest["collision"] — a TOP-LEVEL manifest key beside `artifacts` (NOT an
+// entry inside it). _public_manifest adds voxel_url/mesh_url when ready; the
+// scene.voxel.bin sidecar has no direct route (it ships in the UE bundle).
+export interface SplatCollisionArtifact {
+  status: "ready";
+  built_at: string;
+  mode: "interior" | "exterior" | "raw";
+  parameters?: Record<string, unknown>;
+  files?: SplatExportFile[];
+  command?: string[];
+  voxel_url?: string; // /exports/file/collision-voxel (scene.voxel.json)
+  mesh_url?: string; // /exports/file/collision-mesh (scene.collision.glb)
+}
+
+// POST /jobs/{id}/unreal-bundle (UnrealBundleRequest, export_route.py ~86).
+export interface SplatUnrealBundleRequest {
+  include_zip?: boolean; // default false — the UI always sends true
+  include_canonical_ply?: boolean; // default true
+  include_survey?: boolean; // default true
+  require_current_exports?: boolean; // default true
+}
+
+// POST /jobs/{id}/mesh (MeshExportBody, splat_route.py ~line 4261).
+export interface SplatMeshBuildRequest {
+  finetune?: boolean; // DN escalation, ~10-15 min GPU, REBUILDS (bypasses cache)
+  finish?: boolean; // twin finish — needs the exported splat.ply (preview)
+  gate?: boolean; // mesh-fidelity gate — PSNR/SSIM vs 6 capture photos
+}
+
+export interface SplatMeshBuildResponse {
+  job_id: string;
+  mesh: Record<string, unknown> | null;
+  mesh_file_url: string;
+  mesh_glb_url: string | null;
+  twin_glb_url: string | null;
+  cached: boolean; // true when an existing mesh.ply short-circuited the build
+}
+
+// POST /jobs/{id}/geo/contours (ContoursBody = GroundSampleParams + intervals,
+// geo_route.py ~line 89/107). Prereqs enforced server-side with loud 409s:
+// meters_per_unit (scale calibration) AND meta.geo (Locate anchor), plus a
+// mesh OR a language field (semantic=null AUTO falls back to mesh-slope).
+export interface SplatContoursRequest {
+  epsg?: number; // default 2226 (NAD83 / CA zone 2, US survey foot)
+  cell_m?: number; // 0.05-5.0, default 0.25 — ground-sampling grid (meters)
+  max_slope_deg?: number; // default 40
+  spike_tol_m?: number; // default 0.5
+  semantic?: boolean | null; // default null = AUTO (semantic when field exists)
+  semantic_thresh?: number; // default 0.5
+  minor_ft?: number; // default 0.5; 0 < minor ≤ major ≤ 100
+  major_ft?: number; // default 2.5
+  tin_faces?: boolean; // default false — also draw the TIN as review linework
+}
+
+export interface SplatContoursResponse {
+  job_id: string;
+  contours: Record<string, unknown>;
+  contours_dxf_url: string;
+  ground_points_url: string;
+  receipt_url: string | null;
+  sections_url: string | null;
+  surface_iso_url: string | null;
+}
+
 export interface SplatExportManifest {
   schema: "dev.splatlab.exports/v1";
   job_id: string;
@@ -214,6 +315,7 @@ export interface SplatExportManifest {
     bounds_scene?: { min: number[]; max: number[]; extent: number[] } | null;
   };
   artifacts: Record<string, SplatExportArtifact>;
+  collision?: SplatCollisionArtifact;
   unreal_bundle?: SplatUnrealBundle;
   warnings?: string[];
   result?: {

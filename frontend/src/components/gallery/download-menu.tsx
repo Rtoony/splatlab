@@ -3,6 +3,7 @@
 // the featured viewer, and the /view header.
 import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Link } from "wouter";
 import { buildPortableExports, buildUnrealBundle, fetchPortableExports } from "@/lib/api";
 import type { SplatJob } from "@/lib/contracts";
 import { Button } from "@/components/ui";
@@ -160,6 +161,17 @@ export function DownloadMenu({ job }: { job: SplatJob }) {
                 <p className="text-[11px] text-zinc-500">{o.hint}</p>
               </a>
             ))}
+            {/* The Export tab itself isn't deep-linkable yet (workspace mode is
+                page-local state), so this lands on /view's View mode — one
+                click from the Export tab. */}
+            <Link
+              href={`/view/${job.job_id}`}
+              onClick={() => setOpen(false)}
+              className="block border-t border-white/10 px-3 py-2 hover:bg-white/5"
+            >
+              <p className="text-sm font-medium text-cyan-200">Open export center →</p>
+              <p className="text-[11px] text-zinc-500">format knobs · collision · mesh & contour builds (Export tab)</p>
+            </Link>
           </div>
         </div>
       )}

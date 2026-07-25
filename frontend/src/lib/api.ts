@@ -8,14 +8,22 @@ import type {
   SceneIsolateReport,
   SceneProxyReport,
   SplatCamerasResponse,
+  SplatCollisionArtifact,
+  SplatCollisionRequest,
+  SplatContoursRequest,
+  SplatContoursResponse,
   SplatEditApplyResponse,
   SplatEditOp,
   SplatEditRevertResponse,
   SplatEditVersionsResponse,
+  SplatExportBuildRequest,
+  SplatMeshBuildRequest,
+  SplatMeshBuildResponse,
   SplatSemanticEditRequest,
   SplatSemanticEditResponse,
   SplatExportManifest,
   SplatUnrealBundle,
+  SplatUnrealBundleRequest,
 } from "@/lib/contracts";
 import { recordFailedApiCall } from "@/lib/feedback-context";
 
@@ -96,19 +104,13 @@ export function fetchPortableExports(jobId: string): Promise<SplatExportManifest
   return apiRequest<SplatExportManifest>(`/api/splat/jobs/${jobId}/exports`);
 }
 
-export function buildPortableExports(jobId: string): Promise<SplatExportManifest> {
-  return apiRequest<SplatExportManifest>(`/api/splat/jobs/${jobId}/exports`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({}),
-  });
-}
-
-// FastAPI-error-aware POST for the edit routes. Their failures (langfield-
-// stale 409, edit-lock 423, GPU-arbiter 503, splat-transform exit != 0) carry
-// a human-readable {detail} string — surface it verbatim, same helper pattern
-// as scene-regen.tsx's postJSON. apiRequest() would throw the raw JSON blob.
-async function postEditJSON<T>(path: string, body: unknown): Promise<T> {
+// FastAPI-error-aware POST for the build/edit routes. Their failures
+// (langfield-stale 409, export/edit-lock 409/423, GPU-arbiter 503, tool
+// exit != 0 with a log tail) carry a human-readable {detail} — surface it
+// verbatim, same helper pattern as scene-regen.tsx's postJSON. apiRequest()
+// would throw the raw JSON blob. A non-string detail (FastAPI 422 validation
+// arrays) is stringified rather than becoming "[object Object]".
+async function postJSON<T>(path: string, body: unknown): Promise<T> {
   const resp = await fetch(path, {
     method: "POST",
     credentials: "same-origin",
@@ -116,19 +118,54 @@ async function postEditJSON<T>(path: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   });
   if (!resp.ok) {
-    const detail = String(
-      ((await resp.json().catch(() => null)) as { detail?: string } | null)?.detail ?? `HTTP ${resp.status}`,
-    );
+    const payload = (await resp.json().catch(() => null)) as { detail?: unknown } | null;
+    const detail =
+      payload?.detail === undefined
+        ? `HTTP ${resp.status}`
+        : typeof payload.detail === "string"
+          ? payload.detail
+          : JSON.stringify(payload.detail);
     throw new Error(detail);
   }
   return (await resp.json()) as T;
+}
+
+// Build/refresh the portable formats. Long blocking POST (partial failures
+// come back as 200 with result.failures; all-failed is a 500 whose detail
+// joins the per-format errors). Default sog_iterations stays LOW here too —
+// the backend's own default (10) blew the 60-min timeout live on a 1.32M-
+// gaussian scene (2026-07-25), so the quick-build path must not inherit it.
+export function buildPortableExports(
+  jobId: string,
+  request: SplatExportBuildRequest = { sog_iterations: 2 },
+): Promise<SplatExportManifest> {
+  return postJSON<SplatExportManifest>(`/api/splat/jobs/${jobId}/exports`, request);
+}
+
+// GPU voxelization → collision/scene.voxel.json + .bin + scene.collision.glb.
+// The result is recorded in the exports manifest under its top-level
+// `collision` key — refetch GET /exports to pick up voxel_url/mesh_url.
+export function buildCollision(jobId: string, request: SplatCollisionRequest): Promise<SplatCollisionArtifact> {
+  return postJSON<SplatCollisionArtifact>(`/api/splat/jobs/${jobId}/collision`, request);
+}
+
+// Post-hoc splat→mesh export (Digital Twin kernel). Idempotent without
+// finetune (an existing mesh.ply returns cached=true instantly).
+export function buildSplatMesh(jobId: string, request: SplatMeshBuildRequest): Promise<SplatMeshBuildResponse> {
+  return postJSON<SplatMeshBuildResponse>(`/api/splat/jobs/${jobId}/mesh`, request);
+}
+
+// Ground contours: mesh/semantic ground → PNEZD points → cdt TIN + DXF on
+// office layers. Loud 409s for missing scale calibration / geo anchor.
+export function buildGroundContours(jobId: string, request: SplatContoursRequest): Promise<SplatContoursResponse> {
+  return postJSON<SplatContoursResponse>(`/api/splat/jobs/${jobId}/geo/contours`, request);
 }
 
 // Apply 1-32 destructive edit ops in pipeline order. The backend snapshots
 // _preview/ first (max 5 kept) — pass the returned version_before to
 // revertEdit() for single-step undo.
 export function applyEditOps(jobId: string, ops: SplatEditOp[]): Promise<SplatEditApplyResponse> {
-  return postEditJSON<SplatEditApplyResponse>(`/api/splat/jobs/${jobId}/edit/apply`, { ops });
+  return postJSON<SplatEditApplyResponse>(`/api/splat/jobs/${jobId}/edit/apply`, { ops });
 }
 
 // Text-driven edit: delete/isolate rewrite this scene (snapshot-versioned,
@@ -136,12 +173,12 @@ export function applyEditOps(jobId: string, ops: SplatEditOp[]): Promise<SplatEd
 // derived scene. Failure details worth surfacing verbatim: 409 stale field,
 // 422 no language field / nothing matched, 503 relevancy worker missing.
 export function semanticEdit(jobId: string, req: SplatSemanticEditRequest): Promise<SplatSemanticEditResponse> {
-  return postEditJSON<SplatSemanticEditResponse>(`/api/splat/jobs/${jobId}/edit/semantic`, req);
+  return postJSON<SplatSemanticEditResponse>(`/api/splat/jobs/${jobId}/edit/semantic`, req);
 }
 
 // Restore a snapshot version (itself snapshotted first, so revert is undoable).
 export function revertEdit(jobId: string, version: number): Promise<SplatEditRevertResponse> {
-  return postEditJSON<SplatEditRevertResponse>(`/api/splat/jobs/${jobId}/edit/revert`, { version });
+  return postJSON<SplatEditRevertResponse>(`/api/splat/jobs/${jobId}/edit/revert`, { version });
 }
 
 // List the job's edit restore points (newest-first ordering is the caller's job).
@@ -149,10 +186,11 @@ export function fetchEditVersions(jobId: string): Promise<SplatEditVersionsRespo
   return apiRequest<SplatEditVersionsResponse>(`/api/splat/jobs/${jobId}/edit/versions`);
 }
 
-export function buildUnrealBundle(jobId: string): Promise<SplatUnrealBundle> {
-  return apiRequest<SplatUnrealBundle>(`/api/splat/jobs/${jobId}/unreal-bundle`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ include_zip: true }),
-  });
+// Package the UE 5.6 handoff. Requires current portable exports (409
+// otherwise). include_zip defaults true here — the download row needs it.
+export function buildUnrealBundle(
+  jobId: string,
+  request: SplatUnrealBundleRequest = { include_zip: true },
+): Promise<SplatUnrealBundle> {
+  return postJSON<SplatUnrealBundle>(`/api/splat/jobs/${jobId}/unreal-bundle`, request);
 }
