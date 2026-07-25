@@ -25,7 +25,7 @@ import type {
   SplatJob,
   SplatSceneSummary,
 } from "@/lib/contracts";
-import { Button, Card, Input, SectionLabel } from "@/components/ui";
+import { Button, Card, Dialog, Input, SectionLabel } from "@/components/ui";
 import ReceiptLightbox from "@/components/receipt-lightbox";
 import {
   AlertTriangle,
@@ -185,8 +185,7 @@ export default function SceneRegenModal({ job, onClose }: { job: SplatJob; onClo
   const title = job.input_path?.split("/").pop() || job.job_id;
 
   return (
-    <div className="fixed inset-0 z-50 flex bg-black/70 backdrop-blur-sm">
-      <div className="relative m-2 flex min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-white/10 bg-surface sm:m-4">
+    <Dialog open onOpenChange={(open) => !open && onClose()} title="Scene regeneration" layout="screen" hideClose>
         <div className="flex shrink-0 items-center justify-between gap-2 border-b border-white/10 px-4 py-3">
           <div className="flex min-w-0 items-center gap-2">
             <Layers className="h-4 w-4 shrink-0 text-cyan-300" />
@@ -259,9 +258,8 @@ export default function SceneRegenModal({ job, onClose }: { job: SplatJob; onClo
             )}
           </div>
         </div>
-      </div>
       {lightbox && <ReceiptLightbox src={lightbox} onClose={() => setLightbox(null)} />}
-    </div>
+    </Dialog>
   );
 }
 
