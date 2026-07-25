@@ -7,9 +7,9 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import type { SplatJob } from "@/lib/contracts";
-import { Button, SectionLabel } from "@/components/ui";
+import { Button, Dialog, SectionLabel } from "@/components/ui";
 import ReceiptLightbox from "@/components/receipt-lightbox";
-import { AlertTriangle, Loader2, Mountain, X } from "lucide-react";
+import { AlertTriangle, Loader2, Mountain } from "lucide-react";
 
 // Bypasses api.ts's apiRequest() (raw response body on error) so the
 // backend's real prerequisite/toolchain detail strings render cleanly —
@@ -54,65 +54,58 @@ export default function SiteSectionsModal({ job, onClose }: { job: SplatJob; onC
   const surfaceIsoUrl = mutation.data?.surface_iso_url ?? job.surface_iso_url ?? null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
-      <div className="relative w-full max-w-lg rounded-2xl border border-white/10 bg-surface">
-        <div className="flex items-center justify-between gap-2 border-b border-white/10 px-4 py-3">
-          <div className="flex items-center gap-2">
-            <Mountain className="h-4 w-4 text-cyan-300" />
-            <SectionLabel>Site sections</SectionLabel>
-          </div>
-          <button type="button" onClick={onClose} className="rounded-full p-1 text-zinc-400 transition hover:bg-white/10 hover:text-zinc-100" title="Close">
-            <X className="h-4 w-4" />
-          </button>
-        </div>
+    <Dialog open onOpenChange={(open) => !open && onClose()} title="Site sections">
+      <div className="flex items-center gap-2 border-b border-white/10 px-4 py-3">
+        <Mountain className="h-4 w-4 text-cyan-300" />
+        <SectionLabel>Site sections</SectionLabel>
+      </div>
 
-        <div className="space-y-4 p-4">
-          <p className="text-xs leading-snug text-zinc-500">
-            Two auto-picked cross-sections through the scene's principal axes, plus an isometric shaded ground
-            TIN — a quick, shareable "what does this site actually look like" picture. Needs the scene's scale
-            calibrated and a Locate anchor set, plus either a built mesh or a language field for the ground
-            sample.
+      <div className="space-y-4 p-4">
+        <p className="text-xs leading-snug text-zinc-500">
+          Two auto-picked cross-sections through the scene's principal axes, plus an isometric shaded ground
+          TIN — a quick, shareable "what does this site actually look like" picture. Needs the scene's scale
+          calibrated and a Locate anchor set, plus either a built mesh or a language field for the ground
+          sample.
+        </p>
+
+        <Button type="button" size="sm" onClick={() => mutation.mutate()} disabled={mutation.isPending} className="w-full">
+          {mutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Mountain className="h-3.5 w-3.5" />}
+          Generate site sections
+        </Button>
+        {mutation.isError && (
+          <p className="flex items-start gap-1.5 rounded-lg border border-red-400/25 bg-red-400/10 px-2.5 py-2 text-xs leading-snug text-red-200">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {mutation.error.message}
           </p>
+        )}
 
-          <Button type="button" size="sm" onClick={() => mutation.mutate()} disabled={mutation.isPending} className="w-full">
-            {mutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Mountain className="h-3.5 w-3.5" />}
-            Generate site sections
-          </Button>
-          {mutation.isError && (
-            <p className="flex items-start gap-1.5 rounded-lg border border-red-400/25 bg-red-400/10 px-2.5 py-2 text-xs leading-snug text-red-200">
-              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {mutation.error.message}
-            </p>
-          )}
-
-          {(sectionsUrl || surfaceIsoUrl) && (
-            <div className="grid grid-cols-2 gap-2">
-              {sectionsUrl && (
-                <button type="button" onClick={() => setLightbox(sectionsUrl)} className="block overflow-hidden rounded-lg border border-white/10">
-                  <img
-                    src={sectionsUrl}
-                    alt="sections receipt"
-                    className="w-full object-contain"
-                    onError={(e) => ((e.currentTarget as HTMLImageElement).style.display = "none")}
-                  />
-                  <p className="bg-black/40 py-1 text-center text-[10px] uppercase tracking-wide text-zinc-400">Sections</p>
-                </button>
-              )}
-              {surfaceIsoUrl && (
-                <button type="button" onClick={() => setLightbox(surfaceIsoUrl)} className="block overflow-hidden rounded-lg border border-white/10">
-                  <img
-                    src={surfaceIsoUrl}
-                    alt="surface iso receipt"
-                    className="w-full object-contain"
-                    onError={(e) => ((e.currentTarget as HTMLImageElement).style.display = "none")}
-                  />
-                  <p className="bg-black/40 py-1 text-center text-[10px] uppercase tracking-wide text-zinc-400">3D surface</p>
-                </button>
-              )}
-            </div>
-          )}
-        </div>
+        {(sectionsUrl || surfaceIsoUrl) && (
+          <div className="grid grid-cols-2 gap-2">
+            {sectionsUrl && (
+              <button type="button" onClick={() => setLightbox(sectionsUrl)} className="block overflow-hidden rounded-lg border border-white/10">
+                <img
+                  src={sectionsUrl}
+                  alt="sections receipt"
+                  className="w-full object-contain"
+                  onError={(e) => ((e.currentTarget as HTMLImageElement).style.display = "none")}
+                />
+                <p className="bg-black/40 py-1 text-center text-[10px] uppercase tracking-wide text-zinc-400">Sections</p>
+              </button>
+            )}
+            {surfaceIsoUrl && (
+              <button type="button" onClick={() => setLightbox(surfaceIsoUrl)} className="block overflow-hidden rounded-lg border border-white/10">
+                <img
+                  src={surfaceIsoUrl}
+                  alt="surface iso receipt"
+                  className="w-full object-contain"
+                  onError={(e) => ((e.currentTarget as HTMLImageElement).style.display = "none")}
+                />
+                <p className="bg-black/40 py-1 text-center text-[10px] uppercase tracking-wide text-zinc-400">3D surface</p>
+              </button>
+            )}
+          </div>
+        )}
       </div>
       {lightbox && <ReceiptLightbox src={lightbox} onClose={() => setLightbox(null)} />}
-    </div>
+    </Dialog>
   );
 }
