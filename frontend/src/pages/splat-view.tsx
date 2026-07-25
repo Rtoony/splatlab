@@ -50,10 +50,13 @@ export default function SplatViewPage() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [shortcutLegendOpen, setShortcutLegendOpen] = useState(false);
   const [resetViewToken, setResetViewToken] = useState(0);
-  // Wave-2 Spark cutover, opt-in: the beta viewer carries the real language
-  // heatmap + measure/scale tools; the classic viewer keeps overlays/search
-  // fly-to until the full 2.4 port. Sticky per browser.
-  const [sparkBeta, setSparkBeta] = useState(() => localStorage.getItem("splatlab.sparkBeta") === "1");
+  // Spark cutover: default ON. Absent key => Spark; explicit "0" => classic
+  // (sticky per browser). `?viewer=classic` forces classic for THIS load only
+  // — deliberately not persisted — as an escape hatch while classic exists.
+  const [sparkBeta, setSparkBeta] = useState(() => {
+    if (new URLSearchParams(window.location.search).get("viewer") === "classic") return false;
+    return localStorage.getItem("splatlab.sparkBeta") !== "0";
+  });
   const [geoOpen, setGeoOpen] = useState(false);
   const [sectionsOpen, setSectionsOpen] = useState(false);
   const [sceneRegenOpen, setSceneRegenOpen] = useState(false);
@@ -274,7 +277,7 @@ export default function SplatViewPage() {
               <Compass className="h-3.5 w-3.5" /> {sparkBeta ? "Spark beta ON" : "Spark beta"}
             </Button>
           )}
-          {job && viewUrl && !sparkBeta && (
+          {job && viewUrl && (
             <>
               <Button type="button" variant="outline" size="sm" onClick={resetToDefaultView} title="Reset camera and collapse viewer extras">
                 <RotateCcw className="h-3.5 w-3.5" /> Reset
@@ -335,32 +338,44 @@ export default function SplatViewPage() {
               </p>
             </div>
           </Centered>
-        ) : sparkBeta ? (
-          <SparkSceneViewer
-            key={job.job_id}
-            job={job}
-            safeMode={computeBlocked}
-            computeReason={computeReason}
-            onViewerError={fallBackFromSpark}
-          />
         ) : (
           <>
-            <SplatViewer
-              url={viewUrl}
-              format="ply"
-              fill
-              fallbackImageUrl={`/api/splat/jobs/${job.job_id}/thumbnail`}
-              focus={flyTarget}
-              overlay={overlay}
-              highlights={highlights}
-              cameraOverlay={cameraOverlay}
-              viewCamera={cameraViewTarget}
-              cameraNodeTarget={cameraNodeTarget}
-              resetViewToken={resetViewToken}
-              showShortcutLegend={shortcutLegendOpen}
-              onPickMatch={setActiveIdx}
-              onPickCamera={zoomToCamera}
-            />
+            {sparkBeta ? (
+              <SparkSceneViewer
+                key={job.job_id}
+                job={job}
+                safeMode={computeBlocked}
+                computeReason={computeReason}
+                onViewerError={fallBackFromSpark}
+                focus={flyTarget}
+                overlay={overlay}
+                highlights={highlights}
+                cameraOverlay={cameraOverlay}
+                viewCamera={cameraViewTarget}
+                cameraNodeTarget={cameraNodeTarget}
+                resetViewToken={resetViewToken}
+                showShortcutLegend={shortcutLegendOpen}
+                onPickMatch={setActiveIdx}
+                onPickCamera={zoomToCamera}
+              />
+            ) : (
+              <SplatViewer
+                url={viewUrl}
+                format="ply"
+                fill
+                fallbackImageUrl={`/api/splat/jobs/${job.job_id}/thumbnail`}
+                focus={flyTarget}
+                overlay={overlay}
+                highlights={highlights}
+                cameraOverlay={cameraOverlay}
+                viewCamera={cameraViewTarget}
+                cameraNodeTarget={cameraNodeTarget}
+                resetViewToken={resetViewToken}
+                showShortcutLegend={shortcutLegendOpen}
+                onPickMatch={setActiveIdx}
+                onPickCamera={zoomToCamera}
+              />
+            )}
             {cameraOverlayOn && camerasError && (
               <div className="pointer-events-none absolute right-3 top-20 z-30 max-w-xs rounded-xl border border-amber-300/25 bg-black/70 px-3 py-2 text-xs text-amber-100 shadow backdrop-blur-md">
                 Camera poses are unavailable for this scene. Generated single-image splats and unfinished captures usually do not have SfM cameras.
@@ -386,6 +401,8 @@ export default function SplatViewPage() {
                 open={inventoryOpen}
                 onOpenChange={setInventoryOpen}
                 colorFor={colorFor}
+                // Spark's own control panel owns left-3 top-3; sit just right of it.
+                positionClassName={sparkBeta ? "left-[21.5rem]" : "left-3"}
                 onToggle={(label) =>
                   setActiveLabels((prev) => {
                     const next = new Set(prev);
@@ -397,7 +414,7 @@ export default function SplatViewPage() {
                 onClear={() => setActiveLabels(new Set())}
               />
             )}
-            {job.langfield_available && computeBlocked && (
+            {!sparkBeta && job.langfield_available && computeBlocked && (
               <div className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex justify-center p-3 sm:p-4">
                 <Card className="pointer-events-auto max-w-lg border-amber-300/25 bg-[#070b14]/85 p-3 text-xs text-amber-100 backdrop-blur-md">
                   Real language search is blocked by the current hardware gate. Turn on Spark beta to use safe test
@@ -458,6 +475,7 @@ function InventoryLegend({
   open,
   onOpenChange,
   colorFor,
+  positionClassName = "left-3",
   onToggle,
   onZoom,
   onClear,
@@ -468,13 +486,15 @@ function InventoryLegend({
   open: boolean;
   onOpenChange: (open: boolean) => void;
   colorFor: (label: string) => string;
+  // Horizontal anchor — the Spark viewer's control panel owns left-3.
+  positionClassName?: string;
   onToggle: (label: string) => void;
   onZoom: (it: LangfieldInventoryItem) => void;
   onClear: () => void;
 }) {
   const maxP = Math.max(...items.map((i) => i.presence), 0.0001);
   return (
-    <div className="pointer-events-none absolute left-3 top-3 z-20 w-56">
+    <div className={`pointer-events-none absolute top-3 z-20 w-56 ${positionClassName}`}>
       <Card className="pointer-events-auto border-white/12 bg-[#070b14]/85 p-2 backdrop-blur-md">
         <button
           type="button"

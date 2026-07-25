@@ -16,6 +16,15 @@ import {
   type OverlayMode,
 } from "@/lib/spark-heatmap";
 import type { SplatJob } from "@/lib/contracts";
+import type {
+  ViewerCameraNodeTarget,
+  ViewerCameraOverlay,
+  ViewerCameraPose,
+  ViewerCameraViewTarget,
+  ViewerHighlight,
+  ViewerOverlay,
+  ViewerPoint,
+} from "@/components/splat-viewer";
 import { Button, Input, SectionLabel } from "@/components/ui";
 import { Download, Loader2, Paintbrush, Plus, Ruler, Scissors, Trash2, Undo2, X } from "lucide-react";
 
@@ -106,11 +115,39 @@ export function SparkSceneViewer({
   safeMode = false,
   computeReason = "",
   onViewerError,
+  focus = null,
+  overlay = null,
+  highlights = [],
+  cameraOverlay = null,
+  viewCamera = null,
+  cameraNodeTarget = null,
+  resetViewToken = 0,
+  showShortcutLegend = false,
+  onPickMatch,
+  onPickCamera,
 }: {
   job: SplatJob;
   safeMode?: boolean;
   computeReason?: string;
   onViewerError?: (message: string) => void;
+  // Classic-viewer parity contract (same names/types as SplatViewer) so the
+  // host page can drive either viewer identically.
+  // When set (from a language search hit), fly the camera to this 3D point.
+  focus?: ViewerPoint | null;
+  // When set, draw a highlight marker on each 3D match + a label on the active one.
+  overlay?: ViewerOverlay;
+  // Multiple colored object groups highlighted + labeled simultaneously (legend toggles).
+  highlights?: ViewerHighlight[];
+  // Capture camera positions/directions projected over the current viewer camera.
+  cameraOverlay?: ViewerCameraOverlay;
+  // One-shot request to view the scene from an original capture camera pose.
+  viewCamera?: ViewerCameraViewTarget;
+  // One-shot request to inspect a camera marker from just behind its original pose.
+  cameraNodeTarget?: ViewerCameraNodeTarget;
+  resetViewToken?: number;
+  showShortcutLegend?: boolean;
+  onPickMatch?: (i: number) => void;
+  onPickCamera?: (camera: ViewerCameraPose) => void;
 }) {
   // Bumped after every crop apply/revert: the preview URL string doesn't
   // otherwise change even though the file on disk did, so the mesh-load
@@ -127,6 +164,28 @@ export function SparkSceneViewer({
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
   const meshRef = useRef<SplatMesh | null>(null);
+  // Default FOV to restore on reset (viewCamera can override cam.fov).
+  const defaultFovRef = useRef<number | null>(null);
+
+  // Classic-parity screen-space annotations (ported from splat-viewer.tsx):
+  // screen positions of each 3D match, updated every frame from the camera.
+  const [markers, setMarkers] = useState<{ x: number; y: number; front: boolean }[]>([]);
+  // Screen positions of each highlight group's points (colored legend highlights).
+  const [hlMarkers, setHlMarkers] = useState<{ label: string; color: string; pts: { x: number; y: number; front: boolean }[] }[]>([]);
+  const [cameraMarkers, setCameraMarkers] = useState<
+    {
+      index: number;
+      name: string;
+      x: number;
+      y: number;
+      front: boolean;
+      nose: { x: number; y: number; front: boolean };
+      left: { x: number; y: number; front: boolean };
+      right: { x: number; y: number; front: boolean };
+      top: { x: number; y: number; front: boolean };
+      camera: ViewerCameraPose;
+    }[]
+  >([]);
 
   const channelsRef = useRef<QueryChannel[]>([]);
   const enabledDynosRef = useRef<ReturnType<typeof dyno.dynoBool>[]>([]);
@@ -803,6 +862,7 @@ export function SparkSceneViewer({
     camera.position.copy(INITIAL_CAMERA_POSITION);
     camera.lookAt(INITIAL_CAMERA_LOOK_AT);
     cameraRef.current = camera;
+    defaultFovRef.current = camera.fov;
 
     let renderer: THREE.WebGLRenderer;
     try {
@@ -1139,11 +1199,71 @@ export function SparkSceneViewer({
       }
     }
 
+    // Classic-viewer keyboard parity. The classic component's shortcuts came
+    // from the mkkellogg viewer it wrapped: WASD = OrbitControls key-pan
+    // (keys {LEFT:KeyA, UP:KeyW, RIGHT:KeyD, BOTTOM:KeyS}, keyPanSpeed 7px,
+    // screen-space pan) and ArrowLeft/Right = roll camera.up around the view
+    // axis by ±PI/128. Both reimplemented here with the same math. Guarded on
+    // the event target so typing in the control panel's inputs never moves
+    // the camera (classic relied on the lone search input stopping
+    // propagation; Spark's panel has many inputs).
+    const KEY_PAN_SPEED = 7;
+    const panVecA = new THREE.Vector3();
+    const panVecB = new THREE.Vector3();
+    function panCamera(deltaX: number, deltaY: number) {
+      // OrbitControls._pan for a perspective camera with screenSpacePanning:
+      // half the visible height at the target distance, scaled by px/clientHeight.
+      const targetDistance =
+        camera.position.distanceTo(controls.target) * Math.tan(((camera.fov / 2) * Math.PI) / 180.0);
+      const el = renderer.domElement;
+      panVecA
+        .setFromMatrixColumn(camera.matrix, 0) // panLeft: X column
+        .multiplyScalar((-2 * deltaX * targetDistance) / el.clientHeight);
+      panVecB
+        .setFromMatrixColumn(camera.matrix, 1) // panUp (screen space): Y column
+        .multiplyScalar((2 * deltaY * targetDistance) / el.clientHeight);
+      panVecA.add(panVecB);
+      camera.position.add(panVecA);
+      controls.target.add(panVecA);
+      controls.update();
+    }
+    const rollForward = new THREE.Vector3();
+    const rollMatrix = new THREE.Matrix4();
+    function onKeyDown(e: KeyboardEvent) {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+      switch (e.code) {
+        case "KeyW":
+          panCamera(0, KEY_PAN_SPEED);
+          e.preventDefault();
+          break;
+        case "KeyS":
+          panCamera(0, -KEY_PAN_SPEED);
+          e.preventDefault();
+          break;
+        case "KeyA":
+          panCamera(KEY_PAN_SPEED, 0);
+          e.preventDefault();
+          break;
+        case "KeyD":
+          panCamera(-KEY_PAN_SPEED, 0);
+          e.preventDefault();
+          break;
+        case "ArrowLeft":
+        case "ArrowRight":
+          rollForward.set(0, 0, -1).transformDirection(camera.matrixWorld);
+          rollMatrix.makeRotationAxis(rollForward, e.code === "ArrowLeft" ? Math.PI / 128 : -Math.PI / 128);
+          camera.up.transformDirection(rollMatrix);
+          break;
+      }
+    }
+
     renderer.domElement.addEventListener("pointerdown", onPointerDown);
     renderer.domElement.addEventListener("pointermove", onPointerMove);
     renderer.domElement.addEventListener("pointerup", onPointerUp);
     renderer.domElement.addEventListener("click", onClick);
     renderer.domElement.addEventListener("dblclick", onDoubleClick);
+    window.addEventListener("keydown", onKeyDown);
 
     return () => {
       disposed = true;
@@ -1153,6 +1273,7 @@ export function SparkSceneViewer({
       renderer.domElement.removeEventListener("pointerup", onPointerUp);
       renderer.domElement.removeEventListener("click", onClick);
       renderer.domElement.removeEventListener("dblclick", onDoubleClick);
+      window.removeEventListener("keydown", onKeyDown);
       resizeObserver.disconnect();
       controls.dispose();
       mesh.dispose();
@@ -1170,6 +1291,229 @@ export function SparkSceneViewer({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url]);
+
+  // ---- classic-viewer parity: camera targeting + overlay projection -------
+  // Near-verbatim ports from splat-viewer.tsx, adapted from the mkkellogg
+  // viewer handle (untyped viewer.camera/viewer.controls + Vec3-constructor
+  // tricks) to Spark's typed THREE camera/controls refs. Keep the math in
+  // lockstep with the classic viewer until it is deleted.
+
+  // Restore the viewer's default camera/orbit. Parent state clears overlays separately.
+  useEffect(() => {
+    const cam = cameraRef.current;
+    const ctr = controlsRef.current;
+    if (!resetViewToken || !cam || !ctr) return;
+    if (typeof defaultFovRef.current === "number") {
+      cam.fov = defaultFovRef.current;
+      cam.updateProjectionMatrix();
+    }
+    cam.position.copy(INITIAL_CAMERA_POSITION);
+    cam.up.copy(INITIAL_CAMERA_UP);
+    ctr.target.copy(INITIAL_CAMERA_LOOK_AT);
+    cam.lookAt(ctr.target);
+    ctr.update();
+  }, [resetViewToken]);
+
+  // Fly the camera to a search hit: recenter on the 3D point, keeping the current
+  // viewing angle, pulled back to frame the match (radius-scaled distance).
+  useEffect(() => {
+    const cam = cameraRef.current;
+    const ctr = controlsRef.current;
+    if (!focus || !cam || !ctr) return;
+    const [fx, fy, fz] = focus.point;
+    // Stand back to frame the target by its extent: small item -> close, large space ->
+    // zoom-to-extents. FLY_MAX caps big legend objects (a floor) so we don't fly outside
+    // the scene. (Search matches are small, so their feel is unchanged.)
+    const FLY_ZOOM = 8;
+    const FLY_MIN = 1.8;
+    const FLY_MAX = 16;
+    const dist = Math.min(Math.max(focus.radius * FLY_ZOOM, FLY_MIN), FLY_MAX);
+    let dx = cam.position.x - fx;
+    let dy = cam.position.y - fy;
+    let dz = cam.position.z - fz;
+    let len = Math.hypot(dx, dy, dz);
+    if (len < 1e-3) {
+      dx = 0; dy = -1; dz = 0.6; len = Math.hypot(dx, dy, dz);
+    }
+    ctr.target.set(fx, fy, fz);
+    cam.position.set(fx + (dx / len) * dist, fy + (dy / len) * dist, fz + (dz / len) * dist);
+    ctr.update();
+  }, [focus]);
+
+  // Tight camera-node zoom: unlike generic search/object focus, this aligns the
+  // viewer behind the original camera and keeps the orbit pivot on the node.
+  useEffect(() => {
+    const cam = cameraRef.current;
+    const ctr = controlsRef.current;
+    if (!cameraNodeTarget || !cam || !ctr) return;
+    const p = cameraNodeTarget.camera.position;
+    const f = cameraNodeTarget.camera.forward;
+    const u = cameraNodeTarget.camera.up;
+    const node = new THREE.Vector3(p[0], p[1], p[2]);
+    const forward = new THREE.Vector3(f[0], f[1], f[2]);
+    if (forward.lengthSq() > 1e-10) forward.normalize();
+    else forward.set(0, -1, 0);
+    const up = new THREE.Vector3(u[0], u[1], u[2]);
+    if (up.lengthSq() > 1e-10) up.normalize();
+    else up.copy(INITIAL_CAMERA_UP);
+    const distance = Math.max(cameraNodeTarget.distance ?? 0.35, 0.05);
+    const pos = node.clone().add(forward.multiplyScalar(-distance));
+
+    if (typeof defaultFovRef.current === "number") {
+      cam.fov = defaultFovRef.current;
+      cam.updateProjectionMatrix();
+    }
+    cam.position.copy(pos);
+    cam.up.copy(up);
+    ctr.target.copy(node);
+    cam.lookAt(node);
+    ctr.update();
+  }, [cameraNodeTarget]);
+
+  // Jump to an original capture camera pose. The target token lets the parent
+  // request the same camera repeatedly.
+  useEffect(() => {
+    const cam = cameraRef.current;
+    const ctr = controlsRef.current;
+    if (!viewCamera || !cam || !ctr) return;
+    const p = viewCamera.camera.position;
+    const f = viewCamera.camera.forward;
+    const u = viewCamera.camera.up;
+    const pos = new THREE.Vector3(p[0], p[1], p[2]);
+    const forward = new THREE.Vector3(f[0], f[1], f[2]).normalize();
+    const up = new THREE.Vector3(u[0], u[1], u[2]).normalize();
+    const targetDistance = Math.max(viewCamera.distance ?? 1.2, 0.2);
+    const target = pos.clone().add(forward.multiplyScalar(targetDistance));
+
+    if (typeof viewCamera.camera.fov_y_degrees === "number" && Number.isFinite(viewCamera.camera.fov_y_degrees)) {
+      cam.fov = viewCamera.camera.fov_y_degrees;
+      cam.updateProjectionMatrix();
+    }
+    cam.position.copy(pos);
+    cam.up.copy(up);
+    ctr.target.copy(target);
+    cam.lookAt(target);
+    ctr.update();
+  }, [viewCamera]);
+
+  // Project each 3D match to screen every frame so the highlight markers + label
+  // track the camera as you orbit.
+  useEffect(() => {
+    if (!overlay || overlay.matches.length === 0) {
+      setMarkers([]);
+      return;
+    }
+    let raf = 0;
+    const tick = () => {
+      const cam = cameraRef.current;
+      const root = containerRef.current;
+      if (cam && root) {
+        const rect = root.getBoundingClientRect();
+        const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
+        setMarkers(
+          overlay.matches.map((m) => {
+            const dir = new THREE.Vector3(m.point[0] - cam.position.x, m.point[1] - cam.position.y, m.point[2] - cam.position.z);
+            const front = dir.dot(fwd) > 0;
+            const p = new THREE.Vector3(m.point[0], m.point[1], m.point[2]);
+            p.project(cam);
+            return { x: (p.x * 0.5 + 0.5) * rect.width, y: (-p.y * 0.5 + 0.5) * rect.height, front };
+          }),
+        );
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [overlay]);
+
+  // Project every highlight group's 3D points to screen each frame (legend toggles).
+  // Separate from the search overlay so both can be shown at once without interfering.
+  useEffect(() => {
+    if (!highlights || highlights.length === 0) {
+      setHlMarkers([]);
+      return;
+    }
+    let raf = 0;
+    const tick = () => {
+      const cam = cameraRef.current;
+      const root = containerRef.current;
+      if (cam && root) {
+        const rect = root.getBoundingClientRect();
+        const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
+        setHlMarkers(
+          highlights.map((h) => ({
+            label: h.label,
+            color: h.color,
+            pts: h.points.map((pt) => {
+              const dir = new THREE.Vector3(pt[0] - cam.position.x, pt[1] - cam.position.y, pt[2] - cam.position.z);
+              const front = dir.dot(fwd) > 0;
+              const p = new THREE.Vector3(pt[0], pt[1], pt[2]);
+              p.project(cam);
+              return { x: (p.x * 0.5 + 0.5) * rect.width, y: (-p.y * 0.5 + 0.5) * rect.height, front };
+            }),
+          })),
+        );
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [highlights]);
+
+  // Project capture camera poses into screen-space. These are annotations only; they
+  // don't modify the underlying Spark camera or controls. `frame` ("viewer" vs
+  // "source") affects only the drawn opacity, exactly as in the classic viewer.
+  useEffect(() => {
+    if (!cameraOverlay || cameraOverlay.cameras.length === 0) {
+      setCameraMarkers([]);
+      return;
+    }
+    let raf = 0;
+    const tick = () => {
+      const cam = cameraRef.current;
+      const root = containerRef.current;
+      if (cam && root) {
+        const rect = root.getBoundingClientRect();
+        const viewForward = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
+        const scale = Math.max(cameraOverlay.displayScale || 0.08, 0.01);
+        const add = (a: [number, number, number], b: [number, number, number], m: number): [number, number, number] => [
+          a[0] + b[0] * m,
+          a[1] + b[1] * m,
+          a[2] + b[2] * m,
+        ];
+        const project = (pt: [number, number, number]) => {
+          const dir = new THREE.Vector3(pt[0] - cam.position.x, pt[1] - cam.position.y, pt[2] - cam.position.z);
+          const front = dir.dot(viewForward) > 0;
+          const p = new THREE.Vector3(pt[0], pt[1], pt[2]);
+          p.project(cam);
+          return { x: (p.x * 0.5 + 0.5) * rect.width, y: (-p.y * 0.5 + 0.5) * rect.height, front };
+        };
+
+        setCameraMarkers(
+          cameraOverlay.cameras.map((c) => {
+            const nose = add(c.position, c.forward, scale * 1.8);
+            const left = add(nose, c.right, -scale * 0.55);
+            const right = add(nose, c.right, scale * 0.55);
+            const top = add(nose, c.up, scale * 0.45);
+            const center = project(c.position);
+            return {
+              index: c.index,
+              name: c.image_name,
+              ...center,
+              nose: project(nose),
+              left: project(left),
+              right: project(right),
+              top: project(top),
+              camera: c,
+            };
+          }),
+        );
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [cameraOverlay]);
 
   // No fallback to "the last dimension" here: calibDimId is only ever set by an
   // explicit click on a dimension (line ~1122) or cleared by deleteDim() when its
@@ -1200,6 +1544,94 @@ export function SparkSceneViewer({
           );
         })}
       </div>
+
+      {/* classic-viewer parity overlays: ported markup from splat-viewer.tsx.
+          These are DOM/SVG siblings ABOVE the canvas — clicks on the marker
+          buttons never reach the renderer's own pointer handlers, so they
+          cannot double-fire crop/paint/measure picking. */}
+      {showShortcutLegend && <ShortcutLegend />}
+      {overlay &&
+        markers.map((mk, i) =>
+          mk.front ? (
+            <button
+              key={i}
+              type="button"
+              onClick={() => onPickMatch?.(i)}
+              style={{ left: `${mk.x}px`, top: `${mk.y}px` }}
+              title={`${overlay.label} — ${i + 1}/${overlay.matches.length}`}
+              className={`pointer-events-auto absolute z-20 -translate-x-1/2 -translate-y-1/2 rounded-full transition ${
+                i === overlay.active
+                  ? "h-6 w-6 border-2 border-cyan-300 bg-cyan-300/25 shadow-[0_0_14px_rgba(34,211,238,0.75)]"
+                  : "h-4 w-4 border-2 border-white/60 bg-white/10 hover:border-cyan-200 hover:bg-cyan-200/20"
+              }`}
+            />
+          ) : null,
+        )}
+      {overlay && markers[overlay.active]?.front && (
+        <div
+          style={{ left: `${markers[overlay.active].x}px`, top: `${markers[overlay.active].y - 20}px` }}
+          className="pointer-events-none absolute z-20 -translate-x-1/2 -translate-y-full whitespace-nowrap rounded-md bg-black/75 px-2 py-0.5 text-xs font-semibold text-cyan-100 shadow backdrop-blur-sm"
+        >
+          {overlay.label}
+        </div>
+      )}
+      {/* Legend highlights: a soft AREA wash — many translucent screen-blended dots over
+          the object's own gaussians build up into a colored region — + one label at the
+          region's centroid. "tile" paints the whole floor, not a pin. */}
+      {hlMarkers.map((h, gi) => {
+        const front = h.pts.filter((p) => p.front);
+        if (!front.length) return null;
+        const cx = front.reduce((s, p) => s + p.x, 0) / front.length;
+        const cy = front.reduce((s, p) => s + p.y, 0) / front.length;
+        return (
+          <div key={gi}>
+            {front.map((pt, pi) => (
+              <div
+                key={pi}
+                style={{ left: `${pt.x}px`, top: `${pt.y}px`, backgroundColor: `${h.color}4d`, mixBlendMode: "screen" }}
+                className="pointer-events-none absolute z-20 h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full"
+              />
+            ))}
+            <div
+              style={{ left: `${cx}px`, top: `${cy}px`, color: h.color, borderColor: `${h.color}80` }}
+              className="pointer-events-none absolute z-30 -translate-x-1/2 -translate-y-1/2 whitespace-nowrap rounded-md border bg-black/80 px-1.5 py-0.5 text-[11px] font-bold shadow backdrop-blur-sm"
+            >
+              {h.label}
+            </div>
+          </div>
+        );
+      })}
+      {cameraOverlay && cameraMarkers.length > 0 && (
+        <svg className="pointer-events-none absolute inset-0 z-20 h-full w-full" aria-hidden="true">
+          {cameraMarkers.map((mk) =>
+            mk.front ? (
+              <g key={mk.index} opacity={cameraOverlay.frame === "viewer" ? 0.82 : 0.45}>
+                <line x1={mk.x} y1={mk.y} x2={mk.nose.x} y2={mk.nose.y} stroke="#fbbf24" strokeWidth="1.3" strokeLinecap="round" />
+                <line x1={mk.x} y1={mk.y} x2={mk.left.x} y2={mk.left.y} stroke="#f59e0b" strokeWidth="0.9" strokeLinecap="round" />
+                <line x1={mk.x} y1={mk.y} x2={mk.right.x} y2={mk.right.y} stroke="#f59e0b" strokeWidth="0.9" strokeLinecap="round" />
+                <line x1={mk.x} y1={mk.y} x2={mk.top.x} y2={mk.top.y} stroke="#fde68a" strokeWidth="0.8" strokeLinecap="round" />
+              </g>
+            ) : null,
+          )}
+        </svg>
+      )}
+      {cameraMarkers.map((mk) =>
+        mk.front ? (
+          <button
+            key={mk.index}
+            type="button"
+            title={`Zoom to ${mk.name} · camera ${mk.index + 1}`}
+            onClick={() => onPickCamera?.(mk.camera)}
+            style={{ left: `${mk.x}px`, top: `${mk.y}px` }}
+            className="pointer-events-auto absolute z-30 h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border border-amber-100/80 bg-amber-300/75 shadow-[0_0_10px_rgba(251,191,36,0.65)] transition hover:h-4 hover:w-4 hover:bg-cyan-200"
+          />
+        ) : null,
+      )}
+      {cameraOverlay && cameraMarkers.length > 0 && (
+        <div className="pointer-events-none absolute right-3 top-24 z-20 rounded-full border border-amber-300/25 bg-black/55 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.2em] text-amber-100 backdrop-blur">
+          {cameraMarkers.length} cameras
+        </div>
+      )}
 
       {!ready && !error && (
         <div className="absolute inset-0 flex items-center justify-center text-sm text-zinc-400">
@@ -1647,7 +2079,7 @@ export function SparkSceneViewer({
         )}
       </div>
 
-      {/* legend — updates live with queries, colors, mode, and threshold */}
+      {/* query legend — updates live with queries, colors, mode, and threshold */}
       {channels.length > 0 && (
         <div className="absolute bottom-16 right-3 z-20 w-64 space-y-2 rounded-xl border border-white/10 bg-black/70 p-3 text-xs text-zinc-200 shadow backdrop-blur-md">
           <SectionLabel>Legend</SectionLabel>
@@ -1688,6 +2120,22 @@ export function SparkSceneViewer({
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// Floating shortcut reference — no background, tucked top-right, non-interactive.
+// Ported from the classic viewer, trimmed to the shortcuts Spark actually
+// implements: F/G focal, =/- splat scale, and I/C/P/O were mkkellogg-library
+// internals (focalAdjustment, info panel, mesh cursor, point-cloud, ortho)
+// with no Spark equivalent — advertising them here would be lying.
+function ShortcutLegend() {
+  const k = "text-white/75";
+  return (
+    <div className="pointer-events-none absolute right-3 top-3 z-10 select-none text-right font-mono text-[10px] leading-[1.55] text-white/40">
+      <div><span className={k}>drag</span> orbit · <span className={k}>scroll</span> zoom</div>
+      <div><span className={k}>W A S D</span> pan · <span className={k}>← →</span> roll</div>
+      <div><span className={k}>dbl-click</span> set orbit pivot</div>
     </div>
   );
 }
