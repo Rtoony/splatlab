@@ -7,6 +7,8 @@ import type {
   SceneIsolateReport,
   SceneProxyReport,
   SplatCamerasResponse,
+  SplatExportManifest,
+  SplatUnrealBundle,
 } from "@/lib/contracts";
 import { recordFailedApiCall } from "@/lib/feedback-context";
 
@@ -74,4 +76,24 @@ export function fetchSceneGround(jobId: string): Promise<SceneGroundReport> {
 
 export function fetchSceneAssemble(jobId: string): Promise<SceneAssembleReport> {
   return apiRequest<SceneAssembleReport>(`/api/splat/jobs/${jobId}/scene/assemble/file?fmt=report`);
+}
+
+export function fetchPortableExports(jobId: string): Promise<SplatExportManifest> {
+  return apiRequest<SplatExportManifest>(`/api/splat/jobs/${jobId}/exports`);
+}
+
+export function buildPortableExports(jobId: string): Promise<SplatExportManifest> {
+  return apiRequest<SplatExportManifest>(`/api/splat/jobs/${jobId}/exports`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+}
+
+export function buildUnrealBundle(jobId: string): Promise<SplatUnrealBundle> {
+  return apiRequest<SplatUnrealBundle>(`/api/splat/jobs/${jobId}/unreal-bundle`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ include_zip: true }),
+  });
 }

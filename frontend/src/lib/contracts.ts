@@ -167,6 +167,59 @@ export interface SplatJob {
   scene?: SplatSceneSummary;
 }
 
+export interface SplatExportFile {
+  path: string;
+  media_type: string;
+  bytes: number;
+  sha256: string;
+}
+
+export interface SplatExportArtifact {
+  status: "ready" | "stale" | "skipped" | "failed";
+  built_at?: string;
+  reason?: string;
+  error?: string;
+  url?: string;
+  primary_file?: string;
+  files?: SplatExportFile[];
+  parameters?: Record<string, unknown>;
+}
+
+export interface SplatUnrealBundle {
+  status: "ready";
+  built_at: string;
+  directory: string;
+  manifest: string;
+  files: number;
+  manifest_url?: string;
+  zip_url?: string;
+  zip?: SplatExportFile | null;
+}
+
+export interface SplatExportManifest {
+  schema: "dev.splatlab.exports/v1";
+  job_id: string;
+  status?: "not-built" | "ready" | "stale";
+  created_at?: string;
+  updated_at?: string;
+  manifest_url?: string;
+  source?: {
+    gaussian_count?: number;
+    sh_degree?: number | null;
+    sha256?: string;
+    bounds_scene?: { min: number[]; max: number[]; extent: number[] } | null;
+  };
+  artifacts: Record<string, SplatExportArtifact>;
+  unreal_bundle?: SplatUnrealBundle;
+  warnings?: string[];
+  result?: {
+    built: string[];
+    cached: string[];
+    skipped: string[];
+    failures: string[];
+  };
+}
+
 // meta["scene"] (P6a-P6f). Each key is written by its own route and merged,
 // never replaced (review finding 2026-07-23 fixed a real merge bug) — so any
 // subset can be present depending on which stages have run.
