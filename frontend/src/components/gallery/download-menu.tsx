@@ -162,10 +162,10 @@ export function DownloadMenu({ job }: { job: SplatJob }) {
               </a>
             ))}
             {/* The Export tab itself isn't deep-linkable yet (workspace mode is
-                page-local state), so this lands on /view's View mode — one
-                click from the Export tab. */}
+                page-local state read from ?tab= on mount), so this lands
+                directly on the Export tab. */}
             <Link
-              href={`/view/${job.job_id}`}
+              href={`/view/${job.job_id}?tab=export`}
               onClick={() => setOpen(false)}
               className="block border-t border-white/10 px-3 py-2 hover:bg-white/5"
             >

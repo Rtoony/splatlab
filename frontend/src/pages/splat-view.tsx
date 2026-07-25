@@ -64,7 +64,12 @@ export default function SplatViewPage() {
   const [sceneRegenOpen, setSceneRegenOpen] = useState(false);
   // Workspace mode tab. The viewer never unmounts on tab switch — Edit/Export/
   // Objects render as an overlay lane so the WebGL context and camera survive.
-  const [mode, setMode] = useState<"view" | "measure" | "objects" | "edit" | "export">("view");
+  const [mode, setMode] = useState<"view" | "measure" | "objects" | "edit" | "export">(() => {
+    // Deep-link: /view/<id>?tab=export lands on a specific workspace tab
+    // (the DownloadMenu's "Open export center" row uses this).
+    const tab = new URLSearchParams(window.location.search).get("tab");
+    return tab === "measure" || tab === "objects" || tab === "edit" || tab === "export" ? tab : "view";
+  });
   const queryClient = useQueryClient();
   // Bumped after each successful Edit-lane op: routes into the Spark viewer's
   // reloadToken prop (same reload path its own crop tools use) and refreshes

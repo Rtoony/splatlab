@@ -629,7 +629,7 @@ export function SparkSceneViewer({
       });
       if (res.status === 404 || res.status === 405) {
         throw new Error(
-          "Paint backend not deployed yet — it goes live on the next splatlab restart (waiting for the running job to finish).",
+          "The paint endpoint isn't available on this backend build — the service likely needs its scheduled restart.",
         );
       }
       if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).slice(0, 200)}`);
@@ -2114,8 +2114,8 @@ export function SparkSceneViewer({
         </div>
         {measureArm && (
           <p className="text-[10px] leading-snug text-zinc-500">
-            Click two points on the scene. Drag any endpoint later to adjust; dimensions persist for this
-            browser session.
+            Click two points on the scene. Drag any endpoint later to adjust; dimensions are saved with the
+            scene.
           </p>
         )}
         {dims.map((d, i) => {
