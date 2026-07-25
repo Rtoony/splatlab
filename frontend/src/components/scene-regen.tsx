@@ -16,6 +16,7 @@ import {
   fetchSceneIsolate,
   fetchSceneProxy,
 } from "@/lib/api";
+import { useActivity } from "@/lib/use-activity";
 import type {
   SceneAssembleReport,
   SceneGroundReport,
@@ -181,6 +182,15 @@ export default function SceneRegenModal({ job, onClose }: { job: SplatJob; onClo
     assembleMutation.isPending ||
     approveMutation.isPending;
 
+  // Server-truth build flag: the backend's shared mesh/object/scene-lane lock
+  // for this job (GET /activity, 4s poll). Closes the "refreshed tab can't
+  // tell running from crashed" gap — a build started in another tab, or
+  // before a reload, still shows here. When a LOCAL mutation is pending the
+  // local banner wins (it carries the more specific wording); this one only
+  // covers builds this modal instance didn't start.
+  const activity = useActivity();
+  const serverBuildRunning = Boolean(activity.data?.jobs[jobId]?.meshing);
+
   const scene = job.scene;
   const title = job.input_path?.split("/").pop() || job.job_id;
 
@@ -197,11 +207,15 @@ export default function SceneRegenModal({ job, onClose }: { job: SplatJob; onClo
           </button>
         </div>
 
-        {busy && (
+        {busy ? (
           <div className="flex shrink-0 items-center gap-2 border-b border-cyan-400/20 bg-cyan-400/10 px-4 py-1.5 text-xs text-cyan-100">
             <Loader2 className="h-3.5 w-3.5 animate-spin" /> A build is running for this scene — this can take several minutes. Leave this tab open.
           </div>
-        )}
+        ) : serverBuildRunning ? (
+          <div className="flex shrink-0 items-center gap-2 border-b border-cyan-400/20 bg-cyan-400/10 px-4 py-1.5 text-xs text-cyan-100">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" /> A build is running for this scene — started elsewhere or before a reload. It's safe to leave this open.
+          </div>
+        ) : null}
 
         <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-white/10 px-3 py-2">
           {STAGES.map(({ key, label, icon: Icon }) => {

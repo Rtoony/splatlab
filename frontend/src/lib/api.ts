@@ -1,6 +1,7 @@
 import type {
   LangfieldInventoryResult,
   LangfieldQueryResult,
+  SplatActivityResponse,
   SceneAssembleReport,
   SceneGroundReport,
   SceneInventoryReport,
@@ -53,6 +54,13 @@ export function queryLangfield(jobId: string, text: string): Promise<LangfieldQu
 // toggle-to-highlight legend. Warm-worker only; 503 -> caller hides the legend.
 export function fetchLangfieldInventory(jobId: string): Promise<LangfieldInventoryResult> {
   return apiRequest<LangfieldInventoryResult>(`/api/splat/jobs/${jobId}/langfield/inventory`);
+}
+
+// Live activity snapshot: which jobs have an operation in flight right now
+// (server-truth from the backend's in-process locks, not client state) plus
+// the GPU lease holder. Cheap read-only poll — see useActivity().
+export function fetchActivity(): Promise<SplatActivityResponse> {
+  return apiRequest<SplatActivityResponse>("/api/splat/activity");
 }
 
 export function fetchSplatCameras(jobId: string, limit = 500): Promise<SplatCamerasResponse> {

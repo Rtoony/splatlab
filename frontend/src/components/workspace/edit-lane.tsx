@@ -28,11 +28,12 @@ function parseField(raw: string, identity: number): number {
   return Number(t);
 }
 
-function LangfieldTopologyWarning() {
+function LangfieldTopologyWarning({ stale }: { stale: boolean }) {
   return (
     <p className="mt-2 rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5 text-[10px] leading-snug text-amber-100/85">
-      This scene has a language field. This operation changes the gaussian count, so search and paint will
-      stop working until the language field is rebuilt.
+      {stale
+        ? "This scene's language field is already stale (the scene was edited), so this operation can't make search any worse."
+        : "This scene has a language field. This operation changes the gaussian count, so search and paint will stop working until the language field is rebuilt."}
     </p>
   );
 }
@@ -56,7 +57,9 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
   const [warnings, setWarnings] = useState<string[]>([]);
   // Snapshot seq of the last successful lane apply → the shared Undo target.
   const [lastVersion, setLastVersion] = useState<number | null>(null);
-  const [madeStale, setMadeStale] = useState(false);
+  // Langfield staleness is NOT tracked locally: `job.langfield_stale` arrives
+  // via the status poll (STALE-marker truth, same source as the 409 guard),
+  // so it survives reloads and sees edits made from other tabs/tools.
 
   // Decimate: pct is the percentage of gaussians KEPT (splat-transform -F n%
   // — "Use n% to keep a percentage of Gaussians"), not removed.
@@ -93,7 +96,7 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
     ? `/supersplat/?load=${encodeURIComponent(job.preview_file_url)}&filename=${encodeURIComponent(`${job.job_id}.ply`)}`
     : null;
 
-  async function runApply(kind: Exclude<PendingOp, "undo" | null>, ops: SplatEditOp[], describe: (resp: SplatEditApplyResponse) => string, changesTopology: boolean) {
+  async function runApply(kind: Exclude<PendingOp, "undo" | null>, ops: SplatEditOp[], describe: (resp: SplatEditApplyResponse) => string) {
     setPending(kind);
     setError(null);
     setWarnings([]);
@@ -101,7 +104,6 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
       const resp = await applyEditOps(job.job_id, ops);
       setLastVersion(resp.version_before);
       setWarnings(resp.warnings ?? []);
-      if (changesTopology && job.langfield_available) setMadeStale(true);
       toast(describe(resp), "success");
       void qc.invalidateQueries({ queryKey: ["edit-versions", job.job_id] });
       onEdited?.();
@@ -125,11 +127,11 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
 
   function runFloaters() {
     // {} → the splat-transform CLI's own -G defaults (backend passes through).
-    void runApply("floaters", [{ type: "filter_floaters" }], (resp) => removalToast(resp, "Removed"), true);
+    void runApply("floaters", [{ type: "filter_floaters" }], (resp) => removalToast(resp, "Removed"));
   }
 
   function runDecimate() {
-    void runApply("decimate", [{ type: "decimate", pct: keepPct }], (resp) => removalToast(resp, "Merged away"), true);
+    void runApply("decimate", [{ type: "decimate", pct: keepPct }], (resp) => removalToast(resp, "Merged away"));
   }
 
   // Batch only the non-identity ops into ONE apply call. Backend executes ops
@@ -163,11 +165,12 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
   function runTransform() {
     const ops = buildTransformOps();
     if (typeof ops === "string" || ops.length === 0) return;
+    // Rigid translate/rotate/scale do NOT invalidate the language field —
+    // the backend won't write a STALE marker, so the poll won't flag one.
     void runApply(
       "transform",
       ops,
       (resp) => `Transform applied (${ops.map((o) => o.type).join(" → ")}) · restore point v${resp.version_before} saved`,
-      false, // rigid translate/rotate/scale do NOT invalidate the language field
     );
   }
 
@@ -178,7 +181,6 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
     try {
       const resp = await revertEdit(job.job_id, lastVersion);
       setLastVersion(null);
-      setMadeStale(false);
       setWarnings([]);
       toast(`Restored v${resp.reverted_to} (${resp.restored_files.length} files)`, "success");
       void qc.invalidateQueries({ queryKey: ["edit-versions", job.job_id] });
@@ -238,10 +240,10 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
           </Button>
         </div>
       )}
-      {madeStale && (
+      {job.langfield_stale && (
         <p className="text-[11px] leading-snug text-amber-300/90">
-          Language field is stale — the scene was edited after the field was built. Re-run the language field
-          for this scene to search it again.
+          Language field is stale — the scene was edited after the field was built. Re-run this scene with
+          Language search on to rebuild it (retrains the scene).
         </p>
       )}
 
@@ -255,7 +257,7 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
           defaults). There's no live preview for this one — you'll get the exact removed count afterward,
           and Undo brings it all back.
         </p>
-        {job.langfield_available && <LangfieldTopologyWarning />}
+        {job.langfield_available && <LangfieldTopologyWarning stale={Boolean(job.langfield_stale)} />}
         <Button type="button" size="sm" className="mt-2 w-full" onClick={runFloaters} disabled={busy}>
           {pending === "floaters" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wand2 className="h-3.5 w-3.5" />}
           Clean up floaters
@@ -292,7 +294,7 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
             ? `~${estRemaining.toLocaleString()} of ${gaussians!.toLocaleString()} splats would remain.`
             : "Splat count unknown for this scene — the result count shows after applying."}
         </p>
-        {job.langfield_available && <LangfieldTopologyWarning />}
+        {job.langfield_available && <LangfieldTopologyWarning stale={Boolean(job.langfield_stale)} />}
         <Button
           type="button"
           size="sm"

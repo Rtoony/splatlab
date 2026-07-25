@@ -48,6 +48,10 @@ export interface SplatJob {
   // scenes (which never carry them) keep deserializing unchanged.
   language_field?: boolean;
   langfield_available?: boolean;
+  // A geometry edit invalidated the built field (on-disk STALE marker — the
+  // exact same truth source the backend's 409 guard checks). Polled via
+  // /status, so the UI never has to track "did I just make it stale" locally.
+  langfield_stale?: boolean;
   // Opt-in splat→mesh export (Digital Twin kernel) — optional for the same reason.
   mesh_export?: boolean;
   mesh_file_url?: string | null;
@@ -499,6 +503,25 @@ export interface SplatGpuHolder {
   job_id: string | null;
   since: string | null;
   locked: boolean;
+}
+
+// GET /api/splat/activity (backend/activity_route.py): live "what is busy
+// RIGHT NOW" snapshot from the backend's own in-process locks + the GPU lease.
+// Sparse by contract: only HELD flags appear, and only busy jobs appear in
+// `jobs` — a job with nothing in flight is simply absent.
+export interface SplatActivityJobFlags {
+  editing?: boolean; // mutating scene edit (apply/semantic/merge/restore)
+  preview_exporting?: boolean; // ns-export preview regeneration
+  meshing?: boolean; // mesh, object-isolate, AND scene-lane (P6) builds — one shared lock
+  exporting?: boolean; // portable SPZ/SOG/glTF + collision + Unreal bundle
+}
+
+export interface SplatActivityResponse {
+  gpu: {
+    // null when nobody holds the GPU lease.
+    holder: { lane: string; job_id: string | null; since: string | null } | null;
+  };
+  jobs: Record<string, SplatActivityJobFlags>;
 }
 
 export interface SplatComputeStatus {

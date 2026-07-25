@@ -273,10 +273,9 @@ export function SparkSceneViewer({
   const [cropError, setCropError] = useState<string | null>(null);
   const [cropLastVersion, setCropLastVersion] = useState<number | null>(null);
   const [cropUndoBusy, setCropUndoBusy] = useState(false);
-  // Set right after a successful crop iff this scene had a language field at
-  // that moment — `job.langfield_available` (poll-derived) doesn't flip when
-  // the backend marks the field STALE, so it can't be used to detect this.
-  const [cropMadeStale, setCropMadeStale] = useState(false);
+  // Langfield staleness is read from `job.langfield_stale` (status poll —
+  // STALE-marker truth, same source as the backend's 409 guard), never
+  // tracked locally: it survives reloads and sees edits from other tools.
 
   // crop to box (sibling of crop-to-sphere; same destructive/versioned flow).
   // Backend semantics: crop_box → splat-transform -B, which KEEPS everything
@@ -298,7 +297,6 @@ export function SparkSceneViewer({
   const [boxError, setBoxError] = useState<string | null>(null);
   const [boxLastVersion, setBoxLastVersion] = useState<number | null>(null);
   const [boxUndoBusy, setBoxUndoBusy] = useState(false);
-  const [boxMadeStale, setBoxMadeStale] = useState(false);
 
   // External-edit reload (Edit lane): reuse the crop tools' exact reload path
   // — bump reloadNonce so `url` changes and the mesh-load effect re-runs.
@@ -919,7 +917,6 @@ export function SparkSceneViewer({
       }
       const data = (await resp.json()) as { version_before: number };
       setCropLastVersion(data.version_before);
-      setCropMadeStale(job.langfield_available ?? false);
       setCropMode(false);
       setReloadNonce((n) => n + 1);
     } catch (cause) {
@@ -947,7 +944,6 @@ export function SparkSceneViewer({
         throw new Error(detail);
       }
       setCropLastVersion(null);
-      setCropMadeStale(false);
       setReloadNonce((n) => n + 1);
     } catch (cause) {
       setCropError(cause instanceof Error ? cause.message : "Undo failed.");
@@ -973,7 +969,6 @@ export function SparkSceneViewer({
         { type: "crop_box", min: [cx - ex, cy - ey, cz - ez], max: [cx + ex, cy + ey, cz + ez] },
       ]);
       setBoxLastVersion(resp.version_before);
-      setBoxMadeStale(job.langfield_available ?? false);
       setBoxMode(false);
       setReloadNonce((n) => n + 1);
     } catch (cause) {
@@ -990,7 +985,6 @@ export function SparkSceneViewer({
     try {
       await revertEdit(job.job_id, boxLastVersion);
       setBoxLastVersion(null);
-      setBoxMadeStale(false);
       setReloadNonce((n) => n + 1);
     } catch (cause) {
       setBoxError(cause instanceof Error ? cause.message : "Undo failed.");
@@ -2263,12 +2257,6 @@ export function SparkSceneViewer({
               </>
             )}
             {cropError && <p className="text-[10px] leading-snug text-rose-300/90">{cropError}</p>}
-            {cropMadeStale && (
-              <p className="text-[10px] leading-snug text-amber-300/90">
-                Language field is stale — the scene was edited after the field was built. Re-run the language
-                field for this scene to search it again.
-              </p>
-            )}
 
             <div className="h-px bg-white/10" />
             <SectionLabel>Crop to box</SectionLabel>
@@ -2351,10 +2339,12 @@ export function SparkSceneViewer({
               </>
             )}
             {boxError && <p className="text-[10px] leading-snug text-rose-300/90">{boxError}</p>}
-            {boxMadeStale && (
+            {/* Polled truth, one shared note for both crop tools — shows for
+                ANY stale-making edit (this tab, the Edit lane, another tab). */}
+            {job.langfield_stale && (
               <p className="text-[10px] leading-snug text-amber-300/90">
-                Language field is stale — the scene was edited after the field was built. Re-run the language
-                field for this scene to search it again.
+                Language field is stale — the scene was edited after the field was built. Re-run this scene
+                with Language search on to rebuild it (retrains the scene).
               </p>
             )}
           </>
