@@ -341,6 +341,62 @@ def test_objects_finish_no_smooth_flags_when_not_requested(client, monkeypatch):
     assert "--smooth" not in finish_call
 
 
+def test_objects_listing_unknown_job_404(client):
+    http, outputs = client
+    r = http.get("/api/splat/jobs/splat_00000bad/objects")
+    assert r.status_code == 404
+
+
+def test_objects_listing_empty(client):
+    http, outputs = client
+    _mk_job(outputs)
+    r = http.get("/api/splat/jobs/splat_0b0001/objects")
+    assert r.status_code == 200
+    assert r.json() == {"job_id": "splat_0b0001", "objects": []}
+
+
+def test_objects_listing_after_build(client, monkeypatch):
+    """Splat-only build -> one entry carrying the receipt summary (no raw
+    'artifacts' passthrough) and files{} limited to what exists on disk; the
+    listed URL must be servable by the real file route."""
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(job_dir, calls))
+    assert http.post("/api/splat/jobs/splat_0b0001/objects",
+                     json={"query": "Round Wooden Table!", "mesh": False}).status_code == 200
+
+    r = http.get("/api/splat/jobs/splat_0b0001/objects")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["job_id"] == "splat_0b0001"
+    assert len(body["objects"]) == 1
+    entry = body["objects"][0]
+    assert entry["slug"] == "round-wooden-table"
+    assert entry["pool_members"] == 1801           # receipt summary fields surface
+    assert "artifacts" in OBJ_REPORT and "artifacts" not in entry
+    # splat-only build: object.ply exists, mesh/twin/proxy artifacts do not
+    assert set(entry["files"]) == {"splat"}
+    assert http.get(entry["files"]["splat"]).status_code == 200
+
+    # a stray dir without an object.json is a half-built isolation, not listable
+    (job_dir / splat_route.OBJECTS_DIRNAME / "aborted-thing").mkdir()
+    assert len(http.get("/api/splat/jobs/splat_0b0001/objects").json()["objects"]) == 1
+
+
+def test_objects_listing_full_build_file_subset(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(job_dir, calls))
+    assert http.post("/api/splat/jobs/splat_0b0001/objects",
+                     json={"query": "table", "finish": True}).status_code == 200
+    entry = http.get("/api/splat/jobs/splat_0b0001/objects").json()["objects"][0]
+    # mesh+finish artifacts present; proxy formats absent (never built)
+    assert set(entry["files"]) == {"splat", "ply", "glb", "receipt", "twin", "twin-top", "twin-oblique"}
+    assert entry["files"]["twin"].endswith("/objects/table/file?fmt=twin")
+
+
 def test_objects_finish_failure_is_loud_500(client, monkeypatch):
     """A failed finish must not roll back the already-succeeded raw mesh
     artifacts -- they were a complete, valid build on their own."""

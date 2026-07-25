@@ -1142,6 +1142,14 @@ def _scene_stats(job_id: str, output_dir: Path, meta: dict[str, Any]) -> dict[st
     return stats
 
 
+def _langfield_is_stale(lfdir: Path) -> bool:
+    """True iff a geometry edit wrote the STALE marker after the language field
+    was built (edit_ops._mark_langfield_stale). The exact same path check
+    _langfield_stale_guard 409s on — factored out so /status can report
+    staleness without the frontend having to trigger a 409 to learn it."""
+    return (lfdir / "STALE").is_file()
+
+
 def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
     job_id = meta["job_id"]
     output_dir = Path(meta["output_dir"])
@@ -1174,6 +1182,10 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
         # Opt-in language field: a built per-gaussian feature sidecar exists -> the
         # scene is text-searchable (the viewer shows the query UI when this is true).
         "langfield_available": langfield_built,
+        # A geometry edit invalidated the built field (STALE marker on disk) —
+        # langfield/object routes will 409 until it is rebuilt. Lets the UI show
+        # "rebuild needed" instead of discovering staleness via a 409.
+        "langfield_stale": _langfield_is_stale(output_dir / LANGFIELD_DIRNAME),
         # Client-side heatmap splat: SH-stripped, FULL count, row order == gauss_emb.npz.
         # fmt=langweb falls back to the raw .ply server-side (same order), so this is
         # offered whenever the scene has both a preview and a built language field.
@@ -4789,6 +4801,45 @@ async def get_splat_object_file(
     return FileResponse(str(path), media_type=media, filename=f"{job_id}-{slug}.{suffix}")
 
 
+@router.get("/jobs/{job_id}/objects")
+async def list_splat_objects(job_id: str):
+    """Read-only companion to POST /objects: enumerate every built object for a
+    scene by scanning <job_dir>/_objects/*/object.json (the isolation receipt the
+    build wrote). Each entry carries the receipt's summary fields plus a files{}
+    map of only the formats whose artifacts actually exist on disk right now,
+    with the same per-format URLs get_splat_object_file serves."""
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    output_dir = Path(meta["output_dir"])
+    objects: list[dict[str, Any]] = []
+    objects_dir = output_dir / OBJECTS_DIRNAME
+    if objects_dir.is_dir():
+        for obj_dir in sorted(objects_dir.iterdir()):
+            slug = obj_dir.name
+            receipt_path = obj_dir / "object.json"
+            # Same slug discipline as the file route; a dir without a receipt is
+            # a half-built/aborted isolation, not a listable object.
+            if not obj_dir.is_dir() or _object_slug(slug) != slug or not receipt_path.is_file():
+                continue
+            try:
+                receipt = json.loads(receipt_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            base = f"/api/splat/jobs/{job_id}/objects/{slug}/file"
+            entry = {k: v for k, v in receipt.items() if k != "artifacts"}
+            entry["slug"] = slug
+            entry["files"] = {
+                fmt: f"{base}?fmt={fmt}"
+                for fmt, (rel, _media) in _OBJECT_FILES.items()
+                if (obj_dir / rel).is_file()
+            }
+            objects.append(entry)
+    return {"job_id": job_id, "objects": objects}
+
+
 # ── P6b: scene instance inventory (SAM3/TRELLIS-class scene regeneration) ────────
 # Enumerates EVERY distinct object in a scene, not just one named query — the
 # P5b/P5c isolate->proxy pipeline generalized across the whole capture. Real
@@ -5717,7 +5768,7 @@ async def get_splat_mesh_file(job_id: str, fmt: Literal["ply", "glb", "twin"] = 
 def _langfield_stale_guard(lfdir: Path) -> None:
     """A geometry edit (edit_ops) row-masked splat.ply after the field was built, so
     gauss_emb.npz rows no longer match the scene. Refuse to serve misaligned results."""
-    if (lfdir / "STALE").is_file():
+    if _langfield_is_stale(lfdir):
         raise HTTPException(
             status_code=409,
             detail="Language field is stale (the scene was edited after the field was "

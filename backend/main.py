@@ -32,6 +32,7 @@ import edit_ops  # noqa: E402  (scene editing: snapshots, splat-transform ops, s
 import geo_route  # noqa: E402  (locate-in-the-world: geo anchor, map footprint, GPS suggest, exports)
 import dimensions_route  # noqa: E402  (survey dimensions: pure-stdlib manifest CRUD, no GPU/ML)
 import export_route  # noqa: E402  (portable splat formats, collision, and Unreal handoff)
+import activity_route  # noqa: E402  (read-only busy-now snapshot: GPU holder + held per-job locks)
 import feedback  # noqa: E402  (small SQLite-backed in-app feedback loop)
 import thumb as thumbgen  # noqa: E402  (scene thumbnail generator)
 
@@ -176,6 +177,9 @@ app.include_router(dimensions_route.router, prefix="/api/splat", dependencies=[D
 
 # Portable SPZ/SOG/glTF, collision, and Unreal 5.6 handoff artifacts.
 app.include_router(export_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
+
+# Read-only live-activity snapshot (GPU lease holder + held per-job op locks).
+app.include_router(activity_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
 
 # Feedback is Splatlab-native runtime data, also gated by the same signed cookie.
 app.include_router(feedback.router, dependencies=[Depends(require_auth)])

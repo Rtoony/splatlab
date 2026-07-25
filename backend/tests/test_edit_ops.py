@@ -744,6 +744,9 @@ def test_semantic_delete_dequantizes_with_worker_headers(
     monkeypatch.setattr(edit_ops, "_worker_has_relevancy_endpoint", fake_has)
     monkeypatch.setattr(edit_ops, "_post_worker_relevancy", fake_post)
 
+    # status-payload staleness flag: field built, nothing edited yet -> False
+    assert splat_route._job_payload(splat_route._read_meta(job_id))["langfield_stale"] is False
+
     payload = {"text": "chair", "threshold": 0.45, "mode": "delete", "cleanup": False}
     resp = client.post(f"/api/splat/jobs/{job_id}/edit/semantic", json=payload)
     assert resp.status_code == 200, resp.text
@@ -762,6 +765,8 @@ def test_semantic_delete_dequantizes_with_worker_headers(
     resp2 = client.post(f"/api/splat/jobs/{job_id}/edit/semantic", json=payload)
     assert resp2.status_code == 409
     assert "stale" in resp2.json()["detail"]
+    # ...and /status now carries the same fact WITHOUT anyone triggering a 409
+    assert splat_route._job_payload(splat_route._read_meta(job_id))["langfield_stale"] is True
 
 
 def test_semantic_rejects_stale_language_field(
