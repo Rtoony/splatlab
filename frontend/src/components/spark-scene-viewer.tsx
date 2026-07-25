@@ -24,7 +24,7 @@ import type {
   ViewerHighlight,
   ViewerOverlay,
   ViewerPoint,
-} from "@/components/splat-viewer";
+} from "@/components/viewer-types";
 import { Button, Input, SectionLabel } from "@/components/ui";
 import { Box, Download, Loader2, Paintbrush, Plus, Ruler, Scissors, Trash2, Undo2, X } from "lucide-react";
 

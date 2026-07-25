@@ -1,11 +1,16 @@
-import { useState } from "react";
+import { Suspense, lazy, useState } from "react";
 import type { SplatJob } from "@/lib/contracts";
 import { Badge, Button, Card, SectionLabel } from "@/components/ui";
-import { SplatViewer } from "@/components/splat-viewer";
 import { DownloadMenu } from "@/components/gallery/download-menu";
 import { SceneCard } from "@/components/gallery/scene-card";
 import { CaptureHealthCard } from "@/components/jobs/capture-health-card";
 import { Orbit } from "lucide-react";
+
+// Featured live preview — lazy so the 3D engine chunk never loads unless a
+// previewable scene exists on the landing page.
+const SparkSceneViewer = lazy(() =>
+  import("@/components/spark-scene-viewer").then((m) => ({ default: m.SparkSceneViewer })),
+);
 
 // ── results gallery ───────────────────────────────────────────────────────────
 export function ResultsGallery({
@@ -40,7 +45,11 @@ export function ResultsGallery({
 
       {featuredJob?.preview_web_url && (
         <Card className="mb-4 overflow-hidden">
-          <SplatViewer url={featuredJob.preview_web_url} format="ply" />
+          <div className="relative h-[420px] overflow-hidden">
+            <Suspense fallback={<div className="flex h-full items-center justify-center text-xs uppercase tracking-[0.3em] text-zinc-600">Loading viewer…</div>}>
+              <SparkSceneViewer key={featuredJob.job_id} job={featuredJob} toolsVisible={false} safeMode={computeBlocked} />
+            </Suspense>
+          </div>
           <div className="flex items-center justify-between gap-2 p-3">
             <p className="truncate text-sm text-zinc-300">{featuredJob.input_path.split("/").pop()}</p>
             <div className="flex items-center gap-2">

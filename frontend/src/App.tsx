@@ -9,7 +9,6 @@ const ScenesPage = lazy(() => import("@/pages/scenes"));
 const NewCapturePage = lazy(() => import("@/pages/new-capture"));
 const SplatViewPage = lazy(() => import("@/pages/splat-view"));
 const FeedbackPage = lazy(() => import("@/pages/feedback"));
-const SparkTestPage = lazy(() => import("@/pages/spark-test"));
 
 function Loading() {
   return (
@@ -45,9 +44,6 @@ export default function App() {
           {/* Fullscreen workspace — no app shell. */}
           <Route path="/view/:jobId">
             <SplatViewPage />
-          </Route>
-          <Route path="/spark-test">
-            <SparkTestPage />
           </Route>
           <Route path="/feedback">
             <AppShell>

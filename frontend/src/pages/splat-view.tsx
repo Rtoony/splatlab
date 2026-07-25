@@ -10,7 +10,7 @@ import type {
   SplatJob,
   SplatStatusResponse,
 } from "@/lib/contracts";
-import { SplatViewer, type ViewerCameraNodeTarget, type ViewerCameraPose, type ViewerCameraViewTarget, type ViewerHighlight, type ViewerOverlay } from "@/components/splat-viewer";
+import type { ViewerCameraNodeTarget, ViewerCameraPose, ViewerCameraViewTarget, ViewerHighlight, ViewerOverlay } from "@/components/viewer-types";
 import { Button, Card, DropdownItem, DropdownMenu, DropdownSeparator, Input, SectionLabel, Tabs, TabsList, TabsTrigger } from "@/components/ui";
 import { EditLane } from "@/components/workspace/edit-lane";
 import { ExportLane } from "@/components/workspace/export-lane";
@@ -52,13 +52,9 @@ export default function SplatViewPage() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [shortcutLegendOpen, setShortcutLegendOpen] = useState(false);
   const [resetViewToken, setResetViewToken] = useState(0);
-  // Spark cutover: default ON. Absent key => Spark; explicit "0" => classic
-  // (sticky per browser). `?viewer=classic` forces classic for THIS load only
-  // — deliberately not persisted — as an escape hatch while classic exists.
-  const [sparkBeta, setSparkBeta] = useState(() => {
-    if (new URLSearchParams(window.location.search).get("viewer") === "classic") return false;
-    return localStorage.getItem("splatlab.sparkBeta") !== "0";
-  });
+  // Spark is THE viewer (classic deleted, wave 7.1). A viewer crash renders a
+  // recover card instead of silently falling back.
+  const [viewerError, setViewerError] = useState<string | null>(null);
   const [geoOpen, setGeoOpen] = useState(false);
   const [sectionsOpen, setSectionsOpen] = useState(false);
   const [sceneRegenOpen, setSceneRegenOpen] = useState(false);
@@ -79,18 +75,6 @@ export default function SplatViewPage() {
     setEditReloadToken((t) => t + 1);
     void queryClient.invalidateQueries({ queryKey: ["status"] });
   }
-  function toggleSparkBeta() {
-    setSparkBeta((v) => {
-      localStorage.setItem("splatlab.sparkBeta", v ? "0" : "1");
-      return !v;
-    });
-  }
-
-  function fallBackFromSpark() {
-    localStorage.setItem("splatlab.sparkBeta", "0");
-    setSparkBeta(false);
-  }
-
   const { data: cameras, isFetching: camerasLoading, error: camerasError } = useQuery({
     queryKey: ["cameras", jobId],
     queryFn: () => fetchSplatCameras(jobId),
@@ -290,9 +274,6 @@ export default function SplatViewPage() {
               <DropdownItem onSelect={resetToDefaultView}>Reset view</DropdownItem>
               <DropdownItem onSelect={enableAdvancedView}>Advanced view</DropdownItem>
               <DropdownSeparator />
-              <DropdownItem onSelect={toggleSparkBeta}>
-                {sparkBeta ? "Switch to classic viewer" : "Switch to Spark viewer"}
-              </DropdownItem>
               {job.preview_file_url && (
                 <DropdownItem onSelect={() => window.open(job.preview_file_url!, "_blank")}>
                   Download full-quality .ply
@@ -412,14 +393,29 @@ export default function SplatViewPage() {
           </Centered>
         ) : (
           <>
-            {sparkBeta ? (
+            {viewerError ? (
+              <Centered>
+                <div className="max-w-md text-center">
+                  <p className="font-semibold text-zinc-200">The 3D viewer failed to load.</p>
+                  <p className="mt-1 break-all font-mono text-xs text-zinc-500">{viewerError}</p>
+                  <button
+                    type="button"
+                    onClick={() => window.location.reload()}
+                    className="mt-3 rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-accent-ink hover:bg-accent-hover"
+                  >
+                    Reload
+                  </button>
+                  <p className="mt-2 text-[11px] text-zinc-600">If this keeps happening, file it via Feedback (⋯ menu on Scenes).</p>
+                </div>
+              </Centered>
+            ) : (
               <SparkSceneViewer
                 key={job.job_id}
                 job={job}
                 toolsVisible={mode === "measure"}
                 safeMode={computeBlocked}
                 computeReason={computeReason}
-                onViewerError={fallBackFromSpark}
+                onViewerError={setViewerError}
                 focus={flyTarget}
                 overlay={overlay}
                 highlights={highlights}
@@ -429,23 +425,6 @@ export default function SplatViewPage() {
                 resetViewToken={resetViewToken}
                 showShortcutLegend={shortcutLegendOpen}
                 reloadToken={editReloadToken}
-                onPickMatch={setActiveIdx}
-                onPickCamera={zoomToCamera}
-              />
-            ) : (
-              <SplatViewer
-                url={viewUrl}
-                format="ply"
-                fill
-                fallbackImageUrl={`/api/splat/jobs/${job.job_id}/thumbnail`}
-                focus={flyTarget}
-                overlay={overlay}
-                highlights={highlights}
-                cameraOverlay={cameraOverlay}
-                viewCamera={cameraViewTarget}
-                cameraNodeTarget={cameraNodeTarget}
-                resetViewToken={resetViewToken}
-                showShortcutLegend={shortcutLegendOpen}
                 onPickMatch={setActiveIdx}
                 onPickCamera={zoomToCamera}
               />
@@ -475,8 +454,8 @@ export default function SplatViewPage() {
                 open={inventoryOpen}
                 onOpenChange={setInventoryOpen}
                 colorFor={colorFor}
-                // Spark's own control panel owns left-3 top-3; sit just right of it.
-                positionClassName={sparkBeta ? "left-[21.5rem]" : "left-3"}
+                // Spark's control panel owns left-3 top-3; sit just right of it.
+                positionClassName="left-[21.5rem]"
                 onToggle={(label) =>
                   setActiveLabels((prev) => {
                     const next = new Set(prev);
@@ -487,14 +466,6 @@ export default function SplatViewPage() {
                 onZoom={(it) => setFlyTarget({ point: it.focus, radius: it.radius })}
                 onClear={() => setActiveLabels(new Set())}
               />
-            )}
-            {!sparkBeta && job.langfield_available && computeBlocked && (
-              <div className="pointer-events-none absolute inset-x-0 bottom-0 z-30 flex justify-center p-3 sm:p-4">
-                <Card className="pointer-events-auto max-w-lg border-amber-300/25 bg-[#070b14]/85 p-3 text-xs text-amber-100 backdrop-blur-md">
-                  Real language search is blocked by the current hardware gate. Turn on Spark beta to use safe test
-                  search overlays without starting the LangField worker.
-                </Card>
-              </div>
             )}
             {job.langfield_available && !computeBlocked && (
               <LangfieldSearch
@@ -514,14 +485,6 @@ export default function SplatViewPage() {
               />
             )}
           </>
-        )}
-        {job && viewUrl && mode === "measure" && !sparkBeta && (
-          <div className="absolute left-1/2 top-4 z-30 w-full max-w-md -translate-x-1/2 px-4">
-            <Card className="border-cyan-400/30 bg-cyan-950/80 p-3 text-center text-xs text-cyan-100">
-              Measure, heatmap, and crop tools run in the Spark viewer. Switch via the ⋯ menu
-              (or reload without <span className="font-mono">?viewer=classic</span>).
-            </Card>
-          </div>
         )}
         {job && viewUrl && (mode === "edit" || mode === "export" || mode === "objects") && (
           <aside className="absolute bottom-0 right-0 top-0 z-30 w-[24rem] max-w-full overflow-y-auto border-l border-white/10 bg-surface/95 backdrop-blur-md">
