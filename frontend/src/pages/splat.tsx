@@ -3,23 +3,36 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/api";
 import { setSplatlabFeedbackContext } from "@/lib/feedback-context";
 import { DownloadMenu } from "@/components/gallery/download-menu";
+import { ComputeGateBanner } from "@/components/compute-gate-banner";
+import { UploadBox } from "@/components/create/upload-box";
+import { TransfersPicker } from "@/components/create/transfers-picker";
 import type {
   SplatJob,
   SplatPrecheckResult,
   SplatStatusResponse,
-  SplatTransferEntry,
   SplatTransfersResponse,
   SplatUploadResult,
 } from "@/lib/contracts";
 import { Badge, Button, Card, SectionLabel, useToast } from "@/components/ui";
 import { SplatViewer } from "@/components/splat-viewer";
 import {
+  MAX_ITERS,
+  MIN_ITERS,
+  QUALITY,
+  STAGE_ORDER,
+  humanizeStage,
+  presetForIters,
+  stageShort,
+  trainMinutes,
+} from "@/lib/stage-meta";
+import type { QualityKey } from "@/lib/stage-meta";
+import { fmtCount, relTime, sceneHue } from "@/lib/format";
+import {
   AlertTriangle,
   Box,
   Camera,
   CheckCircle2,
   Cpu,
-  FolderOpen,
   Loader2,
   MapPin,
   Orbit,
@@ -29,93 +42,11 @@ import {
   Trash2,
   Sparkles,
   Square,
-  UploadCloud,
   Wand2,
   X,
   Layers,
   ShieldCheck,
 } from "lucide-react";
-
-// ── pipeline metadata ────────────────────────────────────────────────────────
-const STAGE_ORDER = ["stitch", "process", "train", "langfield", "export", "health", "compress", "webopt", "mesh"];
-const STAGE_HUMAN: Record<string, string> = {
-  stitch: "Unwrapping 360 footage",
-  process: "Finding camera positions",
-  glomap_sfm: "Re-solving with global SfM",
-  rig_sfm: "Solving 360 rig geometry",
-  mast3r_sfm: "Re-solving with MASt3R (pose-free)",
-  train: "Building the 3D scene",
-  langfield: "Building the language field",
-  export: "Finishing the scene",
-  health: "Checking capture health",
-  compress: "Compressing",
-  webopt: "Preparing web viewer",
-  mesh: "Extracting triangle mesh",
-};
-const STAGE_SHORT: Record<string, string> = {
-  stitch: "Stitch",
-  process: "Process",
-  glomap_sfm: "Global SfM",
-  rig_sfm: "360 rig",
-  mast3r_sfm: "MASt3R",
-  train: "Train",
-  langfield: "Language field",
-  export: "Export",
-  health: "Health",
-  compress: "Compress",
-  webopt: "Web",
-  mesh: "Mesh",
-};
-// An auto-fallback solver's process step is named "reprocess<n>" on the backend so
-// it never collides with the original "process" stage key — label it like Process.
-function stageShort(s: string): string {
-  return STAGE_SHORT[s] || (s.startsWith("reprocess") ? "Process" : s);
-}
-function stageHuman(s: string): string {
-  return STAGE_HUMAN[s] || (s.startsWith("reprocess") ? "Finding camera positions" : s);
-}
-const QUALITY = {
-  draft: { label: "Draft", iterations: 7000, blurb: "~2 min" },
-  standard: { label: "Standard", iterations: 30000, blurb: "~6 min" },
-  high: { label: "High detail", iterations: 50000, blurb: "~10 min" },
-} as const;
-type QualityKey = keyof typeof QUALITY;
-
-function humanizeStage(job: SplatJob): string {
-  if (job.status === "starting") return "Getting started…";
-  return job.stage ? stageHuman(job.stage) : "Working…";
-}
-function relTime(value: string | null): string {
-  if (!value) return "—";
-  const d = new Date(value).getTime();
-  const s = Math.max(0, (Date.now() - d) / 1000);
-  if (s < 60) return "just now";
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
-  return `${Math.floor(s / 86400)}d ago`;
-}
-
-const MIN_ITERS = 1000;
-const MAX_ITERS = 50000;
-// Rough training-time estimate (5090): ~1 min overhead + ~1 min / 5k iters.
-function trainMinutes(iters: number): number {
-  return Math.max(2, Math.round(1 + iters / 5000));
-}
-function presetForIters(iters: number): QualityKey | null {
-  return (Object.keys(QUALITY) as QualityKey[]).find((k) => QUALITY[k].iterations === iters) ?? null;
-}
-function sceneHue(id: string): number {
-  let h = 0;
-  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) % 360;
-  return h;
-}
-
-// Compact count: 1284773 -> "1.3M", 608501 -> "609k".
-function fmtCount(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
-  return String(n);
-}
 
 // ── page ──────────────────────────────────────────────────────────────────────
 export default function SplatLabPage() {
@@ -761,220 +692,6 @@ export default function SplatLabPage() {
         onPin={(j) => pinMutation.mutate(j)}
         onDelete={(id) => deleteMutation.mutate(id)}
       />
-    </div>
-  );
-}
-
-function ComputeGateBanner({ compute }: { compute: SplatStatusResponse["compute"] }) {
-  if (!compute) return null;
-  if (compute.enabled && compute.mode === "supervised" && compute.supervised_unlock?.active) {
-    const minutes = Math.max(0, Math.ceil((compute.supervised_unlock.seconds_remaining ?? 0) / 60));
-    return (
-      <Card className="mb-5 border-emerald-500/30 bg-emerald-500/10 p-4">
-        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-          <div className="flex min-w-0 gap-3">
-            <Cpu className="mt-0.5 h-5 w-5 shrink-0 text-emerald-300" />
-            <div className="min-w-0">
-              <p className="text-sm font-semibold text-emerald-100">Supervised compute is armed</p>
-              <p className="mt-1 text-sm text-emerald-100/80">
-                One SplatLab GPU job can run during this test window. Expires in about {minutes} minute{minutes === 1 ? "" : "s"}.
-              </p>
-              <p className="mt-1 truncate font-mono text-[11px] text-emerald-100/50">{compute.unlock_path || compute.supervised_unlock.path}</p>
-            </div>
-          </div>
-          <div className="grid gap-2 text-xs text-emerald-100/80 sm:grid-cols-2 md:w-[520px]">
-            <div className="rounded-xl border border-emerald-400/20 bg-black/20 p-2.5">
-              <p className="mb-1 font-semibold text-emerald-100">Available now</p>
-              <p>{compute.safe_capabilities.slice(0, 3).join(" · ")}</p>
-            </div>
-            <div className="rounded-xl border border-emerald-400/20 bg-black/20 p-2.5">
-              <p className="mb-1 font-semibold text-emerald-100">Still held back</p>
-              <p>{compute.blocked_capabilities.slice(0, 3).join(" · ")}</p>
-            </div>
-          </div>
-        </div>
-      </Card>
-    );
-  }
-  if (compute.enabled) return null;
-  return (
-    <Card className="mb-5 border-amber-500/30 bg-amber-500/10 p-4">
-      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-        <div className="flex min-w-0 gap-3">
-          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-300" />
-          <div className="min-w-0">
-            <p className="text-sm font-semibold text-amber-100">SplatLab is open in safe browse mode</p>
-            <p className="mt-1 text-sm text-amber-100/80">
-              GPU generation and scene mutations are blocked by the hardware-maintenance gate:{" "}
-              {compute.reason || "hardware maintenance is active."}
-            </p>
-            <p className="mt-1 truncate font-mono text-[11px] text-amber-100/50">{compute.marker_path}</p>
-          </div>
-        </div>
-        <div className="grid gap-2 text-xs text-amber-100/80 sm:grid-cols-2 md:w-[520px]">
-          <div className="rounded-xl border border-amber-400/20 bg-black/20 p-2.5">
-            <p className="mb-1 font-semibold text-amber-100">Available now</p>
-            <p>{compute.safe_capabilities.slice(0, 3).join(" · ")}</p>
-          </div>
-          <div className="rounded-xl border border-amber-400/20 bg-black/20 p-2.5">
-            <p className="mb-1 font-semibold text-amber-100">Paused</p>
-            <p>{compute.blocked_capabilities.slice(0, 3).join(" · ")}</p>
-          </div>
-        </div>
-      </div>
-    </Card>
-  );
-}
-
-// ── upload ────────────────────────────────────────────────────────────────────
-function UploadBox({
-  onUploaded,
-  onError,
-  current,
-  disabled,
-  disabledReason,
-}: {
-  onUploaded: (r: SplatUploadResult) => void;
-  onError: (m: string) => void;
-  current: SplatUploadResult | null;
-  disabled: boolean;
-  disabledReason: string;
-}) {
-  const [pct, setPct] = useState<number | null>(null);
-  const inputRef = useRef<HTMLInputElement | null>(null);
-
-  function upload(file: File) {
-    if (disabled) {
-      onError(disabledReason);
-      return;
-    }
-    const form = new FormData();
-    form.append("file", file);
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/splat/upload");
-    xhr.upload.onprogress = (e) => e.lengthComputable && setPct(Math.round((e.loaded / e.total) * 100));
-    xhr.onload = () => {
-      setPct(null);
-      if (xhr.status >= 200 && xhr.status < 300) onUploaded(JSON.parse(xhr.responseText));
-      else onError(`Upload failed (${xhr.status}). Files >100 MB? Use Transfers below.`);
-    };
-    xhr.onerror = () => {
-      setPct(null);
-      onError("Upload failed. For large captures, drop into ~/transfers below.");
-    };
-    setPct(0);
-    xhr.send(form);
-  }
-
-  return (
-    <div
-      onDragOver={(e) => e.preventDefault()}
-      onDrop={(e) => {
-        e.preventDefault();
-        if (!disabled && e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]);
-      }}
-      onClick={() => !disabled && inputRef.current?.click()}
-      className={`rounded-2xl border border-dashed border-white/15 bg-white/[0.02] p-6 text-center transition-colors ${
-        disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer hover:border-cyan-400/40"
-      }`}
-    >
-      <input
-        ref={inputRef}
-        type="file"
-        accept="video/*,.insv,.zip"
-        className="hidden"
-        disabled={disabled}
-        onChange={(e) => e.target.files?.[0] && upload(e.target.files[0])}
-      />
-      {disabled ? (
-        <div className="space-y-1">
-          <AlertTriangle className="mx-auto h-6 w-6 text-amber-300" />
-          <p className="text-sm font-medium text-amber-100">New capture uploads blocked</p>
-          <p className="text-xs text-amber-100/60">Existing scenes and downloads remain available.</p>
-        </div>
-      ) : pct !== null ? (
-        <div className="space-y-2">
-          <Loader2 className="mx-auto h-6 w-6 animate-spin text-cyan-300" />
-          <div className="mx-auto h-1.5 w-2/3 overflow-hidden rounded-full bg-white/10">
-            <div className="h-full bg-cyan-400 transition-all" style={{ width: `${pct}%` }} />
-          </div>
-          <p className="text-xs text-zinc-400">Uploading… {pct}%</p>
-        </div>
-      ) : current && !current.detail.startsWith("From Transfers") ? (
-        <div className="flex items-center justify-center gap-2 text-sm text-emerald-300">
-          <CheckCircle2 className="h-5 w-5" /> {current.name}
-        </div>
-      ) : (
-        <div className="space-y-1">
-          <UploadCloud className="mx-auto h-7 w-7 text-zinc-500" />
-          <p className="text-sm font-medium text-zinc-200">Drop a file or click to browse</p>
-          <p className="text-xs text-zinc-500">Video · 360 .insv · .zip of photos · up to ~100 MB over the web</p>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── transfers ─────────────────────────────────────────────────────────────────
-function TransfersPicker({
-  entries,
-  selectedPath,
-  onSelect,
-  onRefresh,
-  refreshing,
-  disabled,
-}: {
-  entries: SplatTransferEntry[];
-  selectedPath: string | null;
-  onSelect: (e: SplatTransferEntry) => void;
-  onRefresh: () => void;
-  refreshing: boolean;
-  disabled: boolean;
-}) {
-  return (
-    <div className="mt-4 space-y-2">
-      <div className="flex items-center justify-between">
-        <SectionLabel>Or pick from Transfers</SectionLabel>
-        <button
-          onClick={onRefresh}
-          className="flex items-center gap-1 text-[11px] text-zinc-400 hover:text-zinc-200"
-          title="Refresh"
-        >
-          <RefreshCw className={`h-3 w-3 ${refreshing ? "animate-spin" : ""}`} /> no size limit
-        </button>
-      </div>
-      <p className="text-xs text-zinc-500">
-        Sync a capture into <code className="rounded bg-white/10 px-1">~/transfers</code> (Syncthing /
-        pulse-share) — it skips the 100&nbsp;MB upload cap.
-      </p>
-      {entries.length > 0 ? (
-        <div className="max-h-48 space-y-1.5 overflow-y-auto pr-1">
-          {entries.map((e) => {
-            const sel = selectedPath === e.path;
-            return (
-              <button
-                key={e.path}
-                onClick={() => onSelect(e)}
-                disabled={disabled}
-                className={`flex w-full items-center gap-3 rounded-xl border p-2.5 text-left transition-all ${
-                  sel ? "border-cyan-400/40 bg-cyan-400/10" : "border-white/10 bg-white/[0.02] hover:border-cyan-500/20"
-                } disabled:cursor-not-allowed disabled:opacity-50`}
-              >
-                <FolderOpen className={`h-4 w-4 shrink-0 ${sel ? "text-cyan-200" : "text-zinc-500"}`} />
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm font-medium text-zinc-100">{e.name}</span>
-                  <span className="block truncate text-xs text-zinc-500">{e.detail}</span>
-                </span>
-                <Badge>{e.kind}</Badge>
-              </button>
-            );
-          })}
-        </div>
-      ) : (
-        <div className="rounded-xl border border-dashed border-white/10 px-3 py-4 text-center text-xs text-zinc-500">
-          Nothing splat-ready in Transfers yet. Drop a video, a 360 .insv, a .zip of photos, or a folder of JPGs.
-        </div>
-      )}
     </div>
   );
 }
