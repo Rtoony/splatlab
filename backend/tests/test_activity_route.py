@@ -107,3 +107,13 @@ def test_activity_mounted_in_main_behind_auth(monkeypatch: pytest.MonkeyPatch) -
         assert isinstance(body["jobs"], dict)
     finally:
         splat_main.app.dependency_overrides.pop(splat_main.require_auth, None)
+
+
+def test_activity_reports_surveying_lock(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Contours/DXF/sections builds hold geo_route's per-job lock — a reloaded
+    tab must see the running survey build like any other lane."""
+    import geo_route
+
+    monkeypatch.setattr(geo_route, "_GEO_EXPORT_LOCKS", {"splat_svy00001": _held_lock()})
+    r = client.get("/api/splat/activity")
+    assert r.json()["jobs"] == {"splat_svy00001": {"surveying": True}}

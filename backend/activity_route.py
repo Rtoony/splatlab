@@ -24,6 +24,7 @@ from fastapi import APIRouter
 
 import edit_ops
 import export_route
+import geo_route
 import gpu_arbiter
 import splat_route
 
@@ -43,6 +44,8 @@ def _lock_sources() -> list[tuple[str, dict[str, asyncio.Lock]]]:
         ("meshing", splat_route._MESH_EXPORT_LOCKS),
         # Portable SPZ/SOG/glTF + collision + Unreal bundle — export_route.
         ("exporting", export_route._export_locks),
+        # Survey exports (contours / DXF / sections) — geo_route.
+        ("surveying", geo_route._GEO_EXPORT_LOCKS),
     ]
 
 
