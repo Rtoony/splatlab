@@ -1856,3 +1856,23 @@ scenes ≳400k gaussians risk the 60-min CONVERSION_TIMEOUT_S even at low iterat
 is CORRECT now but SLOW — backend follow-ups if it matters: longer timeout for this format, GPU
 SOG (`-g gpu`), or parallel per-chunk encoding. Export Center copy already warns builds can take
 many minutes.
+
+## WAVE 7.1 SHIPPED (2026-07-25) — classic viewer DELETED, builds type-checked. Program COMPLETE.
+
+RToony signed off after the Spark soak ("proceed to the next wave"). `a5f43c9` (+ style commits
+`013faaf`/`f91689c`: Spark tool panel + all three legends now SOLID #0a0f1a/kept hues, per his
+call):
+- DELETED: components/splat-viewer.tsx (mkkellogg classic), pages/spark-test.tsx (the 601-line
+  spike route), mkkellogg.d.ts, @mkkellogg/gaussian-splats-3d dependency. Zero mkkellogg chunks
+  in dist.
+- Shared viewer prop types live in components/viewer-types.ts.
+- /view renders Spark unconditionally; a viewer crash shows a recover card (no silent fallback);
+  sparkBeta/localStorage/?viewer=classic/menu toggle all removed.
+- Home featured pane = lazily-loaded Spark (3D chunk stays out of the landing bundle).
+- `npm run build` = `tsc --noEmit && vite build` — gate PROVEN (injected type error → exit 2).
+  tsc fully clean repo-wide; the grep-exclusion era is over. eslint 0 errors, vitest 9/9.
+
+**The 7-wave professionalization program is COMPLETE.** Remaining ideas are backlog, not plan:
+multi-level streamed-SOG pyramids / GPU SOG (throughput), per-artifact collision staleness,
+SuperSplat save-back button (trigger: manual roundtrip proves annoying), merge-scenes GUI
+(trigger: two geo-anchored scenes of one site), post-hoc langfield rebuild lane, light theme.
