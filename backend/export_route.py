@@ -218,6 +218,11 @@ def _conversion_command(
             str(output),
         ]
     if fmt == "streamed-sog":
+        # lod-meta.json output requires every gaussian to carry an LOD tag —
+        # untagged input dies with "Missing lod assignment" (writeLod). `-l 0`
+        # after the input tags the whole scene as level 0: spatial chunking
+        # still happens (that's the streaming win); multi-level pyramids would
+        # need multiple decimate+tag passes and are a future enhancement.
         return [
             transform,
             "-g",
@@ -229,6 +234,8 @@ def _conversion_command(
             "--lod-chunk-extent",
             str(request.lod_chunk_extent),
             str(source),
+            "-l",
+            "0",
             str(output),
         ]
     return [transform, str(source), str(output)]

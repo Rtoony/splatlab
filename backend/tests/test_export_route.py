@@ -153,6 +153,24 @@ def test_build_formats_manifest_and_cache(client) -> None:
     assert len(state["calls"]) == 3
 
 
+def test_streamed_sog_command_tags_lod_level() -> None:
+    """Untagged input dies in splat-transform's writeLod ("Missing lod
+    assignment") — the streamed-sog command must inject `-l 0` after the
+    input so every gaussian carries an LOD tag. Proven live 2026-07-25."""
+    import export_route
+
+    cmd = export_route._conversion_command(
+        "splat-transform",
+        Path("/in/splat.ply"),
+        Path("/out/lod-meta.json"),
+        "streamed-sog",
+        export_route.ExportRequest(),
+    )
+    src = cmd.index("/in/splat.ply")
+    assert cmd[src + 1 : src + 3] == ["-l", "0"], cmd
+    assert cmd[-1] == "/out/lod-meta.json"
+
+
 def test_streamed_sog_skips_small_scene_unless_forced(client) -> None:
     http, outputs, state = client
     job_dir = _make_job(outputs)
