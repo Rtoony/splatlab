@@ -2354,7 +2354,7 @@ export function SparkSceneViewer({
 
       {/* query legend — updates live with queries, colors, mode, and threshold */}
       {channels.length > 0 && (
-        <div className="absolute bottom-16 right-3 z-20 w-64 space-y-2 rounded-xl border border-white/10 bg-black/70 p-3 text-xs text-zinc-200 shadow backdrop-blur-md">
+        <div className="absolute bottom-16 right-3 z-20 w-64 space-y-2 rounded-xl border border-white/10 bg-[#0a0f1a] p-3 text-xs text-zinc-200 shadow">
           <SectionLabel>Legend</SectionLabel>
           {mode === "tint" ? (
             (() => {

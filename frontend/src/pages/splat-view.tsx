@@ -584,7 +584,7 @@ function InventoryLegend({
   const maxP = Math.max(...items.map((i) => i.presence), 0.0001);
   return (
     <div className={`pointer-events-none absolute top-3 z-20 w-56 ${positionClassName}`}>
-      <Card className="pointer-events-auto border-white/12 bg-[#070b14]/85 p-2 backdrop-blur-md">
+      <Card className="pointer-events-auto border-white/12 bg-[#070b14] p-2">
         <button
           type="button"
           onClick={() => onOpenChange(!open)}
@@ -687,7 +687,7 @@ function CameraShotsLegend({
 }) {
   return (
     <div className="pointer-events-none absolute right-3 top-20 z-20 w-[21rem] max-w-[calc(100vw-1.5rem)]">
-      <Card className="pointer-events-auto border-amber-300/20 bg-[#100d08]/85 p-2 backdrop-blur-md">
+      <Card className="pointer-events-auto border-amber-300/20 bg-[#100d08] p-2">
         <button
           type="button"
           onClick={() => onOpenChange(!open)}
