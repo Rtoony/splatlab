@@ -13,7 +13,6 @@ import { applyEditOps, fetchEditVersions, revertEdit, uploadEditedPly } from "@/
 import { relTime } from "@/lib/format";
 import { useActivity } from "@/lib/use-activity";
 import type { SplatEditApplyResponse, SplatEditOp, SplatJob } from "@/lib/contracts";
-import { EditProgress } from "@/components/edit-progress";
 import { SemanticEditPanel } from "@/components/edit/semantic-edit";
 import { Button, Input, SectionLabel, useToast } from "@/components/ui";
 import { Crosshair, ExternalLink, History, Loader2, Move3d, Shrink, Sparkles, Undo2, UploadCloud, Wand2, Wrench } from "lucide-react";
@@ -50,7 +49,19 @@ function LangfieldTopologyWarning({ stale }: { stale: boolean }) {
   );
 }
 
-export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => void }) {
+export function EditLane({
+  job,
+  onEdited,
+  onBusyChange,
+}: {
+  job: SplatJob;
+  onEdited?: () => void;
+  // Reports "we just started a mutation" up to the page's GLOBAL progress rail.
+  // Without this the rail would wait for the next server poll (up to 4s of
+  // nothing happening on screen) — which is exactly why every section grew its
+  // own local rail in the first place.
+  onBusyChange?: (busy: boolean) => void;
+}) {
   const toast = useToast();
   const qc = useQueryClient();
   // Restore-point timeline (server keeps at most 5 snapshots).
@@ -115,6 +126,15 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
   const localMutating = pending !== null || restoring !== null || semanticBusy;
   const activity = useActivity(localMutating);
   const remoteEditing = Boolean(activity.data?.jobs?.[job.job_id]?.editing) && !localMutating;
+
+  useEffect(() => {
+    onBusyChange?.(localMutating);
+  }, [localMutating, onBusyChange]);
+
+  // This lane unmounts when you leave the Edit tab. Without this, switching
+  // tabs mid-op would strand the page's rail "active" forever; server truth
+  // (the activity `editing` flag) correctly keeps it up while the op runs.
+  useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
 
   useEffect(() => {
     if (!decimateArmed) return;
@@ -340,7 +360,6 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
         <div className="rounded-xl border border-cyan-300/25 bg-cyan-400/10 px-3 py-2 text-xs leading-relaxed text-cyan-100">
           An edit is in progress for this scene (started elsewhere or before a reload). Controls unlock when it
           finishes.
-          <EditProgress jobId={job.job_id} active={false} />
         </div>
       )}
       {lastVersion !== null && (
@@ -354,7 +373,6 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
               {pending === "undo" ? "Undoing…" : "Undo"}
             </Button>
           </div>
-          {pending === "undo" && <EditProgress jobId={job.job_id} active />}
         </>
       )}
       {job.langfield_stale && (
@@ -418,7 +436,6 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
           {pending === "floaters" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wand2 className="h-3.5 w-3.5" />}
           {pending === "floaters" ? "Applying…" : floatersOpen ? "Clean up floaters (tuned)" : "Clean up floaters"}
         </Button>
-        {pending === "floaters" && <EditProgress jobId={job.job_id} active />}
       </div>
 
       {/* Decimate */}
@@ -470,7 +487,6 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
             `Decimate to ${keepPct}%`
           )}
         </Button>
-        {pending === "decimate" && <EditProgress jobId={job.job_id} active />}
       </div>
 
       {/* Transform */}
@@ -542,7 +558,6 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
                 `Apply transform (${transformCount} op${transformCount === 1 ? "" : "s"})`
               )}
             </Button>
-            {pending === "transform" && <EditProgress jobId={job.job_id} active />}
           </div>
         )}
       </div>
@@ -597,7 +612,6 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
               </div>
             ))}
           </div>
-          {restoring !== null && <EditProgress jobId={job.job_id} active />}
         </div>
       )}
 
@@ -662,7 +676,6 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
         </div>
         {/* After the upload leg completes, the server runs the same stepped
             edit pipeline (snapshot → apply → …) — show it here too. */}
-        {pending === "import" && <EditProgress jobId={job.job_id} active />}
         {importFile && pending !== "import" && (
           <Button
             type="button"

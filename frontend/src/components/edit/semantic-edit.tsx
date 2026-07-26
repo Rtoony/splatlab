@@ -19,7 +19,6 @@ import { Link } from "wouter";
 import { semanticEdit } from "@/lib/api";
 import type { SplatJob, SplatSemanticEditRequest } from "@/lib/contracts";
 import { Button, Input, useToast } from "@/components/ui";
-import { EditProgress } from "@/components/edit-progress";
 import { ArrowRight, Loader2, ScanSearch } from "lucide-react";
 
 // Backend defaults, read from edit_ops.py SemanticEditRequest — keep in sync.
@@ -241,7 +240,6 @@ export function SemanticEditPanel({
             )}
           </Button>
           {/* Semantic edits prepend a "match" step to the stepped pipeline. */}
-          {busy && <EditProgress jobId={job.job_id} active />}
 
           {error && (
             <p className="rounded-lg border border-red-400/25 bg-red-400/10 px-2 py-1.5 text-[11px] leading-snug text-red-200">

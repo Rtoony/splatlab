@@ -86,6 +86,11 @@ export default function SplatViewPage() {
   // the tab row, which survives tab switches and the viewer's own reload
   // teardown (the section-local rail vanished with both).
   const [viewerEditPending, setViewerEditPending] = useState(false);
+  // ...and the same for Edit-lane ops, so the ONE rail lights up the instant a
+  // lane op starts instead of waiting on the next activity poll. The lane used
+  // to carry seven local copies of the rail for exactly this reason; the page
+  // now owns the single rail and the lane just reports busy.
+  const [lanePending, setLanePending] = useState(false);
   function handleLaneEdited() {
     setEditReloadToken((t) => t + 1);
     void queryClient.invalidateQueries({ queryKey: ["status"] });
@@ -325,7 +330,7 @@ export default function SplatViewPage() {
                 and it survives tab switches, unlike the old section-local
                 rail that unmounted mid-apply. */}
             <div className="w-full sm:order-last sm:basis-full">
-              <EditProgress jobId={jobId} active={viewerEditPending} />
+              <EditProgress jobId={jobId} active={viewerEditPending || lanePending} />
             </div>
             <div className="flex shrink-0 items-center gap-2">
               {mode === "view" && (
@@ -527,7 +532,9 @@ export default function SplatViewPage() {
         )}
         {job && viewUrl && (mode === "edit" || mode === "export" || mode === "objects") && (
           <aside className="absolute bottom-0 right-0 top-0 z-30 w-[24rem] max-w-full overflow-y-auto border-l border-white/10 bg-surface/95 backdrop-blur-md">
-            {mode === "edit" && <EditLane job={job} onEdited={handleLaneEdited} />}
+            {mode === "edit" && (
+              <EditLane job={job} onEdited={handleLaneEdited} onBusyChange={setLanePending} />
+            )}
             {mode === "export" && <ExportLane job={job} />}
             {mode === "objects" && <ObjectsPanel job={job} onOpenScenePanel={() => setSceneRegenOpen(true)} />}
           </aside>
