@@ -26,6 +26,8 @@ const OBJECT_FILES: { fmt: SplatObjectFileFormat; label: string; hint: string }[
   { fmt: "receipt", label: "Mesh receipt", hint: "render check · PNG" },
   { fmt: "twin-top", label: "Twin top view", hint: "receipt · PNG" },
   { fmt: "twin-oblique", label: "Twin oblique view", hint: "receipt · PNG" },
+  { fmt: "textured", label: "Textured .glb", hint: "simplified + UV colour map · Blender-ready" },
+  { fmt: "textured-atlas", label: "Colour atlas", hint: "the baked texture map · PNG" },
   { fmt: "proxy", label: "Proxy .ply", hint: "AI-generated stand-in · render/VR only, never survey" },
   { fmt: "proxy-preview", label: "Proxy preview", hint: "WEBP thumbnail" },
 ];
@@ -100,6 +102,10 @@ export function ObjectsPanel({ job, onOpenScenePanel }: { job: SplatJob; onOpenS
   const [finish, setFinish] = useState(false);
   const [targetFaces, setTargetFaces] = useState("10000");
   const [cluster, setCluster] = useState("0");
+  const [texture, setTexture] = useState(false);
+  const [textureFaces, setTextureFaces] = useState("8000");
+  const [textureSize, setTextureSize] = useState("1024");
+  const [textureCrop, setTextureCrop] = useState(true);
   const [smooth, setSmooth] = useState(false);
   const [smoothIterations, setSmoothIterations] = useState("2");
   const [smoothFeatureDeg, setSmoothFeatureDeg] = useState("40");
@@ -123,6 +129,10 @@ export function ObjectsPanel({ job, onOpenScenePanel }: { job: SplatJob; onOpenS
         proxy,
         finish: mesh && finish,
         finish_target_faces: parseIntStrict(targetFaces) ?? 10000,
+        texture: mesh && texture,
+        texture_target_faces: parseIntStrict(textureFaces) ?? 8000,
+        texture_size: parseIntStrict(textureSize) ?? 1024,
+        texture_crop: textureCrop,
         smooth,
         smooth_iterations: parseIntStrict(smoothIterations) ?? 2,
         smooth_feature_deg: parseNum(smoothFeatureDeg) ?? 40,
@@ -273,7 +283,7 @@ export function ObjectsPanel({ job, onOpenScenePanel }: { job: SplatJob; onOpenS
               return just the named surface.
             </p>
             <label className={`flex items-start gap-2 ${busy ? "opacity-50" : "cursor-pointer"}`}>
-              <input type="checkbox" checked={mesh} onChange={(e) => { setMesh(e.target.checked); if (!e.target.checked) setFinish(false); }} disabled={busy} className="mt-0.5 h-3.5 w-3.5 accent-cyan-400" />
+              <input type="checkbox" checked={mesh} onChange={(e) => { setMesh(e.target.checked); if (!e.target.checked) { setFinish(false); setTexture(false); } }} disabled={busy} className="mt-0.5 h-3.5 w-3.5 accent-cyan-400" />
               <span className="min-w-0">
                 <span className="block text-xs font-medium text-zinc-200">Build a mesh</span>
                 <span className="block text-[10px] leading-snug text-zinc-500">Tight fine-voxel TSDF mesh of just this object (adds most of the build time).</span>
@@ -298,6 +308,42 @@ export function ObjectsPanel({ job, onOpenScenePanel }: { job: SplatJob; onOpenS
                 </span>
                 <Input size="xs" inputMode="numeric" value={targetFaces} onChange={(e) => setTargetFaces(e.target.value)} disabled={busy} className="w-20 shrink-0" />
               </label>
+            )}
+            <label className={`flex items-start gap-2 ${busy || !mesh ? "opacity-50" : "cursor-pointer"}`}>
+              <input type="checkbox" checked={mesh && texture} onChange={(e) => setTexture(e.target.checked)} disabled={busy || !mesh} className="mt-0.5 h-3.5 w-3.5 accent-cyan-400" />
+              <span className="min-w-0">
+                <span className="block text-xs font-medium text-zinc-200">Textured asset</span>
+                <span className="block text-[10px] leading-snug text-zinc-500">
+                  {mesh
+                    ? "Poisson refit + decimate + UV unwrap, with the splat's colour baked into a texture map — colour no longer capped by the face budget."
+                    : "Needs the mesh — turn \"Build a mesh\" back on."}
+                </span>
+              </span>
+            </label>
+            {mesh && texture && (
+              <div className="space-y-2 pl-5">
+                <label className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] text-zinc-400">
+                    Texture target faces
+                    <span className="block text-[10px] text-zinc-600">500–200,000 · 8k is a simple, solid asset</span>
+                  </span>
+                  <Input size="xs" inputMode="numeric" value={textureFaces} onChange={(e) => setTextureFaces(e.target.value)} disabled={busy} className="w-20 shrink-0" />
+                </label>
+                <label className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] text-zinc-400">
+                    Texture size
+                    <span className="block text-[10px] text-zinc-600">256–4096 px · square atlas</span>
+                  </span>
+                  <Input size="xs" inputMode="numeric" value={textureSize} onChange={(e) => setTextureSize(e.target.value)} disabled={busy} className="w-20 shrink-0" />
+                </label>
+                <label className="flex items-start gap-2 cursor-pointer">
+                  <input type="checkbox" checked={textureCrop} onChange={(e) => setTextureCrop(e.target.checked)} disabled={busy} className="mt-0.5 h-3.5 w-3.5 accent-cyan-400" />
+                  <span className="min-w-0">
+                    <span className="block text-[11px] text-zinc-400">Cut the ground away</span>
+                    <span className="block text-[10px] leading-snug text-zinc-600">TSDF fuses the floor into the object; this crops to the object's own extent.</span>
+                  </span>
+                </label>
+              </div>
             )}
             <label className={`flex items-start gap-2 ${busy ? "opacity-50" : "cursor-pointer"}`}>
               <input type="checkbox" checked={proxy} onChange={(e) => setProxy(e.target.checked)} disabled={busy} className="mt-0.5 h-3.5 w-3.5 accent-cyan-400" />

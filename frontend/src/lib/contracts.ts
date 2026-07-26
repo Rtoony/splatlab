@@ -314,6 +314,8 @@ export type SplatObjectFileFormat =
   | "twin"
   | "twin-top"
   | "twin-oblique"
+  | "textured"
+  | "textured-atlas"
   | "proxy"
   | "proxy-preview";
 
@@ -331,6 +333,12 @@ export interface SplatObjectIsolateRequest {
   smooth?: boolean; // default false — curvature-adaptive smoothing in the finish
   smooth_iterations?: number; // 1-10, default 2
   smooth_feature_deg?: number; // 5-90, default 40
+  // Textured asset lane: Poisson refit + decimate + UV unwrap + a colour map
+  // baked from the gaussians. Independent of `finish`; requires mesh (400).
+  texture?: boolean; // default false
+  texture_target_faces?: number; // 500-200000, default 8000
+  texture_size?: number; // 256-4096, default 1024
+  texture_crop?: boolean; // default true — cut the TSDF-fused ground away
 }
 
 // The object.json isolation receipt (mesh/object_isolate.py). The listing
