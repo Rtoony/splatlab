@@ -35,10 +35,15 @@ def stub_transform(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     SPLAT_TRANSFORM_BIN override that splat_route._splat_transform_path() honors.
     Behavior is driven by marker files in the returned control dir:
       fail_all   -> every invocation exits non-zero
-      fail_regen -> only regen invocations (output splat.spz.*/web.ply.*/langweb.ply.*
-                    tmp names) exit non-zero
+      fail_regen -> only regen invocations (.edit-tmp.*.splat.spz / .web.ply /
+                    .langweb.ply tmp names) exit non-zero
     Otherwise it copies input -> output (argv shape: [bin, -w?, src, flags..., dst]).
-    STUB_SLEEP (seconds) makes invocations slow so tests can overlap requests."""
+    STUB_SLEEP (seconds) makes invocations slow so tests can overlap requests.
+
+    CONTRACT ENFORCEMENT: like the real splat-transform (getOutputFormat), the
+    stub REJECTS any output path whose extension isn't a supported format —
+    the exact failure mode that shipped live on 2026-07-25 because the old
+    extension-blind stub kept the suite green."""
     ctl = tmp_path / "stub-ctl"
     ctl.mkdir()
     script = tmp_path / "stub-splat-transform.sh"
@@ -49,8 +54,14 @@ def stub_transform(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         'for a in "$@"; do out="$a"; done\n'
         'if [ -n "${STUB_SLEEP:-}" ]; then sleep "$STUB_SLEEP"; fi\n'
         'if [ -f "$STUB_CTL/fail_all" ]; then echo "stub: forced failure" >&2; exit 7; fi\n'
+        # Real-contract gate: splat-transform infers output format from the
+        # extension and throws on anything unrecognized.
+        'case "$out" in\n'
+        "  *.ply|*.spz|*.csv|*.sog|*.glb|*.html|*.webp|*.json) ;;\n"
+        '  *) echo "Error: Unsupported output file type: $out" >&2; exit 1;;\n'
+        "esac\n"
         'case "$(basename "$out")" in\n'
-        "  splat.spz.*|web.ply.*|langweb.ply.*)\n"
+        "  *.splat.spz|*.web.ply|*.langweb.ply)\n"
         '    if [ -f "$STUB_CTL/fail_regen" ]; then echo "stub: forced regen failure" >&2; exit 7; fi\n'
         "    ;;\n"
         "esac\n"
@@ -61,6 +72,18 @@ def stub_transform(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("STUB_CTL", str(ctl))
     monkeypatch.delenv("STUB_SLEEP", raising=False)
     return ctl
+
+
+def test_edit_tmp_path_preserves_real_extension() -> None:
+    """splat-transform dispatches output format on the extension — temp output
+    names MUST end with the target's true filename (live failure 2026-07-25:
+    "Unsupported output file type: ...edit-tmp")."""
+    for name in ("splat.ply", "splat.spz", "web.ply", "langweb.ply"):
+        tmp = edit_ops._edit_tmp_path(Path("/j/_preview") / name)
+        assert tmp.name.endswith("." + name), tmp.name
+        assert tmp.suffix == Path(name).suffix
+        assert tmp.name.startswith(".edit-tmp."), tmp.name
+        assert tmp.parent == Path("/j/_preview")
 
 
 def _make_job(root: Path, job_id: str, *, status: str = "completed", with_preview: bool = True) -> Path:
@@ -663,7 +686,7 @@ def test_apply_round_trip_success(outputs_root: Path, client: TestClient, stub_t
     assert (job_dir / "_preview" / "splat.spz").is_file()
     assert (job_dir / "_preview" / "web.ply").is_file()
     # no tmp litter left behind
-    assert list((job_dir / "_preview").glob("*.edit-tmp")) == []
+    assert list((job_dir / "_preview").glob(".edit-tmp.*")) == []
 
 
 def test_apply_failure_leaves_source_and_removes_snapshot(
@@ -682,7 +705,7 @@ def test_apply_failure_leaves_source_and_removes_snapshot(
     assert src.read_bytes() == b"PLY-CONTENT-ORIGINAL"
     # the failed op's snapshot was discarded — repeated failures can't churn the cap
     assert edit_ops._list_version_dirs(job_dir) == []
-    assert list((job_dir / "_preview").glob("*.edit-tmp")) == []
+    assert list((job_dir / "_preview").glob(".edit-tmp.*")) == []
 
 
 def test_apply_regen_failure_unlinks_stale_artifacts(
@@ -1079,7 +1102,7 @@ def test_upload_happy_path_replaces_splat_and_versions(
     assert (job_dir / "_preview" / "web.ply").is_file()
     # an external edit ALWAYS invalidates the language field
     assert (lf / "STALE").is_file()
-    assert list((job_dir / "_preview").glob("*.edit-tmp")) == []
+    assert list((job_dir / "_preview").glob(".edit-tmp.*")) == []
 
 
 def test_upload_rejects_non_ply_content_nothing_mutated(
@@ -1102,7 +1125,7 @@ def test_upload_rejects_non_ply_content_nothing_mutated(
     # nothing mutated, no snapshot left behind, no tmp litter, field untouched
     assert (job_dir / "_preview" / "splat.ply").read_bytes() == b"PLYDATA-v0"
     assert edit_ops._list_version_dirs(job_dir) == []
-    assert list((job_dir / "_preview").glob("*.edit-tmp")) == []
+    assert list((job_dir / "_preview").glob(".edit-tmp.*")) == []
     assert not (lf / "STALE").exists()
 
 
@@ -1130,7 +1153,7 @@ def test_upload_rejects_empty_file(outputs_root: Path, client: TestClient) -> No
     assert "empty" in resp.json()["detail"]
     assert (job_dir / "_preview" / "splat.ply").read_bytes() == b"PLYDATA-v0"
     assert edit_ops._list_version_dirs(job_dir) == []
-    assert list((job_dir / "_preview").glob("*.edit-tmp")) == []
+    assert list((job_dir / "_preview").glob(".edit-tmp.*")) == []
 
 
 def test_upload_rejects_truncated_body(
@@ -1147,7 +1170,7 @@ def test_upload_rejects_truncated_body(
     assert "truncated or corrupt" in resp.json()["detail"]
     assert (job_dir / "_preview" / "splat.ply").read_bytes() == b"PLYDATA-v0"
     assert edit_ops._list_version_dirs(job_dir) == []
-    assert list((job_dir / "_preview").glob("*.edit-tmp")) == []
+    assert list((job_dir / "_preview").glob(".edit-tmp.*")) == []
 
 
 def test_upload_oversized_413(
@@ -1164,7 +1187,7 @@ def test_upload_oversized_413(
     assert "2 GB" in resp.json()["detail"]
     assert (job_dir / "_preview" / "splat.ply").read_bytes() == b"PLYDATA-v0"
     assert edit_ops._list_version_dirs(job_dir) == []
-    assert list((job_dir / "_preview").glob("*.edit-tmp")) == []
+    assert list((job_dir / "_preview").glob(".edit-tmp.*")) == []
 
 
 def test_upload_while_edit_in_progress_409(

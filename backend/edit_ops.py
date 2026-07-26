@@ -67,7 +67,7 @@ EDIT_GPU_VRAM_MB = max(256, int(os.environ.get("SPLAT_EDIT_GPU_VRAM_MB", "2000")
 # the reverted splat.ply.
 SNAPSHOT_ARTIFACT_NAMES = ("splat.ply", "splat.spz", "web.ply", "langweb.ply", "thumb.webp")
 _VERSION_DIR_RE = re.compile(r"^v(\d+)-\d{8}T\d{6}Z$")
-_EDIT_TMP_SUFFIX = ".edit-tmp"
+_EDIT_TMP_PREFIX = ".edit-tmp"
 
 
 def _utc_stamp() -> str:
@@ -78,8 +78,15 @@ def _utc_stamp() -> str:
 def _edit_tmp_path(target: Path) -> Path:
     """Unique per-invocation tmp sibling for an atomic tmp->Path.replace() write.
     The random token means two operations (even a leaked lock / crashed run) can
-    never interleave on a shared fixed tmp name."""
-    return target.with_name(f"{target.name}.{secrets.token_hex(4)}{_EDIT_TMP_SUFFIX}")
+    never interleave on a shared fixed tmp name.
+
+    The temp name MUST end with the target's real filename: splat-transform
+    dispatches its output format purely on the extension (getOutputFormat) and
+    dies with "Unsupported output file type" otherwise — the bug that made
+    every /edit/apply fail live on 2026-07-25 while the extension-blind test
+    stub stayed green. Hence PREFIX + token + untouched name:
+    _preview/.edit-tmp.a1b2c3d4.splat.ply"""
+    return target.with_name(f"{_EDIT_TMP_PREFIX}.{secrets.token_hex(4)}.{target.name}")
 
 
 def _file_identity(path: Path) -> tuple[int, int, int, int]:
@@ -1226,7 +1233,9 @@ async def _chain_floater_cleanup(
     transform_bin = splat_route._splat_transform_path()
     if not transform_bin:
         return ply_path
-    cleaned = ply_path.with_name(ply_path.name + ".float-clean")
+    # Extension-preserving temp name — splat-transform dispatches output format
+    # on the suffix (same contract as _edit_tmp_path).
+    cleaned = ply_path.with_name(f".float-clean.{ply_path.name}")
     rc, _log = await _run_transform_in_transaction(
         [transform_bin, "-w", str(ply_path), "-G", str(cleaned)],
         needs_gpu=True,
