@@ -48,6 +48,10 @@ export interface SplatJob {
   // scenes (which never carry them) keep deserializing unchanged.
   language_field?: boolean;
   langfield_available?: boolean;
+  // Navigable world (_world/ solidify lane). Optional: pre-world payloads
+  // never carry them.
+  world_available?: boolean;
+  world_manifest_url?: string | null;
   // A geometry edit invalidated the built field (on-disk STALE marker — the
   // exact same truth source the backend's 409 guard checks). Polled via
   // /status, so the UI never has to track "did I just make it stale" locally.
@@ -317,7 +321,9 @@ export type SplatObjectFileFormat =
   | "textured"
   | "textured-atlas"
   | "proxy"
-  | "proxy-preview";
+  | "proxy-preview"
+  | "polished"
+  | "polish-receipt";
 
 // POST /jobs/{id}/objects. Needs a built, non-stale language field (409s
 // otherwise); finish requires mesh (400).
@@ -363,12 +369,22 @@ export interface SplatObjectReceipt {
   proxy?: Record<string, unknown>;
 }
 
+// Bake-off summary on the objects listing: verdict winner + ranked paired
+// PSNR only. `error` replaces the rest when bakeoff.json is unreadable.
+export interface SplatObjectBakeoff {
+  winner?: string | null;
+  reason?: string | null;
+  ranked?: { name: string | null; median_psnr_paired: number | null }[];
+  error?: string;
+}
+
 // One entry from GET /jobs/{id}/objects: receipt + slug + a files{} map of
 // only the formats whose artifacts exist on disk RIGHT NOW (same per-format
 // URLs the /objects/{slug}/file route serves).
 export interface SplatObjectEntry extends SplatObjectReceipt {
   slug: string;
   files: Partial<Record<SplatObjectFileFormat, string>>;
+  bakeoff?: SplatObjectBakeoff | null;
 }
 
 export interface SplatObjectListing {

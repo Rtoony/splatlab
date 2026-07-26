@@ -1,6 +1,6 @@
 import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useRoute } from "wouter";
+import { Link, useLocation, useRoute } from "wouter";
 import { apiRequest, fetchLangfieldInventory, fetchSplatCameras, queryLangfield } from "@/lib/api";
 import { setSplatlabFeedbackContext } from "@/lib/feedback-context";
 import type {
@@ -30,6 +30,7 @@ const HL_PALETTE = ["#22d3ee", "#f59e0b", "#a78bfa", "#34d399", "#f472b6", "#60a
 
 export default function SplatViewPage() {
   const [, params] = useRoute("/view/:jobId");
+  const [, navigate] = useLocation();
   const jobId = params?.jobId ?? "";
 
   const { data: status, isLoading } = useQuery({
@@ -308,6 +309,18 @@ export default function SplatViewPage() {
             <div className="flex shrink-0 items-center gap-2">
               {mode === "view" && (
                 <>
+                  {job.world_available && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => navigate(`/world/${job.job_id}`)}
+                      title="Walk this scene in first person (solidified world)"
+                      className="border-cyan-300/40 text-cyan-200"
+                    >
+                      <Mountain className="h-3.5 w-3.5" /> Walk world
+                    </Button>
+                  )}
                   <Button
                     type="button"
                     variant="outline"

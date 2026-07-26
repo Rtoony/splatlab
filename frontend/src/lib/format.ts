@@ -1,3 +1,5 @@
+import type { SplatObjectBakeoff } from "./contracts";
+
 export function relTime(value: string | null): string {
   if (!value) return "—";
   const d = new Date(value).getTime();
@@ -19,4 +21,25 @@ export function fmtCount(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
   return String(n);
+}
+
+// One-line bake-off verdict for an object card, e.g.
+// "Bake-off: textured wins (+0.21 dB vs raw_tsdf)". Ranked entries arrive
+// winner-first from the backend, so the margin is against the runner-up.
+export function formatBakeoffVerdict(bakeoff: SplatObjectBakeoff): string {
+  if (bakeoff.error) return `Bake-off: ${bakeoff.error}`;
+  if (!bakeoff.winner) return "Bake-off: no trustworthy winner";
+  const ranked = bakeoff.ranked ?? [];
+  const top = ranked.find((r) => r.name === bakeoff.winner);
+  const runner = ranked.find(
+    (r) => r.name !== bakeoff.winner && r.median_psnr_paired != null,
+  );
+  if (top?.median_psnr_paired != null && runner?.median_psnr_paired != null) {
+    const margin = top.median_psnr_paired - runner.median_psnr_paired;
+    return `Bake-off: ${bakeoff.winner} wins (+${margin.toFixed(2)} dB vs ${runner.name})`;
+  }
+  if (top?.median_psnr_paired != null) {
+    return `Bake-off: ${bakeoff.winner} wins (${top.median_psnr_paired.toFixed(2)} dB, sole ranked candidate)`;
+  }
+  return `Bake-off: ${bakeoff.winner} wins`;
 }

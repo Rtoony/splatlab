@@ -4946,6 +4946,34 @@ def _object_calibration(obj_dir: Path, receipt: dict[str, Any], meta: dict[str, 
     }
 
 
+def _object_bakeoff_verdict(obj_dir: Path) -> dict[str, Any] | None:
+    """Summarize mesh/bakeoff/bakeoff.json for the listing: winner + ranked
+    scores only. None when no bake-off ran; an unreadable report is surfaced
+    as an error rather than hidden."""
+    path = obj_dir / "mesh" / "bakeoff" / "bakeoff.json"
+    if not path.is_file():
+        return None
+    try:
+        doc = json.loads(path.read_text())
+        verdict = doc.get("verdict") or {}
+        ranked = [
+            # verdict.ranked entries are flat {"name", **scores} records.
+            {
+                "name": entry.get("name"),
+                "median_psnr_paired": entry.get("median_psnr_paired"),
+            }
+            for entry in (verdict.get("ranked") or [])
+            if isinstance(entry, dict)
+        ]
+        return {
+            "winner": verdict.get("winner"),
+            "reason": verdict.get("reason"),
+            "ranked": ranked,
+        }
+    except (OSError, json.JSONDecodeError):
+        return {"error": "unreadable bakeoff.json"}
+
+
 @router.get("/jobs/{job_id}/objects")
 async def list_splat_objects(job_id: str):
     """Read-only companion to POST /objects: enumerate every built object for a
@@ -4982,6 +5010,7 @@ async def list_splat_objects(job_id: str):
                 if (obj_dir / rel).is_file()
             }
             entry["calibration"] = _object_calibration(obj_dir, receipt, meta)
+            entry["bakeoff"] = _object_bakeoff_verdict(obj_dir)
             objects.append(entry)
     return {"job_id": job_id, "objects": objects}
 

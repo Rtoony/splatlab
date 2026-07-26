@@ -605,3 +605,43 @@ def test_objects_finish_failure_is_loud_500(client, monkeypatch):
     obj_dir = job_dir / splat_route.OBJECTS_DIRNAME / "table"
     assert (obj_dir / "mesh" / "mesh.glb").is_file()
     assert (obj_dir / "mesh" / "mesh.json").is_file()
+
+
+def test_listing_carries_bakeoff_verdict(client):
+    http, outputs = client
+    job_dir = _mk_job(outputs, langfield=False)
+    obj_dir = job_dir / "_objects" / "crate"
+    (obj_dir / "mesh" / "bakeoff").mkdir(parents=True)
+    (obj_dir / "object.json").write_text(json.dumps({"slug": "crate"}))
+    (obj_dir / "mesh" / "bakeoff" / "bakeoff.json").write_text(json.dumps({
+        "verdict": {
+            "winner": "textured",
+            "reason": "textured scores 13.76 dB",
+            "ranked": [
+                {"name": "textured", "median_psnr_paired": 13.76,
+                 "median_coverage_paired": 0.074},
+                {"name": "raw_tsdf", "median_psnr_paired": 13.55,
+                 "median_coverage_paired": 0.176},
+            ],
+        },
+    }))
+    listing = http.get("/api/splat/jobs/splat_0b0001/objects").json()
+    entry = listing["objects"][0]
+    assert entry["bakeoff"]["winner"] == "textured"
+    assert entry["bakeoff"]["ranked"][0] == {
+        "name": "textured", "median_psnr_paired": 13.76}
+
+
+def test_listing_bakeoff_absent_and_corrupt(client):
+    http, outputs = client
+    job_dir = _mk_job(outputs, langfield=False)
+    for slug, payload in (("plain", None), ("broken", "{not json")):
+        obj_dir = job_dir / "_objects" / slug
+        (obj_dir / "mesh" / "bakeoff").mkdir(parents=True)
+        (obj_dir / "object.json").write_text(json.dumps({"slug": slug}))
+        if payload is not None:
+            (obj_dir / "mesh" / "bakeoff" / "bakeoff.json").write_text(payload)
+    listing = http.get("/api/splat/jobs/splat_0b0001/objects").json()
+    by_slug = {e["slug"]: e for e in listing["objects"]}
+    assert by_slug["plain"]["bakeoff"] is None
+    assert by_slug["broken"]["bakeoff"] == {"error": "unreadable bakeoff.json"}

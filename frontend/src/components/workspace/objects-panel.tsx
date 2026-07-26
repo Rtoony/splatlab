@@ -12,6 +12,7 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { fetchSplatObjects, isolateSplatObject } from "@/lib/api";
+import { formatBakeoffVerdict } from "@/lib/format";
 import { useActivity } from "@/lib/use-activity";
 import type { SplatJob, SplatObjectEntry, SplatObjectFileFormat } from "@/lib/contracts";
 import { Button, Input, SectionLabel, Skeleton, useToast } from "@/components/ui";
@@ -30,6 +31,7 @@ const OBJECT_FILES: { fmt: SplatObjectFileFormat; label: string; hint: string }[
   { fmt: "textured-atlas", label: "Colour atlas", hint: "the baked texture map · PNG" },
   { fmt: "proxy", label: "Proxy .ply", hint: "AI-generated stand-in · render/VR only, never survey" },
   { fmt: "proxy-preview", label: "Proxy preview", hint: "WEBP thumbnail" },
+  { fmt: "polished", label: "Polished .glb", hint: "externally polished in Blender/UE · uploaded back" },
 ];
 
 function parseNum(raw: string): number | null {
@@ -59,6 +61,14 @@ function ObjectCard({ job, entry }: { job: SplatJob; entry: SplatObjectEntry }) 
         {entry.rel_floor}
         {entry.clusters_found > 1 && <> · {entry.clusters_found} candidate clusters found</>}
       </p>
+      {entry.bakeoff && (
+        <p
+          className="mt-1 text-[10px] leading-snug text-amber-200/80"
+          title={entry.bakeoff.reason ?? undefined}
+        >
+          {formatBakeoffVerdict(entry.bakeoff)}
+        </p>
+      )}
       {files.length > 0 && (
         <div className="mt-2 space-y-1">
           {files.map((f) => (
