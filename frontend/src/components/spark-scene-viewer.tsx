@@ -1,8 +1,17 @@
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { dyno, RgbaArray, SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
 import { apiRequest, applyEditOps, rebuildLangfield, revertEdit } from "@/lib/api";
+import {
+  type EscapeStep,
+  type ShortcutAction,
+  type ToolName,
+  type ViewerToolState,
+  isTextEntryTarget,
+  resolveShortcut,
+  stepRadius,
+} from "@/lib/viewer-shortcuts";
 import {
   buildOverlayModifier,
   buildClassColorModifier,
@@ -28,7 +37,7 @@ import type {
   ViewerPoint,
 } from "@/components/viewer-types";
 import { Button, Input, SectionLabel } from "@/components/ui";
-import { Box, Download, Loader2, Paintbrush, Plus, Ruler, Scissors, Trash2, Undo2, X } from "lucide-react";
+import { Box, Download, Loader2, Paintbrush, Plus, Redo2, Ruler, Scissors, Trash2, Undo2, X } from "lucide-react";
 
 // SPARK BETA viewer for the /view page — the Wave-2 cutover surface.
 // - Multi-query language overlay: up to 4 simultaneous text searches, one
@@ -131,6 +140,9 @@ export function SparkSceneViewer({
   onLangfieldRebuilt,
   onPickMatch,
   onPickCamera,
+  onRequestPanelSection,
+  onToggleShortcutLegend,
+  onResetView,
 }: {
   job: SplatJob;
   safeMode?: boolean;
@@ -170,6 +182,16 @@ export function SparkSceneViewer({
   // Fires after a successful language-field rebuild so the host refreshes the
   // job payload (langfield_stale flips off on the next status fetch).
   onLangfieldRebuilt?: () => void;
+  // A tool shortcut was pressed for a tool the current tab doesn't show. The
+  // host switches tabs so the tool arms VISIBLE — arming a tool whose panel
+  // isn't rendered is exactly the invisible-click-owner bug these keys would
+  // otherwise multiply.
+  onRequestPanelSection?: (section: "measure" | "edit") => void;
+  // "?" — the host owns showShortcutLegend (and reports it in feedback context).
+  onToggleShortcutLegend?: () => void;
+  // "0" — the host's resetToDefaultView also clears overlays/legends, which is
+  // what a reset should mean; the camera half comes back to us as resetViewToken.
+  onResetView?: () => void;
 }) {
   // Bumped after every crop apply/revert: the preview URL string doesn't
   // otherwise change even though the file on disk did, so the mesh-load
@@ -244,11 +266,14 @@ export function SparkSceneViewer({
   const strokeAtRef = useRef<(p: THREE.Vector3) => void>(() => {});
   const selSetRef = useRef<Set<number>>(new Set());
   const strokesRef = useRef<Uint32Array[]>([]);
+  // Undone strokes, newest last. Any NEW stroke invalidates it — the standard
+  // linear-history rule, so you can never redo onto a diverged selection.
+  const redoRef = useRef<Uint32Array[]>([]);
   const [paintMode, setPaintMode] = useState(false);
   const [brushRadius, setBrushRadius] = useState(0.1);
   const brushRadiusRef = useRef(0.1);
   const [selCount, setSelCount] = useState(0);
-  const [strokeBusy, setStrokeBusy] = useState(false);
+  const [redoCount, setRedoCount] = useState(0);
   const [paintLabel, setPaintLabel] = useState("");
   const [paintAliases, setPaintAliases] = useState("");
   const [paintOp, setPaintOp] = useState<"assign" | "boost" | "suppress">("assign");
@@ -326,6 +351,10 @@ export function SparkSceneViewer({
   const [classNeedsForce, setClassNeedsForce] = useState(false);
   const [classNotice, setClassNotice] = useState<string | null>(null);
   const [showClassLayer, setShowClassLayer] = useState(false);
+  // "H" — hide every viewer-owned panel for a clean look/screenshot. Purely
+  // visual: armed tools and the selection stay exactly as they were, which is
+  // why the HUD is part of what hides.
+  const [chromeHidden, setChromeHidden] = useState(false);
 
   useEffect(() => {
     if (paintTarget === "class" && selectedClassId && taxonomy) {
@@ -493,28 +522,22 @@ export function SparkSceneViewer({
     }
   }
 
-  // Log-scale slider mapping: fine steps at small radii, still reaches the
-  // whole scene — the linear slider was unusable in both directions at once.
-  function logSlider(current: number, min: number, max: number, onValue: (v: number) => void) {
-    const lmin = Math.log(min);
-    const lmax = Math.log(max);
-    const t = (Math.log(Math.min(Math.max(current, min), max)) - lmin) / (lmax - lmin);
-    return {
-      min: 0,
-      max: 1000,
-      step: 1,
-      value: Math.round(t * 1000),
-      onChange: (e: React.ChangeEvent<HTMLInputElement>) =>
-        onValue(Math.exp(lmin + (Number(e.target.value) / 1000) * (lmax - lmin))),
-    };
-  }
-
   // Crop-slider ranges derived from the loaded scene's bbox (set once per
   // load in mesh.initialized); null = bounds not measured yet → legacy range.
   const [sliderScale, setSliderScale] = useState<{
     sphereMax: number;
     boxMax: [number, number, number];
   } | null>(null);
+  // ONE definition of each tool's size range, shared by its slider and by the
+  // [ / ] keys. Two copies would drift, and the keys clamp against these — a
+  // key that could exceed the slider's own max is how you end up with a brush
+  // you can't get back.
+  const brushBounds = { min: (sliderScale?.sphereMax ?? 5) / 2000, max: (sliderScale?.sphereMax ?? 5) / 8 };
+  const cropBounds = { min: (sliderScale?.sphereMax ?? 5) / 2000, max: sliderScale?.sphereMax ?? 5 };
+  const boxBounds = (axis: number) => ({
+    min: (sliderScale?.boxMax[axis] ?? 5) / 2000,
+    max: sliderScale?.boxMax[axis] ?? 5,
+  });
   // Non-fatal regen failures from the last crop/undo (backend `warnings[]`) —
   // previously discarded, so a scene silently degrading to raw-.ply serving
   // looked like success. Cleared by the next successful apply/undo.
@@ -574,6 +597,10 @@ export function SparkSceneViewer({
     if (measureArm) {
       setCropMode(false); // one click-owner at a time
       setBoxMode(false);
+      // Paint too. This was the odd one out of the four exclusivity effects,
+      // and because onClick tests paint BEFORE measure, arming the ruler while
+      // the brush was live silently kept painting instead.
+      setPaintMode(false);
     }
   }, [measureArm]);
 
@@ -627,16 +654,28 @@ export function SparkSceneViewer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [boxMode]);
 
-  // Leaving the Edit tab hides the crop sections — ALSO disarm both crop
-  // click-owners, or an invisible armed tool would keep eating scene clicks
-  // (same reset discipline as the mode-flip effects above; their off-branches
-  // do the center/preview cleanup).
+  // A tool whose panel isn't on screen must not stay armed: it keeps eating
+  // canvas clicks, and paint additionally kills orbit on pointerdown. Each tab
+  // disarms the tools the OTHER tab owns (the mode-flip effects above do the
+  // centre/preview cleanup from their off-branches).
   useEffect(() => {
     if (panelSections !== "edit") {
       setCropMode(false);
       setBoxMode(false);
     }
+    if (panelSections !== "measure") {
+      setPaintMode(false);
+      setMeasureArm(false);
+    }
   }, [panelSections]);
+
+  // The paint section also unmounts on its own gate (safe mode, or a stale
+  // language field) without the tab changing — the section vanishes, so the
+  // mode flag has to go with it.
+  const paintSectionAvailable = job.langfield_available && !safeMode && !job.langfield_stale;
+  useEffect(() => {
+    if (!paintSectionAvailable) setPaintMode(false);
+  }, [paintSectionAvailable]);
 
   useEffect(() => {
     cropRadiusRef.current = cropRadius;
@@ -985,7 +1024,14 @@ export function SparkSceneViewer({
         delta.push(i);
       }
     }
-    if (delta.length) strokesRef.current.push(Uint32Array.from(delta));
+    if (delta.length) {
+      strokesRef.current.push(Uint32Array.from(delta));
+      // History diverged — anything previously undone is unreachable now.
+      if (redoRef.current.length) {
+        redoRef.current = [];
+        setRedoCount(0);
+      }
+    }
     setSelCount(selSetRef.current.size);
     scheduleSelectionPreview();
   }
@@ -995,6 +1041,21 @@ export function SparkSceneViewer({
     const last = strokesRef.current.pop();
     if (!last) return;
     for (const i of last) selSetRef.current.delete(i);
+    redoRef.current.push(last);
+    setRedoCount(redoRef.current.length);
+    setSelCount(selSetRef.current.size);
+    refreshModifierRef.current();
+  }
+
+  // Re-add the most recently undone stroke. Safe to replay verbatim: a stroke
+  // delta only ever holds indices that were NOT in the set when it was made,
+  // and undo removed exactly those.
+  function redoStroke() {
+    const next = redoRef.current.pop();
+    if (!next) return;
+    for (const i of next) selSetRef.current.add(i);
+    strokesRef.current.push(next);
+    setRedoCount(redoRef.current.length);
     setSelCount(selSetRef.current.size);
     refreshModifierRef.current();
   }
@@ -1002,6 +1063,8 @@ export function SparkSceneViewer({
   function clearSelection() {
     selSetRef.current.clear();
     strokesRef.current = [];
+    redoRef.current = [];
+    setRedoCount(0);
     setSelCount(0);
     setPaintNeedsForce(false);
     refreshModifierRef.current();
@@ -1300,6 +1363,159 @@ export function SparkSceneViewer({
       setBoxUndoBusy(false);
     }
   }
+
+  // ---- keyboard actions (ref trampoline) ----------------------------------
+  // onKeyDown is created inside the [url] effect, so it only ever sees the
+  // render that built it. Anything reading React state MUST be reached through
+  // a ref re-assigned every render — the same convention as strokeAtRef /
+  // refreshModifierRef above. Bind commitPaint or selectedClassId directly and
+  // it silently acts on whatever was true when the scene last reloaded.
+  const activeTool: ToolName | null = paintMode
+    ? "paint"
+    : cropMode
+      ? "crop"
+      : boxMode
+        ? "box"
+        : measureArm
+          ? "measure"
+          : null;
+
+  const toolStateRef = useRef<ViewerToolState>({
+    tool: null,
+    confirmArmed: false,
+    hasPlacement: false,
+    selCount: 0,
+    canRedo: false,
+    paintTarget: "field",
+    classCount: 0,
+  });
+  toolStateRef.current = {
+    tool: activeTool,
+    confirmArmed: cropConfirmArmed || boxConfirmArmed || recalibrateArmed,
+    hasPlacement:
+      (activeTool === "crop" && cropCenter !== null) ||
+      (activeTool === "box" && boxCenter !== null) ||
+      (activeTool === "measure" && hasPending),
+    selCount,
+    canRedo: redoCount > 0,
+    paintTarget,
+    classCount: taxonomy?.length ?? 0,
+  };
+
+  function clearPlacement() {
+    if (cropModeRef.current) {
+      cropCenterRef.current = null;
+      setCropCenter(null);
+      setCropRemovedCount(null);
+    } else if (boxModeRef.current) {
+      boxCenterRef.current = null;
+      setBoxCenter(null);
+      setBoxRemovedCount(null);
+    } else if (measureArmRef.current) {
+      pendingPointRef.current = null;
+      setHasPending(false);
+      return; // no wireframe / red preview to tear down
+    }
+    redrawCropRef.current();
+    redrawBoxRef.current();
+    refreshModifierRef.current();
+  }
+
+  function disarmAllTools() {
+    setPaintMode(false);
+    setCropMode(false);
+    setBoxMode(false);
+    setMeasureArm(false);
+  }
+
+  function runEscape(step: EscapeStep) {
+    if (step === "cancel-confirm") {
+      setCropConfirmArmed(false);
+      setBoxConfirmArmed(false);
+      setRecalibrateArmed(false);
+    } else if (step === "clear-placement") {
+      clearPlacement();
+    } else {
+      disarmAllTools();
+    }
+  }
+
+  // Arming a tool whose panel isn't on screen is the invisible-click-owner bug;
+  // ask the host for the right tab in the same tick, so the panelSections
+  // disarm effect sees the new section and leaves us armed.
+  function toggleTool(tool: ToolName) {
+    if (activeTool === tool) {
+      disarmAllTools();
+      return;
+    }
+    if ((tool === "crop" || tool === "box") && safeMode) return;
+    if (tool === "paint" && !paintSectionAvailable) return;
+    const wanted = tool === "crop" || tool === "box" ? "edit" : "measure";
+    if (panelSections !== wanted) onRequestPanelSection?.(wanted);
+    setPaintMode(tool === "paint");
+    setCropMode(tool === "crop");
+    setBoxMode(tool === "box");
+    setMeasureArm(tool === "measure");
+  }
+
+  const keyActionsRef = useRef<(action: ShortcutAction) => void>(() => {});
+  keyActionsRef.current = (action) => {
+    switch (action.kind) {
+      case "escape":
+        runEscape(action.step);
+        break;
+      case "toggle-tool":
+        toggleTool(action.tool);
+        break;
+      case "step-radius": {
+        const { dir, fine } = action;
+        if (activeTool === "paint") setBrushRadius((r) => stepRadius(r, dir, brushBounds, fine));
+        else if (activeTool === "crop") setCropRadius((r) => stepRadius(r, dir, cropBounds, fine));
+        else if (activeTool === "box")
+          setBoxExtents(
+            (prev) =>
+              prev.map((v, i) => stepRadius(v, dir, boxBounds(i), fine)) as [number, number, number],
+          );
+        break;
+      }
+      case "undo-stroke":
+        undoStroke();
+        break;
+      case "redo-stroke":
+        redoStroke();
+        break;
+      case "commit":
+        if (activeTool === "paint") {
+          if (paintTarget === "class") void commitClassPaint();
+          else void commitPaint();
+        } else if (activeTool === "crop" && cropCenter) {
+          if (cropConfirmArmed) void applyCrop();
+          else setCropConfirmArmed(true); // Enter arms, Enter again applies
+        } else if (activeTool === "box" && boxCenter) {
+          if (boxConfirmArmed) void applyBoxCrop();
+          else setBoxConfirmArmed(true);
+        }
+        break;
+      case "discard":
+        if (activeTool === "paint" && selCount > 0) clearSelection();
+        else clearPlacement();
+        break;
+      case "pick-class": {
+        const picked = taxonomy?.[action.index];
+        if (picked) setSelectedClassId(picked.id);
+        break;
+      }
+      case "toggle-help":
+        onToggleShortcutLegend?.();
+        break;
+      case "reset-view":
+        onResetView?.();
+        break;
+      case "toggle-chrome":
+        setChromeHidden((v) => !v);
+        break;
+    }
+  };
 
   // ---- three.js scene ------------------------------------------------------
   useEffect(() => {
@@ -1726,6 +1942,25 @@ export function SparkSceneViewer({
       d[drag.end] = [p.x, p.y, p.z];
       redrawDims();
     }
+    // A drag that ends any way OTHER than pointerup — cancelled touch, a
+    // context menu, the browser stealing the pointer — used to leave
+    // paintDrag true and controls.enabled false forever: orbit simply stopped
+    // working and only a scene reload fixed it.
+    function onPointerCancel(e: PointerEvent) {
+      if (!paintDrag && !drag) return;
+      paintDrag = false;
+      lastStroke = null;
+      drag = null;
+      controls.enabled = true;
+      try {
+        renderer.domElement.releasePointerCapture(e.pointerId);
+      } catch {
+        /* already released */
+      }
+    }
+    function onPointerLeave() {
+      brushCursor.visible = false;
+    }
     function onPointerUp(e: PointerEvent) {
       if (paintDrag) {
         paintDrag = false;
@@ -1803,7 +2038,15 @@ export function SparkSceneViewer({
       }
     }
     function onDoubleClick(event: MouseEvent) {
-      if (measureArmRef.current || paintModeRef.current) return; // click-owners active
+      // Every armed tool owns the click. Crop/box were missing here, so a
+      // double-click placed a crop centre AND yanked the orbit pivot to it.
+      if (
+        measureArmRef.current ||
+        paintModeRef.current ||
+        cropModeRef.current ||
+        boxModeRef.current
+      )
+        return;
       const hit = raycastAt(event.clientX, event.clientY);
       if (hit) {
         controls.target.copy(hit);
@@ -1843,37 +2086,28 @@ export function SparkSceneViewer({
     const rollForward = new THREE.Vector3();
     const rollMatrix = new THREE.Matrix4();
     function onKeyDown(e: KeyboardEvent) {
-      const t = e.target as HTMLElement | null;
-      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
-      // Tool shortcuts (predictable-editor conventions, requested 2026-07-26):
-      // Esc = exit the armed tool · [ / ] = shrink/grow the active tool's
-      // sphere · Z = undo the last paint stroke while painting.
-      if (e.code === "Escape") {
-        if (paintModeRef.current || cropModeRef.current || boxModeRef.current || measureArmRef.current) {
-          setPaintMode(false);
-          setCropMode(false);
-          setBoxMode(false);
-          setMeasureArm(false);
-          brushCursor.visible = false;
-          e.preventDefault();
-        }
-        return;
-      }
-      if (e.code === "BracketLeft" || e.code === "BracketRight") {
-        const factor = e.code === "BracketRight" ? 1.25 : 0.8;
-        if (paintModeRef.current) setBrushRadius((r) => r * factor);
-        else if (cropModeRef.current) setCropRadius((r) => r * factor);
-        else if (boxModeRef.current) {
-          setBoxExtents((prev) => [prev[0] * factor, prev[1] * factor, prev[2] * factor]);
-        } else return;
+      if (isTextEntryTarget(e.target)) return;
+
+      // Editor shortcuts first. resolveShortcut is pure and unit-tested
+      // (lib/viewer-shortcuts.ts); everything it can return is executed through
+      // keyActionsRef, which is re-assigned every render — this handler was
+      // built once, inside the [url] effect, and cannot see current state.
+      const action = resolveShortcut(e, toolStateRef.current);
+      if (action) {
+        keyActionsRef.current(action);
+        // The cursor sphere is effect-local, so a keyboard disarm has to hide
+        // it here — updateToolCursor would otherwise leave it on screen until
+        // the next pointermove.
+        if (action.kind === "escape" && action.step === "disarm") brushCursor.visible = false;
         e.preventDefault();
         return;
       }
-      if (e.code === "KeyZ" && !e.ctrlKey && !e.metaKey && paintModeRef.current) {
-        undoStroke();
-        e.preventDefault();
-        return;
-      }
+
+      // Camera parity with the classic viewer (mkkellogg heritage): WASD =
+      // screen-space key-pan, ArrowLeft/Right = roll camera.up about the view
+      // axis by ±PI/128. Modified presses are left to the browser so Ctrl+S
+      // and friends still work.
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
       switch (e.code) {
         case "KeyW":
           panCamera(0, KEY_PAN_SPEED);
@@ -1903,6 +2137,8 @@ export function SparkSceneViewer({
     renderer.domElement.addEventListener("pointerdown", onPointerDown);
     renderer.domElement.addEventListener("pointermove", onPointerMove);
     renderer.domElement.addEventListener("pointerup", onPointerUp);
+    renderer.domElement.addEventListener("pointercancel", onPointerCancel);
+    renderer.domElement.addEventListener("pointerleave", onPointerLeave);
     renderer.domElement.addEventListener("click", onClick);
     renderer.domElement.addEventListener("dblclick", onDoubleClick);
     window.addEventListener("keydown", onKeyDown);
@@ -1913,6 +2149,8 @@ export function SparkSceneViewer({
       renderer.domElement.removeEventListener("pointerdown", onPointerDown);
       renderer.domElement.removeEventListener("pointermove", onPointerMove);
       renderer.domElement.removeEventListener("pointerup", onPointerUp);
+      renderer.domElement.removeEventListener("pointercancel", onPointerCancel);
+      renderer.domElement.removeEventListener("pointerleave", onPointerLeave);
       renderer.domElement.removeEventListener("click", onClick);
       renderer.domElement.removeEventListener("dblclick", onDoubleClick);
       window.removeEventListener("keydown", onKeyDown);
@@ -2193,7 +2431,25 @@ export function SparkSceneViewer({
           These are DOM/SVG siblings ABOVE the canvas — clicks on the marker
           buttons never reach the renderer's own pointer handlers, so they
           cannot double-fire crop/paint/measure picking. */}
-      {showShortcutLegend && <ShortcutLegend />}
+      {showShortcutLegend && !chromeHidden && <ShortcutLegend />}
+      {!chromeHidden && (
+        <ToolHud
+          tool={activeTool}
+          radiusLabel={
+            activeTool === "paint"
+              ? formatSize(brushRadius, metersPerUnit)
+              : activeTool === "crop"
+                ? formatSize(cropRadius, metersPerUnit)
+                : activeTool === "box"
+                  ? boxExtents.map((e) => formatSize(e, metersPerUnit)).join(" × ")
+                  : null
+          }
+          selCount={selCount}
+          confirmArmed={cropConfirmArmed || boxConfirmArmed}
+          hasPlacement={toolStateRef.current.hasPlacement}
+          onDiscard={clearSelection}
+        />
+      )}
       {overlay &&
         markers.map((mk, i) =>
           mk.front ? (
@@ -2294,7 +2550,7 @@ export function SparkSceneViewer({
           both. Under lg on the Edit tab the Edit lane also overlays the right
           edge, so the drawer gets a lower max-height there — a cheap CSS-only
           mitigation that keeps the two from fully covering each other. */}
-      {panelSections && (
+      {panelSections && !chromeHidden && (
       <div
         className={`absolute left-3 top-3 z-20 max-h-[calc(100%-1.5rem)] w-80 space-y-3 overflow-y-auto rounded-xl border border-white/10 bg-[#0a0f1a] p-3 text-xs text-zinc-200 shadow max-lg:bottom-2 max-lg:left-2 max-lg:right-2 max-lg:top-auto max-lg:w-auto ${
           panelSections === "edit" ? "max-lg:max-h-[30vh]" : "max-lg:max-h-[45vh]"
@@ -2506,36 +2762,36 @@ export function SparkSceneViewer({
                 type="button"
                 size="sm"
                 variant={paintMode ? "primary" : "outline"}
-                onClick={() => setPaintMode((v) => !v)}
-                title="Brush splats with a sphere, then pin them to a label — corrects or extends the AI's understanding. Fully revertible."
+                onClick={() => toggleTool("paint")}
+                title="[B] Brush splats with a sphere, then pin them to a label — corrects or extends the AI's understanding. Fully revertible. Esc exits, [ and ] resize."
               >
-                {strokeBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Paintbrush className="h-3.5 w-3.5" />}{" "}
-                {paintMode ? "Painting…" : "Paint"}
+                <Paintbrush className="h-3.5 w-3.5" /> {paintMode ? "Painting…" : "Paint"}
               </Button>
               {selCount > 0 && (
                 <>
-                  <Button type="button" size="sm" variant="outline" onClick={undoStroke} title="Undo last stroke">
+                  <Button type="button" size="sm" variant="outline" onClick={undoStroke} title="[Ctrl+Z] Undo last stroke">
                     <Undo2 className="h-3.5 w-3.5" />
                   </Button>
-                  <Button type="button" size="sm" variant="outline" onClick={clearSelection} title="Clear selection">
+                  <Button type="button" size="sm" variant="outline" onClick={clearSelection} title="[Del] Clear selection">
                     <Trash2 className="h-3.5 w-3.5" />
                   </Button>
                 </>
               )}
+              {redoCount > 0 && (
+                <Button type="button" size="sm" variant="outline" onClick={redoStroke} title="[Ctrl+Shift+Z] Redo stroke">
+                  <Redo2 className="h-3.5 w-3.5" />
+                </Button>
+              )}
             </div>
             {paintMode && (
               <>
-                <div className="flex items-center gap-2">
-                  <span className="shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">brush</span>
-                  <input
-                    type="range"
-                    className="w-full"
-                    {...logSlider(brushRadius, (sliderScale?.sphereMax ?? 5) / 2000, (sliderScale?.sphereMax ?? 5) / 8, setBrushRadius)}
-                  />
-                  <span className="w-16 shrink-0 text-right text-zinc-400">
-                    {metersPerUnit ? `${(brushRadius * metersPerUnit).toFixed(2)} m` : `${brushRadius.toFixed(2)} u`}
-                  </span>
-                </div>
+                <SizeControl
+                  label="brush"
+                  value={brushRadius}
+                  bounds={brushBounds}
+                  metersPerUnit={metersPerUnit}
+                  onChange={setBrushRadius}
+                />
                 {channels.length > 0 && (
                   <label className="flex items-center gap-2 text-[10px] text-zinc-400">
                     <input type="checkbox" checked={limitToQuery} onChange={(e) => setLimitToQuery(e.target.checked)} />
@@ -2715,8 +2971,8 @@ export function SparkSceneViewer({
             type="button"
             size="sm"
             variant={measureArm ? "primary" : "outline"}
-            onClick={() => setMeasureArm((v) => !v)}
-            title="Click two points per dimension; drag endpoints to adjust"
+            onClick={() => toggleTool("measure")}
+            title="[M] Click two points per dimension; drag endpoints to adjust. Esc cancels a half-placed dimension, then exits."
           >
             <Ruler className="h-3.5 w-3.5" /> {measureArm ? (hasPending ? "Pick 2nd point…" : "Adding…") : "Add dimension"}
           </Button>
@@ -2815,8 +3071,8 @@ export function SparkSceneViewer({
                 type="button"
                 size="sm"
                 variant={cropMode ? "primary" : "outline"}
-                onClick={() => setCropMode((v) => !v)}
-                title="Set a sphere around the subject; splats outside it are permanently removed. Undoable."
+                onClick={() => toggleTool("crop")}
+                title="[C] Set a sphere around the subject; splats outside it are permanently removed. Undoable. [ and ] resize, Enter applies, Esc backs out."
               >
                 <Scissors className="h-3.5 w-3.5" /> {cropMode ? "Cropping…" : "Crop to sphere"}
               </Button>
@@ -2832,17 +3088,13 @@ export function SparkSceneViewer({
                   Click the scene to place the sphere's center. Drag the radius slider to size it — everything
                   shown red will be permanently removed.
                 </p>
-                <div className="flex items-center gap-2">
-                  <span className="shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">radius</span>
-                  <input
-                    type="range"
-                    className="w-full"
-                    {...logSlider(cropRadius, (sliderScale?.sphereMax ?? 5) / 2000, sliderScale?.sphereMax ?? 5, setCropRadius)}
-                  />
-                  <span className="w-16 shrink-0 text-right text-zinc-400">
-                    {metersPerUnit ? `${(cropRadius * metersPerUnit).toFixed(2)} m` : `${cropRadius.toFixed(2)} u`}
-                  </span>
-                </div>
+                <SizeControl
+                  label="radius"
+                  value={cropRadius}
+                  bounds={cropBounds}
+                  metersPerUnit={metersPerUnit}
+                  onChange={setCropRadius}
+                />
                 {cropCenter && (
                   <>
                     <p className="text-[10px] leading-snug text-zinc-400">
@@ -2887,8 +3139,8 @@ export function SparkSceneViewer({
                 type="button"
                 size="sm"
                 variant={boxMode ? "primary" : "outline"}
-                onClick={() => setBoxMode((v) => !v)}
-                title="Set a box around the subject; splats outside it are permanently removed. Undoable."
+                onClick={() => toggleTool("box")}
+                title="[Shift+C] Set a box around the subject; splats outside it are permanently removed. Undoable. [ and ] resize all axes, Enter applies, Esc backs out."
               >
                 <Box className="h-3.5 w-3.5" /> {boxMode ? "Cropping…" : "Crop to box"}
               </Button>
@@ -2905,23 +3157,20 @@ export function SparkSceneViewer({
                   (outside the box) will be permanently removed.
                 </p>
                 {(["x", "y", "z"] as const).map((axis, ai) => (
-                  <div key={axis} className="flex items-center gap-2">
-                    <span className="w-8 shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">±{axis}</span>
-                    <input
-                      type="range"
-                      className="w-full"
-                      {...logSlider(boxExtents[ai], (sliderScale?.boxMax[ai] ?? 5) / 2000, sliderScale?.boxMax[ai] ?? 5, (v) =>
-                        setBoxExtents((prev) => {
-                          const next = [...prev] as [number, number, number];
-                          next[ai] = v;
-                          return next;
-                        }),
-                      )}
-                    />
-                    <span className="w-16 shrink-0 text-right text-zinc-400">
-                      {metersPerUnit ? `${(boxExtents[ai] * metersPerUnit).toFixed(2)} m` : `${boxExtents[ai].toFixed(2)} u`}
-                    </span>
-                  </div>
+                  <SizeControl
+                    key={axis}
+                    label={`±${axis}`}
+                    value={boxExtents[ai]}
+                    bounds={boxBounds(ai)}
+                    metersPerUnit={metersPerUnit}
+                    onChange={(v) =>
+                      setBoxExtents((prev) => {
+                        const next = [...prev] as [number, number, number];
+                        next[ai] = v;
+                        return next;
+                      })
+                    }
+                  />
                 ))}
                 {boxCenter && (
                   <>
@@ -3015,7 +3264,7 @@ export function SparkSceneViewer({
       )}
 
       {/* query legend — updates live with queries, colors, mode, and threshold */}
-      {channels.length > 0 && (
+      {channels.length > 0 && !chromeHidden && (
         <div className="absolute bottom-16 right-3 z-20 w-64 space-y-2 rounded-xl border border-white/10 bg-[#0a0f1a] p-3 text-xs text-zinc-200 shadow">
           <SectionLabel>Legend</SectionLabel>
           {mode === "tint" ? (
@@ -3059,18 +3308,208 @@ export function SparkSceneViewer({
   );
 }
 
-// Floating shortcut reference — no background, tucked top-right, non-interactive.
-// Ported from the classic viewer, trimmed to the shortcuts Spark actually
-// implements: F/G focal, =/- splat scale, and I/C/P/O were mkkellogg-library
-// internals (focalAdjustment, info panel, mesh cursor, point-cloud, ortho)
-// with no Spark equivalent — advertising them here would be lying.
-function ShortcutLegend() {
-  const k = "text-white/75";
+/** Scene units rendered as metres once the scene is calibrated. */
+function formatSize(units: number, metersPerUnit: number | null): string {
+  return metersPerUnit ? `${(units * metersPerUnit).toFixed(2)} m` : `${units.toFixed(2)} u`;
+}
+
+// Log-scale mapping for the radius sliders: fine steps at small radii while
+// still reaching the whole scene — a linear range cannot do both at once.
+function logSliderProps(current: number, min: number, max: number, onValue: (v: number) => void) {
+  const lmin = Math.log(min);
+  const lmax = Math.log(max);
+  const t = (Math.log(Math.min(Math.max(current, min), max)) - lmin) / (lmax - lmin);
+  return {
+    min: 0,
+    max: 1000,
+    step: 1,
+    value: Math.round(t * 1000),
+    onChange: (e: React.ChangeEvent<HTMLInputElement>) =>
+      onValue(Math.exp(lmin + (Number(e.target.value) / 1000) * (lmax - lmin))),
+  };
+}
+
+// Slider for sweeping + a typed box for the exact number. The typed box is what
+// makes a crop repeatable: you cannot land on 0.37 m twice by dragging a log
+// slider, and "same radius as last time" is a thing operators actually need.
+// Typing is committed on blur/Enter so a half-typed "0." never resets the tool.
+function SizeControl({
+  label,
+  value,
+  bounds,
+  metersPerUnit,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  bounds: { min: number; max: number };
+  metersPerUnit: number | null;
+  onChange: (v: number) => void;
+}) {
+  const toDisplay = (u: number) => (metersPerUnit ? u * metersPerUnit : u);
+  const fromDisplay = (d: number) => (metersPerUnit ? d / metersPerUnit : d);
+  const [draft, setDraft] = useState<string | null>(null);
+
+  function commitDraft() {
+    if (draft === null) return;
+    const parsed = Number(draft);
+    setDraft(null);
+    if (!Number.isFinite(parsed) || parsed <= 0) return; // keep the old value
+    onChange(Math.min(Math.max(fromDisplay(parsed), bounds.min), bounds.max));
+  }
+
   return (
-    <div className="pointer-events-none absolute right-3 top-3 z-10 select-none text-right font-mono text-[10px] leading-[1.55] text-white/40">
-      <div><span className={k}>drag</span> orbit · <span className={k}>scroll</span> zoom</div>
-      <div><span className={k}>W A S D</span> pan · <span className={k}>← →</span> roll</div>
-      <div><span className={k}>dbl-click</span> set orbit pivot</div>
+    <div className="flex items-center gap-2">
+      <span className="shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">{label}</span>
+      <input type="range" className="w-full" {...logSliderProps(value, bounds.min, bounds.max, onChange)} />
+      <Input
+        size="xs"
+        inputMode="decimal"
+        aria-label={`${label} size in ${metersPerUnit ? "metres" : "units"}`}
+        className="w-16 shrink-0 text-right"
+        value={draft ?? toDisplay(value).toFixed(2)}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commitDraft}
+        onKeyDown={(e) => {
+          // The viewer listens for keys on window — keep typing out of it.
+          e.stopPropagation();
+          if (e.key === "Enter") e.currentTarget.blur();
+        }}
+        onKeyUp={(e) => e.stopPropagation()}
+      />
+      <span className="w-3 shrink-0 text-[10px] text-zinc-600">{metersPerUnit ? "m" : "u"}</span>
+    </div>
+  );
+}
+
+// Live readout of what the canvas will do with your next click, plus the one
+// piece of state that used to be invisible: an uncommitted paint selection.
+// Esc disarms the brush WITHOUT discarding the selection (deliberate — a long
+// paint pass must not die to a stray keypress), so something on screen has to
+// say the selection is still there. Solid, per the panel convention.
+function ToolHud({
+  tool,
+  radiusLabel,
+  selCount,
+  confirmArmed,
+  hasPlacement,
+  onDiscard,
+}: {
+  tool: ToolName | null;
+  radiusLabel: string | null;
+  selCount: number;
+  confirmArmed: boolean;
+  hasPlacement: boolean;
+  onDiscard: () => void;
+}) {
+  if (!tool && selCount === 0) return null;
+  const TOOL_COPY: Record<ToolName, { name: string; hint: string }> = {
+    paint: { name: "Paint", hint: "drag to brush · [ ] size · Ctrl+Z undo · Enter commit · Esc exit" },
+    crop: { name: "Crop sphere", hint: "click to place · [ ] size · Enter applies · Esc backs out" },
+    box: { name: "Crop box", hint: "click to place · [ ] size · Enter applies · Esc backs out" },
+    measure: { name: "Dimension", hint: "click two points · Esc backs out" },
+  };
+  const copy = tool ? TOOL_COPY[tool] : null;
+  return (
+    <div className="pointer-events-none absolute left-1/2 top-3 z-30 flex max-w-[min(34rem,calc(100%-2rem))] -translate-x-1/2 flex-col items-center gap-1 rounded-xl border border-white/10 bg-[#0a0f1a] px-3 py-1.5 text-[11px] text-zinc-200 shadow">
+      {copy && (
+        <div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5">
+          <span className="font-semibold text-cyan-200">{copy.name}</span>
+          {radiusLabel && <span className="font-mono text-zinc-400">{radiusLabel}</span>}
+          {confirmArmed ? (
+            <span className="font-semibold text-amber-300">press Enter again to apply</span>
+          ) : hasPlacement ? (
+            <span className="text-amber-300/90">placed — Enter to apply</span>
+          ) : null}
+          <span className="text-[10px] text-zinc-500">{copy.hint}</span>
+        </div>
+      )}
+      {selCount > 0 && (
+        <div className="pointer-events-auto flex items-center gap-2">
+          <span className="font-semibold text-cyan-200">{selCount.toLocaleString()} splats selected</span>
+          <span className="text-[10px] uppercase tracking-wide text-amber-300">not committed</span>
+          <button
+            type="button"
+            onClick={onDiscard}
+            className="rounded border border-white/15 px-1.5 py-0.5 text-[10px] text-zinc-300 hover:bg-white/10"
+          >
+            Discard
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Shared keycap chip. */
+export function Kbd({ children }: { children: ReactNode }) {
+  return (
+    <kbd className="rounded border border-white/15 bg-white/5 px-1 font-mono text-[10px] text-zinc-200">
+      {children}
+    </kbd>
+  );
+}
+
+// The full, honest shortcut reference. The previous version listed three camera
+// lines and claimed F/G + =/- bindings that never existed in Spark; every row
+// below is wired in lib/viewer-shortcuts.ts and covered by its tests.
+function ShortcutLegend() {
+  const rows: [string, [string, string][]][] = [
+    [
+      "Camera",
+      [
+        ["drag / scroll", "orbit · zoom"],
+        ["W A S D", "pan"],
+        ["← →", "roll"],
+        ["dbl-click", "set orbit pivot"],
+        ["0", "reset view"],
+        ["H", "hide panels"],
+      ],
+    ],
+    [
+      "Tools",
+      [
+        ["B", "paint brush"],
+        ["C", "crop to sphere"],
+        ["Shift C", "crop to box"],
+        ["M", "add dimension"],
+        ["Esc", "back out one level"],
+        ["[  ]", "tool size"],
+      ],
+    ],
+    [
+      "Painting",
+      [
+        ["1 – 9", "pick class"],
+        ["Ctrl Z", "undo stroke"],
+        ["Ctrl ⇧ Z", "redo stroke"],
+        ["Del", "discard selection"],
+        ["Enter", "commit"],
+        ["?", "this card"],
+      ],
+    ],
+  ];
+  return (
+    <div className="absolute right-3 top-3 z-30 max-h-[calc(100%-1.5rem)] w-64 select-none overflow-y-auto rounded-xl border border-white/10 bg-[#0a0f1a] p-3 text-[11px] text-zinc-200 shadow">
+      <div className="mb-2 text-[10px] uppercase tracking-[0.28em] text-zinc-500">Shortcuts</div>
+      {rows.map(([group, items]) => (
+        <div key={group} className="mb-2 last:mb-0">
+          <div className="mb-1 text-[10px] font-semibold text-cyan-200/80">{group}</div>
+          {items.map(([keys, what]) => (
+            <div key={keys} className="flex items-baseline justify-between gap-2 leading-relaxed">
+              <span className="flex shrink-0 gap-1">
+                {keys.split(" ").map((k, i) => (
+                  <Kbd key={i}>{k}</Kbd>
+                ))}
+              </span>
+              <span className="text-right text-[10px] text-zinc-400">{what}</span>
+            </div>
+          ))}
+        </div>
+      ))}
+      <p className="mt-2 text-[10px] leading-snug text-zinc-600">
+        Keys are ignored while you're typing in a field.
+      </p>
     </div>
   );
 }

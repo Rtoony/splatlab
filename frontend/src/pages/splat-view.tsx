@@ -68,6 +68,15 @@ export default function SplatViewPage() {
     const tab = new URLSearchParams(window.location.search).get("tab");
     return tab === "measure" || tab === "objects" || tab === "edit" || tab === "export" ? tab : "view";
   });
+  // ...and write it back, so a reload, a bookmark, or a link you paste to
+  // yourself keeps the lane you were working in. replaceState (not push) —
+  // switching tabs should not stack up browser-back steps.
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (mode === "view") url.searchParams.delete("tab");
+    else url.searchParams.set("tab", mode);
+    if (url.toString() !== window.location.href) window.history.replaceState(null, "", url);
+  }, [mode]);
   const queryClient = useQueryClient();
   // Bumped after each successful Edit-lane op: routes into the Spark viewer's
   // reloadToken prop (same reload path its own crop tools use) and refreshes
@@ -454,6 +463,9 @@ export default function SplatViewPage() {
                 onLangfieldRebuilt={() => void queryClient.invalidateQueries({ queryKey: ["status"] })}
                 onPickMatch={setActiveIdx}
                 onPickCamera={zoomToCamera}
+                onRequestPanelSection={setMode}
+                onToggleShortcutLegend={() => setShortcutLegendOpen((v) => !v)}
+                onResetView={resetToDefaultView}
               />
             )}
             {cameraOverlayOn && camerasError && (
