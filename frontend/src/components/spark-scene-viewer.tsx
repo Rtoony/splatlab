@@ -834,51 +834,120 @@ export function SparkSceneViewer({
     scheduleBoxPreview();
   }
 
-  async function strokeAt(p: THREE.Vector3) {
-    setStrokeBusy(true);
-    setPaintError(null);
-    try {
-      const res = await fetch(`/api/splat/jobs/${job.job_id}/langfield/select/sphere`, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ center: [p.x, p.y, p.z], radius: brushRadiusRef.current }),
-      });
-      if (res.status === 404 || res.status === 405) {
-        throw new Error(
-          "The paint endpoint isn't available on this backend build — the service likely needs its scheduled restart.",
-        );
-      }
-      if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).slice(0, 200)}`);
-      const idx = new Uint32Array(await res.arrayBuffer());
-      // optional hygiene: clip the sloppy sphere to the current query's matches
-      let clipped: Uint32Array | number[] = idx;
-      if (limitToQuery) {
-        const ch = channelsRef.current.find((c) => c.enabled);
-        if (ch) {
-          const cut = Math.round(cutoffForTopPercent(ch.bytes, topPctRef.current) * 255);
-          const keep: number[] = [];
-          for (const i of idx) if (ch.bytes[i] >= cut) keep.push(i);
-          clipped = keep;
-        }
-      }
-      const delta: number[] = [];
-      for (const i of clipped) {
-        if (!selSetRef.current.has(i)) {
-          selSetRef.current.add(i);
-          delta.push(i);
-        }
-      }
-      if (delta.length) strokesRef.current.push(Uint32Array.from(delta));
-      setSelCount(selSetRef.current.size);
-      refreshModifierRef.current();
-    } catch (cause) {
-      setPaintError(cause instanceof Error ? cause.message : "Brush stroke failed.");
-    } finally {
-      setStrokeBusy(false);
+  // ---- LOCAL brush selection --------------------------------------------
+  // Strokes never touch the server: a one-time spatial grid over the loaded
+  // splat positions answers sphere queries in-browser, so sweeps are instant
+  // and NOTHING is sent until the commit button ("save"). The commit already
+  // posts final indices — the per-stroke /select/sphere round-trip (the
+  // choppiness source) was never actually needed.
+  const paintIndexRef = useRef<{
+    positions: Float32Array;
+    grid: Map<string, number[]>;
+    cellSize: number;
+    count: number;
+  } | null>(null);
+
+  function ensurePaintIndex(): boolean {
+    if (paintIndexRef.current) return true;
+    const mesh = meshRef.current;
+    const packed = mesh?.packedSplats;
+    const count = packed?.numSplats ?? 0;
+    if (!packed || !count) return false;
+    const positions = new Float32Array(count * 3);
+    const lo = [Infinity, Infinity, Infinity];
+    const hi = [-Infinity, -Infinity, -Infinity];
+    packed.forEachSplat((i: number, c: THREE.Vector3) => {
+      positions[i * 3] = c.x;
+      positions[i * 3 + 1] = c.y;
+      positions[i * 3 + 2] = c.z;
+      if (c.x < lo[0]) lo[0] = c.x;
+      if (c.y < lo[1]) lo[1] = c.y;
+      if (c.z < lo[2]) lo[2] = c.z;
+      if (c.x > hi[0]) hi[0] = c.x;
+      if (c.y > hi[1]) hi[1] = c.y;
+      if (c.z > hi[2]) hi[2] = c.z;
+    });
+    const diag = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+    const cellSize = Math.max(diag / 128, 1e-3);
+    const grid = new Map<string, number[]>();
+    for (let i = 0; i < count; i += 1) {
+      const key = `${Math.floor(positions[i * 3] / cellSize)},${Math.floor(positions[i * 3 + 1] / cellSize)},${Math.floor(positions[i * 3 + 2] / cellSize)}`;
+      const bucket = grid.get(key);
+      if (bucket) bucket.push(i);
+      else grid.set(key, [i]);
     }
+    paintIndexRef.current = { positions, grid, cellSize, count };
+    return true;
   }
-  strokeAtRef.current = (p) => void strokeAt(p);
+
+  function localSelectSphere(p: THREE.Vector3, radius: number): number[] {
+    const index = paintIndexRef.current;
+    if (!index) return [];
+    const { positions, grid, cellSize } = index;
+    const r2 = radius * radius;
+    const out: number[] = [];
+    const x0 = Math.floor((p.x - radius) / cellSize);
+    const x1 = Math.floor((p.x + radius) / cellSize);
+    const y0 = Math.floor((p.y - radius) / cellSize);
+    const y1 = Math.floor((p.y + radius) / cellSize);
+    const z0 = Math.floor((p.z - radius) / cellSize);
+    const z1 = Math.floor((p.z + radius) / cellSize);
+    for (let ix = x0; ix <= x1; ix += 1) {
+      for (let iy = y0; iy <= y1; iy += 1) {
+        for (let iz = z0; iz <= z1; iz += 1) {
+          const bucket = grid.get(`${ix},${iy},${iz}`);
+          if (!bucket) continue;
+          for (const i of bucket) {
+            const dx = positions[i * 3] - p.x;
+            const dy = positions[i * 3 + 1] - p.y;
+            const dz = positions[i * 3 + 2] - p.z;
+            if (dx * dx + dy * dy + dz * dz <= r2) out.push(i);
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  // Selection-tint refresh is the expensive part of a stroke (full-scene
+  // modifier rebuild) — coalesce to a 120ms trailing update during sweeps.
+  const selPreviewTimer = useRef<number | null>(null);
+  function scheduleSelectionPreview() {
+    if (selPreviewTimer.current !== null) return;
+    selPreviewTimer.current = window.setTimeout(() => {
+      selPreviewTimer.current = null;
+      refreshModifierRef.current();
+    }, 120);
+  }
+
+  function strokeAt(p: THREE.Vector3) {
+    if (!ensurePaintIndex()) {
+      setPaintError("Scene not fully loaded yet — try the stroke again in a second.");
+      return;
+    }
+    setPaintError(null);
+    const idx = localSelectSphere(p, brushRadiusRef.current);
+    // optional hygiene: clip the sloppy sphere to the current query's matches
+    let clipped: number[] = idx;
+    if (limitToQuery) {
+      const ch = channelsRef.current.find((c) => c.enabled);
+      if (ch) {
+        const cut = Math.round(cutoffForTopPercent(ch.bytes, topPctRef.current) * 255);
+        clipped = idx.filter((i) => ch.bytes[i] >= cut);
+      }
+    }
+    const delta: number[] = [];
+    for (const i of clipped) {
+      if (!selSetRef.current.has(i)) {
+        selSetRef.current.add(i);
+        delta.push(i);
+      }
+    }
+    if (delta.length) strokesRef.current.push(Uint32Array.from(delta));
+    setSelCount(selSetRef.current.size);
+    scheduleSelectionPreview();
+  }
+  strokeAtRef.current = (p) => strokeAt(p);
 
   function undoStroke() {
     const last = strokesRef.current.pop();
@@ -1339,8 +1408,6 @@ export function SparkSceneViewer({
     let brushRayAt = 0;
     let paintDrag = false;
     let lastStroke: THREE.Vector3 | null = null;
-    let strokeInFlight = false;
-    const pendingStrokes: THREE.Vector3[] = [];
     function updateToolCursor(clientX: number, clientY: number): THREE.Vector3 | null {
       // One cursor, three owners: cyan brush while painting; a red preview
       // sphere while a crop tool is armed but UNPLACED (the "why is nothing
@@ -1374,33 +1441,19 @@ export function SparkSceneViewer({
       }
       return hit;
     }
-    async function pumpStrokes() {
-      // Serialize the select requests; the queue (with interpolation below)
-      // is what makes a fast sweep gap-free regardless of request latency.
-      if (strokeInFlight) return;
-      strokeInFlight = true;
-      try {
-        while (pendingStrokes.length) {
-          const p = pendingStrokes.shift()!;
-          await strokeAtRef.current(p);
-        }
-      } finally {
-        strokeInFlight = false;
-      }
-    }
     function enqueueStroke(hit: THREE.Vector3) {
+      // Strokes are LOCAL (spatial grid) — instant, so a sweep just needs
+      // spacing + path interpolation for full coverage.
       const spacing = brushRadiusRef.current * 0.6;
       if (lastStroke && lastStroke.distanceTo(hit) < spacing) return;
-      if (lastStroke && pendingStrokes.length < 32) {
-        // fill the path between samples so latency can't leave gaps
+      if (lastStroke) {
         const steps = Math.min(12, Math.floor(lastStroke.distanceTo(hit) / spacing));
         for (let s = 1; s < steps; s += 1) {
-          pendingStrokes.push(lastStroke.clone().lerp(hit, s / steps));
+          strokeAtRef.current(lastStroke.clone().lerp(hit, s / steps));
         }
       }
-      pendingStrokes.push(hit.clone());
+      strokeAtRef.current(hit.clone());
       lastStroke = hit.clone();
-      void pumpStrokes();
     }
 
     function redrawCrop() {
@@ -1516,6 +1569,7 @@ export function SparkSceneViewer({
       .then(() => {
         if (disposed) return;
         setSplatCount(mesh.packedSplats?.numSplats ?? mesh.numSplats ?? 0);
+        paintIndexRef.current = null; // rows/positions changed — rebuild lazily
         // One bbox pass so crop sliders scale to THIS scene: the old fixed
         // 0.05–5 range could never enclose a large capture and dwarfed tiny
         // ones. Floater-inflated bounds only lengthen the slider — harmless.
@@ -1634,7 +1688,6 @@ export function SparkSceneViewer({
       if (paintDrag) {
         paintDrag = false;
         lastStroke = null;
-        pendingStrokes.length = 0;
         controls.enabled = true;
         try {
           renderer.domElement.releasePointerCapture(e.pointerId);
@@ -2426,7 +2479,8 @@ export function SparkSceneViewer({
                 <p className="text-[10px] leading-snug text-zinc-500">
                   The cyan wireframe sphere is your brush. <b>Click</b> for one stroke or{" "}
                   <b>hold and sweep</b> to paint ({selCount.toLocaleString()} splats selected, shown
-                  cyan). Camera orbit is paused while Painting is armed — toggle it off to navigate.
+                  cyan). Everything stays local until you press the commit button — that's the save.
+                  Camera orbit is paused while Painting is armed — toggle it off to navigate.
                 </p>
                 {paintTarget === "class" && (
                   <div className="space-y-1.5">
