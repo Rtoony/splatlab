@@ -265,6 +265,74 @@ def run_object_texture(py: Path, script: Path, mesh: Path, splat: Path, out_glb:
     return {"ok": True, "seconds": round(time.time() - t, 1), "report": report}
 
 
+def _shell_colour_source(job_dir: Path) -> Path:
+    """background.ply is the exact complement of every claimed instance — a
+    cleaner colour source for the shell than the full splat, which still
+    contains the props cut out of the geometry."""
+    splat = job_dir / "_scene" / "isolated" / "background.ply"
+    if not splat.is_file():
+        splat = job_dir / "_preview" / "splat.ply"
+    if not splat.is_file():
+        raise FileNotFoundError("no shell colour source (background.ply or splat.ply)")
+    return splat
+
+
+def build_shell(job_dir: Path, args, instances, py: Path, script: Path, mpu) -> dict:
+    """The visual shell, from one of two geometry sources.
+
+    tsdf  — the original path: TSDF surface with instance boxes cut out.
+            Accurate to the capture but lacy (bonsai: 2,088 components at any
+            budget) — fails its own connectivity/floor gates.
+    voxel — bake colour onto world_shell.py's watertight voxel solid instead.
+            Blockier detail, but ONE component with floor continuity 1.0, so
+            the shell passes its gates, survives Blender editing, and the
+            visual surface coincides exactly with what the walker collides
+            against (no fall-throughs where the eye sees ground).
+    """
+    world = job_dir / "_world"
+    _log(f"  shell ({args.shell_source}) ...")
+    shell: dict = {"role": "shell", "source": args.shell_source}
+    try:
+        if args.shell_source == "voxel":
+            geom = world / "collision_shell.glb"
+            if not geom.is_file():
+                _log("  no collision_shell.glb — running world_shell.py first")
+                proc = subprocess.run(
+                    [str(py), str(Path(__file__).with_name("world_shell.py")),
+                     str(job_dir)],
+                    capture_output=True, text=True, timeout=1800)
+                if proc.returncode != 0 or not geom.is_file():
+                    tail = "\n".join((proc.stderr or "").splitlines()[-4:])
+                    raise RuntimeError(f"world_shell.py failed: {tail[:300]}")
+            cut = None
+        else:
+            geom = world / "_work" / "shell.ply"
+            cut = build_shell_mesh(job_dir, instance_boxes(instances), geom)
+        splat = _shell_colour_source(job_dir)
+        out = world / "shell.glb"
+        # Chunked unwrap is what makes dense-shell budgets tractable
+        # (13x measured at 400k faces); the layout change is confined to
+        # the shell, whose consumers treat GLB+atlas as a regenerated pair.
+        res = run_object_texture(py, script, geom, splat, out, mpu=mpu,
+                                 faces=args.shell_faces, tex=args.shell_texture_size,
+                                 reconstruct=False, crop=False, timeout=3600,
+                                 unwrap_chunks=4)
+        shell.update(cut=cut, built=res["ok"], seconds=res["seconds"],
+                     glb=out.name if res["ok"] else None)
+        if not res["ok"]:
+            shell["reason"] = res.get("error")
+            _log(f"  FAIL shell: {str(res.get('error'))[:200]}")
+        else:
+            r = res.get("report") or {}
+            shell["faces"] = r.get("faces")
+            shell["extent"] = r.get("extent")
+            shell["texture"] = (r.get("texture") or {}).get("baked")
+    except Exception as exc:  # noqa: BLE001 — a failed shell must not lose the props
+        shell.update(built=False, reason=f"{type(exc).__name__}: {exc}"[:300])
+        _log(f"  FAIL shell: {shell['reason']}")
+    return shell
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("job_dir")
@@ -275,6 +343,12 @@ def main() -> int:
     ap.add_argument("--shell-texture-size", type=int, default=2048)
     ap.add_argument("--only", default=None, help="comma-separated slugs")
     ap.add_argument("--skip-shell", action="store_true")
+    ap.add_argument("--shell-source", choices=["tsdf", "voxel"], default="tsdf",
+                    help="voxel = bake colour onto world_shell.py's watertight "
+                         "solid (gate-passing); tsdf = the original cut surface")
+    ap.add_argument("--shell-only", action="store_true",
+                    help="rebuild ONLY the shell and patch it into the existing "
+                         "world.json — elements are untouched")
     ap.add_argument("--prefer-generated", action="store_true",
                     help="use a placed generative reconstruction in place of the captured "
                          "geometry when one exists (render lane only; survey still refuses it)")
@@ -304,6 +378,28 @@ def main() -> int:
 
     world = job_dir / "_world"
     (world / "elements").mkdir(parents=True, exist_ok=True)
+
+    if args.shell_only:
+        # Patch the shell into the EXISTING world.json — never clobber the
+        # element records a full solidify wrote.
+        world_json = world / "world.json"
+        try:
+            doc = json.loads(world_json.read_text())
+        except (OSError, json.JSONDecodeError):
+            print("FATAL: --shell-only needs an existing _world/world.json — "
+                  "run the full solidify first", file=sys.stderr)
+            return 1
+        instances = load_inventory(job_dir) if args.shell_source == "tsdf" else []
+        if args.shell_source == "tsdf" and not instances:
+            print("FATAL: tsdf shell needs _scene/inventory.json for the "
+                  "instance cut boxes", file=sys.stderr)
+            return 1
+        shell = build_shell(job_dir, args, instances, py, script, mpu)
+        doc["shell"] = shell
+        doc.setdefault("counts", {})["shell_built"] = bool(shell.get("built"))
+        world_json.write_text(json.dumps(doc, indent=2))
+        print(json.dumps({"shell": shell}, indent=2))
+        return 0 if shell.get("built") else 1
 
     instances = load_inventory(job_dir)
     if not instances:
@@ -390,40 +486,7 @@ def main() -> int:
 
     shell = None
     if not args.skip_shell:
-        _log("  shell ...")
-        try:
-            shell_ply = world / "_work" / "shell.ply"
-            cut = build_shell_mesh(job_dir, instance_boxes(instances), shell_ply)
-            # background.ply is the exact complement of every claimed instance —
-            # a cleaner colour source for the shell than the full splat, which
-            # still contains the props we just cut out of the geometry.
-            splat = job_dir / "_scene" / "isolated" / "background.ply"
-            if not splat.is_file():
-                splat = job_dir / "_preview" / "splat.ply"
-            if not splat.is_file():
-                raise FileNotFoundError("no shell colour source (background.ply or splat.ply)")
-            out = world / "shell.glb"
-            # Chunked unwrap is what makes dense-shell budgets tractable
-            # (13x measured at 400k faces); the layout change is confined to
-            # the shell, whose consumers treat GLB+atlas as a regenerated pair.
-            res = run_object_texture(py, script, shell_ply, splat, out, mpu=mpu,
-                                     faces=args.shell_faces, tex=args.shell_texture_size,
-                                     reconstruct=False, crop=False, timeout=3600,
-                                     unwrap_chunks=4)
-            shell = {"role": "shell", "cut": cut, "built": res["ok"],
-                     "seconds": res["seconds"], "glb": out.name if res["ok"] else None}
-            if not res["ok"]:
-                shell["reason"] = res.get("error")
-                _log(f"  FAIL shell: {str(res.get('error'))[:200]}")
-            else:
-                r = res.get("report") or {}
-                shell["faces"] = r.get("faces")
-                shell["extent"] = r.get("extent")
-                shell["texture"] = (r.get("texture") or {}).get("baked")
-        except Exception as exc:  # noqa: BLE001 — a failed shell must not lose the props
-            shell = {"role": "shell", "built": False,
-                     "reason": f"{type(exc).__name__}: {exc}"[:300]}
-            _log(f"  FAIL shell: {shell['reason']}")
+        shell = build_shell(job_dir, args, instances, py, script, mpu)
 
     built = [e for e in elements if e.get("built")]
     doc = {
