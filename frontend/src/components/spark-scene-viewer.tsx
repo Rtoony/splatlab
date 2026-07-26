@@ -1340,22 +1340,67 @@ export function SparkSceneViewer({
     let paintDrag = false;
     let lastStroke: THREE.Vector3 | null = null;
     let strokeInFlight = false;
-    function updateBrushCursor(clientX: number, clientY: number): THREE.Vector3 | null {
-      // ~14 Hz raycast throttle — continuous raycasts on a 2M-splat scene
-      // would hitch the render loop.
+    const pendingStrokes: THREE.Vector3[] = [];
+    function updateToolCursor(clientX: number, clientY: number): THREE.Vector3 | null {
+      // One cursor, three owners: cyan brush while painting; a red preview
+      // sphere while a crop tool is armed but UNPLACED (the "why is nothing
+      // showing" moment — the crop sphere only used to appear after the first
+      // click). ~14 Hz raycast throttle so a 2M-splat scene doesn't hitch.
+      const paintArmed = paintModeRef.current;
+      const cropPlacing = cropModeRef.current && !cropCenterRef.current;
+      const boxPlacing = boxModeRef.current && !boxCenterRef.current;
+      if (!paintArmed && !cropPlacing && !boxPlacing) {
+        brushCursor.visible = false;
+        return null;
+      }
       const now = performance.now();
       if (now - brushRayAt < 70) return null;
       brushRayAt = now;
       const hit = raycastAt(clientX, clientY);
       if (hit) {
         brushCursor.position.copy(hit);
-        const r = brushRadiusRef.current;
-        brushCursor.scale.setScalar(r);
+        const r = paintArmed
+          ? brushRadiusRef.current
+          : cropPlacing
+            ? cropRadiusRef.current
+            : Math.min(...boxExtentsRef.current);
+        brushCursor.scale.setScalar(Math.max(r, 1e-4));
+        (brushCursor.material as THREE.MeshBasicMaterial).color.setHex(
+          paintArmed ? 0x22d3ee : 0xf87171,
+        );
         brushCursor.visible = true;
       } else {
         brushCursor.visible = false;
       }
       return hit;
+    }
+    async function pumpStrokes() {
+      // Serialize the select requests; the queue (with interpolation below)
+      // is what makes a fast sweep gap-free regardless of request latency.
+      if (strokeInFlight) return;
+      strokeInFlight = true;
+      try {
+        while (pendingStrokes.length) {
+          const p = pendingStrokes.shift()!;
+          await strokeAtRef.current(p);
+        }
+      } finally {
+        strokeInFlight = false;
+      }
+    }
+    function enqueueStroke(hit: THREE.Vector3) {
+      const spacing = brushRadiusRef.current * 0.6;
+      if (lastStroke && lastStroke.distanceTo(hit) < spacing) return;
+      if (lastStroke && pendingStrokes.length < 32) {
+        // fill the path between samples so latency can't leave gaps
+        const steps = Math.min(12, Math.floor(lastStroke.distanceTo(hit) / spacing));
+        for (let s = 1; s < steps; s += 1) {
+          pendingStrokes.push(lastStroke.clone().lerp(hit, s / steps));
+        }
+      }
+      pendingStrokes.push(hit.clone());
+      lastStroke = hit.clone();
+      void pumpStrokes();
     }
 
     function redrawCrop() {
@@ -1570,24 +1615,13 @@ export function SparkSceneViewer({
       }
     }
     function onPointerMove(e: PointerEvent) {
-      if (paintModeRef.current && !drag) {
-        const hit = updateBrushCursor(e.clientX, e.clientY);
-        // Drag-to-paint: while the primary button is held, lay a stroke each
-        // time the cursor travels ~60% of a brush radius. One request in
-        // flight at a time; skipped hits just wait for the next move event.
-        if (paintDrag && hit && !strokeInFlight) {
-          const spacing = brushRadiusRef.current * 0.6;
-          if (!lastStroke || lastStroke.distanceTo(hit) >= spacing) {
-            lastStroke = hit.clone();
-            strokeInFlight = true;
-            Promise.resolve(strokeAtRef.current(hit)).finally(() => {
-              strokeInFlight = false;
-            });
-          }
-        }
-        return;
+      if (!drag) {
+        const hit = updateToolCursor(e.clientX, e.clientY);
+        // Drag-to-paint: strokes enqueue (with path interpolation) while the
+        // primary button is held — see enqueueStroke/pumpStrokes.
+        if (paintModeRef.current && paintDrag && hit) enqueueStroke(hit);
+        if (paintModeRef.current || cropModeRef.current || boxModeRef.current) return;
       }
-      brushCursor.visible = false;
       if (!drag) return;
       const p = raycastAt(e.clientX, e.clientY);
       if (!p) return;
@@ -1600,6 +1634,7 @@ export function SparkSceneViewer({
       if (paintDrag) {
         paintDrag = false;
         lastStroke = null;
+        pendingStrokes.length = 0;
         controls.enabled = true;
         try {
           renderer.domElement.releasePointerCapture(e.pointerId);
