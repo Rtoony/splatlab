@@ -1876,3 +1876,32 @@ call):
 multi-level streamed-SOG pyramids / GPU SOG (throughput), per-artifact collision staleness,
 SuperSplat save-back button (trigger: manual roundtrip proves annoying), merge-scenes GUI
 (trigger: two geo-anchored scenes of one site), post-hoc langfield rebuild lane, light theme.
+
+## EDIT TOOLS UNBROKEN + STEPPED PROGRESS (2026-07-25 evening) — first successful edits ever
+
+RToony hit "Unsupported output file type: ...edit-tmp" on Clean up floaters (3× live 500s).
+Root cause: `_edit_tmp_path` built temp names ending `.edit-tmp`; splat-transform v2.7.1
+dispatches output format purely on suffix. FIVE sites shared it (apply + all three regens +
+`.float-clean`); **no edit had ever landed on this machine** — the extension-blind test stub
+kept 80 tests green against the wrong contract.
+
+- **Fix** (`649b539`): temp shape `.edit-tmp.<token>.<real name>`; `.float-clean` same
+  treatment. **Stub now enforces the extension contract** (falsification-proven: buggy helper +
+  new stub fails the suite). Unit test on the helper.
+- **Stepped progress** (`1c96bc9` + `a11815d`): in-memory EDIT_PROGRESS (begin/step/end at
+  transaction boundaries; semantic adds leading "match"), additive `edit_progress` on
+  GET /activity; frontend EditProgress strip (stage dots + human labels + 1s elapsed ticker +
+  patience copy, indeterminate degrade), useActivity(fast) 2s poll during local edits,
+  "Applying…" button text, server-truth "edit in progress (started elsewhere)" lock banner.
+- **Crop lives in the Edit tab now** (`b948729`, RToony's call): `toolsVisible` →
+  `panelSections: "measure"|"edit"|null` — Measure = search/paint/dims, Edit = crop sphere+box
+  beside the op cards; leaving Edit disarms crop modes; <1024px drawer capped 30vh on edit.
+- **Live proof (restart window taken, 0 jobs)**: keep-everything crop on the hydrant → HTTP 200
+  in 8.7s, 0 warnings (all regens work), v1 snapshot; /activity showed apply(2/6)→compress(3/6)
+  mid-flight. Revert v1 → 5 files restored. **Acceptance = RToony's real ask: Clean up floaters
+  → 910,560 → 909,532 (−1,028) in 10.1s, GPU splat-edit lane visible as holder, restore point
+  v3 left in place for undo.** Note: −1,028 is `-G` engine defaults — conservative; if streaks
+  remain, the backend accepts tuning params the lane doesn't yet expose (backlog), and crop
+  handles the rest.
+- Tests 567 → **570 passed / 2 skipped**; frontend gates green (tsc-gated build, eslint 0,
+  vitest 9/9).
