@@ -63,7 +63,10 @@ separate:
 
 SplatLab sources are right-handed with `+Z` up and `+Y` forward. UE uses `+Z` up
 and `+X` forward. Importer conventions differ, so verify an axis witness before
-applying a renderer-specific correction. Put scale, axis correction, and site
+applying a renderer-specific correction. Measured 2026-07-26 (first light,
+hydrant): **NanoGS v1.0.3 preserves the +Z-up PLY as-is — no axis correction —
+but does NOT apply the manifest's scale calibration**; set uniform scale on
+`SplatLabSceneRoot`. Put scale, axis correction, and site
 alignment on `SplatLabSceneRoot`, not on individual children. If the manifest
 marks scale as uncalibrated, do not infer real-world size.
 

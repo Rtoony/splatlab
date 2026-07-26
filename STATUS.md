@@ -2015,3 +2015,18 @@ taken (0-jobs verified), routes proven via /openapi.json.
 SDK), then the attended first light per the runbook (screenshot receipt → G:\splatlab-ue\
 receipts\); (2) branch is ~20 commits ahead, unpushed — push is his call; (3) visual-shell
 voxel-bake design call.
+
+## UE FIRST LIGHT ACHIEVED UNATTENDED (2026-07-26 ~11:55) — receipt ok:true
+RToony ran prep --apply (RDP live; SDK add initially failed on MY Start-Process array-quoting
+bug — path with spaces split into 3 tokens; fixed in the script, retried clean: Windows SDK
+22621+26100 + NetFxSDK 4.8.1 installed). SplatLabUE56Editor + NanoGS compiled FROM SOURCE on
+Triforce (UBT green, 419s; needed the NetFx SDK — Build Tools omits it). Headless first light:
+`-run=pythonscript -nullrhi` imports WORK but actor spawn EXCEPTION_ACCESS_VIOLATIONs
+(commandlet has no level-editor frame; recorded in firstlight.py docstring) → full-editor
+`-ExecutePythonScript -RenderOffscreen` run SUCCEEDED: scene.scene + winner mesh imported,
+FirstLight.umap assembled (SplatLabSceneRoot → GaussianRender + ConventionalGeometry), numeric
+witness: dominant axis Z = UPRIGHT (NanoGS preserves +Z-up PLY, no axis correction — folded
+into README); scale NOT auto-applied (bounds = whole cloud incl. background splats; operator
+sets root scale). Receipt: G:\splatlab-ue\receipts\firstlight-splat_513e89171d.json. Vault:
+`Nexus - Triforce Windows Login` (d550d669) added by RToony via vault-add-secret; verified
+readable in-memory. Remaining attended: 30-second RDP eyeball of the FirstLight level + F9.
