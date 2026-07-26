@@ -62,4 +62,11 @@ async def get_activity() -> dict[str, Any]:
         for job_id, lock in list(locks.items()):
             if lock.locked():
                 jobs.setdefault(job_id, {})[flag] = True
-    return {"gpu": {"holder": holder}, "jobs": jobs}
+    # Stepped per-job edit progress (apply/upload/semantic) — additive so the
+    # boolean `editing` flag above keeps its contract for existing consumers.
+    # Same restart-truthfulness rail: the dict dies with the process AND the op.
+    return {
+        "gpu": {"holder": holder},
+        "jobs": jobs,
+        "edit_progress": {job_id: dict(entry) for job_id, entry in edit_ops.EDIT_PROGRESS.items()},
+    }

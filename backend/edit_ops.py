@@ -89,6 +89,36 @@ def _edit_tmp_path(target: Path) -> Path:
     return target.with_name(f"{_EDIT_TMP_PREFIX}.{secrets.token_hex(4)}.{target.name}")
 
 
+# ── live edit progress (read by GET /activity) ──────────────────────────────
+# In-memory ON PURPOSE: it dies with the process, and a restart also kills the
+# edit it described — restart-truthful, the same rail as the activity locks.
+# Single event loop => plain dict mutation is safe.
+EDIT_PROGRESS: dict[str, dict[str, Any]] = {}
+EDIT_STEPS = ("snapshot", "apply", "compress", "webopt", "langweb", "finalize")
+SEMANTIC_STEPS = ("match",) + EDIT_STEPS
+
+
+def _progress_begin(job_id: str, steps: tuple[str, ...] = EDIT_STEPS) -> None:
+    EDIT_PROGRESS[job_id] = {
+        "step": steps[0],
+        "step_index": 1,
+        "steps": len(steps),
+        "labels": list(steps),
+        "started_at": splat_route._utc_now(),
+    }
+
+
+def _progress_step(job_id: str, step: str) -> None:
+    entry = EDIT_PROGRESS.get(job_id)
+    if entry and step in entry["labels"]:
+        entry["step"] = step
+        entry["step_index"] = entry["labels"].index(step) + 1
+
+
+def _progress_end(job_id: str) -> None:
+    EDIT_PROGRESS.pop(job_id, None)
+
+
 def _file_identity(path: Path) -> tuple[int, int, int, int]:
     stat = path.stat()
     return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
@@ -808,10 +838,13 @@ async def _regen_derived_artifacts(job_dir: Path, *, coordinated: bool = False) 
     return accurate warnings. Each failure UNLINKS its stale artifact (see the
     individual _regen_* docstrings), so the fallbacks the warnings promise are real."""
     warnings: list[str] = []
+    _progress_step(job_dir.name, "compress")
     if not await _regen_compress(job_dir, coordinated=coordinated):
         warnings.append("compress (.spz) regeneration failed; stale splat.spz removed (no .spz until a later edit or re-export succeeds)")
+    _progress_step(job_dir.name, "webopt")
     if not await _regen_webopt(job_dir, coordinated=coordinated):
         warnings.append("web-optimized preview regeneration failed; stale web.ply removed — viewer falls back to the raw .ply")
+    _progress_step(job_dir.name, "langweb")
     if not await _regen_langweb(job_dir, coordinated=coordinated):
         warnings.append("langweb regeneration failed; stale langweb.ply removed — client heatmap falls back to the raw .ply")
     return warnings
@@ -830,10 +863,13 @@ async def apply_edit_ops(job_id: str, req: ApplyOpsRequest, request: Request) ->
     changes_topology = _ops_change_topology(req.ops)
 
     async with _hold_edit_locks([job_id]):
+        _progress_begin(job_id)
+
         async def transaction() -> tuple[dict[str, Any], list[str]]:
             snap_dir, manifest, snap_created = _snapshot_preview(
                 job_dir, op="apply", params={"ops": [op.model_dump() for op in req.ops]}
             )
+            _progress_step(job_id, "apply")
             tmp_ply = _edit_tmp_path(src_ply)
             landed = False
             try:
@@ -853,6 +889,7 @@ async def apply_edit_ops(job_id: str, req: ApplyOpsRequest, request: Request) ->
                 landed = True
                 _prune_versions(job_dir)
                 warnings = await _regen_derived_artifacts(job_dir, coordinated=True)
+                _progress_step(job_id, "finalize")
                 _invalidate_previews(job_dir)
                 if changes_topology:
                     _mark_langfield_stale(job_dir)
@@ -872,6 +909,8 @@ async def apply_edit_ops(job_id: str, req: ApplyOpsRequest, request: Request) ->
             )
         except gpu_arbiter.GPUArbiterUnavailable as exc:
             raise HTTPException(status_code=503, detail=f"edit coordination failed: {exc}") from exc
+        finally:
+            _progress_end(job_id)
 
     await audit_operator_event(
         request=request,
@@ -959,12 +998,15 @@ async def upload_edited_ply(job_id: str, file: UploadFile, request: Request) -> 
             )
 
         async with _hold_edit_locks([job_id]):
+            _progress_begin(job_id)
+
             async def transaction() -> tuple[dict[str, Any], list[str]]:
                 snap_dir, manifest, snap_created = _snapshot_preview(
                     job_dir,
                     op="upload",
                     params={"filename": filename, "bytes": written, "gaussians": hdr.vertex_count},
                 )
+                _progress_step(job_id, "apply")
                 landed = False
                 try:
                     os.replace(tmp_ply, src_ply)
@@ -988,6 +1030,8 @@ async def upload_edited_ply(job_id: str, file: UploadFile, request: Request) -> 
                 )
             except gpu_arbiter.GPUArbiterUnavailable as exc:
                 raise HTTPException(status_code=503, detail=f"upload coordination failed: {exc}") from exc
+            finally:
+                _progress_end(job_id)
     finally:
         # No-op after a successful os.replace; covers every refusal/failure
         # path (bad file, 413, lock 409, arbiter 503) without snapshot churn.
@@ -1283,6 +1327,7 @@ async def semantic_edit(job_id: str, req: SemanticEditRequest, request: Request)
     src_ply = splat_route._preview_file_path(job_dir)
 
     async with _hold_edit_locks([job_id]):
+        _progress_begin(job_id, steps=SEMANTIC_STEPS)
         n = splat_route._ply_vertex_count(src_ply)
         if n is None:
             raise HTTPException(status_code=500, detail="could not read splat.ply vertex count")
@@ -1308,11 +1353,13 @@ async def semantic_edit(job_id: str, req: SemanticEditRequest, request: Request)
                 )
 
             if req.mode in ("delete", "isolate"):
+                _progress_step(job_id, "snapshot")
                 snap_dir, manifest, snap_created = _snapshot_preview(
                     job_dir,
                     op="semantic",
                     params={"text": req.text, "threshold": req.threshold, "mode": req.mode},
                 )
+                _progress_step(job_id, "apply")
                 tmp_masked = _edit_tmp_path(src_ply)
                 cleaned = tmp_masked
                 landed = False
@@ -1413,6 +1460,8 @@ async def semantic_edit(job_id: str, req: SemanticEditRequest, request: Request)
             )
         except gpu_arbiter.GPUArbiterUnavailable as exc:
             raise HTTPException(status_code=503, detail=f"semantic edit coordination failed: {exc}") from exc
+        finally:
+            _progress_end(job_id)
 
     extracted = result["mode"] == "extract"
     await audit_operator_event(

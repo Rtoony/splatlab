@@ -52,7 +52,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 def test_activity_idle_shape(client: TestClient) -> None:
     r = client.get("/api/splat/activity")
     assert r.status_code == 200
-    assert r.json() == {"gpu": {"holder": None}, "jobs": {}}
+    assert r.json() == {"gpu": {"holder": None}, "jobs": {}, "edit_progress": {}}
 
 
 def test_activity_reports_gpu_holder(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -117,3 +117,22 @@ def test_activity_reports_surveying_lock(client: TestClient, monkeypatch: pytest
     monkeypatch.setattr(geo_route, "_GEO_EXPORT_LOCKS", {"splat_svy00001": _held_lock()})
     r = client.get("/api/splat/activity")
     assert r.json()["jobs"] == {"splat_svy00001": {"surveying": True}}
+
+
+def test_activity_exposes_edit_progress(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stepped edit progress rides /activity additively — `editing` stays a
+    plain boolean flag for existing consumers."""
+    monkeypatch.setattr(
+        edit_ops,
+        "EDIT_PROGRESS",
+        {"splat_prog0001": {"step": "compress", "step_index": 3, "steps": 6,
+                            "labels": list(edit_ops.EDIT_STEPS), "started_at": "2026-07-25T22:00:00+00:00"}},
+    )
+    r = client.get("/api/splat/activity")
+    body = r.json()
+    assert body["edit_progress"]["splat_prog0001"]["step"] == "compress"
+    assert body["edit_progress"]["splat_prog0001"]["step_index"] == 3
+
+
+def test_activity_edit_progress_empty_by_default(client: TestClient) -> None:
+    assert client.get("/api/splat/activity").json()["edit_progress"] == {}
