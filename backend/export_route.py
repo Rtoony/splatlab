@@ -107,6 +107,8 @@ class UnrealBundleRequest(BaseModel):
     include_zip: bool = False
     include_canonical_ply: bool = True
     include_survey: bool = True
+    include_world: bool = True
+    include_objects: bool = True
     require_current_exports: bool = True
 
 
@@ -438,6 +440,26 @@ def _public_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _annotate_world_current(payload: dict[str, Any], job_dir: Path) -> None:
+    """Serve-time honesty flag: does the bundled world still match disk?
+
+    world_current is True when the world_manifest.json recorded at bundle time
+    is byte-identical now, False when it drifted or a world appeared/vanished
+    after bundling, and None when neither the bundle nor the disk has a world
+    (or the bundle predates world support entirely).
+    """
+    bundle = payload.get("unreal_bundle")
+    if not isinstance(bundle, dict):
+        return
+    world = bundle.get("world")
+    recorded = world.get("world_manifest_identity") if isinstance(world, dict) else None
+    current = job_dir / "_world" / "world_manifest.json"
+    if recorded is None:
+        bundle["world_current"] = False if current.is_file() else None
+    else:
+        bundle["world_current"] = manifests.same_file_identity(current, recorded)
+
+
 @router.get("/jobs/{job_id}/exports")
 async def get_exports(job_id: str) -> dict[str, Any]:
     _meta, job_dir, source = _job(job_id)
@@ -455,7 +477,9 @@ async def get_exports(job_id: str) -> dict[str, Any]:
         manifest["status"] = "stale"
     else:
         manifest["status"] = "ready"
-    return _public_manifest(manifest)
+    payload = _public_manifest(manifest)
+    _annotate_world_current(payload, job_dir)
+    return payload
 
 
 @router.get("/jobs/{job_id}/exports/manifest")
@@ -948,12 +972,158 @@ def _safe_export_relative(value: Any) -> PurePosixPath | None:
     return relative
 
 
+# (source path, bundle-relative path, provenance, role, extra metadata)
+BundleCandidate = tuple[Path, str, str, str, dict[str, Any]]
+
+
+def _world_bundle_candidates(job_dir: Path) -> list[BundleCandidate]:
+    """Everything the navigable-world lane produced, for the World/ section.
+
+    Reads world.json (scene_solidify receipt) and world_manifest.json
+    (world_collision verdict) straight from disk — absent world = empty list,
+    never an error, so pre-world jobs bundle exactly as before.
+    """
+    world_dir = job_dir / "_world"
+    world = manifests.read_json(world_dir / "world.json") or {}
+    verdict = manifests.read_json(world_dir / "world_manifest.json") or {}
+    if not world and not verdict:
+        return []
+    out: list[BundleCandidate] = []
+
+    shell = world.get("shell") if isinstance(world.get("shell"), dict) else {}
+    if shell.get("built"):
+        shell_polished = (world_dir / "shell.polish.json").is_file()
+        out.append((world_dir / (shell.get("glb") or "shell.glb"),
+                    "World/shell.glb",
+                    "polished" if shell_polished else "captured-derived",
+                    "world-visual-shell", {}))
+        out.append((world_dir / "shell_atlas.png", "World/shell_atlas.png",
+                    "captured-derived", "world-atlas", {}))
+        out.append((world_dir / "shell.json", "World/shell.json",
+                    "captured-derived", "world-receipt", {}))
+    for name in ("collision_shell.glb", "collision_shell.json"):
+        out.append((world_dir / name, f"World/{name}",
+                    "captured-derived", "world-collision-shell", {}))
+    for name in ("world.json", "world_manifest.json"):
+        out.append((world_dir / name, f"World/{name}",
+                    "captured-derived", "world-receipt", {}))
+
+    elements = verdict.get("elements")
+    if not isinstance(elements, list):
+        elements = world.get("elements") if isinstance(world.get("elements"), list) else []
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        slug = element.get("slug")
+        glb = element.get("glb") or (f"{slug}.glb" if slug else None)
+        if (not isinstance(slug, str) or not slug
+                or not isinstance(glb, str) or "/" in glb or "\\" in glb):
+            continue
+        polished = (world_dir / "elements" / f"{slug}.polish.json").is_file()
+        out.append((world_dir / "elements" / glb, f"World/Elements/{glb}",
+                    "polished" if polished else "captured-derived",
+                    "world-element",
+                    {"element_role": element.get("role") or "prop"}))
+        out.append((world_dir / "elements" / f"{slug}_atlas.png",
+                    f"World/Elements/{slug}_atlas.png",
+                    "captured-derived", "world-atlas", {}))
+        collision = element.get("collision")
+        collision = collision if isinstance(collision, dict) else {}
+        for hull in collision.get("files") or []:
+            if not isinstance(hull, str) or "/" in hull or "\\" in hull:
+                continue
+            out.append((world_dir / "collision" / hull,
+                        f"World/Collision/{hull}",
+                        "captured-derived", "world-collision-hull",
+                        {"collision_for": f"World/Elements/{glb}"}))
+        ue_glb = collision.get("ue_glb")
+        if isinstance(ue_glb, str) and "/" not in ue_glb and "\\" not in ue_glb:
+            out.append((world_dir / "collision" / ue_glb,
+                        f"World/Props/{slug}.glb",
+                        "captured-derived", "world-prop-ue",
+                        {"note": "single-file UE import; UCX_* nodes are the "
+                                 "collision hulls for the sibling render node"}))
+    return out
+
+
+def _bakeoff_winner_candidate(
+    job_dir: Path, slug: str, bakeoff: dict[str, Any]
+) -> list[BundleCandidate]:
+    verdict = bakeoff.get("verdict") if isinstance(bakeoff.get("verdict"), dict) else {}
+    winner = verdict.get("winner")
+    if not isinstance(winner, str) or not winner:
+        return []
+    candidate = next(
+        (c for c in bakeoff.get("candidates", [])
+         if isinstance(c, dict) and c.get("name") == winner),
+        None,
+    )
+    source = candidate.get("source") if isinstance(candidate, dict) else None
+    if not isinstance(source, str) or not source:
+        return []
+    source_path = Path(source)
+    try:
+        source_path.resolve().relative_to(job_dir.resolve())
+    except (ValueError, OSError):
+        # A winner supplied from outside the job tree (e.g. an operator's
+        # --candidates path) is legitimate but not ours to ship; bakeoff.json
+        # still records it, so the omission is visible rather than silent.
+        return []
+    scores = candidate.get("scores") if isinstance(candidate.get("scores"), dict) else {}
+    candidate_provenance = candidate.get("provenance")
+    provenance = (
+        "captured-derived"
+        if candidate_provenance in ("capture-native", "ours")
+        else "generated"
+    )
+    metadata = {
+        "bakeoff": {
+            "winner": winner,
+            "candidate_provenance": candidate_provenance,
+            "median_psnr_paired": scores.get("median_psnr_paired"),
+        }
+    }
+    suffix = source_path.suffix or ".glb"
+    return [(source_path, f"Objects/{slug}/winner-{winner}{suffix}",
+             provenance, "object-bakeoff-winner", metadata)]
+
+
+def _objects_bundle_candidates(job_dir: Path) -> list[BundleCandidate]:
+    """Textured object assets + bake-off reports/winners for the Objects/ section."""
+    objects_dir = job_dir / "_objects"
+    if not objects_dir.is_dir():
+        return []
+    out: list[BundleCandidate] = []
+    for obj_dir in sorted(objects_dir.iterdir()):
+        slug = obj_dir.name
+        if (not obj_dir.is_dir() or slug.startswith(".")
+                or not (obj_dir / "object.json").is_file()):
+            continue
+        mesh_dir = obj_dir / "mesh"
+        out.append((mesh_dir / "textured.glb", f"Objects/{slug}/textured.glb",
+                    "captured-derived", "object-textured", {}))
+        out.append((mesh_dir / "textured_atlas.png",
+                    f"Objects/{slug}/textured_atlas.png",
+                    "captured-derived", "object-atlas", {}))
+        out.append((mesh_dir / "polished.glb", f"Objects/{slug}/polished.glb",
+                    "polished", "object-polished", {}))
+        out.append((mesh_dir / "polished.json", f"Objects/{slug}/polished.json",
+                    "polished", "object-polish-receipt", {}))
+        bakeoff_path = mesh_dir / "bakeoff" / "bakeoff.json"
+        bakeoff = manifests.read_json(bakeoff_path)
+        if bakeoff:
+            out.append((bakeoff_path, f"Objects/{slug}/bakeoff.json",
+                        "captured-derived", "bakeoff-report", {}))
+            out.extend(_bakeoff_winner_candidate(job_dir, slug, bakeoff))
+    return out
+
+
 def _bundle_candidates(
     job_dir: Path,
     manifest: dict[str, Any],
     request: UnrealBundleRequest,
-) -> list[tuple[Path, str, str, str]]:
-    candidates: list[tuple[Path, str, str, str]] = []
+) -> list[BundleCandidate]:
+    candidates: list[BundleCandidate] = []
     if request.include_canonical_ply:
         candidates.append(
             (
@@ -961,6 +1131,7 @@ def _bundle_candidates(
                 "Gaussian/scene.ply",
                 "captured",
                 "canonical-gaussian-splat",
+                {},
             )
         )
     for name, artifact in manifest.get("artifacts", {}).items():
@@ -989,6 +1160,7 @@ def _bundle_candidates(
                         ).as_posix(),
                         "captured-derived",
                         f"gaussian-{name}",
+                        {},
                     )
                 )
     collision = manifest.get("collision")
@@ -1005,53 +1177,62 @@ def _bundle_candidates(
                         f"Collision/{source_relative.name}",
                         "captured-derived",
                         "collision",
+                        {},
                     )
                 )
 
-    fixed_candidates = [
+    fixed_candidates: list[BundleCandidate] = [
         (
             job_dir / "_mesh" / "twin.glb",
             "Geometry/twin.glb",
             "captured-derived",
             "render-mesh",
+            {},
         ),
         (
             job_dir / "_mesh" / "mesh.glb",
             "Geometry/mesh.glb",
             "captured-derived",
             "mesh",
+            {},
         ),
         (
             job_dir / "_regen" / "scene.glb",
             "Scene/scene.glb",
             "composed",
             "assembled-scene",
+            {},
         ),
         (
             job_dir / "_regen" / "scene.blend",
             "Scene/scene.blend",
             "composed",
             "blender-scene",
+            {},
         ),
         (
             job_dir / "_regen" / "scene_manifest.json",
             "Scene/scene_manifest.json",
             "composed",
             "scene-manifest",
+            {},
         ),
         (
             job_dir / "_preview" / "thumb.webp",
             "Receipts/thumb.webp",
             "captured-derived",
             "thumbnail",
+            {},
         ),
         (
             job_dir / "_langfield" / "hero.webp",
             "Receipts/hero.webp",
             "captured-derived",
             "hero",
+            {},
         ),
-        (job_dir / "dimensions.json", "Survey/dimensions.json", "survey", "dimensions"),
+        (job_dir / "dimensions.json", "Survey/dimensions.json", "survey",
+         "dimensions", {}),
     ]
     candidates.extend(item for item in fixed_candidates if item[0].is_file())
     if request.include_survey:
@@ -1067,9 +1248,15 @@ def _bundle_candidates(
         ):
             path = survey_dir / name
             if path.is_file():
-                candidates.append((path, f"Survey/{name}", "survey", "survey-export"))
+                candidates.append(
+                    (path, f"Survey/{name}", "survey", "survey-export", {})
+                )
+    if request.include_world:
+        candidates.extend(_world_bundle_candidates(job_dir))
+    if request.include_objects:
+        candidates.extend(_objects_bundle_candidates(job_dir))
 
-    unique: dict[str, tuple[Path, str, str, str]] = {}
+    unique: dict[str, BundleCandidate] = {}
     for item in candidates:
         if item[0].is_file():
             unique.setdefault(item[1], item)
@@ -1104,6 +1291,13 @@ def _write_bundle_readme(path: Path, job_id: str, calibrated: bool) -> None:
                 "Import collision and conventional meshes as separate actors, then parent them",
                 "under one scene root so alignment changes remain reversible.",
                 "",
+                "`World/` holds the navigable-world artifacts (visual shell, walkable",
+                "collision shell, elements, loose UCX hulls). `World/Props/<slug>.glb` is a",
+                "single-file prop import whose `UCX_*` nodes are its collision hulls —",
+                "verify the UCX binding on one prop before trusting it for glTF imports.",
+                "`Objects/` holds textured object assets and bake-off winners; a winner with",
+                "provenance `generated` is render-only and must never be treated as survey.",
+                "",
                 scale_note,
                 "The source frame is right-handed, +Z up, with +Y forward.",
                 "Do not treat render-health receipts as survey or geometric truth.",
@@ -1127,7 +1321,7 @@ def _build_unreal_bundle_sync(
     )
     try:
         entries = []
-        for source, relative, provenance, role in _bundle_candidates(
+        for source, relative, provenance, role, extra in _bundle_candidates(
             job_dir, export_manifest, request
         ):
             target = stage / relative
@@ -1139,12 +1333,27 @@ def _build_unreal_bundle_sync(
                     "provenance": provenance,
                     "role": role,
                     "materialization": materialization,
+                    **extra,
                     **manifests.file_identity(target),
                 }
             )
 
         coordinate = manifests.coordinate_record(meta)
         calibrated = coordinate["source_frame"]["scale_calibrated"]
+        world_manifest_path = job_dir / "_world" / "world_manifest.json"
+        world_block = {
+            "present": any(
+                isinstance(entry.get("role"), str)
+                and entry["role"].startswith("world-")
+                for entry in entries
+            ),
+            "collision_built": world_manifest_path.is_file(),
+            "world_manifest_identity": (
+                manifests.file_identity(world_manifest_path)
+                if world_manifest_path.is_file()
+                else None
+            ),
+        }
         bundle = {
             "schema": manifests.UNREAL_SCHEMA,
             "job_id": job_id,
@@ -1172,9 +1381,15 @@ def _build_unreal_bundle_sync(
                 "requires_operator_alignment": not calibrated,
                 "actor_structure": {
                     "root": "SplatLabSceneRoot",
-                    "children": ["GaussianRender", "Collision", "ConventionalGeometry"],
+                    "children": [
+                        "GaussianRender",
+                        "Collision",
+                        "ConventionalGeometry",
+                        "WorldGeometry",
+                    ],
                 },
             },
+            "world": world_block,
             "files": entries,
         }
         manifests.atomic_write_json(stage / "manifest.json", bundle)
@@ -1212,6 +1427,7 @@ def _build_unreal_bundle_sync(
             "directory": "unreal",
             "manifest": "unreal/manifest.json",
             "files": len(entries),
+            "world": world_block,
             "zip": zip_record,
         }
     finally:
@@ -1272,7 +1488,9 @@ async def build_unreal_bundle(
         target=meta.get("mode", "3d"),
         metadata={"job_id": job_id, "include_zip": body.include_zip},
     )
-    return _public_manifest(export_manifest)["unreal_bundle"]
+    payload = _public_manifest(export_manifest)
+    _annotate_world_current(payload, job_dir)
+    return payload["unreal_bundle"]
 
 
 @router.get("/jobs/{job_id}/unreal-bundle/manifest")

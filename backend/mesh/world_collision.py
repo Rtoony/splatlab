@@ -112,6 +112,9 @@ def convex_hulls(mesh_path: Path, out_dir: Path, base: str, max_hulls: int,
     stale = sorted(out_dir.glob(f"UCX_{base}_*.glb"))
     for old in stale:
         old.unlink()
+    # The combined UE file is derived from the hulls; a stale one from a prior
+    # run must not outlive a failed decomposition below.
+    (out_dir / f"UE_{base}.glb").unlink(missing_ok=True)
     written, total_faces = [], 0
     for i, (vs, fs) in enumerate(parts):
         hull = trimesh.Trimesh(vertices=np.asarray(vs), faces=np.asarray(fs), process=False)
@@ -141,12 +144,38 @@ def convex_hulls(mesh_path: Path, out_dir: Path, base: str, max_hulls: int,
         coverage = round(float(inside.mean()), 4)
     except Exception:  # noqa: BLE001 — the metric failing must not fail the prop
         coverage = None
+    # Combined single-file UE import: render mesh + hulls in ONE glb, hull
+    # nodes named UCX_<base>_NN. Unreal's UCX convention binds collision to the
+    # render mesh only within a single imported file — the loose hull files can
+    # never bind on their own, so this is what a UE operator imports, while the
+    # loose hulls stay for three.js/rapier consumers that glob them.
+    ue_name = f"UE_{base}.glb"
+    try:
+        combined = trimesh.Scene()
+        combined.add_geometry(m, node_name=base, geom_name=base)
+        for n in written:
+            h = trimesh.load(str(out_dir / n), force="mesh", process=False)
+            node = n[:-len(".glb")]
+            combined.add_geometry(h, node_name=node, geom_name=node)
+        combined.export(str(out_dir / ue_name))
+        back = trimesh.load(str(out_dir / ue_name))
+        got = len(getattr(back, "geometry", {}) or {})
+        if got != len(written) + 1:
+            raise ValueError(f"readback held {got} geometries, "
+                             f"expected {len(written) + 1}")
+        ue_glb = ue_name
+    except Exception as exc:  # noqa: BLE001 — hulls alone are still a valid prop
+        (out_dir / ue_name).unlink(missing_ok=True)
+        ue_glb = None
+        _log(f"  {base}: combined UE glb failed "
+             f"({type(exc).__name__}: {exc})")
     return {"ok": True, "hulls": len(written), "files": written,
             "hull_faces_total": total_faces,
             "stale_removed": len(stale),
             "capped": len(written) >= max_hulls,
             "surface_coverage": coverage,
             "coverage_ok": (coverage is None) or coverage >= 0.9,
+            "ue_glb": ue_glb,
             "seconds": round(time.time() - t, 1)}
 
 

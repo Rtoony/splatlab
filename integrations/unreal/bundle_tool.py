@@ -262,6 +262,20 @@ def _validate_contract(manifest: dict[str, Any]) -> None:
         or not required_children.issubset(set(children))
     ):
         raise BundleToolError("Bundle actor structure omits required child actors")
+    # WorldGeometry is required only when the bundle actually ships world-role
+    # files: newer producers always emit it (subset check above keeps old tools
+    # happy), while bundles from before the world lane stay valid here.
+    files = manifest.get("files")
+    ships_world = isinstance(files, list) and any(
+        isinstance(item, dict)
+        and isinstance(item.get("role"), str)
+        and item["role"].startswith("world-")
+        for item in files
+    )
+    if ships_world and "WorldGeometry" not in set(children):
+        raise BundleToolError(
+            "Bundle ships world geometry but actor structure omits WorldGeometry"
+        )
 
 
 def _ply_vertex_count(path: Path) -> int | None:

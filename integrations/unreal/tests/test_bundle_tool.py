@@ -284,3 +284,60 @@ def test_checked_in_mcp_policy_is_closed_world() -> None:
     assert result["status"] == "valid"
     assert result["enforcement"] == "contract-only"
     assert "system_control" in result["denied_tools"]
+
+
+def test_world_files_require_worldgeometry_child(tmp_path: Path) -> None:
+    root = _make_bundle(tmp_path / "bundle")
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    shell = root / "World" / "shell.glb"
+    shell.parent.mkdir(parents=True)
+    shell.write_bytes(b"glTF-shell")
+    manifest["files"].append(
+        {
+            "path": "World/shell.glb",
+            "role": "world-visual-shell",
+            "bytes": shell.stat().st_size,
+            "sha256": _sha256(shell),
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(bundle_tool.BundleToolError, match="WorldGeometry"):
+        bundle_tool.verify_bundle(root)
+
+
+def test_worldgeometry_child_accepted_without_world_files(tmp_path: Path) -> None:
+    # A new-producer bundle (4 children) with no world files must verify with
+    # an old-style file list — and the base fixture (3 children, no world
+    # files) is covered by test_verify_bundle_checks_contract_files_and_ply_count,
+    # so both skew directions hold.
+    root = _make_bundle(tmp_path / "bundle")
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["import_contract"]["actor_structure"]["children"].append("WorldGeometry")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    bundle_tool.verify_bundle(root)
+
+
+def test_world_files_verify_with_worldgeometry_child(tmp_path: Path) -> None:
+    root = _make_bundle(tmp_path / "bundle")
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["import_contract"]["actor_structure"]["children"].append("WorldGeometry")
+    shell = root / "World" / "shell.glb"
+    shell.parent.mkdir(parents=True)
+    shell.write_bytes(b"glTF-shell")
+    manifest["files"].append(
+        {
+            "path": "World/shell.glb",
+            "role": "world-visual-shell",
+            "bytes": shell.stat().st_size,
+            "sha256": _sha256(shell),
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    verified = bundle_tool.verify_bundle(root)
+    assert verified.verified_files == 2
+    assert any(
+        item["path"] == "World/shell.glb" for item in verified.manifest["files"]
+    )

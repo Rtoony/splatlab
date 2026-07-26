@@ -580,3 +580,225 @@ def test_unreal_bundle_fails_closed_when_host_admission_is_unavailable(
 
     assert response.status_code == 503
     assert response.json()["detail"].endswith("backup active")
+
+
+def _make_world_and_objects(job_dir: Path) -> None:
+    """The _world/ + _objects/ trees the navigable-world lane leaves on disk,
+    reduced in size but not in shape (mirrors test_world_route fixtures)."""
+    world = job_dir / "_world"
+    (world / "elements").mkdir(parents=True)
+    (world / "collision").mkdir()
+    (world / "world.json").write_text(
+        json.dumps(
+            {
+                "v": 1,
+                "job_id": job_dir.name,
+                "shell": {"built": True, "glb": "shell.glb"},
+                "elements": [],
+            }
+        )
+    )
+    (world / "shell.glb").write_bytes(b"glTF-shell")
+    (world / "shell_atlas.png").write_bytes(b"\x89PNG-shell")
+    (world / "shell.json").write_text(json.dumps({"faces": 100}))
+    (world / "collision_shell.glb").write_bytes(b"glTF-walkable")
+    (world / "collision_shell.json").write_text(json.dumps({"tris": 5}))
+    (world / "world_manifest.json").write_text(
+        json.dumps(
+            {
+                "v": 1,
+                "shell": {"slug": "shell", "role": "static", "glb": "shell.glb"},
+                "elements": [
+                    {
+                        "slug": "crate",
+                        "role": "prop",
+                        "glb": "crate.glb",
+                        "collision": {
+                            "ok": True,
+                            "hulls": 2,
+                            "files": ["UCX_crate_00.glb", "UCX_crate_01.glb"],
+                            "ue_glb": "UE_crate.glb",
+                        },
+                    }
+                ],
+            }
+        )
+    )
+    (world / "elements" / "crate.glb").write_bytes(b"glTF-crate")
+    (world / "elements" / "crate_atlas.png").write_bytes(b"\x89PNG-crate")
+    for index in range(2):
+        (world / "collision" / f"UCX_crate_{index:02d}.glb").write_bytes(b"glTF-hull")
+    (world / "collision" / "UE_crate.glb").write_bytes(b"glTF-combined")
+
+    obj = job_dir / "_objects" / "crate"
+    (obj / "mesh" / "bakeoff").mkdir(parents=True)
+    (obj / "object.json").write_text(json.dumps({"slug": "crate"}))
+    (obj / "mesh" / "textured.glb").write_bytes(b"glTF-textured")
+    (obj / "mesh" / "textured_atlas.png").write_bytes(b"\x89PNG-atlas")
+    winner = obj / "mesh" / "generated" / "sam3d.glb"
+    winner.parent.mkdir()
+    winner.write_bytes(b"glTF-winner")
+    (obj / "mesh" / "bakeoff" / "bakeoff.json").write_text(
+        json.dumps(
+            {
+                "candidates": [
+                    {
+                        "name": "textured",
+                        "source": str(obj / "mesh" / "textured.glb"),
+                        "provenance": "ours",
+                        "scores": {"median_psnr_paired": 12.1},
+                    },
+                    {
+                        "name": "sam3d",
+                        "source": str(winner),
+                        "provenance": "foreign",
+                        "scores": {"median_psnr_paired": 13.8},
+                    },
+                ],
+                "verdict": {"winner": "sam3d", "reason": "highest paired PSNR"},
+            }
+        )
+    )
+
+
+def test_unreal_bundle_includes_world_and_object_sections(client) -> None:
+    http, outputs, _state = client
+    job_dir = _make_job(outputs)
+    _make_world_and_objects(job_dir)
+    assert (
+        http.post(
+            "/api/splat/jobs/splat_e70001/exports", json={"formats": ["spz"]}
+        ).status_code
+        == 200
+    )
+    response = http.post("/api/splat/jobs/splat_e70001/unreal-bundle", json={})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["world"]["present"] is True
+    assert body["world"]["collision_built"] is True
+    assert body["world"]["world_manifest_identity"] is not None
+    assert body["world_current"] is True
+
+    bundle_dir = job_dir / "_exports" / "unreal"
+    bundle = json.loads((bundle_dir / "manifest.json").read_text())
+    by_path = {item["path"]: item for item in bundle["files"]}
+
+    assert by_path["World/shell.glb"]["role"] == "world-visual-shell"
+    assert by_path["World/collision_shell.glb"]["role"] == "world-collision-shell"
+    element = by_path["World/Elements/crate.glb"]
+    assert element["role"] == "world-element"
+    assert element["element_role"] == "prop"
+    hull = by_path["World/Collision/UCX_crate_00.glb"]
+    assert hull["collision_for"] == "World/Elements/crate.glb"
+    assert by_path["World/Props/crate.glb"]["role"] == "world-prop-ue"
+    assert by_path["Objects/crate/textured.glb"]["role"] == "object-textured"
+    assert by_path["Objects/crate/bakeoff.json"]["role"] == "bakeoff-report"
+
+    winner = by_path["Objects/crate/winner-sam3d.glb"]
+    assert winner["role"] == "object-bakeoff-winner"
+    assert winner["provenance"] == "generated"
+    assert winner["bakeoff"]["winner"] == "sam3d"
+    assert winner["bakeoff"]["median_psnr_paired"] == 13.8
+
+    children = bundle["import_contract"]["actor_structure"]["children"]
+    assert "WorldGeometry" in children
+    assert bundle["world"]["present"] is True
+    for relative in by_path:
+        assert (bundle_dir / relative).is_file()
+
+
+def test_unreal_bundle_without_world_stays_compatible(client) -> None:
+    http, outputs, _state = client
+    job_dir = _make_job(outputs)
+    assert (
+        http.post(
+            "/api/splat/jobs/splat_e70001/exports", json={"formats": ["spz"]}
+        ).status_code
+        == 200
+    )
+    response = http.post("/api/splat/jobs/splat_e70001/unreal-bundle", json={})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["world"] == {
+        "present": False,
+        "collision_built": False,
+        "world_manifest_identity": None,
+    }
+    assert body["world_current"] is None
+    bundle = json.loads(
+        (job_dir / "_exports" / "unreal" / "manifest.json").read_text()
+    )
+    assert not any(
+        str(item.get("role", "")).startswith("world-") for item in bundle["files"]
+    )
+
+
+def test_unreal_bundle_include_world_false_omits_world(client) -> None:
+    http, outputs, _state = client
+    job_dir = _make_job(outputs)
+    _make_world_and_objects(job_dir)
+    assert (
+        http.post(
+            "/api/splat/jobs/splat_e70001/exports", json={"formats": ["spz"]}
+        ).status_code
+        == 200
+    )
+    response = http.post(
+        "/api/splat/jobs/splat_e70001/unreal-bundle",
+        json={"include_world": False, "include_objects": False},
+    )
+    assert response.status_code == 200, response.text
+    bundle = json.loads(
+        (job_dir / "_exports" / "unreal" / "manifest.json").read_text()
+    )
+    paths = {item["path"] for item in bundle["files"]}
+    assert not any(p.startswith(("World/", "Objects/")) for p in paths)
+
+
+def test_unreal_bundle_world_current_flags_drift(client) -> None:
+    http, outputs, _state = client
+    job_dir = _make_job(outputs)
+    _make_world_and_objects(job_dir)
+    assert (
+        http.post(
+            "/api/splat/jobs/splat_e70001/exports", json={"formats": ["spz"]}
+        ).status_code
+        == 200
+    )
+    assert (
+        http.post("/api/splat/jobs/splat_e70001/unreal-bundle", json={}).status_code
+        == 200
+    )
+    manifest_path = job_dir / "_world" / "world_manifest.json"
+    manifest_path.write_text(
+        manifest_path.read_text() + "\n"
+    )  # different bytes = drifted world
+    exports = http.get("/api/splat/jobs/splat_e70001/exports")
+    assert exports.status_code == 200
+    assert exports.json()["unreal_bundle"]["world_current"] is False
+
+
+def test_unreal_bundle_skips_winner_outside_job_tree(client, tmp_path) -> None:
+    http, outputs, _state = client
+    job_dir = _make_job(outputs)
+    _make_world_and_objects(job_dir)
+    foreign = tmp_path / "operator-supplied.glb"
+    foreign.write_bytes(b"glTF-foreign")
+    bakeoff_path = job_dir / "_objects" / "crate" / "mesh" / "bakeoff" / "bakeoff.json"
+    bakeoff = json.loads(bakeoff_path.read_text())
+    bakeoff["candidates"][1]["source"] = str(foreign)
+    bakeoff_path.write_text(json.dumps(bakeoff))
+    assert (
+        http.post(
+            "/api/splat/jobs/splat_e70001/exports", json={"formats": ["spz"]}
+        ).status_code
+        == 200
+    )
+    response = http.post("/api/splat/jobs/splat_e70001/unreal-bundle", json={})
+    assert response.status_code == 200, response.text
+    bundle = json.loads(
+        (job_dir / "_exports" / "unreal" / "manifest.json").read_text()
+    )
+    paths = {item["path"] for item in bundle["files"]}
+    assert "Objects/crate/bakeoff.json" in paths
+    assert not any("winner-" in p for p in paths)
