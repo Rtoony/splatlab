@@ -75,6 +75,14 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
 
   // Decimate: pct is the percentage of gaussians KEPT (splat-transform -F n%
   // — "Use n% to keep a percentage of Gaussians"), not removed.
+  // Floater-filter aggressiveness (splat-transform -G triple; all-or-none on
+  // the backend). Prefilled with the engine defaults so "touched but unchanged"
+  // still sends exactly the default behavior.
+  const [floatersOpen, setFloatersOpen] = useState(false);
+  const [gSize, setGSize] = useState("0.05");
+  const [gOp, setGOp] = useState("0.1");
+  const [gMin, setGMin] = useState("0.004");
+
   const [keepPct, setKeepPct] = useState(50);
   const [decimateArmed, setDecimateArmed] = useState(false);
 
@@ -162,9 +170,22 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
     return `Done · restore point v${resp.version_before} saved`;
   }
 
+  // null = invalid input (button disabled); {} = engine defaults (disclosure
+  // closed); full triple when tuned.
+  function buildFloatersOp(): SplatEditOp | null {
+    if (!floatersOpen) return { type: "filter_floaters" };
+    const size = Number(gSize);
+    const op = Number(gOp);
+    const min = Number(gMin);
+    if (![size, op, min].every(Number.isFinite)) return null;
+    if (size <= 0 || op <= 0 || op > 1 || min < 0) return null;
+    return { type: "filter_floaters", size, op, min };
+  }
+
   function runFloaters() {
-    // {} → the splat-transform CLI's own -G defaults (backend passes through).
-    void runApply("floaters", [{ type: "filter_floaters" }], (resp) => removalToast(resp, "Removed"));
+    const opBody = buildFloatersOp();
+    if (!opBody) return;
+    void runApply("floaters", [opBody], (resp) => removalToast(resp, "Removed"));
   }
 
   function runDecimate() {
@@ -354,9 +375,48 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
           and Undo brings it all back.
         </p>
         {job.langfield_available && <LangfieldTopologyWarning stale={Boolean(job.langfield_stale)} />}
-        <Button type="button" size="sm" className="mt-2 w-full" onClick={runFloaters} disabled={busy}>
+        <button
+          type="button"
+          onClick={() => setFloatersOpen((v) => !v)}
+          className="mt-2 text-[10px] font-semibold uppercase tracking-wide text-zinc-500 hover:text-zinc-300"
+        >
+          {floatersOpen ? "▾ aggressiveness" : "▸ aggressiveness"} · engine defaults 0.05 / 0.1 / 0.004
+        </button>
+        {floatersOpen && (
+          <div className="mt-2 space-y-2">
+            <label className="flex items-center justify-between gap-2">
+              <span className="min-w-0 text-[11px] text-zinc-400">
+                Voxel size
+                <span className="block text-[10px] text-zinc-600">world units · finer = stricter solidity test</span>
+              </span>
+              <Input size="xs" inputMode="decimal" value={gSize} onChange={(e) => setGSize(e.target.value)} className="w-24 shrink-0" />
+            </label>
+            <label className="flex items-center justify-between gap-2">
+              <span className="min-w-0 text-[11px] text-zinc-400">
+                Opacity threshold
+                <span className="block text-[10px] text-zinc-600">0–1 · higher = fewer voxels count as solid = removes more</span>
+              </span>
+              <Input size="xs" inputMode="decimal" value={gOp} onChange={(e) => setGOp(e.target.value)} className="w-24 shrink-0" />
+            </label>
+            <label className="flex items-center justify-between gap-2">
+              <span className="min-w-0 text-[11px] text-zinc-400">
+                Min contribution
+                <span className="block text-[10px] text-zinc-600">higher = removes more · try 10× steps (0.04, 0.4)</span>
+              </span>
+              <Input size="xs" inputMode="decimal" value={gMin} onChange={(e) => setGMin(e.target.value)} className="w-24 shrink-0" />
+            </label>
+            <p className="text-[10px] leading-snug text-zinc-600">
+              Results vary per scene — experiment freely, every pass saves a restore point first. Long thin
+              streaks that survive even aggressive passes are usually solid-anchored; crop those out instead.
+            </p>
+            {buildFloatersOp() === null && (
+              <p className="text-[10px] text-red-300">Need: size &gt; 0 · 0 &lt; opacity ≤ 1 · min ≥ 0.</p>
+            )}
+          </div>
+        )}
+        <Button type="button" size="sm" className="mt-2 w-full" onClick={runFloaters} disabled={busy || buildFloatersOp() === null}>
           {pending === "floaters" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wand2 className="h-3.5 w-3.5" />}
-          {pending === "floaters" ? "Applying…" : "Clean up floaters"}
+          {pending === "floaters" ? "Applying…" : floatersOpen ? "Clean up floaters (tuned)" : "Clean up floaters"}
         </Button>
         {pending === "floaters" && <EditProgress jobId={job.job_id} active />}
       </div>
