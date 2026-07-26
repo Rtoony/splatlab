@@ -4852,6 +4852,9 @@ _OBJECT_FILES = {
     "textured-atlas": ("mesh/textured_atlas.png", "image/png"),
     "proxy": ("proxy.ply", "application/octet-stream"),
     "proxy-preview": ("proxy_preview.webp", "image/webp"),
+    # Externally-polished GLB landed via POST .../polish (provenance receipt).
+    "polished": ("mesh/polished.glb", "model/gltf-binary"),
+    "polish-receipt": ("mesh/polished.json", "application/json"),
 }
 
 
@@ -4859,7 +4862,8 @@ _OBJECT_FILES = {
 async def get_splat_object_file(
     job_id: str, slug: str,
     fmt: Literal["splat", "ply", "glb", "receipt", "twin", "twin-top", "twin-oblique",
-                 "textured", "textured-atlas", "proxy", "proxy-preview"] = "splat",
+                 "textured", "textured-atlas", "proxy", "proxy-preview",
+                 "polished", "polish-receipt"] = "splat",
 ):
     if not _safe_job_id(job_id) or _object_slug(slug) != slug:
         raise HTTPException(status_code=404, detail="Object not found")
@@ -6052,6 +6056,23 @@ def _read_world_report(path: Path) -> dict[str, Any] | None:
     return report if isinstance(report, dict) else None
 
 
+def _world_polish_marker(marker: Path) -> dict[str, Any] | None:
+    """The polish receipt beside a replaced element, or None when never
+    polished. Present => the GLB embeds its own textures and the solidify-era
+    faces/extent/atlas no longer describe the file."""
+    if not marker.is_file():
+        return None
+    try:
+        doc = json.loads(marker.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"error": "unreadable polish receipt"}
+    return {
+        "uploaded_at": doc.get("uploaded_at"),
+        "source_filename": doc.get("source_filename"),
+        "atlas_superseded": bool(doc.get("atlas_superseded")),
+    }
+
+
 @router.get("/jobs/{job_id}/world/manifest")
 async def get_splat_world_manifest(job_id: str):
     """The solidified world as one viewer-ready document: merged element list
@@ -6105,6 +6126,7 @@ async def get_splat_world_manifest(job_id: str):
             "reason": element.get("reason"),
             "files": _world_artifact_urls(world_dir, job_id, "elements/", slug),
             "collision": _world_collision(world_dir, job_id, grade.get("collision")),
+            "polished": _world_polish_marker(world_dir / "elements" / f"{slug}.polish.json"),
         })
 
     shell_report = world.get("shell") or {}
@@ -6122,6 +6144,7 @@ async def get_splat_world_manifest(job_id: str):
             "classification": shell_grade.get("classification") or [],
             "files": _world_artifact_urls(world_dir, job_id, "", "shell"),
             "collision": _world_collision(world_dir, job_id, shell_grade.get("collision")),
+            "polished": _world_polish_marker(world_dir / "shell.polish.json"),
         }
 
     # The WALKABLE solid, which is a different mesh from the one you look at.
