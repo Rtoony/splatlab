@@ -389,6 +389,67 @@ def _rasterize_atlas(verts_scene, faces, uv_px, size: int, vnormals):
             np.concatenate(nrm_all) if nrm_all else None)
 
 
+def _parametrize_chunked(verts, faces, chunks: int):
+    """xatlas unwrap, optionally split into spatial chunks for dense shells.
+
+    Chart generation is steeply superlinear in face count (measured 2026-07-26
+    on the world shell: 76 s at 200k faces, 1564 s at 400k) while the SAME
+    400k mesh unwrapped in 4 spatial chunks took 118 s — the cost is chart
+    generation over one huge mesh, not the work itself. Chunks are built by
+    repeatedly median-splitting the largest group on its longest centroid
+    axis, so they stay spatially contiguous; each chunk's charts are packed
+    into its own tile of a sqrt-grid with an inset gutter, which keeps
+    cross-tile dilation bleed no worse than ordinary cross-chart bleed.
+
+    chunks=1 is byte-identical to the plain xatlas.parametrize path. chunks>1
+    CHANGES ATLAS LAYOUT, so it is opt-in per caller (the dense-shell lane),
+    never a silent default.
+
+    Returns (verts, faces, uvs) with vertices already remapped/duplicated the
+    way xatlas requires.
+    """
+    import xatlas
+    if chunks <= 1:
+        vmapping, indices, uvs = xatlas.parametrize(verts, faces)
+        return verts[vmapping], indices.astype(np.int64), uvs
+
+    centroids = verts[faces].mean(axis=1)
+    groups = [np.arange(len(faces), dtype=np.int64)]
+    while len(groups) < chunks:
+        groups.sort(key=len, reverse=True)
+        largest = groups.pop(0)
+        if len(largest) < 2:
+            groups.append(largest)
+            break
+        c = centroids[largest]
+        axis = int(np.argmax(c.max(axis=0) - c.min(axis=0)))
+        order = np.argsort(c[:, axis], kind="stable")
+        mid = len(largest) // 2
+        groups += [largest[order[:mid]], largest[order[mid:]]]
+    groups = [np.sort(g) for g in groups if len(g)]
+
+    grid = int(np.ceil(np.sqrt(len(groups))))
+    inset = 0.01  # of a tile — the dilation gutter between neighbouring tiles
+    out_verts, out_faces, out_uvs = [], [], []
+    base = 0
+    for index, group in enumerate(groups):
+        sub_faces = faces[group]
+        used = np.unique(sub_faces)
+        remap = np.full(int(used.max()) + 1, -1, dtype=np.int64)
+        remap[used] = np.arange(len(used))
+        vmapping, indices, uvs = xatlas.parametrize(verts[used], remap[sub_faces])
+        tile_x, tile_y = index % grid, index // grid
+        scale = (1.0 - 2.0 * inset) / grid
+        offset = np.array([(tile_x + inset) / grid, (tile_y + inset) / grid],
+                          dtype=np.float32)
+        out_verts.append(verts[used][vmapping])
+        out_faces.append(indices.astype(np.int64) + base)
+        out_uvs.append((uvs * scale + offset).astype(np.float32))
+        base += len(vmapping)
+    return (np.concatenate(out_verts), np.concatenate(out_faces),
+            np.concatenate(out_uvs))
+
+
 def bake_texture(verts_scene, faces, uvs, gx, gc, size: int, k: int = 24,
                  vnormals=None):
     """Rasterize every atlas triangle and colour each covered texel from the
@@ -538,6 +599,10 @@ def main() -> int:
     # are legitimately sparse — Bonsai's bike bottle is 288 gaussians and was
     # rejected outright. Low but non-zero, and overridable.
     ap.add_argument("--min-gaussians", type=int, default=250)
+    # >1 = spatially-chunked unwrap for dense shells (13x measured at 400k
+    # faces). Changes atlas layout — see _parametrize_chunked. Default 1 keeps
+    # every existing lane byte-identical.
+    ap.add_argument("--unwrap-chunks", type=int, default=1)
     ap.add_argument("--report", default=None)
     args = ap.parse_args()
     t0 = time.time()
@@ -669,10 +734,8 @@ def main() -> int:
     uvs = None
     t_uv = time.time()
     try:
-        import xatlas
-        vmapping, indices, uvs = xatlas.parametrize(verts_scene, faces)
-        verts_scene = verts_scene[vmapping]
-        faces = indices.astype(np.int64)
+        verts_scene, faces, uvs = _parametrize_chunked(
+            verts_scene, faces, max(1, args.unwrap_chunks))
         uv_seconds = round(time.time() - t_uv, 1)
     except Exception as exc:  # noqa: BLE001 — unwrap is optional, never fatal
         uvs = None
@@ -721,6 +784,7 @@ def main() -> int:
                 "coverage": round(float(shipped_mask.mean()), 4),
                 "coverage_rasterized": round(coverage_rasterized, 4),
                 "unwrap_seconds": uv_seconds,
+                "unwrap_chunks": max(1, args.unwrap_chunks),
                 "charts_uv_range": [round(float(uvs.min()), 4), round(float(uvs.max()), 4)],
                 "atlas_png": atlas_path.name,
                 "atlas_bytes": atlas_path.stat().st_size,

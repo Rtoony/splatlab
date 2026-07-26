@@ -247,3 +247,108 @@ def test_end_to_end_report_carries_both_coverage_keys(tmp_path):
     # rasterized fraction, and on a well-unwrapped cube both are meaningful
     assert tex["coverage"] >= tex["coverage_rasterized"] > 0.0
     assert out_glb.is_file() and report["glb_bytes"] > 0
+
+
+# ---------------------------------------------------------------------------
+# _parametrize_chunked — spatial chunking + tile packing (D1)
+# ---------------------------------------------------------------------------
+
+class _FakeXatlas:
+    """Deterministic stand-in when real xatlas is absent: identity vertex
+    mapping, planar XY unit-square UVs. The chunk/tile/remap math under test
+    is object_texture's own; only chart generation is faked."""
+
+    @staticmethod
+    def parametrize(verts, faces):
+        lo = verts[:, :2].min(axis=0)
+        span = np.maximum(verts[:, :2].max(axis=0) - lo, 1e-9)
+        uvs = ((verts[:, :2] - lo) / span).astype(np.float32)
+        vmapping = np.arange(len(verts), dtype=np.uint32)
+        return vmapping, np.asarray(faces, dtype=np.uint32), uvs
+
+
+@pytest.fixture()
+def fake_xatlas(monkeypatch):
+    try:
+        import xatlas  # noqa: F401
+    except ImportError:
+        monkeypatch.setitem(sys.modules, "xatlas", _FakeXatlas())
+    return None
+
+
+def _strip_mesh(n_quads: int = 8):
+    # a strip of quads along X: spatial median splits are unambiguous
+    verts, faces = [], []
+    for i in range(n_quads + 1):
+        verts += [[float(i), 0.0, 0.0], [float(i), 1.0, 0.0]]
+    for i in range(n_quads):
+        a = 2 * i
+        faces += [[a, a + 2, a + 1], [a + 1, a + 2, a + 3]]
+    return (np.asarray(verts, dtype=np.float32),
+            np.asarray(faces, dtype=np.int64))
+
+
+def test_chunked_unwrap_preserves_geometry_and_tiles(fake_xatlas):
+    verts, faces = _strip_mesh()
+    out_verts, out_faces, out_uvs = ot._parametrize_chunked(verts, faces, 4)
+
+    assert len(out_faces) == len(faces)
+    assert len(out_uvs) == len(out_verts)
+    # every triangle survives with its geometry intact (order-insensitive)
+    def tri_keys(v, f):
+        return sorted(
+            tuple(sorted(map(tuple, np.round(v[tri], 5)))) for tri in f
+        )
+    assert tri_keys(out_verts, out_faces) == tri_keys(verts, faces)
+
+    assert float(out_uvs.min()) >= 0.0 and float(out_uvs.max()) <= 1.0
+    # every face lives wholly inside ONE tile (no face straddles a gutter),
+    # and the chunks actually spread across multiple tiles
+    grid = 2  # ceil(sqrt(4))
+    tiles = set()
+    for tri in out_faces:
+        corner_tiles = {
+            (int(u * grid) if u < 1.0 else grid - 1,
+             int(v * grid) if v < 1.0 else grid - 1)
+            for u, v in out_uvs[tri]
+        }
+        assert len(corner_tiles) == 1
+        tiles |= corner_tiles
+    assert len(tiles) >= 2
+
+
+def test_chunks_one_is_plain_parametrize(fake_xatlas):
+    verts, faces = _strip_mesh(4)
+    v1, f1, u1 = ot._parametrize_chunked(verts, faces, 1)
+    import xatlas
+    vmapping, indices, uvs = xatlas.parametrize(verts, faces)
+    np.testing.assert_array_equal(v1, verts[vmapping])
+    np.testing.assert_array_equal(f1, indices.astype(np.int64))
+    np.testing.assert_array_equal(u1, uvs)
+
+
+@pytest.mark.skipif(
+    os.environ.get("SPLATLAB_RUN_MESH_ENV_TESTS") != "1",
+    reason="opt-in: runs the real object_texture.py in the dn-splatter-probe env",
+)
+def test_end_to_end_chunked_unwrap(tmp_path):
+    if not MESH_ENV_PYTHON.is_file():
+        pytest.skip("dn-splatter-probe env not present on this machine")
+    mesh_ply = tmp_path / "mesh.ply"
+    splat_ply = tmp_path / "splat.ply"
+    out_glb = tmp_path / "out.glb"
+    report_path = tmp_path / "report.json"
+    _write_cube_mesh_ply(mesh_ply)
+    _write_splat_ply(splat_ply)
+    script = Path(__file__).resolve().parents[1] / "mesh" / "object_texture.py"
+    proc = subprocess.run(
+        [str(MESH_ENV_PYTHON), str(script), str(mesh_ply), str(splat_ply),
+         str(out_glb), "--no-crop", "--no-remesh", "--no-reconstruct",
+         "--texture-size", "128", "--unwrap-chunks", "2",
+         "--report", str(report_path)],
+        capture_output=True, text=True, timeout=300)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    report = json.loads(report_path.read_text())
+    assert report["texture"]["baked"] is True
+    assert report["texture"]["unwrap_chunks"] == 2
+    assert report["texture"]["coverage"] >= report["texture"]["coverage_rasterized"]

@@ -232,9 +232,12 @@ def place_generated(gen: dict, out_glb: Path, *, mpu, faces: int, tex: int) -> d
 def run_object_texture(py: Path, script: Path, mesh: Path, splat: Path, out_glb: Path,
                        *, mpu, faces: int, tex: int, reconstruct: bool,
                        crop: bool, smooth: bool = True, timeout: int = 1800,
-                       min_gaussians: int | None = None) -> dict:
+                       min_gaussians: int | None = None,
+                       unwrap_chunks: int = 1) -> dict:
     cmd = [str(py), str(script), str(mesh), str(splat), str(out_glb),
            "--target-faces", str(faces), "--texture-size", str(tex)]
+    if unwrap_chunks > 1:
+        cmd += ["--unwrap-chunks", str(unwrap_chunks)]
     if mpu:
         cmd += ["--meters-per-unit", str(mpu)]
     if smooth:
@@ -400,9 +403,13 @@ def main() -> int:
             if not splat.is_file():
                 raise FileNotFoundError("no shell colour source (background.ply or splat.ply)")
             out = world / "shell.glb"
+            # Chunked unwrap is what makes dense-shell budgets tractable
+            # (13x measured at 400k faces); the layout change is confined to
+            # the shell, whose consumers treat GLB+atlas as a regenerated pair.
             res = run_object_texture(py, script, shell_ply, splat, out, mpu=mpu,
                                      faces=args.shell_faces, tex=args.shell_texture_size,
-                                     reconstruct=False, crop=False, timeout=3600)
+                                     reconstruct=False, crop=False, timeout=3600,
+                                     unwrap_chunks=4)
             shell = {"role": "shell", "cut": cut, "built": res["ok"],
                      "seconds": res["seconds"], "glb": out.name if res["ok"] else None}
             if not res["ok"]:
