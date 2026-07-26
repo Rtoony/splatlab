@@ -131,6 +131,104 @@ def build_shell_mesh(job_dir: Path, boxes, out_ply: Path, margin: float = 0.05) 
     return stats
 
 
+def _generated_candidate(job_dir: Path, slug: str) -> dict | None:
+    """A generated asset for this element, only if it knows where it belongs.
+
+    object_generate.py withholds `transform_4x4_generated_to_capture` whenever
+    its silhouette-IoU orientation search falls below threshold, so a missing
+    transform means "we could not place this", not "we forgot". Refused objects
+    (the mask gate) have no mesh at all and land here as None.
+    """
+    base = job_dir / "_regen" / "objects" / slug
+    mesh, report = base / "generated_mesh.glb", base / "generate_report.json"
+    if not (mesh.is_file() and report.is_file()):
+        return None
+    try:
+        doc = json.loads(report.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    placement = (doc.get("capture_frame_placement") or {}).get("mesh_glb") or {}
+    matrix = placement.get("transform_4x4_generated_to_capture")
+    if not placement.get("placement_resolved") or not matrix:
+        return None
+    return {
+        "mesh": mesh,
+        "matrix": matrix,
+        "iou": float((placement.get("orientation_search") or {}).get("best_silhouette_iou") or 0.0),
+        "report": {
+            "source": str(mesh),
+            "model": doc.get("model") or "sam-3d-objects",
+            "seed": doc.get("seed"),
+            "mask_gate_iou": (doc.get("mask_alignment_gate") or {}).get("iou_vs_captured_object"),
+            "placement_silhouette_iou": (placement.get("orientation_search") or {}).get("best_silhouette_iou"),
+            "fitted_uniform_scale": placement.get("fitted_uniform_scale"),
+            "provenance_tag": doc.get("provenance_tag"),
+            # The placement is FITTED, not recovered from a known convention.
+            # Recorded so a consumer never mistakes it for a measured pose.
+            "placement_is_fitted": True,
+        },
+    }
+
+
+def place_generated(gen: dict, out_glb: Path, *, mpu, faces: int, tex: int) -> dict:
+    """Transform a generated mesh into the capture frame and write it as an element.
+
+    Deliberately does NOT re-run object_texture: the generated asset is already a
+    clean closed surface with its own vertex colours, and a second Poisson refit
+    would only degrade the thing that made it worth choosing.
+
+    It DOES decimate. SAM 3D emits 0.5-1.2M triangles per object — a cardboard
+    box arrived at 1,186,232 — which is unusable in a browser walking a room.
+    Quadric collapse with vertex colours carried through keeps the appearance
+    while meeting the same face budget as every other prop; that is a different
+    operation from refitting the surface.
+    """
+    import numpy as np
+    import open3d as o3d
+    import trimesh
+
+    t0 = time.time()
+    try:
+        scene = trimesh.load(str(gen["mesh"]))
+        mesh = scene.to_geometry() if hasattr(scene, "to_geometry") else scene
+        mesh.apply_transform(np.asarray(gen["matrix"], dtype=np.float64))
+
+        faces_in = int(len(mesh.faces))
+        if faces and faces_in > faces:
+            om = o3d.geometry.TriangleMesh(
+                o3d.utility.Vector3dVector(np.asarray(mesh.vertices, dtype=np.float64)),
+                o3d.utility.Vector3iVector(np.asarray(mesh.faces, dtype=np.int32)))
+            vc = getattr(mesh.visual, "vertex_colors", None)
+            if vc is not None and len(vc) == len(mesh.vertices):
+                om.vertex_colors = o3d.utility.Vector3dVector(
+                    np.asarray(vc, dtype=np.float64)[:, :3] / 255.0)
+            om = om.simplify_quadric_decimation(target_number_of_triangles=int(faces))
+            om.remove_unreferenced_vertices()
+            mesh = trimesh.Trimesh(
+                vertices=np.asarray(om.vertices), faces=np.asarray(om.triangles),
+                vertex_colors=(np.clip(np.asarray(om.vertex_colors), 0, 1) * 255).astype(np.uint8)
+                if om.has_vertex_colors() else None,
+                process=False)
+        if mpu:
+            # Elements are exported in metres, Y-up — the same convention
+            # object_texture.py uses — so the capture-frame result is scaled and
+            # rotated to match its siblings.
+            v = np.asarray(mesh.vertices) * float(mpu)
+            mesh.vertices = np.stack([v[:, 0], v[:, 2], -v[:, 1]], axis=1)
+        out_glb.parent.mkdir(parents=True, exist_ok=True)
+        mesh.export(str(out_glb))
+        back = trimesh.load(str(out_glb), force="mesh")
+        if len(back.faces) != len(mesh.faces):
+            out_glb.unlink(missing_ok=True)
+            return {"ok": False, "error": f"readback mismatch {len(back.faces)} != {len(mesh.faces)}"}
+        return {"ok": True, "seconds": round(time.time() - t0, 1),
+                "faces": int(len(back.faces)),
+                "extent": [round(float(x), 3) for x in back.extents]}
+    except Exception as exc:  # noqa: BLE001 — fall back to captured geometry
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200],
+                "seconds": round(time.time() - t0, 1)}
+
+
 def run_object_texture(py: Path, script: Path, mesh: Path, splat: Path, out_glb: Path,
                        *, mpu, faces: int, tex: int, reconstruct: bool,
                        crop: bool, smooth: bool = True, timeout: int = 1800,
@@ -174,6 +272,9 @@ def main() -> int:
     ap.add_argument("--shell-texture-size", type=int, default=2048)
     ap.add_argument("--only", default=None, help="comma-separated slugs")
     ap.add_argument("--skip-shell", action="store_true")
+    ap.add_argument("--prefer-generated", action="store_true",
+                    help="use a placed generative reconstruction in place of the captured "
+                         "geometry when one exists (render lane only; survey still refuses it)")
     ap.add_argument("--min-gaussians", type=int, default=200,
                     help="floor for reconstructing a prop from its gaussians")
     ap.add_argument("--python", default=str(DEFAULT_PY))
@@ -236,6 +337,38 @@ def main() -> int:
             _log(f"  SKIP {slug}: {entry['reason']}")
             continue
         out = world / "elements" / f"{slug}.glb"
+
+        # GENERATED geometry, when it exists and knows where it goes.
+        # For a sparse capture a generative reconstruction can be plainly better
+        # than anything the scan supports — operator-graded on the fire hydrant,
+        # in form AND colour, against a 17.96% LCC source. It is only usable when
+        # object_generate.py resolved a capture-frame placement; an unplaced
+        # asset is a nice model floating in the wrong spot.
+        #
+        # This is a RENDER decision and stays one. The generative quarantine is
+        # enforced for lane="survey" (geo_export.py, ground_extract.py) and is
+        # untouched — measurement must never consume invented geometry. The
+        # world manifest records the substitution so a viewer can label it.
+        gen = _generated_candidate(job_dir, slug) if args.prefer_generated else None
+        if gen:
+            entry.update(geometry_source="generated", generated=gen["report"])
+            res = place_generated(gen, out, mpu=mpu, faces=args.prop_faces,
+                                  tex=args.texture_size)
+            entry.update(built=res["ok"], seconds=res.get("seconds"),
+                         glb=out.name if res["ok"] else None)
+            if res["ok"]:
+                entry["faces"] = res.get("faces")
+                entry["extent"] = res.get("extent")
+                entry["provenance"] = "generative render-only"
+                _log(f"  prop {slug}: GENERATED (placement iou {gen['iou']:.3f})")
+                elements.append(entry)
+                continue
+            # Fall through to the captured path rather than losing the element.
+            _log(f"  prop {slug}: generated placement failed ({res.get('error')}); "
+                 f"falling back to captured geometry")
+            entry.pop("provenance", None)
+            entry["geometry_source"] = "tsdf" if tsdf.is_file() else "gaussians"
+
         _log(f"  prop {slug} ...")
         res = run_object_texture(py, script, geom, splat_ply, out, mpu=mpu,
                                  faces=args.prop_faces, tex=args.texture_size,
