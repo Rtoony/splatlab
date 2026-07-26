@@ -105,8 +105,16 @@ def _execute(request: dict) -> dict:
             raise ValueError("export_glb requires a .glb output path")
         output_path = Path(output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Same export contract as blender_assemble.py: apply modifiers (the
+        # assembled scene's splat geometry lives behind Geometry Nodes —
+        # without export_apply the glTF has zero meshes, caught by the
+        # readback gate on the first real run), keep provenance extras, Y-up.
         bpy.ops.export_scene.gltf(
-            filepath=str(output_path), export_format="GLB"
+            filepath=str(output_path),
+            export_format="GLB",
+            export_apply=True,
+            export_extras=True,
+            export_yup=True,
         )
         return {
             "exported": True,
