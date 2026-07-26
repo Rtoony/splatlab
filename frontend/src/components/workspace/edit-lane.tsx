@@ -1,7 +1,8 @@
 // Edit lane — the /view workspace Edit tab. Native Edit-mode v1: wires four
 // of edit_ops.py's proven server-side operations (floater cleanup, decimate,
-// rigid transforms here; crop-box lives with crop-sphere in the Measure tab's
-// Spark tool panel where click-to-place picking exists). Every apply is
+// rigid transforms here; crop-box lives with crop-sphere in the Spark tool
+// panel — shown on this same Edit tab — where click-to-place picking
+// exists). Every apply is
 // snapshot-versioned server-side (max 5 kept) — the shared Undo row reverts
 // to the version_before the last lane edit returned. The SuperSplat escape
 // hatch stays for full manual editing, and the Import card closes the
@@ -486,15 +487,16 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
         )}
       </div>
 
-      {/* Crop tools pointer — box + sphere need click-to-place picking, which
-          lives in the Spark viewer's tool panel (Measure tab). */}
+      {/* Crop tools hint — box + sphere need click-to-place picking, so they
+          live in the Spark viewer's tool panel, which now shows the crop
+          sections right here on the Edit tab. */}
       <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-3">
         <p className="flex items-center gap-1.5 text-sm font-semibold text-zinc-100">
           <Crosshair className="h-3.5 w-3.5 text-cyan-200" /> Crop to sphere or box
         </p>
         <p className="mt-1 text-xs leading-relaxed text-zinc-400">
-          In the <span className="text-zinc-200">Measure</span> tab's tool panel — pick a center in the
-          scene, preview exactly what gets removed in red, apply with undo.
+          Crop tools are in the panel on the left — pick a center in the scene, preview what gets removed
+          in red, apply with undo.
         </p>
       </div>
 

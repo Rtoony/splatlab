@@ -47,7 +47,7 @@ export function ResultsGallery({
         <Card className="mb-4 overflow-hidden">
           <div className="relative h-[420px] overflow-hidden">
             <Suspense fallback={<div className="flex h-full items-center justify-center text-xs uppercase tracking-[0.3em] text-zinc-600">Loading viewer…</div>}>
-              <SparkSceneViewer key={featuredJob.job_id} job={featuredJob} toolsVisible={false} safeMode={computeBlocked} />
+              <SparkSceneViewer key={featuredJob.job_id} job={featuredJob} safeMode={computeBlocked} />
             </Suspense>
           </div>
           <div className="flex items-center justify-between gap-2 p-3">

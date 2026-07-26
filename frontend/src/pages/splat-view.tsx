@@ -412,7 +412,7 @@ export default function SplatViewPage() {
               <SparkSceneViewer
                 key={job.job_id}
                 job={job}
-                toolsVisible={mode === "measure"}
+                panelSections={mode === "measure" ? "measure" : mode === "edit" ? "edit" : null}
                 safeMode={computeBlocked}
                 computeReason={computeReason}
                 onViewerError={setViewerError}

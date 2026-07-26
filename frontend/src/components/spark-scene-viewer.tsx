@@ -124,7 +124,7 @@ export function SparkSceneViewer({
   cameraNodeTarget = null,
   resetViewToken = 0,
   showShortcutLegend = false,
-  toolsVisible = true,
+  panelSections = null,
   reloadToken = 0,
   onPickMatch,
   onPickCamera,
@@ -148,9 +148,11 @@ export function SparkSceneViewer({
   // One-shot request to inspect a camera marker from just behind its original pose.
   cameraNodeTarget?: ViewerCameraNodeTarget;
   resetViewToken?: number;
-  // Workspace-mode hint: hide the tool panel (query/paint/measure/crop) when
-  // the host page's active tab doesn't want it. Overlays/viewer unaffected.
-  toolsVisible?: boolean;
+  // Which tool-panel sections the host page's active tab wants: "measure" =
+  // search/paint/dimensions, "edit" = crop-sphere + crop-box, null/undefined
+  // = no panel at all. Panel chrome (splat count + fps) renders for both.
+  // Overlays/viewer unaffected.
+  panelSections?: "measure" | "edit" | null;
   showShortcutLegend?: boolean;
   // Bump after an EXTERNAL edit (the Edit-lane ops) to make the viewer reload
   // the splat file — routes into the same reloadNonce/url mechanism the crop
@@ -385,6 +387,17 @@ export function SparkSceneViewer({
     refreshModifierRef.current();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [boxMode]);
+
+  // Leaving the Edit tab hides the crop sections — ALSO disarm both crop
+  // click-owners, or an invisible armed tool would keep eating scene clicks
+  // (same reset discipline as the mode-flip effects above; their off-branches
+  // do the center/preview cleanup).
+  useEffect(() => {
+    if (panelSections !== "edit") {
+      setCropMode(false);
+      setBoxMode(false);
+    }
+  }, [panelSections]);
 
   useEffect(() => {
     cropRadiusRef.current = cropRadius;
@@ -1832,9 +1845,18 @@ export function SparkSceneViewer({
         </div>
       )}
 
-      {/* control panel — top-left column on desktop, bottom drawer under 1024px */}
-      {toolsVisible && (
-      <div className="absolute left-3 top-3 z-20 max-h-[calc(100%-1.5rem)] w-80 space-y-3 overflow-y-auto rounded-xl border border-white/10 bg-[#0a0f1a] p-3 text-xs text-zinc-200 shadow max-lg:bottom-2 max-lg:left-2 max-lg:right-2 max-lg:top-auto max-lg:max-h-[45vh] max-lg:w-auto">
+      {/* control panel — top-left column on desktop, bottom drawer under
+          1024px. Sections follow the host tab (panelSections: "measure" =
+          search/paint/dimensions, "edit" = crop tools); chrome renders for
+          both. Under lg on the Edit tab the Edit lane also overlays the right
+          edge, so the drawer gets a lower max-height there — a cheap CSS-only
+          mitigation that keeps the two from fully covering each other. */}
+      {panelSections && (
+      <div
+        className={`absolute left-3 top-3 z-20 max-h-[calc(100%-1.5rem)] w-80 space-y-3 overflow-y-auto rounded-xl border border-white/10 bg-[#0a0f1a] p-3 text-xs text-zinc-200 shadow max-lg:bottom-2 max-lg:left-2 max-lg:right-2 max-lg:top-auto max-lg:w-auto ${
+          panelSections === "edit" ? "max-lg:max-h-[30vh]" : "max-lg:max-h-[45vh]"
+        }`}
+      >
         <div className="flex items-center justify-between">
           <span className="font-semibold uppercase tracking-widest text-cyan-300/90">Spark beta</span>
           <span className="text-zinc-400">
@@ -1842,6 +1864,8 @@ export function SparkSceneViewer({
           </span>
         </div>
 
+        {panelSections === "measure" && (
+        <>
         <>
             <SectionLabel>{job.langfield_available ? "Language overlay" : "Test search overlay"}</SectionLabel>
             {safeMode && (
@@ -2182,10 +2206,11 @@ export function SparkSceneViewer({
             )}
           </div>
         )}
+        </>
+        )}
 
-        {!safeMode && (
+        {panelSections === "edit" && !safeMode && (
           <>
-            <div className="h-px bg-white/10" />
             <SectionLabel>Crop to sphere</SectionLabel>
             <div className="flex items-center gap-2">
               <Button
@@ -2355,6 +2380,12 @@ export function SparkSceneViewer({
               </p>
             )}
           </>
+        )}
+        {panelSections === "edit" && safeMode && (
+          <p className="rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5 text-[10px] leading-snug text-amber-100/85">
+            Crop edits are disabled while the hardware-maintenance gate is active
+            {computeReason ? `: ${computeReason}` : "."}
+          </p>
         )}
       </div>
       )}
