@@ -26,6 +26,7 @@ import type {
   ViewerPoint,
 } from "@/components/viewer-types";
 import { Button, Input, SectionLabel } from "@/components/ui";
+import { EditProgress } from "@/components/edit-progress";
 import { Box, Download, Loader2, Paintbrush, Plus, Ruler, Scissors, Trash2, Undo2, X } from "lucide-react";
 
 // SPARK BETA viewer for the /view page — the Wave-2 cutover surface.
@@ -2245,7 +2246,9 @@ export function SparkSceneViewer({
                       className={cropConfirmArmed ? "border-red-400/50 bg-red-400/20 text-red-100" : ""}
                     >
                       {cropBusy ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        <>
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Applying…
+                        </>
                       ) : cropConfirmArmed ? (
                         `Sure? Removes ${(cropRemovedCount ?? 0).toLocaleString()} splats permanently`
                       ) : (
@@ -2254,6 +2257,7 @@ export function SparkSceneViewer({
                     </Button>
                   </>
                 )}
+                <EditProgress jobId={job.job_id} active={cropBusy || boxBusy} />
               </>
             )}
             {cropError && <p className="text-[10px] leading-snug text-rose-300/90">{cropError}</p>}
@@ -2327,7 +2331,9 @@ export function SparkSceneViewer({
                       className={boxConfirmArmed ? "border-red-400/50 bg-red-400/20 text-red-100" : ""}
                     >
                       {boxBusy ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        <>
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Applying…
+                        </>
                       ) : boxConfirmArmed ? (
                         `Sure? Removes ${(boxRemovedCount ?? 0).toLocaleString()} splats permanently`
                       ) : (
@@ -2336,6 +2342,7 @@ export function SparkSceneViewer({
                     </Button>
                   </>
                 )}
+                <EditProgress jobId={job.job_id} active={cropBusy || boxBusy} />
               </>
             )}
             {boxError && <p className="text-[10px] leading-snug text-rose-300/90">{boxError}</p>}

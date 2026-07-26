@@ -6,10 +6,14 @@
 import { useQuery } from "@tanstack/react-query";
 import { fetchActivity } from "@/lib/api";
 
-export function useActivity() {
+// `fast` tightens the poll to 2s — callers pass it while a local edit
+// mutation is pending so the stepped edit_progress keeps up with the server's
+// ~8-15s edit pipeline. All observers share the one ["activity"] cache entry;
+// react-query refetches at the smallest interval any active observer asks for.
+export function useActivity(fast = false) {
   return useQuery({
     queryKey: ["activity"],
     queryFn: fetchActivity,
-    refetchInterval: 4000,
+    refetchInterval: fast ? 2000 : 4000,
   });
 }

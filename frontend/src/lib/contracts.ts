@@ -701,12 +701,28 @@ export interface SplatActivityJobFlags {
   exporting?: boolean; // portable SPZ/SOG/glTF + collision + Unreal bundle
 }
 
+// Server-side stepped progress for one in-flight scene edit. Step vocabulary:
+// apply/upload edits run ["snapshot","apply","compress","webopt","langweb",
+// "finalize"]; semantic edits prepend a leading "match". Entries exist only
+// while an edit is running, and only on newer backends — the deployed server
+// may omit the edit_progress key entirely, so all access must stay
+// optional-chained.
+export interface SplatEditProgress {
+  step: string;
+  step_index: number;
+  steps: number;
+  labels: string[];
+  started_at: string;
+}
+
 export interface SplatActivityResponse {
   gpu: {
     // null when nobody holds the GPU lease.
     holder: { lane: string; job_id: string | null; since: string | null } | null;
   };
   jobs: Record<string, SplatActivityJobFlags>;
+  // Optional by contract: older deployed backends don't send this key at all.
+  edit_progress?: Record<string, SplatEditProgress>;
 }
 
 export interface SplatComputeStatus {

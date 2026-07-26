@@ -10,7 +10,9 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { applyEditOps, fetchEditVersions, revertEdit, uploadEditedPly } from "@/lib/api";
 import { relTime } from "@/lib/format";
+import { useActivity } from "@/lib/use-activity";
 import type { SplatEditApplyResponse, SplatEditOp, SplatJob } from "@/lib/contracts";
+import { EditProgress } from "@/components/edit-progress";
 import { SemanticEditPanel } from "@/components/edit/semantic-edit";
 import { Button, Input, SectionLabel, useToast } from "@/components/ui";
 import { Crosshair, ExternalLink, History, Loader2, Move3d, Shrink, Sparkles, Undo2, UploadCloud, Wand2, Wrench } from "lucide-react";
@@ -91,6 +93,19 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importArmed, setImportArmed] = useState(false);
   const [importPct, setImportPct] = useState<number | null>(null);
+
+  // The semantic panel runs its own mutation — it reports busy up so the
+  // server-truth banner below doesn't misfire ("started elsewhere") on an
+  // edit that was in fact started right here in this lane.
+  const [semanticBusy, setSemanticBusy] = useState(false);
+
+  // Server-truth activity poll (fast while any local mutation is pending).
+  // The per-job `editing` flag is the backend's own in-process edit lock, so
+  // it sees edits started in other tabs or before a reload — local pending
+  // state can't.
+  const localMutating = pending !== null || restoring !== null || semanticBusy;
+  const activity = useActivity(localMutating);
+  const remoteEditing = Boolean(activity.data?.jobs?.[job.job_id]?.editing) && !localMutating;
 
   useEffect(() => {
     if (!decimateArmed) return;
@@ -258,7 +273,10 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
     }
   }
 
-  const busy = pending !== null;
+  // Ops lock while OUR mutation runs OR while the server says another edit
+  // holds this job's edit lock (remoteEditing) — the backend would 423 the
+  // request anyway; disabling is the honest UI for it.
+  const busy = pending !== null || remoteEditing;
 
   async function restoreVersion(seq: number) {
     setRestoring(seq);
@@ -296,15 +314,26 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
           ))}
         </div>
       )}
-      {lastVersion !== null && (
-        <div className="flex items-center justify-between gap-2 rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2">
-          <span className="text-xs text-zinc-400">
-            Restore point <span className="font-semibold text-zinc-200">v{lastVersion}</span> saved before the last edit.
-          </span>
-          <Button type="button" size="sm" variant="outline" onClick={() => void runUndo()} disabled={busy}>
-            {pending === "undo" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Undo2 className="h-3.5 w-3.5" />} Undo
-          </Button>
+      {remoteEditing && (
+        <div className="rounded-xl border border-cyan-300/25 bg-cyan-400/10 px-3 py-2 text-xs leading-relaxed text-cyan-100">
+          An edit is in progress for this scene (started elsewhere or before a reload). Controls unlock when it
+          finishes.
+          <EditProgress jobId={job.job_id} active={false} />
         </div>
+      )}
+      {lastVersion !== null && (
+        <>
+          <div className="flex items-center justify-between gap-2 rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2">
+            <span className="text-xs text-zinc-400">
+              Restore point <span className="font-semibold text-zinc-200">v{lastVersion}</span> saved before the last edit.
+            </span>
+            <Button type="button" size="sm" variant="outline" onClick={() => void runUndo()} disabled={busy}>
+              {pending === "undo" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Undo2 className="h-3.5 w-3.5" />}
+              {pending === "undo" ? "Undoing…" : "Undo"}
+            </Button>
+          </div>
+          {pending === "undo" && <EditProgress jobId={job.job_id} active />}
+        </>
       )}
       {job.langfield_stale && (
         <p className="text-[11px] leading-snug text-amber-300/90">
@@ -326,8 +355,9 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
         {job.langfield_available && <LangfieldTopologyWarning stale={Boolean(job.langfield_stale)} />}
         <Button type="button" size="sm" className="mt-2 w-full" onClick={runFloaters} disabled={busy}>
           {pending === "floaters" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wand2 className="h-3.5 w-3.5" />}
-          Clean up floaters
+          {pending === "floaters" ? "Applying…" : "Clean up floaters"}
         </Button>
+        {pending === "floaters" && <EditProgress jobId={job.job_id} active />}
       </div>
 
       {/* Decimate */}
@@ -370,13 +400,16 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
           disabled={busy}
         >
           {pending === "decimate" ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <>
+              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Applying…
+            </>
           ) : decimateArmed ? (
             `Sure? Permanently merges down to ${keepPct}%`
           ) : (
             `Decimate to ${keepPct}%`
           )}
         </Button>
+        {pending === "decimate" && <EditProgress jobId={job.job_id} active />}
       </div>
 
       {/* Transform */}
@@ -437,7 +470,9 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
               disabled={busy || transformInvalid || transformCount === 0}
             >
               {pending === "transform" ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Applying…
+                </>
               ) : transformArmed ? (
                 `Sure? Permanently applies ${transformCount} op${transformCount === 1 ? "" : "s"}`
               ) : transformCount === 0 ? (
@@ -446,6 +481,7 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
                 `Apply transform (${transformCount} op${transformCount === 1 ? "" : "s"})`
               )}
             </Button>
+            {pending === "transform" && <EditProgress jobId={job.job_id} active />}
           </div>
         )}
       </div>
@@ -486,18 +522,29 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
                   disabled={busy || restoring !== null}
                   onClick={() => (restoreArmed === v.seq ? void restoreVersion(v.seq) : setRestoreArmed(v.seq))}
                 >
-                  {restoring === v.seq ? <Loader2 className="h-3 w-3 animate-spin" /> : restoreArmed === v.seq ? "Sure?" : "Restore"}
+                  {restoring === v.seq ? (
+                    <>
+                      <Loader2 className="h-3 w-3 animate-spin" /> Restoring…
+                    </>
+                  ) : restoreArmed === v.seq ? (
+                    "Sure?"
+                  ) : (
+                    "Restore"
+                  )}
                 </Button>
               </div>
             ))}
           </div>
+          {restoring !== null && <EditProgress jobId={job.job_id} active />}
         </div>
       )}
 
       {/* Semantic edit — text-driven delete/isolate/extract via the language
           field. Renders its own honest disabled card when the field is
-          missing or stale (polled job flags), so it mounts unconditionally. */}
-      <SemanticEditPanel job={job} onEdited={onEdited} />
+          missing or stale (polled job flags), so it mounts unconditionally.
+          onBusyChange keeps the server-truth banner above from misfiring
+          while ITS mutation runs. */}
+      <SemanticEditPanel job={job} onEdited={onEdited} onBusyChange={setSemanticBusy} />
 
       {/* Import edited .ply — the return leg of the SuperSplat roundtrip. */}
       <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-3">
@@ -551,6 +598,9 @@ export function EditLane({ job, onEdited }: { job: SplatJob; onEdited?: () => vo
             <p className="text-xs text-zinc-500">Drop a .ply here or click to browse</p>
           )}
         </div>
+        {/* After the upload leg completes, the server runs the same stepped
+            edit pipeline (snapshot → apply → …) — show it here too. */}
+        {pending === "import" && <EditProgress jobId={job.job_id} active />}
         {importFile && pending !== "import" && (
           <Button
             type="button"

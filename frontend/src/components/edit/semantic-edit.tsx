@@ -19,6 +19,7 @@ import { Link } from "wouter";
 import { semanticEdit } from "@/lib/api";
 import type { SplatJob, SplatSemanticEditRequest } from "@/lib/contracts";
 import { Button, Input, useToast } from "@/components/ui";
+import { EditProgress } from "@/components/edit-progress";
 import { ArrowRight, Loader2, ScanSearch } from "lucide-react";
 
 // Backend defaults, read from edit_ops.py SemanticEditRequest — keep in sync.
@@ -33,7 +34,17 @@ const MODES: { key: SemanticMode; label: string; blurb: string }[] = [
   { key: "extract", label: "Extract", blurb: "Copy the match into a new scene — this scene stays untouched." },
 ];
 
-export function SemanticEditPanel({ job, onEdited }: { job: SplatJob; onEdited?: () => void }) {
+export function SemanticEditPanel({
+  job,
+  onEdited,
+  onBusyChange,
+}: {
+  job: SplatJob;
+  onEdited?: () => void;
+  // Reports this panel's own mutation state up so the host lane's
+  // "edit started elsewhere" server-truth banner doesn't misfire on it.
+  onBusyChange?: (busy: boolean) => void;
+}) {
   const toast = useToast();
   const qc = useQueryClient();
   const [text, setText] = useState("");
@@ -54,6 +65,13 @@ export function SemanticEditPanel({ job, onEdited }: { job: SplatJob; onEdited?:
     const t = window.setTimeout(() => setArmed(false), 4000);
     return () => window.clearTimeout(t);
   }, [armed]);
+
+  // Mirror busy up to the host (cleanup also clears it on unmount so a
+  // mid-flight tab switch can't leave the lane thinking we're still busy).
+  useEffect(() => {
+    onBusyChange?.(busy);
+    return () => onBusyChange?.(false);
+  }, [busy, onBusyChange]);
 
   const gated = !job.langfield_available || Boolean(job.langfield_stale);
 
@@ -205,7 +223,9 @@ export function SemanticEditPanel({ job, onEdited }: { job: SplatJob; onEdited?:
             disabled={busy || !text.trim()}
           >
             {busy ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <>
+                <Loader2 className="h-3.5 w-3.5 animate-spin" /> Applying…
+              </>
             ) : armed ? (
               mode === "delete" ? (
                 "Sure? Permanently removes the matches"
@@ -220,6 +240,8 @@ export function SemanticEditPanel({ job, onEdited }: { job: SplatJob; onEdited?:
               `${activeMode.label} “${text.trim().length > 24 ? `${text.trim().slice(0, 24)}…` : text.trim()}”`
             )}
           </Button>
+          {/* Semantic edits prepend a "match" step to the stepped pipeline. */}
+          {busy && <EditProgress jobId={job.job_id} active />}
 
           {error && (
             <p className="rounded-lg border border-red-400/25 bg-red-400/10 px-2 py-1.5 text-[11px] leading-snug text-red-200">
