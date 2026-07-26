@@ -478,6 +478,11 @@ def dilate_atlas(tex, mask, passes: int = 24):
     chart still get read at the seam. Leaving them black draws dark rims around
     every chart — the classic unpadded-atlas artifact. Nearest-neighbour bleed
     is enough and needs no extra dependency beyond what is already imported.
+
+    Returns (texture, shipped_mask): the dilated atlas plus the mask of texels
+    holding colour in it. The input `mask` describes only what the rasterizer
+    hit; the shipped atlas covers strictly more, and coverage claims about the
+    delivered file must come from the returned mask, not the input one.
     """
     out = tex.copy()
     filled = mask.copy()
@@ -495,7 +500,7 @@ def dilate_atlas(tex, mask, passes: int = 24):
         grow = holes & (cnt > 0)
         out[grow] = (acc[grow] / cnt[grow][:, None]).astype(np.uint8)
         filled = filled | grow
-    return out
+    return out, filled
 
 
 def main() -> int:
@@ -696,8 +701,9 @@ def main() -> int:
         if tex is None:
             texture_report = {"baked": False, "reason": "atlas rasterized zero texels"}
         else:
-            coverage = float(mask.mean())
-            tex = dilate_atlas(tex, mask, passes=max(16, args.texture_size // 48))
+            coverage_rasterized = float(mask.mean())
+            tex, shipped_mask = dilate_atlas(
+                tex, mask, passes=max(16, args.texture_size // 48))
             tex_img = Image.fromarray(tex, mode="RGB")
             # Also write the atlas beside the GLB. The GLB embeds it, but a
             # standalone PNG is what lets the UI show a thumbnail, lets a human
@@ -708,7 +714,12 @@ def main() -> int:
             texture_report = {
                 "baked": True,
                 "size": args.texture_size,
-                "coverage": round(coverage, 4),
+                # `coverage` describes the atlas AS SHIPPED (post-dilation) —
+                # the file a renderer samples. `coverage_rasterized` is the
+                # fraction the rasterizer itself hit, always smaller; keeping
+                # both stops the shipped number masquerading as bake quality.
+                "coverage": round(float(shipped_mask.mean()), 4),
+                "coverage_rasterized": round(coverage_rasterized, 4),
                 "unwrap_seconds": uv_seconds,
                 "charts_uv_range": [round(float(uvs.min()), 4), round(float(uvs.max()), 4)],
                 "atlas_png": atlas_path.name,

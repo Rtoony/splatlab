@@ -476,8 +476,9 @@ def _atlas_coverage(png: Path) -> tuple[float, list[int]]:
     Background is exactly black (or alpha 0): object_texture.bake_texture starts
     from np.zeros and dilate_atlas only ever spreads baked colour, so an
     all-zero texel was touched by neither. This measures the atlas AS SHIPPED,
-    i.e. after dilation, and so reads higher than the `texture.coverage` in the
-    build report, which is the pre-dilation rasterised mask. Both are recorded.
+    i.e. after dilation. The side-by-side build-report value is the pre-dilation
+    rasterised fraction (`texture.coverage_rasterized`; in reports written
+    before 2026-07-26 the same quantity was misfiled under `texture.coverage`).
     Caveat: a genuinely pure-black painted region reads as background.
     """
     img = Image.open(png)
@@ -614,9 +615,11 @@ def run(world: Path, strict: bool) -> dict:
         gates["shell_connectivity"] = gate_shell_connectivity(shell_mesh)
         gates["floor_continuity"] = gate_floor_continuity(shell_mesh, up_axis, units)
         measured_sizes.append(("shell", "shell", list(shell_mesh.extents)))
+        shell_tex = shell_meta.get("texture")
+        shell_tex = shell_tex if isinstance(shell_tex, dict) else {}
         atlases.append(("shell", world / "shell_atlas.png",
-                        ((shell_meta.get("texture") or {}).get("coverage")
-                         if isinstance(shell_meta.get("texture"), dict) else None)))
+                        shell_tex.get("coverage_rasterized",
+                                      shell_tex.get("coverage"))))
 
     # ---- props ----
     gates["prop_integrity"] = gate_prop_integrity(elements, elements_dir)
@@ -638,7 +641,8 @@ def run(world: Path, strict: bool) -> dict:
                 try:
                     tex = json.loads(sj.read_text()).get("texture")
                     if isinstance(tex, dict):
-                        reported = tex.get("coverage")
+                        reported = tex.get("coverage_rasterized",
+                                           tex.get("coverage"))
                 except Exception:  # noqa: BLE001 - comparison value only
                     reported = None
         fixed.append((name, png, reported))
