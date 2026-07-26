@@ -11,8 +11,9 @@
 // panel card at the bottom keeps that door.
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { fetchSplatObjects, isolateSplatObject } from "@/lib/api";
+import { fetchSplatObjects, isolateSplatObject, uploadPolishedObject } from "@/lib/api";
 import { formatBakeoffVerdict } from "@/lib/format";
+import { PolishUploadZone } from "@/components/workspace/polish-upload";
 import { useActivity } from "@/lib/use-activity";
 import type { SplatJob, SplatObjectEntry, SplatObjectFileFormat } from "@/lib/contracts";
 import { Button, Input, SectionLabel, Skeleton, useToast } from "@/components/ui";
@@ -44,6 +45,8 @@ function parseIntStrict(raw: string): number | null {
 }
 
 function ObjectCard({ job, entry }: { job: SplatJob; entry: SplatObjectEntry }) {
+  const toast = useToast();
+  const qc = useQueryClient();
   const files = OBJECT_FILES.filter((f) => entry.files[f.fmt]);
   return (
     <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-3">
@@ -86,6 +89,23 @@ function ObjectCard({ job, entry }: { job: SplatJob; entry: SplatObjectEntry }) 
           ))}
         </div>
       )}
+      {/* Return leg of the Blender round-trip: a polished GLB becomes this
+          object's `polished` asset (prior uploads are versioned server-side). */}
+      <PolishUploadZone
+        title="Drop a polished .glb (Blender/UE) or click"
+        hint="Lands as this object's Polished asset — captured artifacts stay untouched; prior polish uploads are versioned."
+        confirmLabel={
+          entry.files.polished
+            ? "Sure? Replaces the current polished asset (old one is versioned)"
+            : "Upload as this object's polished asset"
+        }
+        onUpload={async (file, onPct) => {
+          const res = await uploadPolishedObject(job.job_id, entry.slug, file, onPct);
+          toast(`Polished asset landed for ${entry.slug}`, "success");
+          void qc.invalidateQueries({ queryKey: ["objects", job.job_id] });
+          void res;
+        }}
+      />
       <p className="sr-only">job {job.job_id}</p>
     </div>
   );

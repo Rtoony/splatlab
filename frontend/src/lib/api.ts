@@ -16,6 +16,7 @@ import type {
   SplatEditOp,
   SplatEditRevertResponse,
   SplatEditUploadResponse,
+  SplatPolishUploadResponse,
   SplatEditVersionsResponse,
   SplatExportBuildRequest,
   SplatMeshBuildRequest,
@@ -241,6 +242,74 @@ export function uploadEditedPly(
 // Restore a snapshot version (itself snapshotted first, so revert is undoable).
 export function revertEdit(jobId: string, version: number): Promise<SplatEditRevertResponse> {
   return postJSON<SplatEditRevertResponse>(`/api/splat/jobs/${jobId}/edit/revert`, { version });
+}
+
+// Polish round-trip return leg: a Blender/UE-polished GLB lands back as a
+// first-class versioned asset. Same XHR-for-progress pattern as
+// uploadEditedPly; failures surface the backend {detail} verbatim
+// (400 bad GLB, 404 unknown slug, 409 build running, 413 >2GB).
+function uploadGlbTo<T>(
+  url: string,
+  file: File,
+  onProgress?: (pct: number) => void,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append("file", file);
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress?.(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText) as T);
+        } catch {
+          reject(new Error("Upload finished but the server response was unreadable."));
+        }
+        return;
+      }
+      let detail = `HTTP ${xhr.status}`;
+      try {
+        const payload = JSON.parse(xhr.responseText) as { detail?: unknown };
+        if (typeof payload.detail === "string") detail = payload.detail;
+        else if (payload.detail !== undefined) detail = JSON.stringify(payload.detail);
+      } catch {
+        // keep the bare HTTP status fallback
+      }
+      reject(new Error(detail));
+    };
+    xhr.onerror = () =>
+      reject(new Error("Upload failed — network error before the server answered."));
+    xhr.send(form);
+  });
+}
+
+export function uploadPolishedObject(
+  jobId: string,
+  slug: string,
+  file: File,
+  onProgress?: (pct: number) => void,
+): Promise<SplatPolishUploadResponse> {
+  return uploadGlbTo(
+    `/api/splat/jobs/${jobId}/objects/${encodeURIComponent(slug)}/polish`,
+    file,
+    onProgress,
+  );
+}
+
+export function uploadPolishedWorldElement(
+  jobId: string,
+  slug: string,
+  file: File,
+  onProgress?: (pct: number) => void,
+): Promise<SplatPolishUploadResponse> {
+  return uploadGlbTo(
+    `/api/splat/jobs/${jobId}/world/elements/${encodeURIComponent(slug)}/polish`,
+    file,
+    onProgress,
+  );
 }
 
 // List the job's edit restore points (newest-first ordering is the caller's job).

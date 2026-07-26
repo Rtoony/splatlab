@@ -15,6 +15,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useRoute } from "wouter";
+import { uploadPolishedWorldElement } from "@/lib/api";
+import { PolishUploadZone } from "@/components/workspace/polish-upload";
 import {
   DEFAULT_WALK_PARAMS,
   WorldWalker,
@@ -39,6 +41,7 @@ import {
   Ruler,
   Settings2,
   Shapes,
+  UploadCloud,
 } from "lucide-react";
 
 const DEV_SOURCE_KEY = "splatlab.world-view.devSource";
@@ -339,8 +342,10 @@ export default function WorldViewPage() {
                 upm={upm}
                 colliderTris={sceneInfo?.colliderTris ?? 0}
                 colliderSource={sceneInfo?.colliderSource ?? "visual_shell"}
+                jobId={jobId}
                 onToggle={toggleVisible}
                 onGo={(slug) => walkerRef.current?.teleportTo(slug)}
+                onPolished={() => setReloadNonce((n) => n + 1)}
               />
             </div>
           )}
@@ -731,17 +736,23 @@ function ElementsPanel({
   upm,
   colliderTris,
   colliderSource,
+  jobId,
   onToggle,
   onGo,
+  onPolished,
 }: {
   rows: ElementRow[];
   hidden: Set<string>;
   upm: number;
   colliderTris: number;
   colliderSource: "collision_shell" | "visual_shell";
+  jobId: string;
   onToggle: (slug: string) => void;
   onGo: (slug: string) => void;
+  onPolished: () => void;
 }) {
+  // One expanded polish zone at a time — the HUD column is narrow.
+  const [polishSlug, setPolishSlug] = useState<string | null>(null);
   return (
     <Panel icon={<Shapes className="h-3.5 w-3.5" />} title={`Loaded elements (${rows.length})`}>
       <p className="mb-2 font-mono text-[10px] text-zinc-500">
@@ -795,6 +806,18 @@ function ElementsPanel({
                     <MapPin className="h-3 w-3" />
                     Go
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => setPolishSlug(polishSlug === r.slug ? null : r.slug)}
+                    title="Replace this element with a Blender-polished .glb"
+                    className={`rounded-md border p-1 transition ${
+                      polishSlug === r.slug
+                        ? "border-cyan-400/50 text-cyan-200"
+                        : "border-white/10 text-zinc-400 hover:text-white"
+                    }`}
+                  >
+                    <UploadCloud className="h-3 w-3" />
+                  </button>
                 </div>
               </div>
               <div className="mt-1 flex flex-wrap items-center gap-1">
@@ -811,6 +834,18 @@ function ElementsPanel({
                 </Tag>
               </div>
               {r.frameWarning && <p className="mt-1 text-[10px] text-amber-300">{r.frameWarning}</p>}
+              {polishSlug === r.slug && (
+                <PolishUploadZone
+                  title="Drop a polished .glb or click"
+                  hint="Replaces this element's GLB (the old one is versioned server-side); the world reloads with it."
+                  confirmLabel={`Sure? Replaces ${r.slug} in the world`}
+                  onUpload={async (file, onPct) => {
+                    await uploadPolishedWorldElement(jobId, r.slug, file, onPct);
+                    setPolishSlug(null);
+                    onPolished();
+                  }}
+                />
+              )}
             </li>
           );
         })}

@@ -902,6 +902,16 @@ export interface SplatEditUploadResponse extends SplatEditApplyResponse {
   gaussians: number;
 }
 
+// Polish upload response (polish_route.py POST .../polish, both object and
+// world-element variants): serving URL for the landed GLB + the provenance
+// receipt (schema dev.splatlab.polish-receipt/v1).
+export interface SplatPolishUploadResponse {
+  ok: boolean;
+  slug: string;
+  url: string;
+  receipt: Record<string, unknown>;
+}
+
 // revert_version response (edit_ops.py ~line 410).
 export interface SplatEditRevertResponse {
   ok: boolean;
