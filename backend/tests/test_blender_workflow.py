@@ -204,3 +204,88 @@ def test_typed_parameters_reject_implicit_boolean_and_vector_coercion() -> None:
         blender_workflow._sanitize_params(
             "transform_object", {"object": "Cube", "location": [True, 2, 3]}
         )
+
+
+def _minimal_glb_bytes(meshes: int = 1) -> bytes:
+    import struct
+
+    doc = json.dumps(
+        {
+            "asset": {"version": "2.0", "generator": "fake-blender"},
+            "meshes": [{"primitives": []} for _ in range(meshes)],
+            "nodes": [{}],
+        }
+    ).encode()
+    doc += b" " * ((4 - len(doc) % 4) % 4)
+    body = struct.pack("<I4s", len(doc), b"JSON") + doc
+    return struct.pack("<4sII", b"glTF", 2, 12 + len(body)) + body
+
+
+def test_export_glb_creates_validated_artifact_and_receipt(
+    workflow: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_dir = _make_job(workflow)
+
+    def fake_run(command: list[str], timeout: int = 0) -> tuple[int, str]:
+        request = json.loads(Path(command[-2]).read_text())
+        assert request["action"] == "export_glb"
+        assert request["output_glb"].endswith(".glb")
+        Path(request["output_glb"]).write_bytes(_minimal_glb_bytes(meshes=2))
+        Path(command[-1]).write_text(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "result": {"exported": True, "meshes": 2},
+                    "blender": {"version": "4.5.11 LTS", "background": True},
+                }
+            )
+        )
+        return 0, "ok"
+
+    monkeypatch.setattr(blender_workflow, "_run_process", fake_run)
+    receipt = blender_workflow.export_glb("splat_b1e001", note="for UE")
+    exports = job_dir / "_blender" / "exports"
+    assert (exports / "scene-v0000.glb").is_file()
+    assert receipt["gltf"]["meshes"] == 2
+    assert receipt["output"]["path"] == "_blender/exports/scene-v0000.glb"
+    assert receipt["base"]["version"] is None
+    assert json.loads((exports / "scene-v0000.json").read_text())["schema"] == (
+        "dev.splatlab.blender-export-receipt/v1"
+    )
+    assert not list(exports.glob(".building-*"))
+
+
+def test_export_glb_invalid_output_is_rejected_loudly(
+    workflow: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_dir = _make_job(workflow)
+
+    def fake_run(command: list[str], timeout: int = 0) -> tuple[int, str]:
+        request = json.loads(Path(command[-2]).read_text())
+        Path(request["output_glb"]).write_bytes(b"not a glb")
+        Path(command[-1]).write_text(json.dumps({"status": "ok", "result": {}}))
+        return 0, "ok"
+
+    monkeypatch.setattr(blender_workflow, "_run_process", fake_run)
+    with pytest.raises(
+        blender_workflow.BlenderWorkflowError, match="structural validation"
+    ):
+        blender_workflow.export_glb("splat_b1e001")
+    exports = job_dir / "_blender" / "exports"
+    assert not list(exports.glob("*.glb"))
+    assert not list(exports.glob(".building-*"))
+
+
+def test_export_glb_failed_process_leaves_nothing(
+    workflow: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_dir = _make_job(workflow)
+
+    def fake_failure(command: list[str], timeout: int = 0) -> tuple[int, str]:
+        return 7, "blender exploded"
+
+    monkeypatch.setattr(blender_workflow, "_run_process", fake_failure)
+    with pytest.raises(blender_workflow.BlenderWorkflowError, match="export_glb"):
+        blender_workflow.export_glb("splat_b1e001")
+    exports = job_dir / "_blender" / "exports"
+    assert not exports.is_dir() or not list(exports.iterdir())

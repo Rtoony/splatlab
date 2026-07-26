@@ -95,6 +95,18 @@ def transform_object(
     )
 
 
+@mcp.tool(title="Export Blender scene as GLB", annotations=ADDITIVE)
+def export_blend_glb(
+    job_id: str, version: int | None = None, note: str = ""
+) -> dict[str, Any]:
+    """Export a blend version as a validated GLB under _blender/exports/.
+
+    Versions are untouched; the artifact is readback-validated (glb_check)
+    before it lands. Feeding it back into the app stays a separate, audited
+    step via the polish-upload route."""
+    return workflow.export_glb(job_id, base_version=version, note=note)
+
+
 @mcp.tool(title="Restore Blender version", annotations=ADDITIVE)
 def restore_blender_version(
     job_id: str, version: int, note: str = ""

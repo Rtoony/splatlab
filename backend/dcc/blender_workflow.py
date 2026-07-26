@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import artifact_manifest as manifests
+import glb_check
 
 
 BLENDER_BIN = Path(
@@ -402,6 +403,110 @@ def run_action(
             "result": response.get("result"),
             "blender": response.get("blender"),
         }
+
+
+def _exports_dir(job_dir: Path) -> Path:
+    return _workflow_dir(job_dir) / "exports"
+
+
+def export_glb(
+    job_id: str, *, base_version: int | None = None, note: str = ""
+) -> dict[str, Any]:
+    """Export a blend version (or the assembled scene) as a GLB artifact.
+
+    Read-only with respect to the version history — no new .blend is created.
+    Output lands at _blender/exports/scene-vNNNN.glb via a .building- stage,
+    with a MANDATORY glb_check readback (the open3d lesson: never trust an
+    exporter's exit code) and a receipt beside it. Re-exporting the same base
+    version replaces the derived artifact and its receipt — versions are
+    immutable, exports are derived. The exported file feeds the polish-upload
+    route; ingestion stays a separate, audited step.
+    """
+    if not BLENDER_BIN.is_file() or not ACTION_SCRIPT.is_file():
+        raise BlenderWorkflowError("Blender 4.5 LTS workflow toolchain is unavailable")
+    job_dir = _job_dir(job_id)
+    with _job_lock(job_dir):
+        source, resolved_base = _source_blend(job_dir, base_version)
+        exports_dir = _exports_dir(job_dir)
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"scene-v{(resolved_base or 0):04d}"
+        final_output = exports_dir / f"{stem}.glb"
+        # The stage name must still END in .glb — suffix-dispatching consumers
+        # (the splat-transform lesson) and glb_check both key on it.
+        staged_output = final_output.with_name(f".building-{final_output.name}")
+        staged_output.unlink(missing_ok=True)
+
+        with tempfile.TemporaryDirectory(prefix="splatlab-blender-") as temp_name:
+            temp_dir = Path(temp_name)
+            request_path = temp_dir / "request.json"
+            response_path = temp_dir / "response.json"
+            request_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "dev.splatlab.blender-action/v1",
+                        "job_id": job_id,
+                        "action": "export_glb",
+                        "params": {},
+                        "source_blend": str(source),
+                        "output_blend": None,
+                        "output_glb": str(staged_output),
+                    }
+                )
+            )
+            os.chmod(request_path, 0o600)
+            command = [
+                str(BLENDER_BIN),
+                "--disable-autoexec",
+                "--background",
+                str(source),
+                "--python",
+                str(ACTION_SCRIPT),
+                "--",
+                str(request_path),
+                str(response_path),
+            ]
+            return_code, log = _run_process(command)
+            response = manifests.read_json(response_path)
+            if return_code != 0 or not response or response.get("status") != "ok":
+                staged_output.unlink(missing_ok=True)
+                detail = response.get("error") if response else log
+                raise BlenderWorkflowError(
+                    f"Blender export_glb failed (exit {return_code}): {detail}"
+                )
+
+        if not staged_output.is_file():
+            raise BlenderWorkflowError(
+                "Blender reported a successful export without a file"
+            )
+        try:
+            gltf_summary = glb_check.validate_glb(staged_output)
+        except ValueError as exc:
+            staged_output.unlink(missing_ok=True)
+            raise BlenderWorkflowError(
+                f"exported GLB failed structural validation: {exc}"
+            ) from exc
+        os.replace(staged_output, final_output)
+        receipt = {
+            "schema": "dev.splatlab.blender-export-receipt/v1",
+            "job_id": job_id,
+            "action": "export_glb",
+            "note": note[:500],
+            "base": {
+                "version": resolved_base,
+                "path": manifests.relative_job_path(source, job_dir),
+                **manifests.file_identity(source),
+            },
+            "output": {
+                "path": manifests.relative_job_path(final_output, job_dir),
+                **manifests.file_identity(final_output),
+            },
+            "gltf": gltf_summary,
+            "created_at": manifests.utc_now(),
+            "blender": response.get("blender"),
+            "result": response.get("result"),
+        }
+        manifests.atomic_write_json(exports_dir / f"{stem}.json", receipt)
+        return receipt
 
 
 def restore_version(job_id: str, version: int, note: str = "") -> dict[str, Any]:

@@ -11,7 +11,13 @@ from pathlib import Path
 import bpy
 
 
-ALLOWED_ACTIONS = {"inspect", "snapshot", "toggle_collection", "transform_object"}
+ALLOWED_ACTIONS = {
+    "inspect",
+    "snapshot",
+    "toggle_collection",
+    "transform_object",
+    "export_glb",
+}
 
 
 def _inspect() -> dict:
@@ -90,6 +96,24 @@ def _execute(request: dict) -> dict:
         }
     elif action == "inspect":
         return _inspect()
+    elif action == "export_glb":
+        # Read-only with respect to the .blend: exports the scene as binary
+        # glTF and returns without saving a new version. Zero free-form
+        # params — the output path comes from the host-side request only.
+        output = request.get("output_glb")
+        if not isinstance(output, str) or not output.endswith(".glb"):
+            raise ValueError("export_glb requires a .glb output path")
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        bpy.ops.export_scene.gltf(
+            filepath=str(output_path), export_format="GLB"
+        )
+        return {
+            "exported": True,
+            "objects": len(bpy.data.objects),
+            "meshes": len(bpy.data.meshes),
+            "bytes": output_path.stat().st_size,
+        }
     else:
         result = {"snapshot": True}
 

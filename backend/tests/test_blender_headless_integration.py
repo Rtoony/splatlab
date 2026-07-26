@@ -83,3 +83,42 @@ def test_headless_snapshot_and_inspect(tmp_path: Path) -> None:
     result = json.loads(response.read_text())
     assert result["status"] == "ok"
     assert result["result"]["location"] == [1.0, 2.0, 3.0]
+
+
+@pytest.mark.skipif(
+    os.environ.get("SPLATLAB_RUN_BLENDER_TESTS") != "1",
+    reason="set SPLATLAB_RUN_BLENDER_TESTS=1 for the real Blender smoke test",
+)
+def test_headless_export_glb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    blender = blender_workflow.BLENDER_BIN
+    if not blender.is_file():
+        pytest.skip("Blender binary is unavailable")
+
+    outputs = tmp_path / "outputs"
+    job_dir = outputs / "splat_b1e999"
+    (job_dir / "_regen").mkdir(parents=True)
+    (job_dir / "meta.json").write_text(json.dumps({
+        "job_id": "splat_b1e999", "status": "completed",
+        "output_dir": str(job_dir),
+    }))
+    source = job_dir / "_regen" / "scene.blend"
+    create = subprocess.run(
+        [
+            str(blender), "--disable-autoexec", "--background",
+            "--factory-startup", "--python-expr",
+            (
+                "import bpy; "
+                f"bpy.ops.wm.save_as_mainfile(filepath={str(source)!r}, check_existing=False)"
+            ),
+        ],
+        check=False, capture_output=True, text=True, timeout=120,
+        env=blender_workflow._sanitized_env(),
+    )
+    assert create.returncode == 0, create.stdout + create.stderr
+
+    monkeypatch.setattr(blender_workflow, "OUTPUT_ROOT", outputs.resolve())
+    receipt = blender_workflow.export_glb("splat_b1e999", note="integration")
+    exported = job_dir / "_blender" / "exports" / "scene-v0000.glb"
+    assert exported.is_file()
+    assert receipt["gltf"]["meshes"] >= 1  # factory startup scene has the cube
+    assert receipt["result"]["exported"] is True
