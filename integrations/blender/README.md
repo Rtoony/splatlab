@@ -35,3 +35,21 @@ used or supported.
 `base_version` defaults to the latest immutable version. Use `0` to operate from
 the assembled `_regen/scene.blend`, or a positive version to branch from that
 receipt. `open_blender` is the only attended GUI action.
+
+## Persistent service + launcher (2026-07-26)
+
+The server now runs as a systemd user unit — `splatlab-blender-mcp.service`
+(loopback :9877, `Restart=on-failure`, no secrets) — and is registered as the
+`splatlab-blender` HTTP MCP server in `~/.claude.json` (user scope), so agent
+sessions get the 9 typed tools without any manual start. The general-purpose
+:9876 addon bridge (`blender-cockpit`) is a different server; never conflate.
+
+Outbound leg: `~/bin/splatlab-blender <job_id> [--artifact ...]` opens a job's
+assets in GPU Blender 4.5 LTS (latest `_blender/versions` blend → the P6
+`_regen/scene.blend` → best GLB set, in that order) and prints the matching
+polish-upload return path.
+
+Bootstrap convention: the FIRST `snapshot_blend` after a P6 assemble creates
+`_blender/versions/scene-v0001.blend`; every mutating op after that lands as a
+new immutable version with a receipt, and `export_blend_glb` writes a
+validated GLB to `_blender/exports/` ready for the polish-upload route.
