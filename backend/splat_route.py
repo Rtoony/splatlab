@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
@@ -1243,6 +1244,16 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
         "surface_iso_url": (
             f"/api/splat/jobs/{job_id}/geo/export?fmt=surface-iso"
             if (output_dir / MESH_DIRNAME / "geo" / "surface_iso.png").is_file()
+            else None
+        ),
+        # Solidified world (scene_solidify -> world_collision): a shell mesh plus
+        # per-element GLBs and convex-hull collision under _world/. world.json is
+        # the stage's own receipt, so its presence — not the dir's — is what says
+        # the lane actually produced something to view.
+        "world_available": (output_dir / WORLD_DIRNAME / "world.json").is_file(),
+        "world_manifest_url": (
+            f"/api/splat/jobs/{job_id}/world/manifest"
+            if (output_dir / WORLD_DIRNAME / "world.json").is_file()
             else None
         ),
         # Cheap per-scene stats for the gallery card (gaussian count, resolution, images).
@@ -5879,6 +5890,304 @@ async def get_scene_assemble_file(job_id: str, fmt: Literal["report", "glb", "bl
         path, media = out_dir / "scene_manifest.json", "application/json"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Assembled scene artifact not built yet")
+    return FileResponse(str(path), media_type=media, filename=path.name)
+
+
+# ── Solidified world (_world/): the three.js-facing view of the scene ───────────
+# scene_solidify.py writes _world/{world.json, shell.glb+shell_atlas.png+shell.json,
+# elements/<slug>.{glb,json} + <slug>_atlas.png}; world_collision.py then writes
+# world_manifest.json plus collision/UCX_<slug>_NN.glb convex hulls. Both are CLI
+# stages, so these two routes are the only way a browser reaches that tree.
+#
+# A viewer needs three things the raw files do not hand it:
+#   1. ONE element list. Geometry facts (faces, extent, label, built) live in
+#      world.json; role/collision/classification live in world_manifest.json,
+#      which only exists once the collision stage has run. Merging is the route's
+#      job, not the client's.
+#   2. Resolved URLs. The reports name bare files ("red-bicycle.glb",
+#      "UCX_cardboard-box_00.glb") whose directory is implied by which report they
+#      came from — an easy thing for a client to get wrong.
+#   3. An explicit calibration statement. These scenes are usually
+#      "scene-units (uncalibrated)"; a viewer that silently assumes metres puts a
+#      1.75-unit bicycle in the wrong world. Say scale is unknown out loud.
+WORLD_DIRNAME = "_world"
+# Media types for what a solidified world actually contains. Anything else under
+# the dir is stage scratch (_work/), served as an opaque download rather than
+# guessed at — the containment check below is what keeps that safe.
+_WORLD_MEDIA_TYPES = {
+    ".glb": "model/gltf-binary",
+    ".png": "image/png",
+    ".json": "application/json",
+}
+
+
+def _world_rel_ok(name: str) -> bool:
+    """True iff `name` is a relative path that cannot climb out of _world/.
+
+    First half of the two-part guard on the free-form /world/file name: rejects
+    the lexical attacks (absolute paths, "..", NUL) before any filesystem call.
+    The resolve()-based containment check in _resolve_world_artifact is the
+    second half and is what catches symlink escapes.
+    """
+    if not name or "\x00" in name or name.startswith(("/", "\\")):
+        return False
+    path = Path(name)
+    return bool(path.parts) and not path.is_absolute() and ".." not in path.parts
+
+
+def _resolve_world_artifact(world_dir: Path, name: str) -> Path | None:
+    """Resolve `name` under `world_dir`, or None if it escapes / does not exist.
+
+    None (never an exception) so every rejection collapses to one 404: a caller
+    probing for files outside the job learns nothing from the response.
+
+    resolve(strict=True) on BOTH sides is the load-bearing part — it collapses
+    symlinks, so a link planted inside _world/ pointing at ~/.ssh resolves to its
+    real target and then fails the is-inside-root test.
+    """
+    if not _world_rel_ok(name):
+        return None
+    try:
+        root = world_dir.resolve(strict=True)
+        target = (root / name).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):  # missing, loop, or bad name
+        return None
+    if root not in target.parents:
+        return None
+    return target if target.is_file() else None
+
+
+def _world_file_url(job_id: str, name: str) -> str:
+    return f"/api/splat/jobs/{job_id}/world/file?name={quote(name)}"
+
+
+def _world_artifact_urls(world_dir: Path, job_id: str, rel_dir: str, stem: str) -> dict[str, str]:
+    """URL per artifact that EXISTS on disk right now for one element (or the
+    shell). Same discipline as list_splat_objects' files{}: never advertise a
+    file the solidify stage did not write — a texture bake can fail on its own
+    while the .glb succeeds."""
+    urls: dict[str, str] = {}
+    for key, filename in (("glb", f"{stem}.glb"),
+                          ("atlas", f"{stem}_atlas.png"),
+                          ("report", f"{stem}.json")):
+        rel = f"{rel_dir}{filename}"
+        if (world_dir / rel).is_file():
+            urls[key] = _world_file_url(job_id, rel)
+    return urls
+
+
+def _world_collision(world_dir: Path, job_id: str, raw: Any) -> dict[str, Any] | None:
+    """Collision state for one element with a URL per hull, or None if the
+    collision stage has not graded this element yet.
+
+    world_collision.py rewrites collision/ in place per run, so a manifest that
+    listed 12 hulls from an earlier pass can still name files a later 8-hull pass
+    removed. Every listed file is re-checked; ones that vanished are reported as
+    missing_hulls rather than served as dead URLs.
+
+    hull_urls is always present on a graded element so the viewer branches on one
+    shape: [] means "no hulls" — a static element whose render mesh IS its
+    collision (strategy complex_as_simple)."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, Any] = {k: v for k, v in raw.items() if k != "files"}
+    listed = raw.get("files")
+    hull_urls, missing = [], []
+    for filename in listed if isinstance(listed, list) else []:
+        rel = f"collision/{filename}"
+        if isinstance(filename, str) and _world_rel_ok(rel) and (world_dir / rel).is_file():
+            hull_urls.append(_world_file_url(job_id, rel))
+        else:
+            missing.append(filename)
+    out["hull_urls"] = hull_urls
+    if missing:
+        out["missing_hulls"] = missing
+    return out
+
+
+def _world_calibration(world: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
+    """Real-world scale state of the built world — the same trap
+    _object_calibration guards for single objects, at scene scale.
+
+    meters_per_unit is stamped into world.json when solidify runs; a later
+    POST /jobs/{id}/scale updates the JOB but nothing re-stamps artifacts already
+    on disk. So the viewer must be told BOTH numbers: what the GLBs were built
+    with, and what the job believes now."""
+    raw_world = world.get("meters_per_unit")
+    raw_job = meta.get("meters_per_unit")
+    world_mpu = float(raw_world) if raw_world else None
+    job_mpu = float(raw_job) if raw_job else None
+    stale = bool(job_mpu and (world_mpu is None or abs(world_mpu - job_mpu) > 1e-9))
+
+    if world_mpu is None and job_mpu is None:
+        detail = ("World is in scene units — real-world scale is unknown. Measure a "
+                  "known length on the scene to calibrate it.")
+    elif world_mpu is None:
+        detail = (f"World was solidified before calibration; the job now measures "
+                  f"{job_mpu:.6g} m/unit. Re-run solidify to bake real-world scale in.")
+    elif stale:
+        detail = (f"World was solidified at {world_mpu:.6g} m/unit; the job now measures "
+                  f"{job_mpu:.6g} m/unit. Re-run solidify.")
+    else:
+        detail = "World carries the job's current calibration."
+
+    return {
+        "meters_per_unit": world_mpu,
+        "job_meters_per_unit": job_mpu,
+        # The one flag a viewer must branch on before it labels any dimension.
+        "uncalibrated": world_mpu is None,
+        "stale": stale,
+        "units": world.get("units"),
+        "detail": detail,
+    }
+
+
+def _read_world_report(path: Path) -> dict[str, Any] | None:
+    """A world report, or None if absent/corrupt. A half-written report is
+    treated exactly like a missing one — never as a partially valid world."""
+    try:
+        report = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return report if isinstance(report, dict) else None
+
+
+@router.get("/jobs/{job_id}/world/manifest")
+async def get_splat_world_manifest(job_id: str):
+    """The solidified world as one viewer-ready document: merged element list
+    (geometry from world.json, role/collision from world_manifest.json), a
+    resolved URL per artifact that exists, and explicit calibration state.
+
+    404 until the solidify stage has run — there is no partial world to show."""
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    world_dir = Path(meta["output_dir"]) / WORLD_DIRNAME
+    world = _read_world_report(world_dir / "world.json") if world_dir.is_dir() else None
+    if world is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No solidified world for this scene — run the solidify stage "
+                   "(scene_solidify.py) first to build _world/.",
+        )
+    # Present only once the collision stage has run; until then every element is
+    # ungraded (role None, collision None) and the viewer can say so.
+    manifest = _read_world_report(world_dir / "world_manifest.json") or {}
+    graded = {
+        entry["slug"]: entry
+        for entry in (manifest.get("elements") or [])
+        if isinstance(entry, dict) and isinstance(entry.get("slug"), str)
+    }
+
+    elements: list[dict[str, Any]] = []
+    for element in world.get("elements") or []:
+        slug = element.get("slug")
+        # A slug becomes a path segment below, so it gets the same containment
+        # guard as the free-form file name.
+        if not isinstance(slug, str) or "/" in slug or not _world_rel_ok(slug):
+            continue
+        grade = graded.get(slug, {})
+        elements.append({
+            "slug": slug,
+            "label": element.get("label"),
+            # world_collision.py's verdict: "prop" (own convex hulls) /
+            # "static" (complex-as-simple) / "unbuilt". None = not graded yet.
+            "role": grade.get("role"),
+            "built": bool(element.get("built")),
+            "faces": element.get("faces"),
+            "extent": element.get("extent"),
+            "geometry_source": element.get("geometry_source"),
+            "n_members": element.get("n_members"),
+            "textured": bool(element.get("texture")),
+            "classification": grade.get("classification") or [],
+            "reason": element.get("reason"),
+            "files": _world_artifact_urls(world_dir, job_id, "elements/", slug),
+            "collision": _world_collision(world_dir, job_id, grade.get("collision")),
+        })
+
+    shell_report = world.get("shell") or {}
+    shell_grade = manifest.get("shell") or {}
+    shell = None
+    if shell_report.get("built"):
+        shell = {
+            "slug": "shell",
+            # The shell is the environment; world_collision.py always calls it
+            # static, so that is the sane default before it has run.
+            "role": shell_grade.get("role") or "static",
+            "faces": shell_report.get("faces"),
+            "extent": shell_report.get("extent"),
+            "textured": bool(shell_report.get("texture")),
+            "classification": shell_grade.get("classification") or [],
+            "files": _world_artifact_urls(world_dir, job_id, "", "shell"),
+            "collision": _world_collision(world_dir, job_id, shell_grade.get("collision")),
+        }
+
+    # The WALKABLE solid, which is a different mesh from the one you look at.
+    # The visual shell is the textured TSDF surface — accurate to the capture
+    # but a thin, fragmented web that a capsule falls straight through. The
+    # collision shell is voxel-solidified (world_shell.py) and watertight. A
+    # viewer must render the first and collide against the second; shipping
+    # only the visual one is what makes a world look right and be unwalkable.
+    collision_shell = None
+    if (world_dir / "collision_shell.glb").is_file():
+        gates = {}
+        report = world_dir / "collision_shell.json"
+        if report.is_file():
+            try:
+                doc = json.loads(report.read_text())
+                gates = doc.get("gates") or doc.get("winner", {}).get("gates") or {}
+            except (OSError, json.JSONDecodeError):
+                gates = {}
+        collision_shell = {
+            "glb": _world_file_url(job_id, "collision_shell.glb"),
+            "report": (_world_file_url(job_id, "collision_shell.json")
+                       if report.is_file() else None),
+            "gates": gates,
+        }
+
+    calibration = _world_calibration(world, meta)
+    return {
+        "job_id": job_id,
+        "v": world.get("v"),
+        "units": world.get("units"),
+        "up_axis": world.get("up_axis") or "Y",
+        # Hoisted out of calibration{} so a viewer cannot miss them.
+        "meters_per_unit": calibration["meters_per_unit"],
+        "uncalibrated": calibration["uncalibrated"],
+        "calibration": calibration,
+        "scene_extent": manifest.get("scene_extent") or shell_report.get("extent"),
+        "counts": {**(world.get("counts") or {}), **(manifest.get("counts") or {})},
+        # False -> every role is None and no hulls exist; run world_collision.py.
+        "collision_built": bool(manifest),
+        "coacd_available": manifest.get("coacd_available"),
+        "thresholds": manifest.get("thresholds"),
+        "shell": shell,
+        "collision_shell": collision_shell,
+        "elements": elements,
+        "reports": {
+            key: _world_file_url(job_id, name)
+            for key, name in (("world", "world.json"), ("manifest", "world_manifest.json"))
+            if (world_dir / name).is_file()
+        },
+    }
+
+
+@router.get("/jobs/{job_id}/world/file")
+async def get_splat_world_file(job_id: str, name: str):
+    """Serve one artifact from this job's _world/ tree by relative name
+    (`shell.glb`, `elements/red-bicycle_atlas.png`, `collision/UCX_x_00.glb`).
+
+    Unlike the fmt=... file routes, `name` is free-form, so the path is resolved
+    and proven to stay inside THIS job's _world/ before anything is read;
+    traversal, absolute paths and symlink escapes all 404 like a missing file."""
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    path = _resolve_world_artifact(_job_dir(job_id) / WORLD_DIRNAME, name)
+    if path is None:
+        raise HTTPException(status_code=404, detail="World artifact not found")
+    media = _WORLD_MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream")
     return FileResponse(str(path), media_type=media, filename=path.name)
 
 
