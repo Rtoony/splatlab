@@ -4801,6 +4801,77 @@ async def get_splat_object_file(
     return FileResponse(str(path), media_type=media, filename=f"{job_id}-{slug}.{suffix}")
 
 
+def _object_calibration(obj_dir: Path, receipt: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
+    """Real-world scale state for one isolated object.
+
+    Two things a consumer of _objects/<slug>/mesh/*.glb otherwise has to
+    re-derive by hand — and can get wrong:
+
+    1. Whether the artifacts on disk carry the job's CURRENT calibration.
+       meters_per_unit arrives via the geo route, which can land AFTER an
+       object was built: the fire-hydrant field proof was meshed 13:05:03 and
+       calibrated 13:15:16, leaving a twin permanently stamped
+       "scene-units (uncalibrated)" on a job that does know its own scale.
+       Nothing re-stamps prior artifacts, so at least surface the
+       disagreement instead of serving stale units silently.
+
+    2. How big the object actually is. object.json's bbox_tight is the
+       SEMANTIC bbox (the langfield-selected gaussians), so it excludes the
+       ground that TSDF fusion welds into the object mesh. Scene z is up.
+       Comparing object_height_m against the mesh's own height is what
+       reveals how much non-object a mesh carries — the trap that otherwise
+       puts reconstructed features at the wrong height.
+    """
+    job_mpu = meta.get("meters_per_unit")
+    job_mpu = float(job_mpu) if job_mpu else None
+
+    art_mpu: float | None = None
+    twin_report = obj_dir / "mesh" / "twin_finish.json"
+    twin_built = twin_report.is_file()
+    if twin_built:
+        try:
+            raw = json.loads(twin_report.read_text()).get("meters_per_unit")
+            art_mpu = float(raw) if raw else None
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            art_mpu = None  # unreadable/legacy report -> treat as uncalibrated
+
+    stale = bool(twin_built and job_mpu and (art_mpu is None or abs(art_mpu - job_mpu) > 1e-9))
+    if not twin_built:
+        detail = "No twin built for this object yet."
+    elif not job_mpu:
+        detail = "Job is uncalibrated — set a scale on the scene to get real-world units."
+    elif art_mpu is None:
+        detail = (f"Twin was built before calibration; the job now measures {job_mpu:.6g} m/unit. "
+                  "Rebuild the twin to apply real-world scale.")
+    elif stale:
+        detail = (f"Twin was built at {art_mpu:.6g} m/unit; the job now measures {job_mpu:.6g} m/unit. "
+                  "Rebuild the twin.")
+    else:
+        detail = "Twin carries the job's current calibration."
+
+    dims_m: list[float] | None = None
+    height_m: float | None = None
+    tight = receipt.get("bbox_tight") or {}
+    lo, hi = tight.get("min"), tight.get("max")
+    if job_mpu and isinstance(lo, list) and isinstance(hi, list) and len(lo) == len(hi) == 3:
+        try:
+            dims = [(float(b) - float(a)) * job_mpu for a, b in zip(lo, hi)]
+        except (TypeError, ValueError):
+            dims = []
+        if dims:
+            dims_m = [round(d, 3) for d in dims]
+            height_m = round(dims[2], 3)  # scene z is up
+
+    return {
+        "job_meters_per_unit": job_mpu,
+        "artifact_meters_per_unit": art_mpu,
+        "stale": stale,
+        "detail": detail,
+        "object_dims_m": dims_m,
+        "object_height_m": height_m,
+    }
+
+
 @router.get("/jobs/{job_id}/objects")
 async def list_splat_objects(job_id: str):
     """Read-only companion to POST /objects: enumerate every built object for a
@@ -4836,6 +4907,7 @@ async def list_splat_objects(job_id: str):
                 for fmt, (rel, _media) in _OBJECT_FILES.items()
                 if (obj_dir / rel).is_file()
             }
+            entry["calibration"] = _object_calibration(obj_dir, receipt, meta)
             objects.append(entry)
     return {"job_id": job_id, "objects": objects}
 

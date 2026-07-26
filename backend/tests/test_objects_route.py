@@ -397,6 +397,102 @@ def test_objects_listing_full_build_file_subset(client, monkeypatch):
     assert entry["files"]["twin"].endswith("/objects/table/file?fmt=twin")
 
 
+def _finished_object(http, monkeypatch, job_dir: Path, slug: str = "table") -> Path:
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(job_dir, calls))
+    assert http.post("/api/splat/jobs/splat_0b0001/objects",
+                     json={"query": slug, "finish": True}).status_code == 200
+    return job_dir / splat_route.OBJECTS_DIRNAME / slug
+
+
+def _patch_json(path: Path, **fields) -> None:
+    doc = json.loads(path.read_text())
+    for k, v in fields.items():
+        if v is None:
+            doc.pop(k, None)
+        else:
+            doc[k] = v
+    path.write_text(json.dumps(doc))
+
+
+def test_objects_listing_flags_calibration_added_after_the_build(client, monkeypatch):
+    """Calibration can land AFTER an object is built (the fire-hydrant field
+    proof: meshed 13:05:03, calibrated 13:15:16). Nothing re-stamps the twin, so
+    the listing must say so rather than serve scene-units as if they were real."""
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    obj_dir = _finished_object(http, monkeypatch, job_dir)
+    # TWIN_REPORT carries no meters_per_unit -> built before any calibration
+    _patch_json(obj_dir / "object.json",
+                bbox_tight={"min": [0.0, 0.0, 0.0], "max": [0.1, 0.2, 0.4]})
+    _patch_json(job_dir / "meta.json", meters_per_unit=2.0)
+
+    cal = http.get("/api/splat/jobs/splat_0b0001/objects").json()["objects"][0]["calibration"]
+    assert cal["stale"] is True
+    assert cal["job_meters_per_unit"] == 2.0
+    assert cal["artifact_meters_per_unit"] is None
+    assert "Rebuild the twin" in cal["detail"]
+    # semantic bbox * mpu -> real dims; scene z is up
+    assert cal["object_dims_m"] == [0.2, 0.4, 0.8]
+    assert cal["object_height_m"] == 0.8
+
+
+def test_objects_listing_calibration_current_is_not_stale(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    obj_dir = _finished_object(http, monkeypatch, job_dir)
+    _patch_json(obj_dir / "mesh" / "twin_finish.json", meters_per_unit=2.0, units="meters")
+    _patch_json(job_dir / "meta.json", meters_per_unit=2.0)
+
+    cal = http.get("/api/splat/jobs/splat_0b0001/objects").json()["objects"][0]["calibration"]
+    assert cal["stale"] is False
+    assert cal["artifact_meters_per_unit"] == 2.0
+    assert cal["detail"] == "Twin carries the job's current calibration."
+
+
+def test_objects_listing_recalibration_marks_the_twin_stale(client, monkeypatch):
+    """A twin built at one scale must not silently survive a scale change."""
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    obj_dir = _finished_object(http, monkeypatch, job_dir)
+    _patch_json(obj_dir / "mesh" / "twin_finish.json", meters_per_unit=2.0, units="meters")
+    _patch_json(job_dir / "meta.json", meters_per_unit=3.5)
+
+    cal = http.get("/api/splat/jobs/splat_0b0001/objects").json()["objects"][0]["calibration"]
+    assert cal["stale"] is True
+    assert cal["artifact_meters_per_unit"] == 2.0 and cal["job_meters_per_unit"] == 3.5
+
+
+def test_objects_listing_uncalibrated_job_makes_no_scale_claim(client, monkeypatch):
+    """No calibration anywhere is not staleness, and must not invent metres."""
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    obj_dir = _finished_object(http, monkeypatch, job_dir)
+    _patch_json(obj_dir / "object.json",
+                bbox_tight={"min": [0.0, 0.0, 0.0], "max": [0.1, 0.2, 0.4]})
+
+    cal = http.get("/api/splat/jobs/splat_0b0001/objects").json()["objects"][0]["calibration"]
+    assert cal["stale"] is False
+    assert cal["job_meters_per_unit"] is None
+    assert cal["object_dims_m"] is None and cal["object_height_m"] is None
+    assert "uncalibrated" in cal["detail"]
+
+
+def test_objects_listing_calibration_without_a_twin(client, monkeypatch):
+    """Splat-only build: no twin on disk -> nothing to call stale."""
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(job_dir, calls))
+    assert http.post("/api/splat/jobs/splat_0b0001/objects",
+                     json={"query": "table", "mesh": False}).status_code == 200
+    _patch_json(job_dir / "meta.json", meters_per_unit=2.0)
+
+    cal = http.get("/api/splat/jobs/splat_0b0001/objects").json()["objects"][0]["calibration"]
+    assert cal["stale"] is False
+    assert cal["detail"] == "No twin built for this object yet."
+
+
 def test_objects_finish_failure_is_loud_500(client, monkeypatch):
     """A failed finish must not roll back the already-succeeded raw mesh
     artifacts -- they were a complete, valid build on their own."""

@@ -142,6 +142,16 @@ def main() -> int:
         "verts": int(len(yup)), "faces": int(len(faces)),
         "solid_gaussians": int(len(gx)),
         "units": "meters" if args.meters_per_unit else "scene-units (uncalibrated)",
+        # The FACTOR, not just the derived string. A consumer that finds
+        # "scene-units (uncalibrated)" here on a job whose meta now carries a
+        # meters_per_unit has no way to tell whether this artifact predates
+        # calibration or the calibration disagrees — recording the value the
+        # build actually used makes that comparison mechanical (see
+        # _object_calibration in splat_route.py). null = built uncalibrated.
+        "meters_per_unit": float(args.meters_per_unit) if args.meters_per_unit else None,
+        # Y-up per the export convention above (scene z -> glb y, scene y -> glb -z),
+        # stated explicitly so downstream tools stop inferring it from extents.
+        "up_axis": "Y",
         "extent": [round(float(x), 2) for x in back.extents],
         "glb_bytes": out_glb.stat().st_size,
         "seconds": round(time.time() - t0, 1),
