@@ -2050,3 +2050,26 @@ readable in-memory. Remaining attended: 30-second RDP eyeball of the FirstLight 
   REAL polished content (W4) rather than landing test data in a live slot.
 - **W4 pending RToony's capture** (scene w/ ground, 150-300 photos, taped distance, map
   pin — spec in the plan). Sequencing: derive (objects/P6/world) BEFORE destructive edits.
+
+## SEMANTIC PAINT-TO-GENERATE PHASE — P1+P2 SHIPPED (2026-07-26 pm; plan purring-coalescing-crane v3)
+Direction (RToony): crop → label → generative uses labels ("representative but faked").
+Taxonomy fixed+extensible; first gen output = class-textured ground; testbed = bicycle.
+- **P1 crop honesty (8b664db)**: "queued" lead step (host-lock waits visible — the recorded
+  "takes forever" source), revert/upload rails, to_thread snapshots (event loop no longer
+  freezes /activity), GLOBAL EditProgress under the tab row (survives tab switches/viewer
+  teardown), off-by-one fixed (rail read done while running), warnings[] surfaced,
+  bbox-derived slider ranges, placement-miss notice, honest preview-count copy. 668 tests.
+- **P2 langfield rebuild (aa9c949)**: REALIGNMENT not re-lift — langfield_realign.py
+  (exact-xyz map rebuild, total-or-nothing; painted records carried via xyz snapshots,
+  now written on every paint commit; legacy via old-map chain) + POST /langfield/rebuild
+  (edit-lock, rail, GPU lane only for one-time ckpt_xyz cache, worker /invalidate) + UI:
+  stale banner + one-click Rebuild CTA in search AND crop surfaces, TEST PATTERN badge.
+  681 tests. **LIVE PROOF on the hydrant** (stale from RToony's own edit session):
+  rebuild in 16 s incl. first checkpoint load — 909,527 rows realigned, 1,610 edited-away
+  rows detected, relevancy 200 w/ X-Count exact + hydrant found. Bit-exact xyz through
+  splat-transform CONFIRMED on real edits (risk #1 retired).
+- **Worker truth found**: splatlab-langfield.service binds :3425 (drop-in; :3417 code
+  default is cerberus-studio's port), deliberately on-demand/disabled — language tools are
+  down whenever nobody started it (`systemctl --user start splatlab-langfield`). Started
+  this session with the new /invalidate + snapshot code.
+- Open: P3 class-label painting → P4 class-textured ground/shell → bicycle E2E.
