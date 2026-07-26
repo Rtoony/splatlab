@@ -31,6 +31,11 @@ written GLB to prove the UVs and image actually survived export.
 Measured end to end on three objects across two captures (2026-07-25):
 fire-hydrant 0.85 m, round-wooden-table 1.6 m, garden flower-vase — 5-9 s each.
 
+Dense visual shells (200k-600k faces) are a different regime and were measured
+separately on 2026-07-26. The bake is flat there — ~5 s at any face count, see
+bake_texture — so the remaining cost is the UV unwrap, which is superlinear and
+dominates everything else past ~200k faces. See the note at the unwrap call.
+
 Usage: object_texture.py <mesh.ply> <splat.ply> <out.glb>
        [--meters-per-unit MPU] [--target-faces 8000] [--texture-size 1024]
        [--smooth] [--smooth-iterations 2] [--smooth-feature-deg 40.0]
@@ -92,6 +97,35 @@ def crop_to_box(mesh, lo, hi, margin: float):
     inside = np.all((v >= lo) & (v <= hi), axis=1)
     keep = inside[mesh.faces].all(axis=1)
     return keep, lo, hi
+
+
+def mesh_from_points(xyz, depth: int = 8, trim_pct: float = 8.0, knn: int = 32):
+    """Screened-Poisson surface straight from a gaussian point cloud.
+
+    Used when there is no TSDF mesh to start from — which is the normal case
+    for scene-lane instances, since batch_isolate.py claims gaussians into
+    object.ply and never meshes them.
+
+    orient_normals_consistent_tangent_plane is not optional: estimate_normals
+    returns normals with arbitrary sign, and Poisson interprets that sign as
+    which side is 'inside'. Left unoriented it reconstructs inside-out shards
+    instead of a surface. Density trimming afterwards removes the closure
+    Poisson invents wherever the capture saw nothing.
+    """
+    import open3d as o3d
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.asarray(xyz, dtype=np.float64))
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=knn))
+    pcd.orient_normals_consistent_tangent_plane(knn)
+    rec, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=depth, linear_fit=False)
+    dens = np.asarray(dens)
+    if len(dens) and float(np.ptp(dens)) > 0:
+        rec.remove_vertices_by_mask(dens < np.quantile(dens, trim_pct / 100.0))
+        rec.remove_unreferenced_vertices()
+    return trimesh.Trimesh(vertices=np.asarray(rec.vertices),
+                           faces=np.asarray(rec.triangles), process=False)
 
 
 def clean_and_simplify(mesh, target_faces: int, min_component_frac: float,
@@ -199,6 +233,162 @@ def clean_and_simplify(mesh, target_faces: int, min_component_frac: float,
             np.asarray(tm.triangles, dtype=np.int64), stats)
 
 
+# Working-set caps for the rasterizer and the neighbour query. Both stages run
+# on ONE flat array covering many faces at once, so without a cap a 600k-face
+# shell would allocate tens of GB where an 8k-face prop allocates megabytes.
+# Slabbing keeps peak RAM flat and face count only buys more slabs; the numbers
+# are chosen so a slab's transient arrays stay under ~1 GB.
+_RASTER_TEXEL_BATCH = 4_000_000   # candidate texels per rasterizer slab
+_QUERY_ELEMENT_BATCH = 8_000_000  # texels x k elements per KD query slab
+
+
+def _face_slabs(ends, budget: int):
+    """Yield face ranges [lo, hi) whose candidate texels fit in `budget`.
+
+    Splits BETWEEN faces, never inside one. A face's texels have to stay
+    contiguous and in face order because the final scatter is last-writer-wins
+    (see _rasterize_atlas), and one face whose UV bbox alone exceeds the budget
+    still gets its own slab rather than stalling.
+    """
+    total = len(ends)
+    lo = 0
+    while lo < total:
+        base = int(ends[lo - 1]) if lo else 0
+        hi = max(int(np.searchsorted(ends, base + budget, side="right")), lo + 1)
+        yield lo, hi
+        lo = hi
+
+
+def _rasterize_atlas(verts_scene, faces, uv_px, size: int, vnormals):
+    """All atlas triangles rasterized at once — the vectorized form of what used
+    to be a Python for-loop over every face.
+
+    The loop was O(faces) interpreter round trips, each allocating a meshgrid
+    and a handful of small arrays. Numpy does the same work on one flat array of
+    candidate texels — every pixel of every face's UV bounding box laid end to
+    end — with the per-face scalars broadcast through an index map.
+
+    Measured 2026-07-26, whole-bake wall time on a 2048 atlas (the world shell,
+    480k gaussians) — looped vs vectorized: 8k faces 5.4 -> 5.2 s, 50k 7.1 ->
+    4.9 s, 100k 8.8 -> 5.8 s, 200k 11.8 -> 5.0 s, 400k 18.5 -> 4.9 s, 600k
+    27.2 -> 6.3 s; peak RSS at 400k 2.70 -> 0.83 GB. Vectorized the bake is
+    FLAT in face count because the work is then bounded by covered TEXELS, which
+    the atlas size caps — a 600k-face shell costs the same as an 8k-face prop.
+
+    Returns (px, py, pos, nrm) in EXACTLY the order the loop emitted them:
+    faces in index order, and within a face the bbox pixel centres in row-major
+    order. That order is load-bearing, not cosmetic — tex[py, px] = cols is a
+    last-writer-wins scatter, so two faces sharing a texel have to resolve the
+    same way they always did. Returns Nones when nothing was covered.
+    """
+    if len(faces) == 0:
+        return None, None, None, None
+
+    tri_uv = uv_px[faces]                       # (F, 3, 2), float32 as before
+    tx, ty = tri_uv[:, :, 0], tri_uv[:, :, 1]
+    x0 = np.maximum(np.floor(tx.min(axis=1)).astype(np.int64), 0)
+    x1 = np.minimum(np.ceil(tx.max(axis=1)).astype(np.int64), size - 1)
+    y0 = np.maximum(np.floor(ty.min(axis=1)).astype(np.int64), 0)
+    y1 = np.minimum(np.ceil(ty.max(axis=1)).astype(np.int64), size - 1)
+    on_atlas = (x1 >= x0) & (y1 >= y0)          # else the loop skipped the face
+    bw = np.where(on_atlas, x1 - x0 + 1, 0)
+    npix = bw * np.where(on_atlas, y1 - y0 + 1, 0)
+    ends = np.cumsum(npix)
+
+    ax, ay = tx[:, 0], ty[:, 0]
+    bx, by = tx[:, 1], ty[:, 1]
+    cx, cy = tx[:, 2], ty[:, 2]
+    den = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+    ok_den = np.abs(den) >= 1e-12
+    # Degenerate faces are masked out below; substituting 1 only keeps the
+    # division from raising, it never reaches the output.
+    safe_den = np.where(ok_den, den, np.float32(1.0))
+
+    px_all, py_all, pos_all, nrm_all = [], [], [], []
+    for lo, hi in _face_slabs(ends, _RASTER_TEXEL_BATCH):
+        sub = slice(lo, hi)
+        base = int(ends[lo - 1]) if lo else 0
+        n = int(ends[hi - 1]) - base
+        if n:
+            fi = np.repeat(np.arange(lo, hi, dtype=np.int64), npix[sub])
+            # position of each candidate inside its own face's bbox
+            local = np.arange(n, dtype=np.int64) - (ends[fi] - npix[fi] - base)
+            wf = bw[fi]
+            xs = (x0[fi] + local % wf) + 0.5
+            ys = (y0[fi] + local // wf) + 0.5
+
+            # barycentric coords of every pixel centre in the bbox
+            dxc, dyc = xs - cx[fi], ys - cy[fi]
+            inv = safe_den[fi]
+            w0 = ((by[fi] - cy[fi]) * dxc + (cx[fi] - bx[fi]) * dyc) / inv
+            w1 = ((cy[fi] - ay[fi]) * dxc + (ax[fi] - cx[fi]) * dyc) / inv
+            w2 = 1.0 - w0 - w1
+            hit = (w0 >= -1e-4) & (w1 >= -1e-4) & (w2 >= -1e-4) & ok_den[fi]
+            sel = np.flatnonzero(hit)
+        else:
+            fi = sel = np.empty(0, dtype=np.int64)
+
+        # Sub-pixel or degenerate UV triangles: no pixel centre falls inside
+        # them, so the plain rasterizer writes nothing and the face samples
+        # black at render time. At a few thousand faces in a 1024 atlas this is
+        # common, and it is exactly the black speckling seen on the first bake.
+        # Guarantee every face owns at least one texel, at its UV centroid.
+        f_hit = fi[sel] - lo
+        cnt = np.bincount(f_hit, minlength=hi - lo)
+        fb = np.flatnonzero((cnt == 0) & on_atlas[sub])
+
+        # Interleave centroid texels back into face order (see docstring).
+        out_cnt = np.where(cnt > 0, cnt, on_atlas[sub].astype(np.int64))
+        out_end = np.cumsum(out_cnt)
+        m = int(out_end[-1]) if len(out_end) else 0
+        if m == 0:
+            continue
+        out_start = out_end - out_cnt
+        dest_hit = out_start[f_hit] + (np.arange(len(sel), dtype=np.int64)
+                                       - (np.cumsum(cnt) - cnt)[f_hit])
+        dest_fb = out_start[fb]
+
+        b_px = np.empty(m, dtype=np.int32)
+        b_py = np.empty(m, dtype=np.int32)
+        b_pos = np.empty((m, 3), dtype=np.float32)
+        b_nrm = np.empty((m, 3), dtype=np.float32) if vnormals is not None else None
+
+        if len(sel):
+            tri = faces[fi[sel]]
+            u0, u1, u2 = w0[sel, None], w1[sel, None], w2[sel, None]
+            b_px[dest_hit] = (xs[sel] - 0.5).astype(np.int32)
+            b_py[dest_hit] = (ys[sel] - 0.5).astype(np.int32)
+            b_pos[dest_hit] = (u0 * verts_scene[tri[:, 0]]
+                               + u1 * verts_scene[tri[:, 1]]
+                               + u2 * verts_scene[tri[:, 2]]).astype(np.float32)
+            if vnormals is not None:
+                b_nrm[dest_hit] = (u0 * vnormals[tri[:, 0]]
+                                   + u1 * vnormals[tri[:, 1]]
+                                   + u2 * vnormals[tri[:, 2]]).astype(np.float32)
+        if len(fb):
+            gfb = fb + lo
+            tri = faces[gfb]
+            b_px[dest_fb] = np.clip(np.round(tx[gfb].mean(axis=1)),
+                                    0, size - 1).astype(np.int32)
+            b_py[dest_fb] = np.clip(np.round(ty[gfb].mean(axis=1)),
+                                    0, size - 1).astype(np.int32)
+            b_pos[dest_fb] = verts_scene[tri].mean(axis=1).astype(np.float32)
+            if vnormals is not None:
+                b_nrm[dest_fb] = vnormals[tri].mean(axis=1)
+
+        px_all.append(b_px)
+        py_all.append(b_py)
+        pos_all.append(b_pos)
+        if b_nrm is not None:
+            nrm_all.append(b_nrm)
+
+    if not pos_all:
+        return None, None, None, None
+    return (np.concatenate(px_all), np.concatenate(py_all),
+            np.concatenate(pos_all),
+            np.concatenate(nrm_all) if nrm_all else None)
+
+
 def bake_texture(verts_scene, faces, uvs, gx, gc, size: int, k: int = 24,
                  vnormals=None):
     """Rasterize every atlas triangle and colour each covered texel from the
@@ -213,73 +403,42 @@ def bake_texture(verts_scene, faces, uvs, gx, gc, size: int, k: int = 24,
     tex = np.zeros((size, size, 3), dtype=np.float32)
     mask = np.zeros((size, size), dtype=bool)
 
-    # Collect every covered texel first, then do ONE batched KD query — a
+    # Collect every covered texel first, then do batched KD queries — a
     # per-triangle query would be ~10k round trips into the tree.
-    px_all, py_all, pos_all, nrm_all = [], [], [], []
-    uv_px = uvs * (size - 1)
-
-    for f in faces:
-        t = uv_px[f]
-        x0 = max(int(np.floor(t[:, 0].min())), 0)
-        x1 = min(int(np.ceil(t[:, 0].max())), size - 1)
-        y0 = max(int(np.floor(t[:, 1].min())), 0)
-        y1 = min(int(np.ceil(t[:, 1].max())), size - 1)
-        if x1 < x0 or y1 < y0:
-            continue
-        xs, ys = np.meshgrid(np.arange(x0, x1 + 1), np.arange(y0, y1 + 1))
-        xs = xs.ravel() + 0.5
-        ys = ys.ravel() + 0.5
-
-        # barycentric coords of every pixel centre in the bbox
-        tri3 = verts_scene[f]
-        ax, ay = t[0]; bx, by = t[1]; cx, cy = t[2]
-        den = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
-        inside = None
-        if abs(den) >= 1e-12:
-            w0 = ((by - cy) * (xs - cx) + (cx - bx) * (ys - cy)) / den
-            w1 = ((cy - ay) * (xs - cx) + (ax - cx) * (ys - cy)) / den
-            w2 = 1.0 - w0 - w1
-            inside = (w0 >= -1e-4) & (w1 >= -1e-4) & (w2 >= -1e-4)
-
-        if inside is None or not inside.any():
-            # Sub-pixel or degenerate UV triangle: no pixel centre falls inside
-            # it, so the plain rasterizer writes nothing and the face samples
-            # black at render time. At a few thousand faces in a 1024 atlas
-            # this is common, and it is exactly the black speckling seen on the
-            # first bake. Guarantee every face owns at least one texel.
-            cu = int(np.clip(round(t[:, 0].mean()), 0, size - 1))
-            cv = int(np.clip(round(t[:, 1].mean()), 0, size - 1))
-            px_all.append(np.array([cu], dtype=np.int32))
-            py_all.append(np.array([cv], dtype=np.int32))
-            pos_all.append(tri3.mean(axis=0)[None, :])
-            if vnormals is not None:
-                nrm_all.append(vnormals[f].mean(axis=0)[None, :])
-            continue
-
-        w0, w1, w2 = w0[inside], w1[inside], w2[inside]
-        pos = (w0[:, None] * tri3[0] + w1[:, None] * tri3[1] + w2[:, None] * tri3[2])
-        px_all.append((xs[inside] - 0.5).astype(np.int32))
-        py_all.append((ys[inside] - 0.5).astype(np.int32))
-        pos_all.append(pos)
-        if vnormals is not None:
-            tn = vnormals[f]
-            nrm_all.append(w0[:, None] * tn[0] + w1[:, None] * tn[1] + w2[:, None] * tn[2])
-
-    if not pos_all:
+    px, py, pos, nrm = _rasterize_atlas(verts_scene, faces, uvs * (size - 1),
+                                        size, vnormals)
+    if pos is None:
         return None, None
-
-    px = np.concatenate(px_all)
-    py = np.concatenate(py_all)
-    pos = np.concatenate(pos_all).astype(np.float32)
-    nrm = np.concatenate(nrm_all).astype(np.float32) if nrm_all else None
     if nrm is not None:
         nrm /= np.maximum(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-9)
 
+    # DROP SHADOWED SAMPLES. The final write is a last-writer-wins scatter, so
+    # when several faces cover one texel only the last sample can ever be seen —
+    # colouring the rest is pure waste, and at 400k faces in a 2048 atlas the
+    # duplicates are a large minority of all samples. Keeping the last index per
+    # texel is exactly what the scatter would have resolved to, so the image is
+    # unchanged; the neighbour query just gets a smaller input. A full-atlas
+    # index buffer beats sorting: O(size^2 + n) with trivial constants.
+    winner = np.full(size * size, -1, dtype=np.int32)
+    winner[py.astype(np.int64) * size + px] = np.arange(len(px), dtype=np.int32)
+    keep = winner[winner >= 0]
+    px, py, pos = px[keep], py[keep], pos[keep]
+    if nrm is not None:
+        nrm = nrm[keep]
+
     kq = min(k, len(gx))
-    dist, idx = cKDTree(gx).query(pos, k=kq, workers=-1)
-    if kq == 1:
-        cols = gc[idx]
-    else:
+    tree = cKDTree(gx)
+    cols = np.empty((len(pos), 3), dtype=np.float32)
+    # Every texel's colour depends only on its own neighbours, so slabbing the
+    # query is arithmetically identical to one giant call — it just bounds the
+    # (n, k) intermediates, which are what actually blow up at scale.
+    step = max(1, _QUERY_ELEMENT_BATCH // max(kq, 1))
+    for s in range(0, len(pos), step):
+        e = min(s + step, len(pos))
+        dist, idx = tree.query(pos[s:e], k=kq, workers=-1)
+        if kq == 1:
+            cols[s:e] = gc[idx]
+            continue
         # ADAPTIVE GAUSSIAN kernel, not 1/d. The gaussians are far sparser than
         # the atlas: ~20k solid gaussians over a ~1 m object is ~7 mm spacing,
         # while a 1024 atlas texel is ~1 mm, so every gaussian owns ~50 texels.
@@ -298,14 +457,14 @@ def bake_texture(verts_scene, faces, uvs, gx, gc, size: int, k: int = 24,
             # feature or inside the body — and interior gaussians are dark,
             # which is where the black blotches on the first bakes came from.
             # Keep only gaussians on the outward side of the local surface.
-            side = np.einsum("nkc,nc->nk", gx[idx] - pos[:, None, :], nrm)
+            side = np.einsum("nkc,nc->nk", gx[idx] - pos[s:e, None, :], nrm[s:e])
             ok = side > -h * 0.5
             # a texel with nothing on its outward side falls back to unfiltered
             # rather than going black
             w = np.where(ok.any(axis=1, keepdims=True), w * ok, w)
         wsum = w.sum(axis=1, keepdims=True)
         w = np.where(wsum > 0, w / np.maximum(wsum, 1e-12), 1.0 / kq)
-        cols = np.einsum("nk,nkc->nc", w, gc[idx])
+        cols[s:e] = np.einsum("nk,nkc->nc", w, gc[idx])
 
     tex[py, px] = cols
     mask[py, px] = True
@@ -369,20 +528,48 @@ def main() -> int:
                     help="skip screened-Poisson refit (keeps the raw open shell)")
     ap.add_argument("--poisson-depth", type=int, default=8)
     ap.add_argument("--poisson-trim-pct", type=float, default=8.0)
+    # The floor guards against reconstructing noise. 1000 suited the single-
+    # object lane (tens of thousands of gaussians per object); scene-lane props
+    # are legitimately sparse — Bonsai's bike bottle is 288 gaussians and was
+    # rejected outright. Low but non-zero, and overridable.
+    ap.add_argument("--min-gaussians", type=int, default=250)
     ap.add_argument("--report", default=None)
     args = ap.parse_args()
     t0 = time.time()
     out_glb = Path(args.out_glb)
     out_glb.parent.mkdir(parents=True, exist_ok=True)
 
-    mesh = trimesh.load(args.mesh, force="mesh", process=False)
-    if len(mesh.faces) == 0:
-        print("FATAL: empty mesh", file=sys.stderr)
-        return 1
     gx, gc = load_solid_gaussians(Path(args.splat))
-    if len(gx) < 1000:
-        print(f"FATAL: only {len(gx)} solid gaussians", file=sys.stderr)
+    if len(gx) < args.min_gaussians:
+        print(f"FATAL: only {len(gx)} solid gaussians "
+              f"(floor {args.min_gaussians}; lower with --min-gaussians)", file=sys.stderr)
         return 1
+
+    mesh = trimesh.load(args.mesh, force="mesh", process=False)
+    points_source = False
+    if len(mesh.faces) == 0:
+        # POINT-CLOUD SOURCE. The scene lane (batch_isolate.py) claims each
+        # instance's gaussians into object.ply and never builds a per-object
+        # mesh — so for whole-scene work there is no TSDF to start from, and
+        # running one per instance would be the most expensive step in the
+        # pipeline. Poisson takes an oriented point cloud natively, so the
+        # gaussians ARE a valid surface source. Normals must be made globally
+        # consistent first: with per-point normals left arbitrarily flipped,
+        # Poisson produces inside-out shards rather than a surface.
+        _log_pts = len(gx)
+        depth = args.poisson_depth
+        if _log_pts < 1_000:
+            depth = min(depth, 6)
+        elif _log_pts < 5_000:
+            depth = min(depth, 7)
+        knn = max(8, min(32, _log_pts // 20))
+        mesh = mesh_from_points(gx, depth=depth, knn=knn,
+                                trim_pct=args.poisson_trim_pct)
+        points_source = True
+        _stage(f"surface from {_log_pts} gaussians (depth {depth}, knn {knn}) -> {len(mesh.faces)} faces", t0)
+        if len(mesh.faces) < 4:
+            print("FATAL: point-cloud reconstruction produced no surface", file=sys.stderr)
+            return 1
 
     crop_stats = None
     lo = hi = None
@@ -452,14 +639,27 @@ def main() -> int:
     verts_scene, faces, stats = clean_and_simplify(
         mesh, args.target_faces, args.min_component_frac,
         args.smooth, args.smooth_iterations, args.smooth_feature_deg,
-        remesh=not args.no_remesh, reconstruct=not args.no_reconstruct,
+        remesh=not args.no_remesh,
+        reconstruct=(not args.no_reconstruct) and not points_source,
         poisson_depth=args.poisson_depth, poisson_trim_pct=args.poisson_trim_pct)
     if len(faces) < 4:
         print(f"FATAL: cleanup left {len(faces)} faces", file=sys.stderr)
         return 1
     stats["crop"] = crop_stats
+    stats["geometry_source"] = "gaussians (poisson)" if points_source else "mesh"
 
     # ---- UV unwrap (best effort; vertex colours remain the honest fallback) ----
+    #
+    # ⚠ THIS is the wall on dense shells, not the bake. xatlas.parametrize is
+    # steeply superlinear in face count — measured 2026-07-26 on the world shell
+    # at 0.2 s / 8k, 2.1 s / 50k, 10.3 s / 100k, 76.2 s / 200k and 1564.2 s
+    # (26 min) / 400k, which is what actually blew the 10-minute budget on the
+    # first 400k run. The bake below is ~5 s flat at any of those sizes.
+    # Unwrapping the SAME 400k mesh in 4 spatial chunks and packing each chart
+    # set into its own UV tile took 118 s total, so the cost is chart generation
+    # over one huge mesh rather than the work itself — but chunking changes the
+    # atlas layout, i.e. the output, so it is a deliberate design call for the
+    # dense-shell lane and not something to slip in as an optimization.
     texture_report = None
     uvs = None
     t_uv = time.time()
