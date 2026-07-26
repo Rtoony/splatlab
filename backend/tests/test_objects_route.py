@@ -28,6 +28,16 @@ MESH_REPORT = {"v": 1, "tris": 109232, "lcc_pct": 99.1,
 TWIN_REPORT = {"verts": 6919, "faces": 10000, "solid_gaussians": 19659,
                "units": "scene-units (uncalibrated)", "extent": [0.47, 0.47, 0.47],
                "glb_bytes": 231708, "seconds": 0.7}
+TEXTURE_REPORT = {"verts": 6580, "faces": 7999, "solid_gaussians": 19659,
+                  "units": "meters", "meters_per_unit": 2.0, "up_axis": "Y",
+                  "extent": [0.318, 0.846, 0.278],
+                  "simplify": {"faces_in": 89990, "faces_out": 7999,
+                               "reconstructed": True,
+                               "crop": {"source": "auto (object.json bbox_tight)",
+                                        "faces_kept": 47625, "faces_before": 89990}},
+                  "texture": {"baked": True, "size": 1024, "coverage": 0.6,
+                              "atlas_png": "textured_atlas.png"},
+                  "glb_bytes": 1194076, "seconds": 6.5}
 
 
 @pytest.fixture()
@@ -101,6 +111,13 @@ def _fake_subprocess(job_dir: Path, calls: list):
             recv_dir = Path(command[3])
             (recv_dir / "receipt_top.png").write_bytes(b"png")
             (recv_dir / "receipt_oblique.png").write_bytes(b"png")
+            return 0, b"", b""
+        if "object_texture" in joined:
+            out_glb = Path(command[4])
+            out_glb.parent.mkdir(parents=True, exist_ok=True)
+            out_glb.write_bytes(b"glb")
+            out_glb.with_name(out_glb.stem + "_atlas.png").write_bytes(b"png")
+            (out_glb.parent / "object_texture.json").write_text(json.dumps(TEXTURE_REPORT))
             return 0, b"", b""
         raise AssertionError(f"unexpected subprocess: {command}")
 
@@ -395,6 +412,80 @@ def test_objects_listing_full_build_file_subset(client, monkeypatch):
     # mesh+finish artifacts present; proxy formats absent (never built)
     assert set(entry["files"]) == {"splat", "ply", "glb", "receipt", "twin", "twin-top", "twin-oblique"}
     assert entry["files"]["twin"].endswith("/objects/table/file?fmt=twin")
+
+
+def test_objects_texture_bakes_a_uv_mapped_asset(client, monkeypatch):
+    """The texture lane produces a simplified GLB plus a standalone atlas, and
+    both are served. It is independent of `finish` — asking for texture alone
+    must not require or trigger the twin."""
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(job_dir, calls))
+    _patch_json(job_dir / "meta.json", meters_per_unit=2.0)
+    r = http.post("/api/splat/jobs/splat_0b0001/objects",
+                  json={"query": "table", "texture": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["object"]["textured"]["texture"]["baked"] is True
+    assert body["textured_glb_url"].endswith("fmt=textured")
+    assert body["textured_atlas_url"].endswith("fmt=textured-atlas")
+
+    tex_cmd = next(c for c in calls if "object_texture" in " ".join(str(x) for x in c))
+    joined = " ".join(str(x) for x in tex_cmd)
+    assert "--meters-per-unit 2.0" in joined      # calibration threaded through
+    assert "--no-crop" not in joined              # ground removal on by default
+    assert not any("twin_finish" in " ".join(str(x) for x in c) for c in calls)
+
+    entry = http.get("/api/splat/jobs/splat_0b0001/objects").json()["objects"][0]
+    assert {"textured", "textured-atlas"} <= set(entry["files"])
+    for fmt in ("textured", "textured-atlas"):
+        assert http.get(entry["files"][fmt]).status_code == 200
+
+
+def test_objects_texture_requires_mesh(client):
+    http, outputs = client
+    _mk_job(outputs)
+    r = http.post("/api/splat/jobs/splat_0b0001/objects",
+                  json={"query": "table", "mesh": False, "texture": True})
+    assert r.status_code == 400
+    assert "requires mesh" in r.json()["detail"]
+
+
+def test_objects_texture_honours_crop_and_size_overrides(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(job_dir, calls))
+    assert http.post("/api/splat/jobs/splat_0b0001/objects",
+                     json={"query": "table", "texture": True, "texture_crop": False,
+                           "texture_size": 2048, "texture_target_faces": 3000}).status_code == 200
+    joined = " ".join(str(x) for c in calls if "object_texture" in " ".join(str(y) for y in c)
+                      for x in c)
+    assert "--no-crop" in joined
+    assert "--texture-size 2048" in joined
+    assert "--target-faces 3000" in joined
+
+
+def test_objects_texture_failure_is_loud_500(client, monkeypatch):
+    """A failed bake must not be reported as a successful build."""
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls: list = []
+    inner = _fake_subprocess(job_dir, calls)
+
+    async def run(command):
+        if "object_texture" in " ".join(str(c) for c in command):
+            return 1, b"", b"xatlas exploded"
+        return await inner(command)
+
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", run)
+    r = http.post("/api/splat/jobs/splat_0b0001/objects",
+                  json={"query": "table", "texture": True})
+    assert r.status_code == 500
+    assert "texture bake failed" in r.json()["detail"]
+    # the raw mesh it already built is a valid artifact on its own
+    assert (job_dir / splat_route.OBJECTS_DIRNAME / "table" / "mesh" / "mesh.ply").is_file()
 
 
 def _finished_object(http, monkeypatch, job_dir: Path, slug: str = "table") -> Path:

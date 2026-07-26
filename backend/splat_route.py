@@ -4253,6 +4253,7 @@ async def get_splat_preview_file(job_id: str, fmt: Literal["ply", "spz", "web", 
 
 
 TWIN_FINISH_SCRIPT = MESH_DIR / "twin_finish.py"
+OBJECT_TEXTURE_SCRIPT = MESH_DIR / "object_texture.py"
 MESH_GATE_SCRIPT = MESH_DIR / "mesh_gate.py"
 MESH_COMPLETENESS_SCRIPT = MESH_DIR / "mesh_completeness.py"
 MESH_GATE_VRAM_MB = 4_000  # one EGL offscreen renderer + dataparser (CPU)
@@ -4538,6 +4539,20 @@ class ObjectIsolateBody(BaseModel):
     smooth: bool = False
     smooth_iterations: int = Field(default=2, ge=1, le=10)
     smooth_feature_deg: float = Field(default=40.0, ge=5.0, le=90.0)
+    # Textured asset (2026-07-25). twin finish carries colour in VERTEX
+    # COLOURS, so colour fidelity is chained to the vertex budget and a
+    # genuinely simple asset throws the capture's colour away with the
+    # geometry. This lane decouples them: screened-Poisson refit -> decimate ->
+    # UV unwrap -> bake the gaussian colours into a texture map, so a few-
+    # thousand-face model still carries a 1k-2k colour map. Independent of
+    # `finish` — you can ask for either, both, or neither.
+    texture: bool = False
+    texture_target_faces: int = Field(default=8_000, ge=500, le=200_000)
+    texture_size: int = Field(default=1024, ge=256, le=4096)
+    # Ground removal. Auto-derives its box from object.json's bbox_tight (or,
+    # on older object lanes that predate that field, percentiles of the
+    # isolated gaussians). Off = keep the fused ground.
+    texture_crop: bool = True
 
 
 def _object_slug(query: str) -> str:
@@ -4582,6 +4597,10 @@ async def isolate_splat_object(request: Request, job_id: str, body: ObjectIsolat
         raise HTTPException(status_code=400, detail="TripoSplat lane unavailable for proxy generation.")
     if body.finish and not body.mesh:
         raise HTTPException(status_code=400, detail="Twin finish requires mesh=True.")
+    if body.texture and not body.mesh:
+        raise HTTPException(status_code=400, detail="Textured asset requires mesh=True.")
+    if body.texture and not OBJECT_TEXTURE_SCRIPT.is_file():
+        raise HTTPException(status_code=400, detail="Texture-bake toolchain unavailable.")
 
     slug = _object_slug(body.query)
     obj_dir = output_dir / OBJECTS_DIRNAME / slug
@@ -4688,6 +4707,33 @@ async def isolate_splat_object(request: Request, job_id: str, body: ObjectIsolat
                 str(MESH_ENV_PYTHON), str(GROUND_MESH_RECEIPT_SCRIPT), str(twin_glb), str(obj_dir / "mesh"),
             ])
 
+        if body.mesh and body.texture:
+            textured_glb = obj_dir / "mesh" / "textured.glb"
+            texture_cmd = [
+                str(MESH_ENV_PYTHON), str(OBJECT_TEXTURE_SCRIPT),
+                str(obj_dir / "mesh" / "mesh.ply"), str(obj_dir / "object.ply"),
+                str(textured_glb),
+                "--target-faces", str(body.texture_target_faces),
+                "--texture-size", str(body.texture_size),
+            ]
+            mpu = meta.get("meters_per_unit")
+            if mpu:
+                texture_cmd += ["--meters-per-unit", str(mpu)]
+            if body.smooth:
+                texture_cmd += ["--smooth", "--smooth-iterations", str(body.smooth_iterations)]
+            if not body.texture_crop:
+                texture_cmd += ["--no-crop"]
+            rc, _out, stderr = await _run_capture_subprocess(texture_cmd)
+            if rc != 0 or not textured_glb.is_file():
+                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                raise HTTPException(
+                    status_code=500, detail=f"Object texture bake failed (exit {rc}): {tail}")
+            try:
+                report["textured"] = json.loads(
+                    (obj_dir / "mesh" / "object_texture.json").read_text())
+            except (OSError, json.JSONDecodeError):
+                report["textured"] = {}
+
         if body.proxy:
             crop_png = obj_dir / "crop.png"
             rc, _out, stderr = await _run_capture_subprocess([
@@ -4765,6 +4811,15 @@ async def isolate_splat_object(request: Request, job_id: str, body: ObjectIsolat
             f"{base}?fmt=twin"
             if body.mesh and body.finish and (obj_dir / "mesh" / "twin.glb").is_file() else None
         ),
+        "textured_glb_url": (
+            f"{base}?fmt=textured"
+            if body.mesh and body.texture and (obj_dir / "mesh" / "textured.glb").is_file() else None
+        ),
+        "textured_atlas_url": (
+            f"{base}?fmt=textured-atlas"
+            if body.mesh and body.texture
+            and (obj_dir / "mesh" / "textured_atlas.png").is_file() else None
+        ),
         "proxy_url": f"{base}?fmt=proxy" if body.proxy else None,
         "proxy_preview_url": (
             f"{base}?fmt=proxy-preview"
@@ -4781,6 +4836,9 @@ _OBJECT_FILES = {
     "twin": ("mesh/twin.glb", "model/gltf-binary"),
     "twin-top": ("mesh/receipt_top.png", "image/png"),
     "twin-oblique": ("mesh/receipt_oblique.png", "image/png"),
+    # Simplified + UV-textured asset and its standalone colour atlas.
+    "textured": ("mesh/textured.glb", "model/gltf-binary"),
+    "textured-atlas": ("mesh/textured_atlas.png", "image/png"),
     "proxy": ("proxy.ply", "application/octet-stream"),
     "proxy-preview": ("proxy_preview.webp", "image/webp"),
 }
@@ -4789,7 +4847,8 @@ _OBJECT_FILES = {
 @router.get("/jobs/{job_id}/objects/{slug}/file")
 async def get_splat_object_file(
     job_id: str, slug: str,
-    fmt: Literal["splat", "ply", "glb", "receipt", "twin", "twin-top", "twin-oblique", "proxy", "proxy-preview"] = "splat",
+    fmt: Literal["splat", "ply", "glb", "receipt", "twin", "twin-top", "twin-oblique",
+                 "textured", "textured-atlas", "proxy", "proxy-preview"] = "splat",
 ):
     if not _safe_job_id(job_id) or _object_slug(slug) != slug:
         raise HTTPException(status_code=404, detail="Object not found")
