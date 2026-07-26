@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { dyno, RgbaArray, SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
-import { apiRequest, applyEditOps, revertEdit } from "@/lib/api";
+import { apiRequest, applyEditOps, rebuildLangfield, revertEdit } from "@/lib/api";
 import {
   buildOverlayModifier,
   buildTestRelevancy,
@@ -126,6 +126,7 @@ export function SparkSceneViewer({
   panelSections = null,
   reloadToken = 0,
   onEditPendingChange,
+  onLangfieldRebuilt,
   onPickMatch,
   onPickCamera,
 }: {
@@ -164,6 +165,9 @@ export function SparkSceneViewer({
   // drives the host page's GLOBAL progress rail, which survives tab switches
   // and this component's own url-keyed teardown.
   onEditPendingChange?: (pending: boolean) => void;
+  // Fires after a successful language-field rebuild so the host refreshes the
+  // job payload (langfield_stale flips off on the next status fetch).
+  onLangfieldRebuilt?: () => void;
 }) {
   // Bumped after every crop apply/revert: the preview URL string doesn't
   // otherwise change even though the file on disk did, so the mesh-load
@@ -304,6 +308,35 @@ export function SparkSceneViewer({
   const [boxError, setBoxError] = useState<string | null>(null);
   const [boxLastVersion, setBoxLastVersion] = useState<number | null>(null);
   const [boxUndoBusy, setBoxUndoBusy] = useState(false);
+  // Post-edit language-field rebuild: the one-click cure for a STALE field.
+  // Success is confirmed by the status poll flipping langfield_stale off; the
+  // notice shows the receipt's carried-label counts until then.
+  const [rebuildBusy, setRebuildBusy] = useState(false);
+  const [rebuildNotice, setRebuildNotice] = useState<string | null>(null);
+  const [rebuildError, setRebuildError] = useState<string | null>(null);
+  async function runLangfieldRebuild() {
+    setRebuildBusy(true);
+    setRebuildError(null);
+    setRebuildNotice(null);
+    try {
+      const resp = await rebuildLangfield(job.job_id);
+      const records = resp.receipt.records ?? [];
+      const kept = records.reduce((a, r) => a + (r.kept || 0), 0);
+      const dropped = records.reduce((a, r) => a + (r.dropped || 0), 0);
+      setRebuildNotice(
+        records.length
+          ? `Language field rebuilt — ${kept.toLocaleString()} painted gaussians carried across${dropped ? `, ${dropped.toLocaleString()} were in removed geometry` : ""}.`
+          : "Language field rebuilt.",
+      );
+      void loadOverridesList();
+      onLangfieldRebuilt?.();
+    } catch (cause) {
+      setRebuildError(cause instanceof Error ? cause.message : "Rebuild failed.");
+    } finally {
+      setRebuildBusy(false);
+    }
+  }
+
   // Crop-slider ranges derived from the loaded scene's bbox (set once per
   // load in mesh.initialized); null = bounds not measured yet → legacy range.
   const [sliderScale, setSliderScale] = useState<{
@@ -1929,6 +1962,35 @@ export function SparkSceneViewer({
                 This scene has no language field, so searches use a test pattern to verify overlay controls.
               </p>
             )}
+            {/* Stale field: strokes/searches would 409 server-side — say so
+                and offer the one-click cure instead of harvesting errors. */}
+            {job.langfield_available && job.langfield_stale && (
+              <div className="space-y-1.5 rounded-lg border border-amber-300/25 bg-amber-300/10 px-2 py-1.5">
+                <p className="text-[10px] leading-snug text-amber-100/85">
+                  The language field no longer matches this scene's geometry — it was edited after the field
+                  was built. Search and paint are disabled until it's rebuilt (seconds; painted labels are
+                  carried across).
+                </p>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="primary"
+                  className="w-full"
+                  onClick={() => void runLangfieldRebuild()}
+                  disabled={rebuildBusy}
+                >
+                  {rebuildBusy ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" /> Rebuilding…
+                    </>
+                  ) : (
+                    "Rebuild language field"
+                  )}
+                </Button>
+              </div>
+            )}
+            {rebuildNotice && <p className="text-[10px] leading-snug text-emerald-300/90">{rebuildNotice}</p>}
+            {rebuildError && <p className="text-[10px] leading-snug text-rose-300/90">{rebuildError}</p>}
             <form
               className="flex items-center gap-2"
               onSubmit={(e) => {
@@ -1940,11 +2002,18 @@ export function SparkSceneViewer({
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder={channels.length >= 4 ? "4 query limit reached" : "Add a search…"}
-                disabled={channels.length >= 4}
+                disabled={channels.length >= 4 || Boolean(job.langfield_available && job.langfield_stale)}
                 size="xs"
                 className="disabled:opacity-50"
               />
-              <Button type="submit" size="sm" disabled={queryBusy || !query.trim() || channels.length >= 4}>
+              <Button
+                type="submit"
+                size="sm"
+                disabled={
+                  queryBusy || !query.trim() || channels.length >= 4 ||
+                  Boolean(job.langfield_available && job.langfield_stale)
+                }
+              >
                 {queryBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
               </Button>
             </form>
@@ -1963,8 +2032,15 @@ export function SparkSceneViewer({
                 <span className="min-w-0 flex-1 truncate" title={c.text}>
                   {c.text}
                 </span>
-                <span className="shrink-0 text-[10px] text-zinc-500">
-                  {c.source === "test" ? "test" : c.matchCount !== null ? `${c.matchCount}×` : ""}
+                <span
+                  className={
+                    c.source === "test"
+                      ? "shrink-0 rounded border border-amber-300/40 bg-amber-300/15 px-1 text-[9px] font-bold uppercase text-amber-200"
+                      : "shrink-0 text-[10px] text-zinc-500"
+                  }
+                  title={c.source === "test" ? "Deterministic fake pattern — NOT a real search. The splatlab-langfield worker service is down (start it: systemctl --user start splatlab-langfield) or the hardware gate is active." : undefined}
+                >
+                  {c.source === "test" ? "test pattern" : c.matchCount !== null ? `${c.matchCount}×` : ""}
                 </span>
                 <button type="button" onClick={() => removeQuery(i)} className="shrink-0 text-zinc-500 hover:text-rose-300">
                   <X className="h-3.5 w-3.5" />
@@ -2022,7 +2098,7 @@ export function SparkSceneViewer({
             )}
         </>
 
-        {job.langfield_available && !safeMode && (
+        {job.langfield_available && !safeMode && !job.langfield_stale && (
           <>
             <div className="h-px bg-white/10" />
             <SectionLabel>Paint the field</SectionLabel>
@@ -2309,7 +2385,7 @@ export function SparkSceneViewer({
                     {job.langfield_available && (
                       <p className="rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5 text-[10px] leading-snug text-amber-100/85">
                         This scene has a language field. Cropping changes the gaussian count, so search and paint
-                        will stop working until the language field is rebuilt.
+                        pause until the field is rebuilt — one click afterwards, painted labels carry across.
                       </p>
                     )}
                     <Button
@@ -2393,7 +2469,7 @@ export function SparkSceneViewer({
                     {job.langfield_available && (
                       <p className="rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5 text-[10px] leading-snug text-amber-100/85">
                         This scene has a language field. Cropping changes the gaussian count, so search and paint
-                        will stop working until the language field is rebuilt.
+                        pause until the field is rebuilt — one click afterwards, painted labels carry across.
                       </p>
                     )}
                     <Button
@@ -2434,14 +2510,35 @@ export function SparkSceneViewer({
                 ))}
               </div>
             )}
-            {/* Polled truth, one shared note for both crop tools — shows for
-                ANY stale-making edit (this tab, the Edit lane, another tab). */}
+            {/* Polled truth, one shared block for both crop tools — shows for
+                ANY stale-making edit (this tab, the Edit lane, another tab)
+                and offers the one-click rebuild right where the crop landed. */}
             {job.langfield_stale && (
-              <p className="text-[10px] leading-snug text-amber-300/90">
-                Language field is stale — the scene was edited after the field was built. Re-run this scene
-                with Language search on to rebuild it (retrains the scene).
-              </p>
+              <div className="space-y-1.5 rounded-lg border border-amber-300/25 bg-amber-300/10 px-2 py-1.5">
+                <p className="text-[10px] leading-snug text-amber-100/85">
+                  Language field is stale — the scene was edited after the field was built. Rebuild it in one
+                  click (seconds; painted labels are carried across the edit).
+                </p>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="primary"
+                  className="w-full"
+                  onClick={() => void runLangfieldRebuild()}
+                  disabled={rebuildBusy}
+                >
+                  {rebuildBusy ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" /> Rebuilding…
+                    </>
+                  ) : (
+                    "Rebuild language field now"
+                  )}
+                </Button>
+                {rebuildError && <p className="text-[10px] leading-snug text-rose-300/90">{rebuildError}</p>}
+              </div>
             )}
+            {rebuildNotice && <p className="text-[10px] leading-snug text-emerald-300/90">{rebuildNotice}</p>}
           </>
         )}
         {panelSections === "edit" && safeMode && (

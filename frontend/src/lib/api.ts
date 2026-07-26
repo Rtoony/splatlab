@@ -19,6 +19,7 @@ import type {
   SplatPolishUploadResponse,
   SplatEditVersionsResponse,
   SplatExportBuildRequest,
+  SplatJob,
   SplatMeshBuildRequest,
   SplatMeshBuildResponse,
   SplatObjectIsolateRequest,
@@ -242,6 +243,22 @@ export function uploadEditedPly(
 // Restore a snapshot version (itself snapshotted first, so revert is undoable).
 export function revertEdit(jobId: string, version: number): Promise<SplatEditRevertResponse> {
   return postJSON<SplatEditRevertResponse>(`/api/splat/jobs/${jobId}/edit/revert`, { version });
+}
+
+// Post-edit language-field rebuild (realignment): clears STALE, carries
+// painted labels across the edit, receipt says what survived. 422 = geometry
+// was transformed (retrain is the only cure); 409 = an edit is running.
+export function rebuildLangfield(jobId: string): Promise<{
+  ok: boolean;
+  receipt: {
+    ply_rows?: number;
+    dropped_ckpt_rows?: number;
+    records?: { label?: string | null; kept: number; dropped: number; invalid?: string }[];
+  };
+  warnings: string[];
+  job: SplatJob;
+}> {
+  return postJSON(`/api/splat/jobs/${jobId}/langfield/rebuild`, {});
 }
 
 // Polish round-trip return leg: a Blender/UE-polished GLB lands back as a

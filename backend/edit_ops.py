@@ -447,6 +447,123 @@ async def revert_version(job_id: str, req: RevertRequest, request: Request) -> d
     }
 
 
+# ── post-edit language-field rebuild (realignment) ───────────────────────────
+REBUILD_STEPS = ("queued", "align", "overrides", "finalize")
+LANGFIELD_REALIGN_SCRIPT = Path(__file__).with_name("langfield_realign.py")
+REALIGN_VRAM_MB = int(os.environ.get("SPLAT_REALIGN_VRAM_MB", "4096"))
+
+
+@router.post("/jobs/{job_id}/langfield/rebuild")
+async def rebuild_langfield(job_id: str, request: Request) -> dict[str, Any]:
+    """Bring a STALE language field back after an edit — realignment, not a
+    re-lift (edits never touch the checkpoint; what breaks is the exported-ply
+    row map). Runs langfield_realign.py in the langfield env: exact-xyz map
+    rebuild, painted records carried across via xyz snapshots, STALE cleared
+    last. Total-or-nothing — transformed geometry fails loud (422) with the
+    retrain guidance. Idempotent on a fresh field. Deliberately NOT behind the
+    stale guard (it is the cure)."""
+    meta, job_dir = _require_editable_job(job_id)
+    lf_dir = job_dir / splat_route.LANGFIELD_DIRNAME
+    if not (lf_dir / "gauss_emb.npz").is_file():
+        raise HTTPException(
+            status_code=404, detail="this scene has no language field to rebuild"
+        )
+    lf_py = os.environ.get("SPLAT_LANGFIELD_PYTHON", "").strip() or str(
+        splat_route.LANGFIELD_ENV_PYTHON
+    )
+    if not Path(lf_py).is_file():
+        raise HTTPException(
+            status_code=503, detail="langfield toolchain unavailable on this host"
+        )
+
+    command = [lf_py, str(LANGFIELD_REALIGN_SCRIPT), str(job_dir)]
+    config_path = splat_route._find_latest_config(job_dir)
+    if config_path is not None:
+        command += ["--config", str(config_path)]
+    # First realign on a scene loads the checkpoint (GPU) to cache ckpt_xyz;
+    # every later run is pure numpy on the host lane.
+    needs_gpu = not (lf_dir / "ckpt_xyz.npy").is_file()
+
+    async with _hold_edit_locks([job_id]):
+        _progress_begin(job_id, REBUILD_STEPS)
+        try:
+            async def operation() -> tuple[int, bytes, bytes]:
+                _progress_step(job_id, "align")
+                return await splat_route._run_capture_subprocess(command)
+
+            try:
+                if needs_gpu:
+                    rc, stdout, stderr = await gpu_arbiter.run_gpu_operation(
+                        lane="langfield-realign",
+                        operation_id=f"realign:{job_id}",
+                        vram_mb=REALIGN_VRAM_MB,
+                        operation=operation,
+                    )
+                else:
+                    rc, stdout, stderr = await gpu_arbiter.run_host_operation(
+                        operation=operation
+                    )
+            except gpu_arbiter.GPUArbiterUnavailable as exc:
+                raise HTTPException(
+                    status_code=503, detail=f"realign coordination failed: {exc}"
+                ) from exc
+
+            _progress_step(job_id, "overrides")
+            lines = [ln for ln in stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
+            payload: dict[str, Any] = {}
+            if lines:
+                with contextlib.suppress(json.JSONDecodeError):
+                    payload = json.loads(lines[-1])
+            if rc == 2:
+                raise HTTPException(
+                    status_code=422,
+                    detail=payload.get("detail")
+                    or "realign impossible — geometry was transformed; retrain "
+                    "with Language search to restore the field",
+                )
+            if rc != 0:
+                tail = stderr.decode("utf-8", "replace")[-1500:]
+                raise HTTPException(
+                    status_code=500,
+                    detail=payload.get("error") or f"realign failed (exit {rc}): {tail}",
+                )
+
+            _progress_step(job_id, "finalize")
+            warnings: list[str] = []
+            # The worker may hold a cached pre-edit Scene with the OLD map —
+            # drop it. Best-effort: an unreachable worker is a warning, and the
+            # client's row-count guard fails loud as the backstop.
+            resp = None
+            with contextlib.suppress(Exception):
+                resp = await splat_route._langfield_worker_json(
+                    "/invalidate", {"config": str(config_path or "")}
+                )
+            if resp is None or resp.status_code != 200:
+                warnings.append(
+                    "language worker cache could not be invalidated — the first "
+                    "search after this rebuild may fail once, then recover"
+                )
+        finally:
+            _progress_end(job_id)
+
+    await audit_operator_event(
+        request=request,
+        title="Rebuilt language field",
+        description=f"{job_id}: {payload.get('ply_rows')} rows, "
+        f"{len(payload.get('records') or [])} painted records carried",
+        variant="success",
+        action="splat.langfield_rebuild",
+        target="3d",
+    )
+    updated_meta = splat_route._read_meta(job_id) or meta
+    return {
+        "ok": True,
+        "receipt": payload,
+        "warnings": warnings,
+        "job": splat_route._job_payload(updated_meta),
+    }
+
+
 def _restore_from_snapshot(
     job_dir: Path, src_dir: Path, snap_dir: Path, snap_created: bool, version: int
 ) -> list[str]:

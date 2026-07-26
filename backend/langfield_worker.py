@@ -919,13 +919,23 @@ async def overrides_add(req: OverrideAddReq) -> dict[str, Any]:
         raise HTTPException(400, "indices payload is not a uint32 array")
     indices = np.frombuffer(raw, dtype="<u4").astype(np.int64)
 
-    # n_ply from the alignment map (authoritative client-space row count)
+    # n_ply from the alignment map (authoritative client-space row count).
+    # Also capture the painted rows' POSITIONS while the scene is held: the
+    # xyz snapshot is what lets this paint survive later crops (realign
+    # re-matches positions instead of trusting dead row numbers).
+    xyz_rows = None
     sc = await _acquire_scene(req.config, req.lfdir)
     try:
         ply_map = getattr(sc, "ply_map", None)
         if ply_map is None:
             raise HTTPException(409, "scene has no ply->ckpt map — painting unavailable")
         n_ply = int(ply_map.shape[0])
+        means_ply = getattr(sc, "means_ply", None)
+        if means_ply is not None and indices.size and int(indices.max()) < n_ply and int(indices.min()) >= 0:
+            picked = means_ply[np.unique(indices)]
+            xyz_rows = (
+                picked.detach().cpu().numpy() if hasattr(picked, "detach") else np.asarray(picked)
+            ).astype(np.float32)
     finally:
         await _release_scene(sc)
 
@@ -943,9 +953,24 @@ async def overrides_add(req: OverrideAddReq) -> dict[str, Any]:
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    if xyz_rows is not None:
+        lov.save_xyz_snapshot(Path(req.lfdir), record["id"], xyz_rows)
     await _invalidate_scene(req.config)
     log.info("paint override added: %s '%s' (%d rows)", record["op"], record["label"], record["count"])
     return {"ok": True, "override": record}
+
+
+class InvalidateReq(BaseModel):
+    config: str
+
+
+@app.post("/invalidate")
+async def invalidate(req: InvalidateReq) -> dict[str, Any]:
+    """Drop the cached Scene for a config. Called by the app after a langfield
+    realign: a cached pre-edit Scene holds the OLD ply map and would mistint
+    every query until it happened to rebuild."""
+    await _invalidate_scene(req.config)
+    return {"ok": True}
 
 
 @app.post("/overrides_delete")

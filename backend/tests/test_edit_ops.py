@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import struct
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -1325,3 +1327,142 @@ def test_revert_emits_a_progress_rail_and_cleans_up(
     assert begun == [edit_ops.REVERT_STEPS]
     assert stepped == ["snapshot", "restore", "finalize"]
     assert job_id not in edit_ops.EDIT_PROGRESS
+
+
+# =============================================================================
+# POST /langfield/rebuild — the realignment lane's route contract
+# =============================================================================
+
+
+def _mk_langfield(outputs_root: Path, job_id: str, *, ckpt_cached: bool = True) -> Path:
+    lf = outputs_root / job_id / "_langfield"
+    lf.mkdir(parents=True, exist_ok=True)
+    (lf / "gauss_emb.npz").write_bytes(b"npz")
+    if ckpt_cached:
+        (lf / "ckpt_xyz.npy").write_bytes(b"npy")
+    return lf
+
+
+def _stub_realign(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    rc: int = 0,
+    payload: dict | None = None,
+    worker_status: int | None = 200,
+):
+    payload = payload if payload is not None else {
+        "ok": True, "ply_rows": 5, "ckpt_rows": 5,
+        "dropped_ckpt_rows": 0, "records": [],
+    }
+    calls: dict[str, object] = {}
+
+    async def fake_run(command):
+        calls["command"] = command
+        return rc, json.dumps(payload).encode(), b"stderr-tail"
+
+    async def fake_worker(path, body):
+        calls["worker"] = (path, body)
+        if worker_status is None:
+            return None
+        return SimpleNamespace(status_code=worker_status)
+
+    async def host_runner(**kwargs):
+        calls["lane"] = "host"
+        return await kwargs["operation"]()
+
+    async def gpu_runner(**kwargs):
+        calls["lane"] = "gpu"
+        return await kwargs["operation"]()
+
+    monkeypatch.setattr(edit_ops.splat_route, "_run_capture_subprocess", fake_run)
+    monkeypatch.setattr(edit_ops.splat_route, "_langfield_worker_json", fake_worker)
+    monkeypatch.setattr(edit_ops.splat_route, "LANGFIELD_ENV_PYTHON", Path("/usr/bin/python3"))
+    monkeypatch.setattr(edit_ops.gpu_arbiter, "run_host_operation", host_runner)
+    monkeypatch.setattr(edit_ops.gpu_arbiter, "run_gpu_operation", gpu_runner)
+    return calls
+
+
+def test_rebuild_langfield_happy_path_host_lane(
+    outputs_root: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = "splat_0f000001"
+    _make_job(outputs_root, job_id)
+    _mk_langfield(outputs_root, job_id)
+    calls = _stub_realign(monkeypatch)
+
+    r = client.post(f"/api/splat/jobs/{job_id}/langfield/rebuild")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["receipt"]["ply_rows"] == 5
+    assert body["warnings"] == []
+    assert calls["lane"] == "host"  # ckpt_xyz cached => numpy-only path
+    assert calls["worker"][0] == "/invalidate"
+    assert job_id not in edit_ops.EDIT_PROGRESS
+
+
+def test_rebuild_langfield_first_run_uses_gpu_lane(
+    outputs_root: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = "splat_0f000002"
+    _make_job(outputs_root, job_id)
+    _mk_langfield(outputs_root, job_id, ckpt_cached=False)
+    calls = _stub_realign(monkeypatch)
+
+    r = client.post(f"/api/splat/jobs/{job_id}/langfield/rebuild")
+    assert r.status_code == 200, r.text
+    assert calls["lane"] == "gpu"
+
+
+def test_rebuild_langfield_unreachable_worker_is_a_warning(
+    outputs_root: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = "splat_0f000003"
+    _make_job(outputs_root, job_id)
+    _mk_langfield(outputs_root, job_id)
+    _stub_realign(monkeypatch, worker_status=None)
+
+    r = client.post(f"/api/splat/jobs/{job_id}/langfield/rebuild")
+    assert r.status_code == 200, r.text
+    assert any("worker cache" in w for w in r.json()["warnings"])
+
+
+def test_rebuild_langfield_404_without_field(
+    outputs_root: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = "splat_0f000004"
+    _make_job(outputs_root, job_id)
+    _stub_realign(monkeypatch)
+    r = client.post(f"/api/splat/jobs/{job_id}/langfield/rebuild")
+    assert r.status_code == 404
+    assert "no language field" in r.json()["detail"]
+
+
+def test_rebuild_langfield_422_on_transformed_geometry(
+    outputs_root: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = "splat_0f000005"
+    _make_job(outputs_root, job_id)
+    _mk_langfield(outputs_root, job_id)
+    _stub_realign(monkeypatch, rc=2, payload={
+        "error": "realign_failed",
+        "detail": "geometry was transformed; retrain to restore the field",
+    })
+    r = client.post(f"/api/splat/jobs/{job_id}/langfield/rebuild")
+    assert r.status_code == 422
+    assert "retrain" in r.json()["detail"]
+
+
+def test_rebuild_langfield_409_while_edit_running(
+    outputs_root: Path, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = "splat_0f000006"
+    _make_job(outputs_root, job_id)
+    _mk_langfield(outputs_root, job_id)
+    _stub_realign(monkeypatch)
+    edit_ops._edit_lock(job_id)._locked = True  # noqa: SLF001 - simulate a running edit
+    try:
+        r = client.post(f"/api/splat/jobs/{job_id}/langfield/rebuild")
+        assert r.status_code == 409
+    finally:
+        edit_ops._edit_lock(job_id)._locked = False  # noqa: SLF001

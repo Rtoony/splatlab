@@ -51,6 +51,17 @@ def _indices_path(lfdir: Path, oid: str) -> Path:
     return Path(lfdir) / f"override_idx_{oid}.npy"
 
 
+def _xyz_path(lfdir: Path, oid: str) -> Path:
+    return Path(lfdir) / f"override_xyz_{oid}.npy"
+
+
+def save_xyz_snapshot(lfdir: Path, oid: str, xyz: np.ndarray) -> None:
+    """Positions of the painted rows at commit time. This is what lets a paint
+    SURVIVE later crops: langfield_realign re-matches these bytes against the
+    edited ply instead of trusting row numbers that no longer exist."""
+    np.save(_xyz_path(lfdir, oid), np.asarray(xyz, dtype=np.float32))
+
+
 def load_manifest(lfdir: Path) -> list[dict]:
     p = _manifest_path(lfdir)
     if not p.is_file():
@@ -135,6 +146,7 @@ def delete_override(lfdir: Path, oid: str) -> bool:
         return False
     _save_manifest(lfdir, kept)
     _indices_path(lfdir, oid).unlink(missing_ok=True)
+    _xyz_path(lfdir, oid).unlink(missing_ok=True)
     return True
 
 

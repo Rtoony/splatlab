@@ -451,6 +451,7 @@ export default function SplatViewPage() {
                 showShortcutLegend={shortcutLegendOpen}
                 reloadToken={editReloadToken}
                 onEditPendingChange={setViewerEditPending}
+                onLangfieldRebuilt={() => void queryClient.invalidateQueries({ queryKey: ["status"] })}
                 onPickMatch={setActiveIdx}
                 onPickCamera={zoomToCamera}
               />
