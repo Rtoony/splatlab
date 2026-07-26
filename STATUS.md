@@ -2073,3 +2073,28 @@ Taxonomy fixed+extensible; first gen output = class-textured ground; testbed = b
   down whenever nobody started it (`systemctl --user start splatlab-langfield`). Started
   this session with the new /invalidate + snapshot code.
 - Open: P3 class-label painting → P4 class-textured ground/shell → bicycle E2E.
+
+## PAINT-TO-GENERATE P3+P4 SHIPPED (2026-07-26 evening) — the loop is closed
+- **P3 class painting (400aa3f)**: class_taxonomy.json (9 classes, each w/ generative
+  meaning) + stdlib loader (extend-only job extras); class_labels.py store (overrides
+  discipline + xyz snapshots DAY ONE); worker class_add/delete/map/summary; app routes
+  (taxonomy validated before the worker; binary map w/ X-Class-Order); realign carries
+  class records. Viewer: Label|Class brush toggle, palette chips, per-record delete,
+  "Show class layer" via new direct-color modifier (no 4-channel limit). 692 tests.
+- **P4 class-textured world (b5e2462)**: semantic_ground keeps class_rel [N,C] (+taxonomy
+  queries, --live-map post-crop honesty, --class-labels = user paint ABSOLUTE precedence);
+  ground_mesh_build per-cell vote → ground_class_cells.npz; class_textures.py (seeded
+  procedural tiles; textures/<id>.png upgrade path) + ground_texture.py (planar-XY UV,
+  world-space sampling, jittered boundaries, readback, provenance
+  "captured-geometry/class-textured") FAIL-LOUD in /scene/ground (fmt=glb_classed/
+  atlas_classed/report_classed); shell --class-map (xyz-keyed, composite post-dilation,
+  per-class blend_capture) via scene_solidify's auto class-map. Survey rails proven
+  untouched. 697 tests + probe-env e2e.
+- **LIVE BICYCLE PROOF (machine half)**: POST /scene/ground on splat_3aaf8067 →
+  10,689 cells auto-classed (grass 7,505 / dirt 1,360 / pavement 1,223 / gravel 601) →
+  ground_classed.glb, texel fractions 61/17/13/9% — matches the scene's real lawn+path.
+- **Awaiting RToony (attended half)**: paint pass on bicycle (Measure → Paint → Class:
+  correct/override the auto classes, e.g. paint the gravel patch properly) → re-run
+  /scene/ground (paint precedence) → optionally solidify --shell-source voxel for the
+  classed shell + /world walk. Worker note: language tools need
+  `systemctl --user start splatlab-langfield` (on-demand by design, :3425).
