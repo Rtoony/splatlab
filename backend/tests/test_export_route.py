@@ -256,7 +256,132 @@ def test_collision_command_has_one_typed_mode() -> None:
     assert "--voxel-external-fill" in command
     assert "--voxel-floor-fill" not in command
     assert "--voxel-carve" in command
-    assert command[-2:] == ["source.ply", "scene.voxel.json"]
+    # splat-transform's contract is `input [ACTIONS] ... output`: the source
+    # must LEAD so ordered actions apply to it, and the output trails.
+    assert command[1] == "source.ply"
+    assert command[-1] == "scene.voxel.json"
+
+
+def test_collision_command_rotates_capture_frame_into_engine_frame() -> None:
+    """SplatLab captures are Z-up; splat-transform voxelizes Y-up.
+
+    Without the rotation, --voxel-floor-fill ("fill columns upward from
+    bottom") fills along the wrong axis and the resulting floor is unwalkable.
+    The rotation is an ACTION, so it must come after the input file.
+    """
+    command = export_route._collision_command(
+        "/tool", Path("source.ply"), Path("scene.voxel.json"),
+        export_route.CollisionRequest(),
+    )
+    assert command[1] == "source.ply"
+    assert command[2:4] == ["-r", "-90,0,0"]
+    assert command.index("-r") < command.index("--voxel-floor-fill")
+
+
+def test_collision_command_rotates_the_seed_with_the_cloud() -> None:
+    """Everything after -r is evaluated in the rotated frame, so a seed given
+    in capture coords must be rotated too or it silently points elsewhere."""
+    command = export_route._collision_command(
+        "/tool", Path("source.ply"), Path("scene.voxel.json"),
+        export_route.CollisionRequest(seed_position=(1, 2, 3)),
+    )
+    assert command[command.index("--seed-pos") + 1] == "1,3,-2"
+
+
+def _write_binary_ply(path: Path, points) -> None:
+    """Minimal binary_little_endian PLY with a couple of extra properties, so
+    the reader is exercised on a strided layout rather than a bare xyz block."""
+    import struct
+    header = (
+        "ply\nformat binary_little_endian 1.0\n"
+        f"element vertex {len(points)}\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property uchar red\nproperty float opacity\n"
+        "end_header\n"
+    ).encode("ascii")
+    body = b"".join(struct.pack("<fffBf", x, y, z, 7, 0.5) for x, y, z in points)
+    path.write_bytes(header + body)
+
+
+def test_ply_xyz_reads_strided_binary_ply(tmp_path: Path) -> None:
+    """The backend venv has numpy but NOT trimesh/plyfile — the reader has to
+    stand alone, or the crop silently never happens in production."""
+    pts = [(0.0, 0.0, 0.0), (1.0, 2.0, 3.0), (-1.0, -2.0, -3.0)]
+    ply = tmp_path / "m.ply"
+    _write_binary_ply(ply, pts)
+    got = export_route._ply_xyz(ply)
+    assert got is not None and got.shape == (3, 3)
+    assert got[1].tolist() == [1.0, 2.0, 3.0]
+
+
+def test_ply_xyz_rejects_non_ply_without_raising(tmp_path: Path) -> None:
+    bad = tmp_path / "nope.ply"
+    bad.write_bytes(b"this is not a ply")
+    assert export_route._ply_xyz(bad) is None
+
+
+def test_derive_filter_box_prefers_the_mesh_over_the_splat(tmp_path: Path) -> None:
+    """The TSDF mesh already dropped most far-field, so it gives the tighter
+    (correct) crop; the splat is only a fallback."""
+    job = tmp_path / "job"
+    (job / "_mesh").mkdir(parents=True)
+    _write_binary_ply(job / "_mesh" / "mesh.ply",
+                      [(float(i % 3), float(i % 5), float(i % 2)) for i in range(64)])
+    splat = job / "splat.ply"
+    _write_binary_ply(splat, [(100.0 * i, 100.0 * i, 100.0 * i) for i in range(64)])
+    box = export_route._derive_filter_box(job, splat, 2.0)
+    assert box is not None
+    lo_x = float(box.split(",")[0])
+    assert lo_x < 10, f"box came from the splat, not the mesh: {box}"
+
+
+def test_derive_filter_box_falls_back_to_the_splat(tmp_path: Path) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    splat = job / "splat.ply"
+    _write_binary_ply(splat, [(float(i), float(i), float(i)) for i in range(64)])
+    assert export_route._derive_filter_box(job, splat, 2.0) is not None
+
+
+def test_derive_filter_box_returns_none_when_nothing_readable(tmp_path: Path) -> None:
+    assert export_route._derive_filter_box(tmp_path, tmp_path / "missing.ply", 2.0) is None
+
+
+def test_collision_command_crops_before_rotating() -> None:
+    """--filter-box is in the CAPTURE frame, so it must precede -r; applied
+    after the rotation it would crop the wrong region entirely."""
+    command = export_route._collision_command(
+        "/tool", Path("source.ply"), Path("scene.voxel.json"),
+        export_route.CollisionRequest(), "-1,-2,-3,4,5,6",
+    )
+    assert command.index("--filter-box") < command.index("-r")
+    assert command[command.index("--filter-box") + 1] == "-1,-2,-3,4,5,6"
+
+
+def test_collision_command_explicit_box_beats_derived() -> None:
+    command = export_route._collision_command(
+        "/tool", Path("source.ply"), Path("scene.voxel.json"),
+        export_route.CollisionRequest(filter_box="9,9,9,10,10,10"), None,
+    )
+    assert command[command.index("--filter-box") + 1] == "9,9,9,10,10,10"
+
+
+def test_collision_command_box_can_be_disabled() -> None:
+    command = export_route._collision_command(
+        "/tool", Path("source.ply"), Path("scene.voxel.json"),
+        export_route.CollisionRequest(auto_filter_box=False), None,
+    )
+    assert "--filter-box" not in command
+
+
+def test_collision_command_rotation_can_be_disabled() -> None:
+    """An already-Y-up source must be able to opt out."""
+    command = export_route._collision_command(
+        "/tool", Path("source.ply"), Path("scene.voxel.json"),
+        export_route.CollisionRequest(rotate="", seed_position=(1, 2, 3)),
+    )
+    assert "-r" not in command
+    assert command[command.index("--seed-pos") + 1] == "1,2,3"
 
 
 @pytest.mark.skipif(

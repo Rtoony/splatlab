@@ -81,6 +81,26 @@ class CollisionRequest(BaseModel):
     carve_height: float = Field(default=1.6, gt=0, le=20)
     carve_radius: float = Field(default=0.2, gt=0, le=10)
     mesh_style: Literal["smooth", "faces"] = "smooth"
+    # Capture frame -> splat-transform's engine frame. SplatLab captures are
+    # Z-up (bundle_tool.py declares source_up_axis "+Z"; mesh_report.py applies
+    # rotation_matrix(-pi/2,[1,0,0]) for glTF), but splat-transform voxelizes
+    # Y-up. --voxel-floor-fill "fills columns upward from bottom", so without
+    # this rotation the floor was filled sideways along the wrong axis.
+    # "-90,0,0" maps (x,y,z) -> (x,z,-y), the same conversion the rest of the
+    # repo uses. Set to "" only if the input is already Y-up.
+    rotate: str = "-90,0,0"
+    # Spatial crop, in the CAPTURE frame, applied before the rotation.
+    # A capture's gaussians extend far past the subject (sky, neighbouring
+    # buildings, reconstruction floaters). Voxelizing all of it spans tens of
+    # units of empty space instead of the scene, which inflates the collision
+    # mesh by ~50x and buries the real geometry: unfiltered Bonsai voxelized to
+    # 6.8M triangles over 64x53x70 units; cropped it is 137k over 8x10x4.
+    # Explicit "x,y,z,X,Y,Z" wins; otherwise it is derived from the job's
+    # reconstructed mesh. Set auto_filter_box=False for the old whole-cloud
+    # behaviour.
+    filter_box: str | None = None
+    auto_filter_box: bool = True
+    filter_box_percentile: float = Field(default=2.0, ge=0.0, lt=50.0)
 
 
 class UnrealBundleRequest(BaseModel):
@@ -580,12 +600,133 @@ async def build_exports(
     return payload
 
 
+def _derive_filter_box(job_dir: Path, source: Path, percentile: float) -> str | None:
+    """A capture-frame crop around the actual scene, as "x,y,z,X,Y,Z".
+
+    Preference order is deliberate: the reconstructed TSDF mesh first, because
+    meshing already discarded most of the far-field that makes a raw gaussian
+    cloud so much larger than its subject. The splat is the fallback so this
+    still works before a mesh exists.
+
+    Percentiles, not min/max — a handful of stray gaussians or one floater
+    triangle would otherwise restore the very extent this is meant to remove.
+    Blocking file I/O, so callers should run it off the event loop.
+    """
+    import numpy as np  # local: keep module import cost off the request path
+
+    for candidate in (job_dir / splat_route.MESH_DIRNAME / "mesh.ply", source):
+        if not candidate.is_file():
+            continue
+        points = _ply_xyz(candidate)
+        if points is None or len(points) < 8:
+            continue
+        lo = np.percentile(points, percentile, axis=0)
+        hi = np.percentile(points, 100.0 - percentile, axis=0)
+        if np.all(hi > lo):
+            return ",".join(f"{v:.6g}" for v in (*lo, *hi))
+    return None
+
+
+# PLY scalar type -> numpy dtype. Deliberately hand-rolled rather than using
+# plyfile/trimesh: those live only in the mesh conda env, NOT in the backend
+# venv, so importing them here silently returned None in production and the
+# crop never happened.
+_PLY_DTYPES = {
+    "char": "i1", "int8": "i1", "uchar": "u1", "uint8": "u1",
+    "short": "i2", "int16": "i2", "ushort": "u2", "uint16": "u2",
+    "int": "i4", "int32": "i4", "uint": "u4", "uint32": "u4",
+    "float": "f4", "float32": "f4", "double": "f8", "float64": "f8",
+}
+
+
+def _ply_xyz(path: Path) -> Any:
+    """x/y/z of a binary-little-endian PLY's vertex element, as an (N,3) array.
+
+    Reads only the vertex block: the header gives the count and the property
+    layout, which is enough to build a structured dtype and slice out the three
+    columns without materialising the rest (a splat PLY carries ~60 properties
+    per point, so this matters).
+    """
+    import numpy as np
+
+    try:
+        with path.open("rb") as handle:
+            if handle.readline().strip() != b"ply":
+                return None
+            fmt = ""
+            count = 0
+            fields: list[tuple[str, str]] = []
+            in_vertex = False
+            while True:
+                raw = handle.readline()
+                if not raw:
+                    return None
+                line = raw.decode("ascii", "replace").strip()
+                if line == "end_header":
+                    break
+                parts = line.split()
+                if not parts:
+                    continue
+                if parts[0] == "format":
+                    fmt = parts[1]
+                elif parts[0] == "element":
+                    in_vertex = parts[1] == "vertex"
+                    if in_vertex:
+                        count = int(parts[2])
+                elif parts[0] == "property" and in_vertex:
+                    if parts[1] == "list":  # not valid on vertex; bail out
+                        return None
+                    dtype = _PLY_DTYPES.get(parts[1])
+                    if dtype is None:
+                        return None
+                    fields.append((parts[-1], dtype))
+            names = [name for name, _ in fields]
+            if fmt != "binary_little_endian" or count <= 0:
+                return None
+            if not {"x", "y", "z"} <= set(names):
+                return None
+            block = np.fromfile(handle, dtype=np.dtype(fields), count=count)
+        if len(block) == 0:
+            return None
+        return np.stack(
+            [block["x"], block["y"], block["z"]], axis=1
+        ).astype(np.float64)
+    except Exception:  # noqa: BLE001 — no crop is a valid outcome, never a 500
+        return None
+
+
 def _collision_command(
-    transform: str, source: Path, output: Path, request: CollisionRequest
+    transform: str,
+    source: Path,
+    output: Path,
+    request: CollisionRequest,
+    filter_box: str | None = None,
 ) -> list[str]:
-    seed = ",".join(f"{value:.9g}" for value in request.seed_position)
-    command = [
-        transform,
+    # splat-transform's contract is `input [ACTIONS] ... output`, and ACTIONS
+    # execute IN ORDER. --rotate is a true action, so it only applies to the
+    # working set if it comes after the input file — which is why the source
+    # now leads instead of sitting second-to-last.
+    seed_xyz = tuple(float(v) for v in request.seed_position)
+    if request.rotate.strip() == "-90,0,0":
+        # Rotate the seed with the cloud. Everything after the -r action is
+        # evaluated in the rotated frame, so a caller-supplied seed given in
+        # capture coords would otherwise point somewhere else entirely. The
+        # default (0,0,0) is rotation-invariant, so this only bites non-default
+        # seeds — silently, which is the worst kind.
+        x, y, z = seed_xyz
+        seed_xyz = (x, z, -y if y else 0.0)  # avoid "-0" in the argv
+    seed = ",".join(f"{value:.9g}" for value in seed_xyz)
+
+    command = [transform, str(source)]
+    # Order is load-bearing: the box is expressed in the capture frame, so it
+    # must be applied BEFORE the rotation into engine space. Everything after
+    # -r (cluster, seed, voxel) is evaluated rotated.
+    box = filter_box if filter_box is not None else request.filter_box
+    if box:
+        command.extend(["--filter-box", box.strip()])
+    if request.rotate.strip():
+        command.extend(["-r", request.rotate.strip()])
+    command.extend([
         "--filter-cluster",
         (
             f"{request.cluster_resolution:.9g},"
@@ -596,7 +737,7 @@ def _collision_command(
         seed,
         "--voxel-params",
         f"{request.voxel_size:.9g},{request.opacity_threshold:.9g}",
-    ]
+    ])
     if request.mode == "interior":
         command.extend(["--voxel-external-fill", f"{request.fill_size:.9g}"])
     elif request.mode == "exterior":
@@ -608,7 +749,7 @@ def _collision_command(
                 f"{request.carve_height:.9g},{request.carve_radius:.9g}",
             ]
         )
-    command.extend(["--collision-mesh", request.mesh_style, str(source), str(output)])
+    command.extend(["--collision-mesh", request.mesh_style, str(output)])
     return command
 
 
@@ -634,7 +775,12 @@ async def build_collision(
             tempfile.mkdtemp(prefix=".building-collision-", dir=export_dir)
         )
         output = stage_dir / "scene.voxel.json"
-        command = _collision_command(transform, source, output, body)
+        resolved_box = body.filter_box
+        if not resolved_box and body.auto_filter_box:
+            resolved_box = await asyncio.to_thread(
+                _derive_filter_box, job_dir, source, body.filter_box_percentile
+            )
+        command = _collision_command(transform, source, output, body, resolved_box)
         try:
             try:
                 return_code, log = await gpu_arbiter.run_gpu_operation(
