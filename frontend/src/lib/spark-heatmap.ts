@@ -334,3 +334,47 @@ export function buildOverlayModifier({
     return { gsplat: dyno.combineGsplat({ gsplat, rgb: outRgb, opacity: outOpacity }) };
   });
 }
+
+// ── user class layer (paint-a-class) ─────────────────────────────────────────
+// One RGBA texel per splat holding the CLASS COLOR directly (alpha 255 =
+// labeled, 0 = unlabeled). Direct colors instead of the 4-channel relevancy
+// packing because a taxonomy has ~10 classes and needs no per-channel
+// thresholds — the map already IS the decision.
+export function packClassColorsRgba(
+  classIdx: Int16Array,
+  palette: [number, number, number][],
+  numSplats: number,
+): Uint8Array {
+  const out = new Uint8Array(numSplats * 4);
+  const n = Math.min(classIdx.length, numSplats);
+  for (let i = 0; i < n; i += 1) {
+    const c = classIdx[i];
+    if (c >= 0 && c < palette.length) {
+      const [r, g, b] = palette[c];
+      out[i * 4] = Math.round(r * 255);
+      out[i * 4 + 1] = Math.round(g * 255);
+      out[i * 4 + 2] = Math.round(b * 255);
+      out[i * 4 + 3] = 255;
+    }
+  }
+  return out;
+}
+
+export function buildClassColorModifier({
+  colorArray,
+  strength = 0.85,
+}: {
+  colorArray: RgbaArray;
+  strength?: number;
+}) {
+  return dyno.dynoBlock({ gsplat: dyno.Gsplat }, { gsplat: dyno.Gsplat }, ({ gsplat }) => {
+    if (!gsplat) throw new Error("class modifier: no gsplat input");
+    const { rgb, index } = dyno.splitGsplat(gsplat).outputs;
+    const raw = readRgbaArray(colorArray.dyno, index);
+    const labeled = dyno.lessThan(dyno.dynoFloat(0.5), dyno.split(raw).outputs.w);
+    const classColor = dyno.swizzle(raw, "xyz");
+    const tinted = dyno.mix(rgb, classColor, dyno.dynoFloat(strength));
+    const outRgb = dyno.select(labeled, tinted, rgb);
+    return { gsplat: dyno.combineGsplat({ gsplat, rgb: outRgb }) };
+  });
+}

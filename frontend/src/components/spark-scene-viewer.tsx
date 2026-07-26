@@ -5,10 +5,12 @@ import { dyno, RgbaArray, SparkRenderer, SplatFileType, SplatMesh } from "@spark
 import { apiRequest, applyEditOps, rebuildLangfield, revertEdit } from "@/lib/api";
 import {
   buildOverlayModifier,
+  buildClassColorModifier,
   buildTestRelevancy,
   cutoffForTopPercent,
   fetchRelevancy,
   packChannelsRgba,
+  packClassColorsRgba,
   rampCssGradient,
   RAMPS,
   shouldUseTestRelevancy,
@@ -308,6 +310,140 @@ export function SparkSceneViewer({
   const [boxError, setBoxError] = useState<string | null>(null);
   const [boxLastVersion, setBoxLastVersion] = useState<number | null>(null);
   const [boxUndoBusy, setBoxUndoBusy] = useState(false);
+  // ---- class painting (grass/dirt/... — the generative labels) -------------
+  // Same brush, second target: "field" paints search embeddings (overrides),
+  // "class" paints surface classes the generative stages consume.
+  const [paintTarget, setPaintTarget] = useState<"field" | "class">("field");
+  const [taxonomy, setTaxonomy] = useState<
+    { id: string; display: string; color: string; category: string }[] | null
+  >(null);
+  const [selectedClassId, setSelectedClassId] = useState<string | null>(null);
+  const [classRecords, setClassRecords] = useState<
+    { id: string; class_id: string; count: number; invalid_reason?: string }[]
+  >([]);
+  const [classBusy, setClassBusy] = useState(false);
+  const [classError, setClassError] = useState<string | null>(null);
+  const [classNeedsForce, setClassNeedsForce] = useState(false);
+  const [classNotice, setClassNotice] = useState<string | null>(null);
+  const [showClassLayer, setShowClassLayer] = useState(false);
+
+  async function loadClassTaxonomy() {
+    try {
+      const data = await apiRequest<{ classes: { id: string; display: string; color: string; category: string }[] }>(
+        `/api/splat/jobs/${job.job_id}/class-taxonomy`,
+      );
+      setTaxonomy(data.classes);
+      setSelectedClassId((prev) => prev ?? data.classes[0]?.id ?? null);
+    } catch {
+      setClassError("Could not load the class taxonomy.");
+    }
+  }
+
+  async function loadClassRecords() {
+    try {
+      const data = await apiRequest<{ records: { id: string; class_id: string; count: number; invalid_reason?: string }[] }>(
+        `/api/splat/jobs/${job.job_id}/class-labels`,
+      );
+      setClassRecords(data.records);
+    } catch {
+      /* list is advisory */
+    }
+  }
+
+  async function refreshClassLayer() {
+    const mesh = meshRef.current;
+    if (!mesh || !taxonomy) return;
+    const resp = await fetch(`/api/splat/jobs/${job.job_id}/class-labels/map`, {
+      credentials: "same-origin",
+    });
+    if (!resp.ok) throw new Error(`class map HTTP ${resp.status}`);
+    const order = JSON.parse(resp.headers.get("X-Class-Order") ?? "[]") as string[];
+    const bytes = new Int16Array(await resp.arrayBuffer());
+    const numSplats = mesh.packedSplats?.numSplats ?? mesh.numSplats ?? 0;
+    if (bytes.length !== numSplats) {
+      throw new Error(
+        `class map rows (${bytes.length.toLocaleString()}) != loaded splats (${numSplats.toLocaleString()})`,
+      );
+    }
+    const byId = new Map(taxonomy.map((c) => [c.id, c]));
+    const palette = order.map((cid) => {
+      const hex = byId.get(cid)?.color ?? "#ffffff";
+      return [
+        parseInt(hex.slice(1, 3), 16) / 255,
+        parseInt(hex.slice(3, 5), 16) / 255,
+        parseInt(hex.slice(5, 7), 16) / 255,
+      ] as [number, number, number];
+    });
+    const colorArray = new RgbaArray({
+      array: packClassColorsRgba(bytes, palette, numSplats),
+      count: numSplats,
+    });
+    mesh.worldModifier = buildClassColorModifier({ colorArray });
+    mesh.updateGenerator();
+  }
+
+  async function toggleClassLayer(on: boolean) {
+    setShowClassLayer(on);
+    setClassError(null);
+    try {
+      if (on) await refreshClassLayer();
+      else rebuildOverlay(channelsRef.current, mode, rampName); // restore query overlay
+    } catch (cause) {
+      setShowClassLayer(false);
+      setClassError(cause instanceof Error ? cause.message : "Class layer failed.");
+    }
+  }
+
+  async function commitClassPaint(force = false) {
+    const n = selSetRef.current.size;
+    if (!selectedClassId || n === 0) return;
+    setClassBusy(true);
+    setClassError(null);
+    setClassNotice(null);
+    try {
+      const resp = await fetch(`/api/splat/jobs/${job.job_id}/class-labels`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          class_id: selectedClassId,
+          indices_b64: b64FromUint32(Uint32Array.from(selSetRef.current)),
+          force,
+        }),
+      });
+      if (!resp.ok) {
+        const detail = String(
+          ((await resp.json().catch(() => null)) as { detail?: string } | null)?.detail ?? "commit failed",
+        );
+        setClassNeedsForce(detail.includes("force"));
+        throw new Error(detail);
+      }
+      setClassNeedsForce(false);
+      const display = taxonomy?.find((c) => c.id === selectedClassId)?.display ?? selectedClassId;
+      setClassNotice(`Painted ${n.toLocaleString()} splats as ${display}. Survives crops (positions are snapshotted).`);
+      clearSelection();
+      void loadClassRecords();
+      if (showClassLayer) void refreshClassLayer().catch(() => undefined);
+    } catch (cause) {
+      setClassError(cause instanceof Error ? cause.message : "Commit failed.");
+    } finally {
+      setClassBusy(false);
+    }
+  }
+
+  async function removeClassRecord(rid: string) {
+    try {
+      await fetch(`/api/splat/jobs/${job.job_id}/class-labels/${rid}`, {
+        method: "DELETE",
+        credentials: "same-origin",
+      });
+      void loadClassRecords();
+      if (showClassLayer) void refreshClassLayer().catch(() => undefined);
+    } catch {
+      /* record list refresh will show the truth */
+    }
+  }
+
   // Post-edit language-field rebuild: the one-click cure for a STALE field.
   // Success is confirmed by the status poll flipping langfield_stale off; the
   // notice shows the receipt's carried-label counts until then.
@@ -2102,6 +2238,40 @@ export function SparkSceneViewer({
           <>
             <div className="h-px bg-white/10" />
             <SectionLabel>Paint the field</SectionLabel>
+            {/* One brush, two targets: "field" biases search embeddings,
+                "class" assigns surface classes the generative stages use. */}
+            <div className="flex items-center gap-1.5">
+              <Button
+                type="button"
+                size="sm"
+                variant={paintTarget === "field" ? "primary" : "outline"}
+                onClick={() => setPaintTarget("field")}
+                title="Pin/boost/suppress a search label on the brushed splats"
+              >
+                Label
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={paintTarget === "class" ? "primary" : "outline"}
+                onClick={() => {
+                  setPaintTarget("class");
+                  if (!taxonomy) void loadClassTaxonomy();
+                  void loadClassRecords();
+                }}
+                title="Assign a surface class (grass/dirt/pavement/…) — feeds the generative stages"
+              >
+                Class
+              </Button>
+              <label className="ml-auto flex items-center gap-1 text-[10px] text-zinc-400">
+                <input
+                  type="checkbox"
+                  checked={showClassLayer}
+                  onChange={(e) => void toggleClassLayer(e.target.checked)}
+                />
+                Show class layer
+              </label>
+            </div>
             <div className="flex items-center gap-2">
               <Button
                 type="button"
@@ -2151,7 +2321,81 @@ export function SparkSceneViewer({
                 <p className="text-[10px] leading-snug text-zinc-500">
                   Click the scene to add sphere strokes ({selCount.toLocaleString()} splats selected, shown cyan).
                 </p>
-                {selCount > 0 && (
+                {paintTarget === "class" && (
+                  <div className="space-y-1.5">
+                    {taxonomy ? (
+                      <div className="flex flex-wrap gap-1">
+                        {taxonomy.map((c) => (
+                          <button
+                            key={c.id}
+                            type="button"
+                            onClick={() => setSelectedClassId(c.id)}
+                            title={`${c.display} (${c.category})`}
+                            className={`flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold transition ${
+                              selectedClassId === c.id
+                                ? "border-white/60 text-white"
+                                : "border-white/15 text-zinc-400 hover:text-zinc-200"
+                            }`}
+                          >
+                            <span className="h-2 w-2 rounded-full" style={{ backgroundColor: c.color }} />
+                            {c.display}
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-[10px] text-zinc-500">Loading classes…</p>
+                    )}
+                    {selCount > 0 && selectedClassId && (
+                      <div className="flex items-center gap-1.5">
+                        <Button
+                          type="button"
+                          size="sm"
+                          onClick={() => void commitClassPaint(false)}
+                          disabled={classBusy}
+                        >
+                          {classBusy ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            `Paint ${selCount.toLocaleString()} as ${taxonomy?.find((c) => c.id === selectedClassId)?.display ?? selectedClassId}`
+                          )}
+                        </Button>
+                        {classNeedsForce && (
+                          <Button type="button" size="sm" variant="outline" onClick={() => void commitClassPaint(true)}>
+                            Force
+                          </Button>
+                        )}
+                      </div>
+                    )}
+                    {classNotice && <p className="text-[10px] leading-snug text-emerald-300/90">{classNotice}</p>}
+                    {classError && <p className="text-[10px] leading-snug text-rose-300/90">{classError}</p>}
+                    {classRecords.length > 0 && (
+                      <div className="space-y-1">
+                        {classRecords.map((r) => (
+                          <div key={r.id} className="flex items-center gap-2 text-[10px]">
+                            <span
+                              className="h-2 w-2 shrink-0 rounded-full"
+                              style={{ backgroundColor: taxonomy?.find((c) => c.id === r.class_id)?.color ?? "#fff" }}
+                            />
+                            <span className="min-w-0 flex-1 truncate text-zinc-300">
+                              {taxonomy?.find((c) => c.id === r.class_id)?.display ?? r.class_id} ·{" "}
+                              {r.count.toLocaleString()} splats
+                              {r.invalid_reason && <span className="text-amber-300"> · {r.invalid_reason}</span>}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => void removeClassRecord(r.id)}
+                              className="shrink-0 text-zinc-500 hover:text-rose-300"
+                              title="Delete this class paint (fully reverts it)"
+                            >
+                              <X className="h-3 w-3" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {paintTarget === "field" && selCount > 0 && (
                   <div className="space-y-1.5">
                     <Input
                       value={paintLabel}

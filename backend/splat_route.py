@@ -44,6 +44,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+import class_taxonomy
 import gpu_arbiter
 import maintenance_gate
 from health.precheck import precheck_input
@@ -6441,6 +6442,122 @@ async def langfield_overrides_delete(job_id: str, override_id: str):
         raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield on :3417).")
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=resp.json().get("detail", "worker error"))
+    return resp.json()
+
+
+@router.get("/jobs/{job_id}/class-taxonomy")
+async def get_class_taxonomy(job_id: str):
+    """Merged class taxonomy (built-ins + this job's extend-only extras).
+    Static data — deliberately NOT stale-guarded."""
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    try:
+        return class_taxonomy.load_taxonomy(_job_dir(job_id))
+    except class_taxonomy.TaxonomyError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/jobs/{job_id}/class-labels")
+async def class_labels_list(job_id: str):
+    """Disk read (worker-down tolerant), same shape as the overrides list."""
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    manifest = _job_dir(job_id) / LANGFIELD_DIRNAME / "class_labels.json"
+    if not manifest.is_file():
+        return {"records": []}
+    try:
+        items = json.loads(manifest.read_text())
+    except (json.JSONDecodeError, OSError):
+        items = []
+    return {"records": items if isinstance(items, list) else []}
+
+
+@router.post("/jobs/{job_id}/class-labels")
+async def class_labels_add(job_id: str, payload: dict[str, Any]):
+    """Commit a class paint (class_id + indices). The class_id is validated
+    against the merged taxonomy HERE (stdlib); guardrails worker-side."""
+    config_path, lfdir = _langfield_paint_context(job_id)
+    class_id = str(payload.get("class_id", ""))
+    try:
+        allowed = class_taxonomy.class_ids(_job_dir(job_id))
+    except class_taxonomy.TaxonomyError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if class_id not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown class '{class_id}' — not in this job's taxonomy",
+        )
+    body = {
+        "config": config_path,
+        "lfdir": lfdir,
+        "class_id": class_id,
+        "indices_b64": str(payload.get("indices_b64", "")),
+        "force": bool(payload.get("force", False)),
+        "note": str(payload.get("note", "")),
+    }
+    resp = await _langfield_worker_json("/class_add", body)
+    if resp is None:
+        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield service).")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.json().get("detail", "worker error"))
+    return resp.json()
+
+
+@router.delete("/jobs/{job_id}/class-labels/{record_id}")
+async def class_labels_delete(job_id: str, record_id: str):
+    config_path, lfdir = _langfield_paint_context(job_id)
+    if not re.fullmatch(r"[0-9a-f]{8}", record_id):
+        raise HTTPException(status_code=404, detail="class label record not found")
+    resp = await _langfield_worker_json(
+        "/class_delete", {"config": config_path, "lfdir": lfdir, "record_id": record_id}
+    )
+    if resp is None:
+        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield service).")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.json().get("detail", "worker error"))
+    return resp.json()
+
+
+def _class_order_for(job_id: str) -> list[str]:
+    taxonomy = class_taxonomy.load_taxonomy(_job_dir(job_id))
+    return [c["id"] for c in taxonomy["classes"]]
+
+
+@router.get("/jobs/{job_id}/class-labels/map")
+async def class_labels_map(job_id: str):
+    """Resolved per-gaussian class map — int16 LE body in exported-ply order,
+    -1 = unlabeled. X-Class-Order header carries the index->id mapping."""
+    config_path, lfdir = _langfield_paint_context(job_id)
+    order = _class_order_for(job_id)
+    resp = await _langfield_worker_json(
+        "/class_map", {"config": config_path, "lfdir": lfdir, "class_order": order}
+    )
+    if resp is None:
+        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield service).")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="worker error")
+    return Response(
+        content=resp.content,
+        media_type="application/octet-stream",
+        headers={
+            "X-Count": resp.headers.get("X-Count", "0"),
+            "X-Class-Order": json.dumps(order),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@router.get("/jobs/{job_id}/class-labels/summary")
+async def class_labels_summary(job_id: str):
+    config_path, lfdir = _langfield_paint_context(job_id)
+    order = _class_order_for(job_id)
+    resp = await _langfield_worker_json(
+        "/class_summary", {"config": config_path, "lfdir": lfdir, "class_order": order}
+    )
+    if resp is None:
+        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield service).")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="worker error")
     return resp.json()
 
 

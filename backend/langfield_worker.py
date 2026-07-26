@@ -964,6 +964,120 @@ class InvalidateReq(BaseModel):
     config: str
 
 
+class ClassAddReq(BaseModel):
+    config: str
+    lfdir: str
+    class_id: str  # validated against the merged taxonomy by the APP route
+    indices_b64: str  # base64 little-endian uint32, EXPORTED-PLY order
+    force: bool = False
+    note: str = ""
+
+
+class ClassDeleteReq(BaseModel):
+    config: str
+    lfdir: str
+    record_id: str
+
+
+class ClassMapReq(BaseModel):
+    config: str
+    lfdir: str
+    class_order: list[str]
+
+
+def _class_mod():
+    import sys as _sys
+    _here = str(Path(__file__).resolve().parent)
+    if _here not in _sys.path:
+        _sys.path.insert(0, _here)
+    import class_labels
+    return class_labels
+
+
+async def _n_ply_and_xyz(config: str, lfdir: str, indices):
+    """Authoritative client-space row count + positions of the given rows,
+    captured while the scene is held (the xyz snapshot is edit-survival)."""
+    import numpy as np
+    sc = await _acquire_scene(config, lfdir)
+    try:
+        ply_map = getattr(sc, "ply_map", None)
+        if ply_map is None:
+            raise HTTPException(409, "scene has no ply->ckpt map — painting unavailable")
+        n_ply = int(ply_map.shape[0])
+        xyz_rows = None
+        means_ply = getattr(sc, "means_ply", None)
+        if (means_ply is not None and indices is not None and len(indices)
+                and int(indices.max()) < n_ply and int(indices.min()) >= 0):
+            picked = means_ply[np.unique(indices)]
+            xyz_rows = (
+                picked.detach().cpu().numpy() if hasattr(picked, "detach") else np.asarray(picked)
+            ).astype(np.float32)
+        return n_ply, xyz_rows
+    finally:
+        await _release_scene(sc)
+
+
+@app.post("/class_add")
+async def class_add(req: ClassAddReq) -> dict[str, Any]:
+    """Commit one CLASS paint action (grass/dirt/...). Same guardrails and
+    layout discipline as overrides_add, but class labels never touch the
+    search embeddings — no scene invalidation needed."""
+    import base64
+    import numpy as np
+    cl = _class_mod()
+    try:
+        raw = base64.b64decode(req.indices_b64, validate=True)
+    except Exception as exc:
+        raise HTTPException(400, f"indices_b64 is not valid base64: {exc}")
+    if len(raw) % 4 != 0:
+        raise HTTPException(400, "indices payload is not a uint32 array")
+    indices = np.frombuffer(raw, dtype="<u4").astype(np.int64)
+    n_ply, xyz_rows = await _n_ply_and_xyz(req.config, req.lfdir, indices)
+    try:
+        record = cl.add_class_label(
+            Path(req.lfdir),
+            class_id=req.class_id,
+            indices=indices,
+            xyz=xyz_rows,
+            n_ply=n_ply,
+            force=req.force,
+            note=req.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    log.info("class label added: %s (%d rows)", record["class_id"], record["count"])
+    return {"ok": True, "record": record}
+
+
+@app.post("/class_delete")
+async def class_delete(req: ClassDeleteReq) -> dict[str, Any]:
+    cl = _class_mod()
+    if not cl.delete_class_label(Path(req.lfdir), req.record_id):
+        raise HTTPException(404, "class label record not found")
+    return {"ok": True, "deleted": req.record_id}
+
+
+@app.post("/class_map")
+async def class_map(req: ClassMapReq):
+    """Resolved per-gaussian class map (int16 LE, exported-ply order; -1 =
+    unlabeled). Same binary contract style as /relevancy."""
+    cl = _class_mod()
+    n_ply, _ = await _n_ply_and_xyz(req.config, req.lfdir, None)
+    out = cl.resolve_class_map(Path(req.lfdir), n_ply, req.class_order)
+    return Response(
+        content=out.astype("<i2").tobytes(),
+        media_type="application/octet-stream",
+        headers={"X-Count": str(int(out.size)), "Cache-Control": "no-store"},
+    )
+
+
+@app.post("/class_summary")
+async def class_summary(req: ClassMapReq) -> dict[str, Any]:
+    cl = _class_mod()
+    n_ply, _ = await _n_ply_and_xyz(req.config, req.lfdir, None)
+    return cl.summary(Path(req.lfdir), n_ply, req.class_order)
+
+
 @app.post("/invalidate")
 async def invalidate(req: InvalidateReq) -> dict[str, Any]:
     """Drop the cached Scene for a config. Called by the app after a langfield

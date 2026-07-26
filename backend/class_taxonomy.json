@@ -1,0 +1,132 @@
+{
+  "schema": "dev.splatlab.class-taxonomy/v1",
+  "version": 1,
+  "classes": [
+    {
+      "id": "grass",
+      "display": "Grass",
+      "color": "#4ade80",
+      "category": "ground",
+      "queries": ["grass lawn", "green grass"],
+      "generative": {
+        "base_rgb": [0.28, 0.46, 0.2],
+        "roughness": 0.9,
+        "metallic": 0.0,
+        "blend_capture": 0.25,
+        "noise": {"scale": 14, "luma_jitter": 0.1, "speckle": 0.35}
+      }
+    },
+    {
+      "id": "dirt",
+      "display": "Dirt",
+      "color": "#a16207",
+      "category": "ground",
+      "queries": ["dirt ground", "bare soil"],
+      "generative": {
+        "base_rgb": [0.42, 0.32, 0.2],
+        "roughness": 0.95,
+        "metallic": 0.0,
+        "blend_capture": 0.25,
+        "noise": {"scale": 10, "luma_jitter": 0.12, "speckle": 0.3}
+      }
+    },
+    {
+      "id": "gravel",
+      "display": "Gravel",
+      "color": "#9ca3af",
+      "category": "ground",
+      "queries": ["gravel ground", "crushed rock path"],
+      "generative": {
+        "base_rgb": [0.52, 0.5, 0.47],
+        "roughness": 0.85,
+        "metallic": 0.0,
+        "blend_capture": 0.25,
+        "noise": {"scale": 24, "luma_jitter": 0.16, "speckle": 0.55}
+      }
+    },
+    {
+      "id": "pavement",
+      "display": "Pavement / Asphalt",
+      "color": "#52525b",
+      "category": "ground",
+      "queries": ["stone pavement", "asphalt road"],
+      "generative": {
+        "base_rgb": [0.3, 0.3, 0.31],
+        "roughness": 0.8,
+        "metallic": 0.0,
+        "blend_capture": 0.25,
+        "noise": {"scale": 8, "luma_jitter": 0.06, "speckle": 0.2}
+      }
+    },
+    {
+      "id": "concrete",
+      "display": "Concrete",
+      "color": "#d4d4d8",
+      "category": "ground",
+      "queries": ["concrete ground", "concrete slab"],
+      "generative": {
+        "base_rgb": [0.62, 0.61, 0.58],
+        "roughness": 0.75,
+        "metallic": 0.0,
+        "blend_capture": 0.25,
+        "noise": {"scale": 6, "luma_jitter": 0.05, "speckle": 0.15}
+      }
+    },
+    {
+      "id": "mulch",
+      "display": "Mulch / Bark",
+      "color": "#7c2d12",
+      "category": "ground",
+      "queries": ["bark mulch", "wood chip ground cover"],
+      "generative": {
+        "base_rgb": [0.3, 0.18, 0.1],
+        "roughness": 0.95,
+        "metallic": 0.0,
+        "blend_capture": 0.3,
+        "noise": {"scale": 18, "luma_jitter": 0.14, "speckle": 0.45}
+      }
+    },
+    {
+      "id": "vegetation",
+      "display": "Vegetation / Hedge",
+      "color": "#166534",
+      "category": "vegetation",
+      "queries": ["green bushes", "hedge", "leafy foliage"],
+      "generative": {
+        "base_rgb": [0.16, 0.3, 0.12],
+        "roughness": 0.9,
+        "metallic": 0.0,
+        "blend_capture": 0.5,
+        "noise": {"scale": 20, "luma_jitter": 0.18, "speckle": 0.6}
+      }
+    },
+    {
+      "id": "structure",
+      "display": "Structure / Wall",
+      "color": "#f59e0b",
+      "category": "structure",
+      "queries": ["building wall", "fence", "man-made structure"],
+      "generative": {
+        "base_rgb": [0.55, 0.5, 0.45],
+        "roughness": 0.7,
+        "metallic": 0.0,
+        "blend_capture": 0.6,
+        "noise": {"scale": 4, "luma_jitter": 0.04, "speckle": 0.1}
+      }
+    },
+    {
+      "id": "water",
+      "display": "Water",
+      "color": "#38bdf8",
+      "category": "water",
+      "queries": ["water surface", "pond", "puddle"],
+      "generative": {
+        "base_rgb": [0.12, 0.25, 0.35],
+        "roughness": 0.15,
+        "metallic": 0.0,
+        "blend_capture": 0.3,
+        "noise": {"scale": 30, "luma_jitter": 0.05, "speckle": 0.1}
+      }
+    }
+  ]
+}
