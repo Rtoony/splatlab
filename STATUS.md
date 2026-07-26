@@ -2030,3 +2030,23 @@ into README); scale NOT auto-applied (bounds = whole cloud incl. background spla
 sets root scale). Receipt: G:\splatlab-ue\receipts\firstlight-splat_513e89171d.json. Vault:
 `Nexus - Triforce Windows Login` (d550d669) added by RToony via vault-add-secret; verified
 readable in-memory. Remaining attended: 30-second RDP eyeball of the FirstLight level + F9.
+
+## BLENDER STUDIO LOOP — W1-W3 SHIPPED (2026-07-26 pm; plan purring-coalescing-crane v2)
+- **W1 voxel shell (64423ba)**: scene_solidify `--shell-source voxel` + `--shell-only`
+  (patches world.json in place). Bonsai: 41s bake, 120k faces → **world_gate shell gates
+  FLIPPED to PASS** (1 component / 1.0 fraction / floor 0.94; was 2,088 components). Visual
+  surface now coincides with the collider. prop_integrity still FAIL = pre-existing drift.
+- **W2 polish UI (0af2e3f)**: PolishUploadZone (shared, .glb preflight/arm/progress) on
+  object cards + per-row in the world Elements panel (incl. shell) with reloadNonce reload.
+  All frontend gates green.
+- **W3 Blender infra (b6979c5, 52b3c3f)**: `splatlab-blender-mcp.service` LIVE (user unit,
+  loopback :9877; initialize handshake verified "SplatLab Blender") + registered as claude
+  MCP `splatlab-blender` (✔ Connected; :9876 untouched) + manifest node/log +
+  `~/bin/splatlab-blender` launcher (versions→_regen→GLB fallback; prints return path).
+  **First-ever real _blender lane on splat_aea04ab3**: P6 assemble via API (6 built, gate
+  ok) → snapshot v1 → transform v2 → export_glb 6 meshes/81.5MB validated. Caught+fixed:
+  glTF export of GN-driven assembled scenes needs export_apply (readback gate flagged the
+  zero-mesh export exactly as designed). Polish-upload leg of the loop deliberately awaits
+  REAL polished content (W4) rather than landing test data in a live slot.
+- **W4 pending RToony's capture** (scene w/ ground, 150-300 photos, taped distance, map
+  pin — spec in the plan). Sequencing: derive (objects/P6/world) BEFORE destructive edits.
