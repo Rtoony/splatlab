@@ -1905,3 +1905,55 @@ kept 80 tests green against the wrong contract.
   handles the rest.
 - Tests 567 → **570 passed / 2 skipped**; frontend gates green (tsc-gated build, eslint 0,
   vitest 9/9).
+
+## NAVIGABLE WORLD + CANDIDATE BAKE-OFF (2026-07-26) — splat → walkable three.js world, and generative candidates
+
+13 commits on `object-calibration-staleness` (unpushed). Suite **626 passed, 2 skipped** throughout.
+
+### What shipped
+- **Texture bake** — `object_texture.py`: clean → simplify → xatlas unwrap → bake gaussian colour into a UV
+  map. Decouples colour fidelity from face budget. Exposed as `texture:true` on POST /jobs/{id}/objects
+  plus an Objects-panel control. Also takes a POINT CLOUD as geometry source (Poisson direct from
+  gaussians) — the scene lane never meshes, so this is the normal path.
+- **Whole-capture solidify** — `scene_solidify.py` (props + shell), `world_collision.py` (static/prop
+  classification + CoACD `UCX_` hulls), `world_shell.py` (watertight walkable solid), `world_gate.py`
+  (acceptance gates).
+- **Walkable world** — `/world/:jobId`, three.js + three-mesh-bvh capsule collision, backend
+  `/world/manifest` + `/world/file`. Renders the visual shell, COLLIDES against the solid.
+- **Candidate bake-off** — `world_bakeoff.py` + `mesh_gate.py --transform`, registers candidates into one
+  frame then scores against the real photos.
+- **Parametric authoring** — `parametric_schema.json` + `parametric_build.py` (measure/validate/build).
+- **Generative** — `object_generate.py` wrapping SAM 3D Objects (13 GB ckpts local).
+
+### Findings that cost time — do not re-derive
+- **Render geometry ≠ collision geometry.** Bonsai's TSDF shell is a lacy web (645 components, 67% floor
+  continuity). NO decimation budget preserves connectivity (2,088 components even at 40%). The walkable
+  solid must be voxelised separately — `world_shell.py`, 222k tris, watertight, floor continuity 1.0.
+- **`/collision` was voxelising in the wrong frame AND uncropped.** Captures are Z-up, splat-transform is
+  Y-up, so `--voxel-floor-fill` filled sideways; and no `--filter-box` meant 64×53×70 units of sky.
+  Fixed: 6,826,202 tris → 138,556. splat-transform's contract is `input [ACTIONS] … output`, actions in
+  order — the source must LEAD.
+- **Open3D aborts the PROCESS** (uncatchable C++ terminate) on `enable_post_processing` for an image-less
+  GLB, and on `np.asarray()` of an empty texture placeholder. Read the glTF JSON chunk first; call
+  `tex.is_empty()` always.
+- **pymeshlab screened Poisson never returns** (>240 s at depth 6 on 49k faces). Open3D: 1.5 s at depth 8.
+- **xatlas is steeply superlinear**: 0.2 s @8k → 46 s @200k → 1564 s @400k. Measured 13× fix (chunked
+  unwrap, 118 s) documented at the call site, NOT applied — it changes atlas layout.
+- **Volume-based hull checks are meaningless** on density-trimmed Poisson meshes (not watertight). Use
+  sampled surface coverage.
+- **The object lane's `bbox_extent_m` is a MISLABEL** (fixed 2026-07-21). Older meshes carry scene units
+  under that key. Bonsai is UNCALIBRATED.
+- **PSNR ranks by alignment, not quality.** The operator-preferred generated hydrant scores LAST (9.83 dB
+  vs 13.76) because its yaw is fitted. Only rank exactly-registered candidates. Fix = photometric pose
+  refinement, not a different verdict.
+- **DATA DEFECT: camera 0 of `splat_513e89171d` is badly posed** — ~6 dB shared dip across every
+  candidate, object renders ~3× oversized. One bad frame in 45.
+
+### Open
+- Bonsai has no real scale (viewer guesses 0.9428 u/m from a 2.6 m storey; bicycle then reads 1.86 m).
+- Visual shell still fails its own gates; chunked xatlas is the measured fix, pending a design call.
+- `object_texture.py` reports coverage PRE-dilation (0.53) under the same name as the shipped atlas (0.98).
+- 13 commits unpushed.
+- **UE 5.6.1 installed on Triforce** (`G:\UE_5.6`, 25.76 GB, verified; Quixel Bridge + Fab plugin).
+  Triforce: i7-7700 4c/8t, 64 GB, RTX 2080 SUPER 8 GB, Win10 19045, VS Build Tools 2022 present.
+  C: only 27.8 GB free — keep engine work on G:. UE is a POLISH station; three.js stays the runtime.
