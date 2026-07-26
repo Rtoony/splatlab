@@ -12,6 +12,7 @@ import type {
 } from "@/lib/contracts";
 import type { ViewerCameraNodeTarget, ViewerCameraPose, ViewerCameraViewTarget, ViewerHighlight, ViewerOverlay } from "@/components/viewer-types";
 import { Button, Card, DropdownItem, DropdownMenu, DropdownSeparator, Input, SectionLabel, Tabs, TabsList, TabsTrigger } from "@/components/ui";
+import { EditProgress } from "@/components/edit-progress";
 import { EditLane } from "@/components/workspace/edit-lane";
 import { ExportLane } from "@/components/workspace/export-lane";
 import { ObjectsPanel } from "@/components/workspace/objects-panel";
@@ -72,6 +73,10 @@ export default function SplatViewPage() {
   // reloadToken prop (same reload path its own crop tools use) and refreshes
   // the status poll so splat counts/stats update.
   const [editReloadToken, setEditReloadToken] = useState(0);
+  // Viewer-initiated crop/undo in flight — drives the GLOBAL edit rail below
+  // the tab row, which survives tab switches and the viewer's own reload
+  // teardown (the section-local rail vanished with both).
+  const [viewerEditPending, setViewerEditPending] = useState(false);
   function handleLaneEdited() {
     setEditReloadToken((t) => t + 1);
     void queryClient.invalidateQueries({ queryKey: ["status"] });
@@ -306,6 +311,13 @@ export default function SplatViewPage() {
                 <TabsTrigger value="export"><PackageOpen className="h-3.5 w-3.5" /> Export</TabsTrigger>
               </TabsList>
             </Tabs>
+            {/* GLOBAL edit-progress rail: activity-driven, so it covers viewer
+                crops, Edit-lane ops, reverts, and edits started elsewhere —
+                and it survives tab switches, unlike the old section-local
+                rail that unmounted mid-apply. */}
+            <div className="w-full sm:order-last sm:basis-full">
+              <EditProgress jobId={jobId} active={viewerEditPending} />
+            </div>
             <div className="flex shrink-0 items-center gap-2">
               {mode === "view" && (
                 <>
@@ -438,6 +450,7 @@ export default function SplatViewPage() {
                 resetViewToken={resetViewToken}
                 showShortcutLegend={shortcutLegendOpen}
                 reloadToken={editReloadToken}
+                onEditPendingChange={setViewerEditPending}
                 onPickMatch={setActiveIdx}
                 onPickCamera={zoomToCamera}
               />

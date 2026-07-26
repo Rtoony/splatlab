@@ -94,8 +94,14 @@ def _edit_tmp_path(target: Path) -> Path:
 # edit it described — restart-truthful, the same rail as the activity locks.
 # Single event loop => plain dict mutation is safe.
 EDIT_PROGRESS: dict[str, dict[str, Any]] = {}
-EDIT_STEPS = ("snapshot", "apply", "compress", "webopt", "langweb", "finalize")
+# "queued" leads every rail: _progress_begin fires before the host-wide work
+# lease is acquired (shared with training/exports, unbounded wait), so without
+# it the rail sat on "snapshot" for the whole queue wait — the recorded #1
+# source of "the crop takes forever with no indication". Each transaction's
+# first act is stepping to "snapshot", which can only happen lock-in-hand.
+EDIT_STEPS = ("queued", "snapshot", "apply", "compress", "webopt", "langweb", "finalize")
 SEMANTIC_STEPS = ("match",) + EDIT_STEPS
+REVERT_STEPS = ("queued", "snapshot", "restore", "finalize")
 
 
 def _progress_begin(job_id: str, steps: tuple[str, ...] = EDIT_STEPS) -> None:
@@ -391,36 +397,23 @@ async def revert_version(job_id: str, req: RevertRequest, request: Request) -> d
     src_dir, _manifest = found
 
     async with _hold_edit_locks([job_id]):
-        async def transaction() -> list[str]:
-            # Snapshot and every live artifact replacement share one backup lease.
-            snap_dir, _snap_manifest, snap_created = _snapshot_preview(
-                job_dir, op="revert", params={"reverted_to": req.version}
-            )
-            preview_dir = splat_route._preview_dir_path(job_dir)
-            preview_dir.mkdir(parents=True, exist_ok=True)
-            restored: list[str] = []
-            for name in SNAPSHOT_ARTIFACT_NAMES:
-                src = src_dir / name
-                dst = preview_dir / name
-                if src.is_file():
-                    tmp = _edit_tmp_path(dst)
-                    try:
-                        shutil.copy2(src, tmp)
-                        tmp.replace(dst)
-                    except OSError as exc:
-                        tmp.unlink(missing_ok=True)
-                        if name == "splat.ply":
-                            _discard_snapshot(snap_dir, snap_created)
-                            raise HTTPException(
-                                status_code=500,
-                                detail=f"failed to restore splat.ply from v{req.version}: {exc}",
-                            ) from exc
-                        continue
-                    restored.append(name)
-                elif dst.is_file():
-                    with contextlib.suppress(OSError):
-                        dst.unlink()
+        _progress_begin(job_id, REVERT_STEPS)
 
+        async def transaction() -> list[str]:
+            _progress_step(job_id, "snapshot")
+            # Snapshot and every live artifact replacement share one backup lease.
+            snap_dir, _snap_manifest, snap_created = await asyncio.to_thread(
+                _snapshot_preview,
+                job_dir,
+                op="revert",
+                params={"reverted_to": req.version},
+            )
+            _progress_step(job_id, "restore")
+            restored = await asyncio.to_thread(
+                _restore_from_snapshot,
+                job_dir, src_dir, snap_dir, snap_created, req.version,
+            )
+            _progress_step(job_id, "finalize")
             _prune_versions(job_dir)
             _mark_langfield_stale(job_dir)
             splat_route._patch_meta(job_id, stats=None)
@@ -434,6 +427,8 @@ async def revert_version(job_id: str, req: RevertRequest, request: Request) -> d
             )
         except gpu_arbiter.GPUArbiterUnavailable as exc:
             raise HTTPException(status_code=503, detail=f"revert coordination failed: {exc}") from exc
+        finally:
+            _progress_end(job_id)
 
     await audit_operator_event(
         request=request,
@@ -450,6 +445,38 @@ async def revert_version(job_id: str, req: RevertRequest, request: Request) -> d
         "restored_files": restored,
         "job": splat_route._job_payload(updated_meta),
     }
+
+
+def _restore_from_snapshot(
+    job_dir: Path, src_dir: Path, snap_dir: Path, snap_created: bool, version: int
+) -> list[str]:
+    """Sync file copies for revert — runs in a worker thread (to_thread), never
+    on the event loop: two full-size artifact sets move through here."""
+    preview_dir = splat_route._preview_dir_path(job_dir)
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    restored: list[str] = []
+    for name in SNAPSHOT_ARTIFACT_NAMES:
+        src = src_dir / name
+        dst = preview_dir / name
+        if src.is_file():
+            tmp = _edit_tmp_path(dst)
+            try:
+                shutil.copy2(src, tmp)
+                tmp.replace(dst)
+            except OSError as exc:
+                tmp.unlink(missing_ok=True)
+                if name == "splat.ply":
+                    _discard_snapshot(snap_dir, snap_created)
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"failed to restore splat.ply from v{version}: {exc}",
+                    ) from exc
+                continue
+            restored.append(name)
+        elif dst.is_file():
+            with contextlib.suppress(OSError):
+                dst.unlink()
+    return restored
 
 
 def _mark_langfield_stale(job_dir: Path) -> None:
@@ -866,8 +893,14 @@ async def apply_edit_ops(job_id: str, req: ApplyOpsRequest, request: Request) ->
         _progress_begin(job_id)
 
         async def transaction() -> tuple[dict[str, Any], list[str]]:
-            snap_dir, manifest, snap_created = _snapshot_preview(
-                job_dir, op="apply", params={"ops": [op.model_dump() for op in req.ops]}
+            _progress_step(job_id, "snapshot")
+            # to_thread: the snapshot is plain shutil on multi-GB files and
+            # previously stalled the whole event loop (frozen /activity).
+            snap_dir, manifest, snap_created = await asyncio.to_thread(
+                _snapshot_preview,
+                job_dir,
+                op="apply",
+                params={"ops": [op.model_dump() for op in req.ops]},
             )
             _progress_step(job_id, "apply")
             tmp_ply = _edit_tmp_path(src_ply)
@@ -1001,7 +1034,9 @@ async def upload_edited_ply(job_id: str, file: UploadFile, request: Request) -> 
             _progress_begin(job_id)
 
             async def transaction() -> tuple[dict[str, Any], list[str]]:
-                snap_dir, manifest, snap_created = _snapshot_preview(
+                _progress_step(job_id, "snapshot")
+                snap_dir, manifest, snap_created = await asyncio.to_thread(
+                    _snapshot_preview,
                     job_dir,
                     op="upload",
                     params={"filename": filename, "bytes": written, "gaussians": hdr.vertex_count},
@@ -1344,6 +1379,9 @@ async def semantic_edit(job_id: str, req: SemanticEditRequest, request: Request)
             )
 
         keep_mask = match_mask if req.mode in ("isolate", "extract") else [not m for m in match_mask]
+        # Match is done; the next wait is the host work lease inside the
+        # transaction runner — show it honestly.
+        _progress_step(job_id, "queued")
 
         async def transaction() -> dict[str, Any]:
             if _file_identity(src_ply) != source_identity or (lf_dir / "STALE").is_file():
@@ -1354,7 +1392,8 @@ async def semantic_edit(job_id: str, req: SemanticEditRequest, request: Request)
 
             if req.mode in ("delete", "isolate"):
                 _progress_step(job_id, "snapshot")
-                snap_dir, manifest, snap_created = _snapshot_preview(
+                snap_dir, manifest, snap_created = await asyncio.to_thread(
+                    _snapshot_preview,
                     job_dir,
                     op="semantic",
                     params={"text": req.text, "threshold": req.threshold, "mode": req.mode},

@@ -13,11 +13,15 @@ import { useActivity } from "@/lib/use-activity";
 // apply → compress → webopt → langweb → finalize; semantic prepends "match").
 const STEP_HUMAN: Record<string, string> = {
   match: "Matching gaussians",
+  queued: "Waiting for other work to finish",
   snapshot: "Saving restore point",
   apply: "Applying the edit",
+  restore: "Restoring files",
   compress: "Rebuilding compressed copy",
   webopt: "Rebuilding web preview",
   langweb: "Rebuilding search overlay",
+  align: "Re-aligning language field",
+  overrides: "Carrying painted labels across",
   finalize: "Finishing up",
 };
 
@@ -88,8 +92,11 @@ export function EditProgress({ jobId, active }: { jobId: string; active: boolean
       <div className="flex items-center gap-2">
         {labels.length > 0 && (
           <span className="flex shrink-0 items-center gap-1">
+            {/* step_index is 1-based ("N of M"); dots are 0-based. Without the
+                -1 the running dot led the label by one step and the rail read
+                fully done while the request was still open. */}
             {labels.map((l, i) => (
-              <StepDot key={`${l}-${i}`} done={i < stepIndex} running={i === stepIndex} title={stepHuman(l)} />
+              <StepDot key={`${l}-${i}`} done={i < stepIndex - 1} running={i === stepIndex - 1} title={stepHuman(l)} />
             ))}
           </span>
         )}

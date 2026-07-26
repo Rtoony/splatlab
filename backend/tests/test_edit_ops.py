@@ -1254,3 +1254,74 @@ def test_merge_holds_host_transaction_through_destination_commit(
     assert response.status_code == 200, response.text
     assert calls == 1
     assert lease_active is False
+
+
+# =============================================================================
+# Progress-rail lifecycle: honest "queued" lead step, revert gets a rail at
+# all (it previously emitted nothing), cleanup on completion.
+# =============================================================================
+
+
+def _spy_progress(monkeypatch: pytest.MonkeyPatch):
+    begun: list[tuple[str, ...]] = []
+    stepped: list[str] = []
+    original_begin = edit_ops._progress_begin
+    original_step = edit_ops._progress_step
+
+    def spy_begin(jid: str, steps: tuple[str, ...] = edit_ops.EDIT_STEPS) -> None:
+        begun.append(tuple(steps))
+        original_begin(jid, steps)
+
+    def spy_step(jid: str, step: str) -> None:
+        stepped.append(step)
+        original_step(jid, step)
+
+    monkeypatch.setattr(edit_ops, "_progress_begin", spy_begin)
+    monkeypatch.setattr(edit_ops, "_progress_step", spy_step)
+    return begun, stepped
+
+
+def test_apply_rail_leads_with_queued_then_snapshot(
+    outputs_root: Path,
+    client: TestClient,
+    stub_transform: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = "splat_0a110001"
+    _make_job(outputs_root, job_id)
+    begun, stepped = _spy_progress(monkeypatch)
+
+    response = client.post(f"/api/splat/jobs/{job_id}/edit/apply", json=_TRANSLATE_OPS)
+    assert response.status_code == 200, response.text
+
+    # The rail begins on "queued" (the host-lock wait is visible), and the
+    # transaction's first act is stepping to "snapshot" — lock in hand.
+    assert begun == [edit_ops.EDIT_STEPS]
+    assert edit_ops.EDIT_STEPS[0] == "queued"
+    assert stepped[0] == "snapshot"
+    assert stepped[1] == "apply"
+    assert stepped[-1] == "finalize"
+    # completed rail is cleaned up (restart-truthful contract)
+    assert job_id not in edit_ops.EDIT_PROGRESS
+
+
+def test_revert_emits_a_progress_rail_and_cleans_up(
+    outputs_root: Path,
+    client: TestClient,
+    stub_transform: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = "splat_0a110002"
+    _make_job(outputs_root, job_id)
+    assert (
+        client.post(f"/api/splat/jobs/{job_id}/edit/apply", json=_TRANSLATE_OPS).status_code
+        == 200
+    )
+    begun, stepped = _spy_progress(monkeypatch)
+
+    response = client.post(f"/api/splat/jobs/{job_id}/edit/revert", json={"version": 1})
+    assert response.status_code == 200, response.text
+
+    assert begun == [edit_ops.REVERT_STEPS]
+    assert stepped == ["snapshot", "restore", "finalize"]
+    assert job_id not in edit_ops.EDIT_PROGRESS

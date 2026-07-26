@@ -26,7 +26,6 @@ import type {
   ViewerPoint,
 } from "@/components/viewer-types";
 import { Button, Input, SectionLabel } from "@/components/ui";
-import { EditProgress } from "@/components/edit-progress";
 import { Box, Download, Loader2, Paintbrush, Plus, Ruler, Scissors, Trash2, Undo2, X } from "lucide-react";
 
 // SPARK BETA viewer for the /view page — the Wave-2 cutover surface.
@@ -126,6 +125,7 @@ export function SparkSceneViewer({
   showShortcutLegend = false,
   panelSections = null,
   reloadToken = 0,
+  onEditPendingChange,
   onPickMatch,
   onPickCamera,
 }: {
@@ -160,6 +160,10 @@ export function SparkSceneViewer({
   reloadToken?: number;
   onPickMatch?: (i: number) => void;
   onPickCamera?: (camera: ViewerCameraPose) => void;
+  // Fires when a viewer-initiated edit (crop apply/undo) starts or settles —
+  // drives the host page's GLOBAL progress rail, which survives tab switches
+  // and this component's own url-keyed teardown.
+  onEditPendingChange?: (pending: boolean) => void;
 }) {
   // Bumped after every crop apply/revert: the preview URL string doesn't
   // otherwise change even though the file on disk did, so the mesh-load
@@ -300,6 +304,36 @@ export function SparkSceneViewer({
   const [boxError, setBoxError] = useState<string | null>(null);
   const [boxLastVersion, setBoxLastVersion] = useState<number | null>(null);
   const [boxUndoBusy, setBoxUndoBusy] = useState(false);
+  // Crop-slider ranges derived from the loaded scene's bbox (set once per
+  // load in mesh.initialized); null = bounds not measured yet → legacy range.
+  const [sliderScale, setSliderScale] = useState<{
+    sphereMax: number;
+    boxMax: [number, number, number];
+  } | null>(null);
+  // Non-fatal regen failures from the last crop/undo (backend `warnings[]`) —
+  // previously discarded, so a scene silently degrading to raw-.ply serving
+  // looked like success. Cleared by the next successful apply/undo.
+  const [editWarnings, setEditWarnings] = useState<string[]>([]);
+  // Armed-tool click that hit nothing (raycast miss on faint splats) —
+  // previously a silent no-op that read as "the tool is broken".
+  const [placementMiss, setPlacementMiss] = useState(false);
+  const placementMissTimer = useRef<number | null>(null);
+  function flagPlacementMiss() {
+    setPlacementMiss(true);
+    if (placementMissTimer.current) window.clearTimeout(placementMissTimer.current);
+    placementMissTimer.current = window.setTimeout(() => setPlacementMiss(false), 2500);
+  }
+  // The click handler lives inside the url-keyed three.js effect; a ref keeps
+  // it pointed at the current closure without re-running that effect.
+  const flagPlacementMissRef = useRef(flagPlacementMiss);
+  flagPlacementMissRef.current = flagPlacementMiss;
+
+  // Host page's global progress rail rides these — it survives tab switches
+  // and this component's own reload teardown.
+  const editPending = cropBusy || boxBusy || cropUndoBusy || boxUndoBusy;
+  useEffect(() => {
+    onEditPendingChange?.(editPending);
+  }, [editPending, onEditPendingChange]);
 
   // External-edit reload (Edit lane): reuse the crop tools' exact reload path
   // — bump reloadNonce so `url` changes and the mesh-load effect re-runs.
@@ -915,22 +949,11 @@ export function SparkSceneViewer({
     setCropBusy(true);
     setCropError(null);
     try {
-      const resp = await fetch(`/api/splat/jobs/${job.job_id}/edit/apply`, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ops: [{ type: "crop_sphere", center, radius: cropRadiusRef.current }],
-        }),
-      });
-      if (!resp.ok) {
-        const detail = String(
-          ((await resp.json().catch(() => null)) as { detail?: string } | null)?.detail ?? `HTTP ${resp.status}`,
-        );
-        throw new Error(detail);
-      }
-      const data = (await resp.json()) as { version_before: number };
-      setCropLastVersion(data.version_before);
+      const resp = await applyEditOps(job.job_id, [
+        { type: "crop_sphere", center, radius: cropRadiusRef.current },
+      ]);
+      setCropLastVersion(resp.version_before);
+      setEditWarnings(resp.warnings ?? []);
       setCropMode(false);
       setReloadNonce((n) => n + 1);
     } catch (cause) {
@@ -945,19 +968,9 @@ export function SparkSceneViewer({
     setCropUndoBusy(true);
     setCropError(null);
     try {
-      const resp = await fetch(`/api/splat/jobs/${job.job_id}/edit/revert`, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ version: cropLastVersion }),
-      });
-      if (!resp.ok) {
-        const detail = String(
-          ((await resp.json().catch(() => null)) as { detail?: string } | null)?.detail ?? `HTTP ${resp.status}`,
-        );
-        throw new Error(detail);
-      }
+      await revertEdit(job.job_id, cropLastVersion);
       setCropLastVersion(null);
+      setEditWarnings([]);
       setReloadNonce((n) => n + 1);
     } catch (cause) {
       setCropError(cause instanceof Error ? cause.message : "Undo failed.");
@@ -983,6 +996,7 @@ export function SparkSceneViewer({
         { type: "crop_box", min: [cx - ex, cy - ey, cz - ez], max: [cx + ex, cy + ey, cz + ez] },
       ]);
       setBoxLastVersion(resp.version_before);
+      setEditWarnings(resp.warnings ?? []);
       setBoxMode(false);
       setReloadNonce((n) => n + 1);
     } catch (cause) {
@@ -1256,6 +1270,34 @@ export function SparkSceneViewer({
       .then(() => {
         if (disposed) return;
         setSplatCount(mesh.packedSplats?.numSplats ?? mesh.numSplats ?? 0);
+        // One bbox pass so crop sliders scale to THIS scene: the old fixed
+        // 0.05–5 range could never enclose a large capture and dwarfed tiny
+        // ones. Floater-inflated bounds only lengthen the slider — harmless.
+        const packed = mesh.packedSplats;
+        if (packed?.numSplats) {
+          const lo = [Infinity, Infinity, Infinity];
+          const hi = [-Infinity, -Infinity, -Infinity];
+          packed.forEachSplat((_i: number, c: THREE.Vector3) => {
+            if (c.x < lo[0]) lo[0] = c.x;
+            if (c.y < lo[1]) lo[1] = c.y;
+            if (c.z < lo[2]) lo[2] = c.z;
+            if (c.x > hi[0]) hi[0] = c.x;
+            if (c.y > hi[1]) hi[1] = c.y;
+            if (c.z > hi[2]) hi[2] = c.z;
+          });
+          const ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+          if (ext.every((v) => Number.isFinite(v) && v > 0)) {
+            const diagonal = Math.hypot(ext[0], ext[1], ext[2]);
+            setSliderScale({
+              sphereMax: Math.max(0.5, 0.75 * diagonal),
+              boxMax: [
+                Math.max(0.5, 1.5 * (ext[0] / 2)),
+                Math.max(0.5, 1.5 * (ext[1] / 2)),
+                Math.max(0.5, 1.5 * (ext[2] / 2)),
+              ] as [number, number, number],
+            });
+          }
+        }
         setReady(true);
         applyOverlayRef.current(); // re-apply overlay after a reload
       })
@@ -1352,16 +1394,19 @@ export function SparkSceneViewer({
       if (cropModeRef.current) {
         const hit = raycastAt(e.clientX, e.clientY);
         if (hit) setCropCenterFromHit([hit.x, hit.y, hit.z]);
+        else flagPlacementMissRef.current();
         return;
       }
       if (boxModeRef.current) {
         const hit = raycastAt(e.clientX, e.clientY);
         if (hit) setBoxCenterFromHit([hit.x, hit.y, hit.z]);
+        else flagPlacementMissRef.current();
         return;
       }
       if (paintModeRef.current) {
         const hit = raycastAt(e.clientX, e.clientY);
         if (hit) strokeAtRef.current(hit);
+        else flagPlacementMissRef.current();
         return;
       }
       if (!measureArmRef.current) return;
@@ -1863,6 +1908,11 @@ export function SparkSceneViewer({
             {splatCount !== null ? `${splatCount.toLocaleString()} splats` : "…"} · {fps} fps
           </span>
         </div>
+        {placementMiss && (
+          <p className="rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5 text-[10px] leading-snug text-amber-100/85">
+            That click missed the splats — click on visible geometry (very faint splats don't register).
+          </p>
+        )}
 
         {panelSections === "measure" && (
         <>
@@ -2238,9 +2288,9 @@ export function SparkSceneViewer({
                   <span className="shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">radius</span>
                   <input
                     type="range"
-                    min={0.05}
-                    max={5}
-                    step={0.05}
+                    min={sliderScale ? sliderScale.sphereMax / 200 : 0.05}
+                    max={sliderScale?.sphereMax ?? 5}
+                    step={sliderScale ? sliderScale.sphereMax / 200 : 0.05}
                     value={cropRadius}
                     onChange={(e) => setCropRadius(Number(e.target.value))}
                     className="w-full"
@@ -2253,7 +2303,7 @@ export function SparkSceneViewer({
                   <>
                     <p className="text-[10px] leading-snug text-zinc-400">
                       {cropRemovedCount !== null
-                        ? `${cropRemovedCount.toLocaleString()} of ${(splatCount ?? 0).toLocaleString()} splats would be removed (${splatCount ? Math.round((cropRemovedCount / splatCount) * 100) : 0}%).`
+                        ? `${job.langfield_available ? "" : "≈"}${cropRemovedCount.toLocaleString()} of ${(splatCount ?? 0).toLocaleString()} loaded splats would be removed (${splatCount ? Math.round((cropRemovedCount / splatCount) * 100) : 0}%).${job.langfield_available ? "" : " Preview estimate — the full scene has more splats than this decimated preview."}`
                         : "Counting…"}
                     </p>
                     {job.langfield_available && (
@@ -2282,7 +2332,6 @@ export function SparkSceneViewer({
                     </Button>
                   </>
                 )}
-                <EditProgress jobId={job.job_id} active={cropBusy || boxBusy} />
               </>
             )}
             {cropError && <p className="text-[10px] leading-snug text-rose-300/90">{cropError}</p>}
@@ -2316,9 +2365,9 @@ export function SparkSceneViewer({
                     <span className="w-8 shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">±{axis}</span>
                     <input
                       type="range"
-                      min={0.05}
-                      max={5}
-                      step={0.05}
+                      min={sliderScale ? sliderScale.boxMax[ai] / 200 : 0.05}
+                      max={sliderScale?.boxMax[ai] ?? 5}
+                      step={sliderScale ? sliderScale.boxMax[ai] / 200 : 0.05}
                       value={boxExtents[ai]}
                       onChange={(e) =>
                         setBoxExtents((prev) => {
@@ -2338,7 +2387,7 @@ export function SparkSceneViewer({
                   <>
                     <p className="text-[10px] leading-snug text-zinc-400">
                       {boxRemovedCount !== null
-                        ? `${boxRemovedCount.toLocaleString()} of ${(splatCount ?? 0).toLocaleString()} splats would be removed (${splatCount ? Math.round((boxRemovedCount / splatCount) * 100) : 0}%).`
+                        ? `${job.langfield_available ? "" : "≈"}${boxRemovedCount.toLocaleString()} of ${(splatCount ?? 0).toLocaleString()} loaded splats would be removed (${splatCount ? Math.round((boxRemovedCount / splatCount) * 100) : 0}%).${job.langfield_available ? "" : " Preview estimate — the full scene has more splats than this decimated preview."}`
                         : "Counting…"}
                     </p>
                     {job.langfield_available && (
@@ -2367,10 +2416,24 @@ export function SparkSceneViewer({
                     </Button>
                   </>
                 )}
-                <EditProgress jobId={job.job_id} active={cropBusy || boxBusy} />
               </>
             )}
             {boxError && <p className="text-[10px] leading-snug text-rose-300/90">{boxError}</p>}
+            {/* Non-fatal regen failures from the last crop/undo — a scene
+                silently degrading to raw-.ply serving used to look like
+                success. Survives section collapse; cleared on next apply. */}
+            {editWarnings.length > 0 && (
+              <div className="rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5">
+                <p className="text-[10px] font-semibold text-amber-100/90">
+                  The crop applied, but some derived copies failed to rebuild:
+                </p>
+                {editWarnings.map((w, i) => (
+                  <p key={i} className="mt-0.5 text-[10px] leading-snug text-amber-100/75">
+                    {w}
+                  </p>
+                ))}
+              </div>
+            )}
             {/* Polled truth, one shared note for both crop tools — shows for
                 ANY stale-making edit (this tab, the Edit lane, another tab). */}
             {job.langfield_stale && (
