@@ -1957,3 +1957,61 @@ kept 80 tests green against the wrong contract.
 - **UE 5.6.1 installed on Triforce** (`G:\UE_5.6`, 25.76 GB, verified; Quixel Bridge + Fab plugin).
   Triforce: i7-7700 4c/8t, 64 GB, RTX 2080 SUPER 8 GB, Win10 19045, VS Build Tools 2022 present.
   C: only 27.8 GB free — keep engine work on G:. UE is a POLISH station; three.js stays the runtime.
+
+## BLENDER+UE PIPELINE CONTINUATION WAVE (2026-07-26, second session) — UE first light staged, bundle catches up, polish round-trip
+
+Plan: ~/.claude/plans/purring-coalescing-crane.md (approved). 7 commits eb11eea..850d727 on
+`object-calibration-staleness`. Suite 626 → **666 passed / 5 skipped** (3 opt-in lanes run once
+this session: mesh-env e2e ×2, real headless Blender ×1 — all green). Two safe-restart windows
+taken (0-jobs verified), routes proven via /openapi.json.
+
+- **B2 coverage honesty (eb11eea)**: `texture.coverage` now = the SHIPPED dilated atlas;
+  `coverage_rasterized` = the pre-dilation fraction (was misfiled under one key: 0.53 vs 0.98).
+  world_gate comparison reads the rasterized key for either report vintage. First-ever
+  test_object_texture.py (12 tests incl. real-env e2e).
+- **B1 bundle catch-up (080f7e6)**: UE bundle ships `World/` (shell, collision_shell, elements,
+  UCX hulls w/ `collision_for`, combined per-prop `World/Props/<slug>.glb` — UCX binds only
+  within ONE imported file; node-name preservation probe-proven) + `Objects/` (textured+atlas,
+  bakeoff.json, **winner GLB with score metadata**; provenance: capture-native/ours →
+  captured-derived, else generated=render-only; out-of-tree winners skipped visibly) + 4th
+  actor child `WorldGeometry` + manifest `world` block + serve-time `world_current` flag.
+  bundle_tool requires WorldGeometry only when world files present (skew-safe both ways).
+  world_collision.py emits `UE_<slug>.glb` per prop (first CoACD-real file on next collision run).
+- **A-lane: UE FIRST LIGHT STAGED ON TRIFORCE.** Preflight probed live (UE 5.6 CL-44394996 at
+  G:\UE_5.6, MSVC 14.44, py 3.14, driver 566.03; **Windows SDK MISSING**, RDP disabled, also a
+  UE_5.8 dir). `~/scripts/triforce-ue-station-prep.sh` (dry-run proven) = RToony's --apply gate
+  for RDP+SDK. Staged on G:\splatlab-ue\: SplatLabUE56 project + PS scripts + **NanoGS v1.0.3
+  prebuilt** (Plugins/NanoGS) + the REAL hydrant bundle (splat_513e89171d: exports built SPZ
+  22.6MB/GLB 218MB, 398MB zip, byte-verified transfer) — probe/verify/stage receipts ALL GREEN
+  on Triforce (staged_path SplatLabImports\splat_513e89171d\50a210ca9afe0019, 14 files, NanoGS
+  selected; bundle carries Objects/fire-hydrant + winner-textured 13.76dB). Attended half =
+  `integrations/unreal/first-light-runbook.md` (copy beside the kit on G:). Gotchas: Windows
+  scp needs `-O` (sftp mode dies); CLIXML noise → grep -v; base64 -EncodedCommand for PS.
+- **C1 polish round-trip (09949fd)**: `backend/glb_check.py` (stdlib GLB validation — Open3D
+  BANNED here, hard-aborts on image-less GLBs) + `polish_route.py`:
+  POST /jobs/{id}/objects/{slug}/polish + /world/elements/{slug}/polish (shell ok). edit/upload
+  discipline: stream→validate→lock→version prior→atomic land→provenance receipt; every
+  400/404/409/413 leaves the tree untouched (20 tests). Walker needs no change; world manifest
+  gains additive `polished` marker; _OBJECT_FILES += polished/polish-receipt.
+- **C2 UI (f1e3312)**: objects listing carries additive `bakeoff` verdict; "Walk world" button
+  on /view when `world_available` (bonsai proven live); verdict line on object cards
+  (formatBakeoffVerdict, vitest'd); Polished .glb in the downloads list.
+  ⚠️ Route-decorator gotcha cost 12 tests: inserting a helper between @router.get and its
+  handler registers the HELPER as the route (422s everywhere). Helpers go above the decorator.
+- **D1 chunked xatlas (c7ac40d)**: `--unwrap-chunks N` (default 1 byte-identical; solidify
+  passes 4 for the SHELL only). **Real bonsai shell @400k: unwrap 96s vs 1564s = 16×**, bake
+  total 119s, shipped coverage 1.0, texture gate PASSES. Honest residual (scratch world_gate
+  A/B, live tree untouched): shell_connectivity/floor_continuity still FAIL — 2,088 components,
+  the EXACT recorded source-TSDF number → the blocker is source lacing, not unwrap cost; fix =
+  bake onto the voxel-solidified shell (design call, backlog). Also seen: live world.json was
+  rewritten 08:24 with shell:null (stale shell.glb on disk) and prop_integrity now 3/5 on the
+  current tree — pre-existing drift, not this wave.
+- **D2 typed export_glb (850d727)**: 9th allowlisted action on the restricted workflow
+  (:9877 MCP tool `export_blend_glb`): zero free-form params, staged output, glb_check
+  readback, receipt at _blender/exports/scene-vNNNN.{glb,json}. REAL headless Blender 4.5.11
+  integration test run this session (2 passed). Loop closes: export_glb → polish upload.
+
+**Awaiting RToony**: (1) `! bash ~/scripts/triforce-ue-station-prep.sh --apply` (RDP + Windows
+SDK), then the attended first light per the runbook (screenshot receipt → G:\splatlab-ue\
+receipts\); (2) branch is ~20 commits ahead, unpushed — push is his call; (3) visual-shell
+voxel-bake design call.
