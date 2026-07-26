@@ -1326,6 +1326,38 @@ export function SparkSceneViewer({
     scene.add(cropGroup);
     cropGroupRef.current = cropGroup;
 
+    // Brush cursor: a unit wireframe sphere scaled to the live brush radius,
+    // following the raycast hit while a paint mode is armed. Without it the
+    // operator aims blind (real complaint, 2026-07-26). Unit geometry +
+    // scale means slider changes never rebuild geometry.
+    const brushCursor = new THREE.Mesh(
+      new THREE.SphereGeometry(1, 24, 16),
+      new THREE.MeshBasicMaterial({ color: 0x22d3ee, wireframe: true, transparent: true, opacity: 0.5 }),
+    );
+    brushCursor.visible = false;
+    scene.add(brushCursor);
+    let brushRayAt = 0;
+    let paintDrag = false;
+    let lastStroke: THREE.Vector3 | null = null;
+    let strokeInFlight = false;
+    function updateBrushCursor(clientX: number, clientY: number): THREE.Vector3 | null {
+      // ~14 Hz raycast throttle — continuous raycasts on a 2M-splat scene
+      // would hitch the render loop.
+      const now = performance.now();
+      if (now - brushRayAt < 70) return null;
+      brushRayAt = now;
+      const hit = raycastAt(clientX, clientY);
+      if (hit) {
+        brushCursor.position.copy(hit);
+        const r = brushRadiusRef.current;
+        brushCursor.scale.setScalar(r);
+        brushCursor.visible = true;
+      } else {
+        brushCursor.visible = false;
+      }
+      return hit;
+    }
+
     function redrawCrop() {
       const group = cropGroupRef.current;
       if (!group) return;
@@ -1521,6 +1553,15 @@ export function SparkSceneViewer({
       downX = e.clientX;
       downY = e.clientY;
       if (e.button !== 0) return;
+      // Armed brush owns left-drag: hold and sweep to paint (disarm Painting
+      // to orbit again). Single clicks still stroke via onClick.
+      if (paintModeRef.current) {
+        paintDrag = true;
+        lastStroke = null;
+        controls.enabled = false;
+        renderer.domElement.setPointerCapture(e.pointerId);
+        return;
+      }
       const hit = endpointAt(e.clientX, e.clientY);
       if (hit) {
         drag = hit;
@@ -1529,6 +1570,24 @@ export function SparkSceneViewer({
       }
     }
     function onPointerMove(e: PointerEvent) {
+      if (paintModeRef.current && !drag) {
+        const hit = updateBrushCursor(e.clientX, e.clientY);
+        // Drag-to-paint: while the primary button is held, lay a stroke each
+        // time the cursor travels ~60% of a brush radius. One request in
+        // flight at a time; skipped hits just wait for the next move event.
+        if (paintDrag && hit && !strokeInFlight) {
+          const spacing = brushRadiusRef.current * 0.6;
+          if (!lastStroke || lastStroke.distanceTo(hit) >= spacing) {
+            lastStroke = hit.clone();
+            strokeInFlight = true;
+            Promise.resolve(strokeAtRef.current(hit)).finally(() => {
+              strokeInFlight = false;
+            });
+          }
+        }
+        return;
+      }
+      brushCursor.visible = false;
       if (!drag) return;
       const p = raycastAt(e.clientX, e.clientY);
       if (!p) return;
@@ -1538,6 +1597,17 @@ export function SparkSceneViewer({
       redrawDims();
     }
     function onPointerUp(e: PointerEvent) {
+      if (paintDrag) {
+        paintDrag = false;
+        lastStroke = null;
+        controls.enabled = true;
+        try {
+          renderer.domElement.releasePointerCapture(e.pointerId);
+        } catch {
+          /* already released */
+        }
+        return;
+      }
       if (!drag) return;
       const draggedId = drag.dimId;
       drag = null;
@@ -2300,9 +2370,9 @@ export function SparkSceneViewer({
                   <span className="shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">brush</span>
                   <input
                     type="range"
-                    min={0.02}
-                    max={0.4}
-                    step={0.01}
+                    min={sliderScale ? sliderScale.sphereMax / 400 : 0.02}
+                    max={sliderScale ? sliderScale.sphereMax / 8 : 0.4}
+                    step={sliderScale ? sliderScale.sphereMax / 400 : 0.01}
                     value={brushRadius}
                     onChange={(e) => setBrushRadius(Number(e.target.value))}
                     className="w-full"
@@ -2319,7 +2389,9 @@ export function SparkSceneViewer({
                   </label>
                 )}
                 <p className="text-[10px] leading-snug text-zinc-500">
-                  Click the scene to add sphere strokes ({selCount.toLocaleString()} splats selected, shown cyan).
+                  The cyan wireframe sphere is your brush. <b>Click</b> for one stroke or{" "}
+                  <b>hold and sweep</b> to paint ({selCount.toLocaleString()} splats selected, shown
+                  cyan). Camera orbit is paused while Painting is armed — toggle it off to navigate.
                 </p>
                 {paintTarget === "class" && (
                   <div className="space-y-1.5">
