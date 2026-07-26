@@ -26,6 +26,7 @@
     "react-dom": "^19.0.0",
     "tailwind-merge": "^2.6.1",
     "three": "0.183.2",
+    "three-mesh-bvh": "^0.9.13",
     "wouter": "^3.3.0"
   },
   "devDependencies": {

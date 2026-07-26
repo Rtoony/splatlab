@@ -8,6 +8,7 @@ import { Compass } from "lucide-react";
 const ScenesPage = lazy(() => import("@/pages/scenes"));
 const NewCapturePage = lazy(() => import("@/pages/new-capture"));
 const SplatViewPage = lazy(() => import("@/pages/splat-view"));
+const WorldViewPage = lazy(() => import("@/pages/world-view"));
 const FeedbackPage = lazy(() => import("@/pages/feedback"));
 
 function Loading() {
@@ -44,6 +45,10 @@ export default function App() {
           {/* Fullscreen workspace — no app shell. */}
           <Route path="/view/:jobId">
             <SplatViewPage />
+          </Route>
+          {/* Walkable world — pointer-locked, also no shell. */}
+          <Route path="/world/:jobId">
+            <WorldViewPage />
           </Route>
           <Route path="/feedback">
             <AppShell>
