@@ -45,6 +45,12 @@ def main() -> int:
         print(f"FATAL: only {len(pts)} ground gaussians at rel>={args.semantic_thresh}",
               file=sys.stderr)
         return 1
+    # Per-class scores (semantic_ground keeps the class axis since 2026-07-26);
+    # absent on legacy npz files -> classless build, same output as before.
+    class_ids = [str(x) for x in g["class_ids"]] if "class_ids" in g.files else None
+    class_rel_kept = (
+        g["class_rel"].astype(np.float32)[keep] if "class_rel" in g.files else None
+    )
 
     # ── cell-bin (verbatim ground_extract.py algorithm, scene-unit XY) ───────
     ij = np.floor(pts[:, :2] / args.cell_units).astype(np.int64)
@@ -52,9 +58,16 @@ def main() -> int:
     ij_sorted, z_sorted = ij[order], pts[order, 2]
     keys, starts = np.unique(ij_sorted, axis=0, return_index=True)
     cells: dict[tuple[int, int], float] = {}
+    cell_votes: dict[tuple[int, int], np.ndarray] = {}
+    rel_sorted = class_rel_kept[order] if class_rel_kept is not None else None
     for k, (s, e) in enumerate(zip(starts, list(starts[1:]) + [len(z_sorted)])):
         if e - s >= args.min_pts_cell:
-            cells[tuple(keys[k])] = float(np.percentile(z_sorted[s:e], 15))
+            key = tuple(keys[k])
+            cells[key] = float(np.percentile(z_sorted[s:e], 15))
+            if rel_sorted is not None:
+                # summed-score vote: every member gaussian's class evidence
+                # counts, not just its argmax — robust at class boundaries.
+                cell_votes[key] = rel_sorted[s:e].sum(axis=0)
 
     kept_cells: dict[tuple[int, int], float] = {}
     rejected = 0
@@ -88,12 +101,38 @@ def main() -> int:
         disconnected_dropped = len(kept_cells) - len(best_comp)
         kept_cells = {k: kept_cells[k] for k in best_comp}
 
-    ground = np.array([((i + 0.5) * args.cell_units, (j + 0.5) * args.cell_units, z)
-                       for (i, j), z in kept_cells.items()])
+    cell_keys = list(kept_cells.keys())
+    ground = np.array([((i + 0.5) * args.cell_units, (j + 0.5) * args.cell_units,
+                        kept_cells[(i, j)]) for (i, j) in cell_keys])
     if len(ground) < args.min_ground_points:
         print(f"FATAL: only {len(ground)} ground cells after filtering "
               f"(floor: {args.min_ground_points})", file=sys.stderr)
         return 1
+
+    # Per-cell class (TIN vertices are cell centers 1:1, so this array is also
+    # the per-VERTEX class). -1 = no class evidence in the cell.
+    class_counts: dict[str, int] = {}
+    if class_ids is not None:
+        votes = np.array([
+            cell_votes.get(k, np.zeros(len(class_ids), np.float32))
+            for k in cell_keys
+        ])
+        totals = votes.sum(axis=1)
+        cell_class = np.where(totals > 0, votes.argmax(axis=1), -1).astype(np.int16)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cell_conf = np.where(totals > 0, votes.max(axis=1) / np.maximum(totals, 1e-9), 0.0)
+        np.savez_compressed(
+            args.out_dir / "ground_class_cells.npz",
+            cell_ij=np.array(cell_keys, dtype=np.int64),
+            cell_units=np.float64(args.cell_units),
+            class_idx=cell_class,
+            conf=cell_conf.astype(np.float32),
+            class_ids=np.array(class_ids),
+        )
+        class_counts = {
+            cid: int((cell_class == i).sum()) for i, cid in enumerate(class_ids)
+            if int((cell_class == i).sum())
+        }
 
     # ── Delaunay TIN in XY, Z carried per vertex ─────────────────────────────
     tri = Delaunay(ground[:, :2])
@@ -113,7 +152,10 @@ def main() -> int:
         "ground_points": int(len(ground)), "triangles": int(len(tri.simplices)),
         "ground_z_range_units": [round(float(ground[:, 2].min()), 4),
                                  round(float(ground[:, 2].max()), 4)],
-        "artifacts": {"mesh": "ground_mesh_raw.ply"},
+        "class_cells": class_counts or None,
+        "artifacts": {"mesh": "ground_mesh_raw.ply",
+                      **({"class_cells": "ground_class_cells.npz"}
+                         if class_counts else {})},
     }
     (args.out_dir / "ground_mesh_build.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))

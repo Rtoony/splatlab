@@ -134,3 +134,29 @@ class TestSceneManifest:
         m["doctrine"] = "trust me"
         with pytest.raises(scene_manifest.ManifestError, match="doctrine"):
             scene_manifest.write_manifest(tmp_path, m)
+
+
+class TestClassTexturingStaysOffSurveyRails:
+    """Class-textured artifacts (P4) change SURFACING, never geometry — the
+    survey guard must neither block their capture-side inputs nor start
+    accepting anything generative because of them."""
+
+    def test_class_artifacts_are_not_quarantined(self, tmp_path: Path):
+        # The class lane's own outputs live outside _regen/ and untagged —
+        # survey inputs beside them stay acceptable.
+        ground = tmp_path / "_scene" / "ground"
+        ground.mkdir(parents=True)
+        (ground / "ground_class_cells.npz").write_bytes(b"npz")
+        (ground / "ground_atlas.png").write_bytes(b"png")
+        raw = _write_ply(ground / "ground_mesh_raw.ply", [])
+        # unchanged verdict: the raw ground mesh remains survey-usable
+        provenance.assert_not_generative(raw, lane="survey")
+
+    def test_classed_glb_itself_is_render_lane_only_by_provenance_note(self, tmp_path: Path):
+        # ground_classed.glb is a RENDER artifact; nothing in the survey lane
+        # consumes GLBs, and the quarantine rule is unchanged by its presence.
+        regen_asset = tmp_path / "_regen" / "objects" / "x" / "generated_mesh.glb"
+        regen_asset.parent.mkdir(parents=True)
+        regen_asset.write_bytes(b"glb")
+        with pytest.raises(provenance.GenerativeInputRefused):
+            provenance.assert_not_generative(regen_asset, lane="survey")

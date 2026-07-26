@@ -5639,6 +5639,7 @@ async def get_scene_proxy_file(
 SCENE_SEMANTIC_GROUND_SCRIPT = MESH_DIR / "semantic_ground.py"
 GROUND_MESH_BUILD_SCRIPT = MESH_DIR / "ground_mesh_build.py"
 GROUND_MESH_RECEIPT_SCRIPT = MESH_DIR / "ground_mesh_receipt.py"
+GROUND_TEXTURE_SCRIPT = MESH_DIR / "ground_texture.py"
 SCENE_GROUND_VRAM_MB = 6_000  # checkpoint load + SigLIP2 text encoder
 
 
@@ -5689,11 +5690,20 @@ async def scene_ground(request: Request, job_id: str, body: SceneGroundBody):
     async with lock:
         gg = out_dir / "ground_gaussians.npz"
 
+        sem_cmd = [
+            str(LANGFIELD_ENV_PYTHON), str(SCENE_SEMANTIC_GROUND_SCRIPT),
+            str(gauss_emb), str(config_path), str(gg),
+            "--taxonomy", str(class_taxonomy.TAXONOMY_PATH),
+        ]
+        # Post-crop honesty + user-paint precedence: both live in _langfield.
+        lf_dir = output_dir / LANGFIELD_DIRNAME
+        if (lf_dir / "ply_index_map.npy").is_file():
+            sem_cmd += ["--live-map", str(lf_dir / "ply_index_map.npy")]
+        if (lf_dir / "class_labels.json").is_file():
+            sem_cmd += ["--class-labels", str(lf_dir)]
+
         async def sem_operation() -> tuple[int, bytes, bytes]:
-            return await _run_capture_subprocess([
-                str(LANGFIELD_ENV_PYTHON), str(SCENE_SEMANTIC_GROUND_SCRIPT),
-                str(gauss_emb), str(config_path), str(gg),
-            ])
+            return await _run_capture_subprocess(sem_cmd)
         try:
             rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
                 lane="scene-ground", operation_id=job_id,
@@ -5730,12 +5740,38 @@ async def scene_ground(request: Request, job_id: str, body: SceneGroundBody):
             str(MESH_ENV_PYTHON), str(GROUND_MESH_RECEIPT_SCRIPT), str(ground_glb), str(out_dir),
         ])
 
+        # Class-textured ground — the first generative consumer of painted
+        # labels. Runs whenever class cells exist; FAIL-LOUD (the operator
+        # asked for classes; a silent skip would hide a broken lane).
+        classed_report = None
+        if (out_dir / "ground_class_cells.npz").is_file():
+            classed_glb = out_dir / "ground_classed.glb"
+            classed_cmd = [
+                str(MESH_ENV_PYTHON), str(GROUND_TEXTURE_SCRIPT),
+                str(out_dir / "ground_mesh_raw.ply"),
+                str(out_dir / "ground_class_cells.npz"),
+                str(class_taxonomy.TAXONOMY_PATH),
+                str(classed_glb),
+            ]
+            if mpu:
+                classed_cmd += ["--meters-per-unit", str(mpu)]
+            rc, _out, stderr = await _run_capture_subprocess(classed_cmd)
+            if rc != 0 or not classed_glb.is_file():
+                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Class-textured ground failed (exit {rc}): {tail}",
+                )
+            classed_report = json.loads(
+                (out_dir / "ground_texture_report.json").read_text())
+
         build_report = json.loads((out_dir / "ground_mesh_build.json").read_text())
         finish_report = (
             json.loads((out_dir / "twin_finish.json").read_text())
             if (out_dir / "twin_finish.json").is_file() else {}
         )
-        report = {"job_id": job_id, **build_report, "finish": finish_report}
+        report = {"job_id": job_id, **build_report, "finish": finish_report,
+                  "classed": classed_report}
         (out_dir / "ground.report.json").write_text(json.dumps(report, indent=2))
 
         fresh_scene_meta = (_read_meta(job_id) or {}).get("scene") or {}
@@ -5758,7 +5794,11 @@ async def scene_ground(request: Request, job_id: str, body: SceneGroundBody):
 
 
 @router.get("/jobs/{job_id}/scene/ground/file")
-async def get_scene_ground_file(job_id: str, fmt: Literal["report", "glb", "top", "oblique"] = "report"):
+async def get_scene_ground_file(
+    job_id: str,
+    fmt: Literal["report", "glb", "glb_classed", "atlas_classed",
+                 "report_classed", "top", "oblique"] = "report",
+):
     if not _safe_job_id(job_id):
         raise HTTPException(status_code=404, detail="Splat job not found")
     out_dir = _job_dir(job_id) / SCENE_DIRNAME / "ground"
@@ -5766,6 +5806,12 @@ async def get_scene_ground_file(job_id: str, fmt: Literal["report", "glb", "top"
         path, media = out_dir / "ground.report.json", "application/json"
     elif fmt == "glb":
         path, media = out_dir / "ground_mesh.glb", "model/gltf-binary"
+    elif fmt == "glb_classed":
+        path, media = out_dir / "ground_classed.glb", "model/gltf-binary"
+    elif fmt == "atlas_classed":
+        path, media = out_dir / "ground_atlas.png", "image/png"
+    elif fmt == "report_classed":
+        path, media = out_dir / "ground_texture_report.json", "application/json"
     else:
         path, media = out_dir / f"receipt_{fmt}.png", "image/png"
     if not path.is_file():

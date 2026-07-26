@@ -564,6 +564,56 @@ def dilate_atlas(tex, mask, passes: int = 24):
     return out, filled
 
 
+def _composite_class_texels(tex, verts_scene, faces, uvs, size: int,
+                            class_map_path, taxonomy_path, radius: float):
+    """Blend per-class procedural tiles into classed regions of a baked atlas.
+
+    Texel -> 3D via a second _rasterize_atlas pass (deterministic, ~5 s flat),
+    3D -> class via KDTree against the xyz-keyed class map with a hard radius
+    (no class = texel untouched). The blend ratio comes from each class's
+    taxonomy `blend_capture` (how much of the real capture colour survives).
+    Mutates `tex` in place; returns per-class texel fractions."""
+    from class_textures import sample_world, tile_for  # noqa: PLC0415
+
+    cm = np.load(class_map_path)
+    cm_xyz = cm["xyz"].astype(np.float32)
+    cm_cls = cm["class_idx"].astype(np.int64)
+    class_ids = [str(x) for x in cm["class_ids"]]
+    if not len(cm_xyz):
+        return None
+    taxonomy = json.loads(Path(taxonomy_path).read_text())
+    by_id = {c["id"]: c for c in taxonomy.get("classes", [])}
+
+    px, py, pos, _n = _rasterize_atlas(
+        verts_scene, faces, uvs * (size - 1), size, None)
+    if pos is None:
+        return None
+    # last-writer-wins dedup, identical to bake_texture's scatter resolution
+    winner = np.full(size * size, -1, dtype=np.int64)
+    winner[py.astype(np.int64) * size + px] = np.arange(len(px))
+    keep = winner[winner >= 0]
+    px, py, pos = px[keep], py[keep], pos[keep]
+
+    dist, idx = cKDTree(cm_xyz).query(pos, k=1, workers=-1,
+                                      distance_upper_bound=radius)
+    matched = np.isfinite(dist)
+    fractions: dict[str, float] = {}
+    total_texels = float(size * size)
+    for ci, cid in enumerate(class_ids):
+        sel = matched & (cm_cls[idx.clip(max=len(cm_cls) - 1)] == ci)
+        if not bool(sel.any()):
+            continue
+        entry = by_id.get(cid, {"id": cid})
+        blend = float(((entry.get("generative") or {}).get("blend_capture", 0.25)))
+        tile = tile_for(entry, 512)
+        tile_rgb = sample_world(tile, pos[sel, 0], pos[sel, 1], 64.0).astype(np.float32)
+        base = tex[py[sel], px[sel]].astype(np.float32)
+        tex[py[sel], px[sel]] = np.clip(
+            tile_rgb * (1.0 - blend) + base * blend, 0, 255).astype(np.uint8)
+        fractions[cid] = round(float(sel.sum()) / total_texels, 4)
+    return fractions or None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("mesh")
@@ -603,6 +653,16 @@ def main() -> int:
     # faces). Changes atlas layout — see _parametrize_chunked. Default 1 keeps
     # every existing lane byte-identical.
     ap.add_argument("--unwrap-chunks", type=int, default=1)
+    # xyz-keyed class map {xyz [M,3] f32, class_idx int16, class_ids} — texels
+    # near a classed position composite a procedural class tile over the baked
+    # gaussian colour ("representative but faked" surfacing; geometry and the
+    # survey lane untouched). xyz-keyed because the shell's colour source is a
+    # SUBSET ply whose row numbers don't transfer.
+    ap.add_argument("--class-map", default=None)
+    ap.add_argument("--class-taxonomy", default=None,
+                    help="taxonomy json for tile params (required with --class-map)")
+    ap.add_argument("--class-radius", type=float, default=0.15,
+                    help="scene-unit match radius texel->classed position")
     ap.add_argument("--report", default=None)
     args = ap.parse_args()
     t0 = time.time()
@@ -767,6 +827,15 @@ def main() -> int:
             coverage_rasterized = float(mask.mean())
             tex, shipped_mask = dilate_atlas(
                 tex, mask, passes=max(16, args.texture_size // 48))
+            class_fractions = None
+            if args.class_map and args.class_taxonomy:
+                # Class compositing AFTER dilation (dilation is colour-only;
+                # classes are decided from 3D positions, so bleed can't smear
+                # them past the match radius).
+                class_fractions = _composite_class_texels(
+                    tex, verts_scene, faces, uvs, args.texture_size,
+                    Path(args.class_map), Path(args.class_taxonomy),
+                    args.class_radius)
             tex_img = Image.fromarray(tex, mode="RGB")
             # Also write the atlas beside the GLB. The GLB embeds it, but a
             # standalone PNG is what lets the UI show a thumbnail, lets a human
@@ -785,6 +854,7 @@ def main() -> int:
                 "coverage_rasterized": round(coverage_rasterized, 4),
                 "unwrap_seconds": uv_seconds,
                 "unwrap_chunks": max(1, args.unwrap_chunks),
+                "class_texel_fractions": class_fractions,
                 "charts_uv_range": [round(float(uvs.min()), 4), round(float(uvs.max()), 4)],
                 "atlas_png": atlas_path.name,
                 "atlas_bytes": atlas_path.stat().st_size,

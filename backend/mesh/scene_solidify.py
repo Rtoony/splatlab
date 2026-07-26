@@ -233,11 +233,15 @@ def run_object_texture(py: Path, script: Path, mesh: Path, splat: Path, out_glb:
                        *, mpu, faces: int, tex: int, reconstruct: bool,
                        crop: bool, smooth: bool = True, timeout: int = 1800,
                        min_gaussians: int | None = None,
-                       unwrap_chunks: int = 1) -> dict:
+                       unwrap_chunks: int = 1,
+                       class_map: Path | None = None) -> dict:
     cmd = [str(py), str(script), str(mesh), str(splat), str(out_glb),
            "--target-faces", str(faces), "--texture-size", str(tex)]
     if unwrap_chunks > 1:
         cmd += ["--unwrap-chunks", str(unwrap_chunks)]
+    if class_map is not None:
+        taxonomy = Path(__file__).resolve().parents[1] / "class_taxonomy.json"
+        cmd += ["--class-map", str(class_map), "--class-taxonomy", str(taxonomy)]
     if mpu:
         cmd += ["--meters-per-unit", str(mpu)]
     if smooth:
@@ -277,6 +281,33 @@ def _shell_colour_source(job_dir: Path) -> Path:
     return splat
 
 
+def _materialize_class_map(job_dir: Path, conf_floor: float = 0.6) -> Path | None:
+    """xyz-keyed class map for the shell bake, from semantic_ground's
+    class-aware npz (user paints are one-hot 1.0 there, so paint precedence
+    rides along for free). None when the ground lane hasn't produced classes."""
+    gg = job_dir / "_scene" / "ground" / "ground_gaussians.npz"
+    if not gg.is_file():
+        return None
+    d = np.load(gg)
+    if "class_rel" not in d.files:
+        return None
+    class_rel = d["class_rel"].astype(np.float32)
+    conf = class_rel.max(axis=1)
+    keep = conf >= conf_floor
+    if not bool(keep.any()):
+        return None
+    out = job_dir / "_world" / "_work" / "class_map.npz"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        out,
+        xyz=d["xyz"][keep].astype(np.float32),
+        class_idx=class_rel[keep].argmax(axis=1).astype(np.int16),
+        class_ids=d["class_ids"],
+    )
+    _log(f"  class map: {int(keep.sum())} classed gaussians -> {out.name}")
+    return out
+
+
 def build_shell(job_dir: Path, args, instances, py: Path, script: Path, mpu) -> dict:
     """The visual shell, from one of two geometry sources.
 
@@ -310,13 +341,16 @@ def build_shell(job_dir: Path, args, instances, py: Path, script: Path, mpu) -> 
             cut = build_shell_mesh(job_dir, instance_boxes(instances), geom)
         splat = _shell_colour_source(job_dir)
         out = world / "shell.glb"
+        class_map = _materialize_class_map(job_dir)
+        if class_map is not None:
+            shell["classed"] = True
         # Chunked unwrap is what makes dense-shell budgets tractable
         # (13x measured at 400k faces); the layout change is confined to
         # the shell, whose consumers treat GLB+atlas as a regenerated pair.
         res = run_object_texture(py, script, geom, splat, out, mpu=mpu,
                                  faces=args.shell_faces, tex=args.shell_texture_size,
                                  reconstruct=False, crop=False, timeout=3600,
-                                 unwrap_chunks=4)
+                                 unwrap_chunks=4, class_map=class_map)
         shell.update(cut=cut, built=res["ok"], seconds=res["seconds"],
                      glb=out.name if res["ok"] else None)
         if not res["ok"]:
