@@ -1,0 +1,306 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://splatlab.local/schemas/parametric-archetype-v1.json",
+  "title": "SplatLab parametric archetype v1 — lathe with radial features",
+  "description": "A DETERMINISTIC build recipe for a scan-guided clean solid. A model (or a human) fills in numbers; parametric_build.py turns numbers into geometry. Nothing here is geometry or code — that separation is what keeps the output editable, re-runnable and reviewable. Every length is in METRES in the object's own model frame: z = 0 at grade (the underside of the base flange), +z up, azimuth measured CCW from +x. Heights measured off an object-lane mesh are in THAT mesh's frame, which usually includes a ground slab — subtract provenance.grade_offset_m before writing them here, or the features land too high (this has already cost one build: the nozzles ended up on the dome).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "archetype",
+    "name",
+    "units",
+    "provenance",
+    "segments",
+    "shade_auto_smooth_deg",
+    "materials",
+    "profile",
+    "features",
+    "flange_bolts",
+    "crown_nut"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "parametric-archetype/1",
+      "description": "Exact version tag. A different value must be rejected, not coerced."
+    },
+    "archetype": {
+      "enum": ["lathe_with_features"],
+      "description": "The only archetype v1 knows how to build: a solid of revolution plus radial features, optional flange bolt ring, optional crown nut."
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+      "description": "Slug for the built object and its material names. kebab/snake, lower case."
+    },
+    "units": {
+      "const": "meters",
+      "description": "v1 is metric-only. Declaring it makes an unconverted scan-unit instance a loud failure rather than a 2x-scale surprise."
+    },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "segments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lathe", "feature"],
+      "properties": {
+        "lathe": {
+          "type": "integer",
+          "minimum": 8,
+          "maximum": 512,
+          "description": "Radial segments of the body revolve. 72 = 5 deg, the proven default."
+        },
+        "feature": {
+          "type": "integer",
+          "minimum": 4,
+          "maximum": 128,
+          "description": "Radial segments of feature tubes (necks, caps). 24 is the proven default."
+        }
+      }
+    },
+    "shade_auto_smooth_deg": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 180,
+      "description": "Smooth-by-angle threshold. 40 keeps the barrel round while leaving flange/collar edges crisp."
+    },
+    "materials": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 16,
+      "description": "Material ROLES, keyed by role name (body, cap, metal, ...). Features and hardware reference these role names. Every declared role MUST receive geometry — an unused role is a schema/reality mismatch and is rejected, not silently dropped by the exporter.",
+      "additionalProperties": { "$ref": "#/$defs/material" }
+    },
+    "profile": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 512,
+      "description": "The lathe profile: an ordered (radius, height) polyline revolved about +z. MUST start and end on the axis (radius 0) so the solid is closed. Heights are non-decreasing and measured from grade. This is where a measured radius-vs-height table goes, verbatim.",
+      "items": { "$ref": "#/$defs/profile_point" }
+    },
+    "features": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 64,
+      "description": "Radial features (nozzles, bosses) attached to the body surface. Azimuth and height come from radial lobe analysis of the scan; form and colour role come from the photo.",
+      "items": { "$ref": "#/$defs/feature" }
+    },
+    "flange_bolts": {
+      "oneOf": [{ "$ref": "#/$defs/flange_bolts" }, { "type": "null" }],
+      "description": "Bolt ring on the base flange, or explicit null for 'this archetype has no flange bolts'. The key is REQUIRED so 'no bolts' is a decision on the record rather than an omission."
+    },
+    "crown_nut": {
+      "oneOf": [{ "$ref": "#/$defs/crown_nut" }, { "type": "null" }],
+      "description": "Operating nut on the crown, or explicit null. Note: on a scan the nut is usually fused into the dome and already present in the measured profile — adding one then double-counts the height. Null is the correct value for a purely measured instance."
+    }
+  },
+  "$defs": {
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "source", "meters_per_unit", "grade_offset_m", "generated_at", "notes", "measurement"],
+      "description": "Where the numbers came from. Not decoration: grade_offset_m is the single value that most often ruins a build.",
+      "properties": {
+        "method": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 200,
+          "description": "How this instance was produced, e.g. 'parametric_build.py measure v1' or 'vision model from crop.png + measured profile'."
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "description": "The artifact the numbers were read off — usually an object-lane mesh path, plus the photo used for form."
+        },
+        "meters_per_unit": {
+          "type": ["number", "null"],
+          "exclusiveMinimum": 0,
+          "maximum": 10000,
+          "description": "Scene-unit -> metre calibration applied to the source, or null when the source was already metric. Recorded so a re-measure is reproducible."
+        },
+        "grade_offset_m": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Height of grade in the SOURCE mesh's own frame, already subtracted from every height in this instance. An object-lane mesh normally carries a ground slab; leaving this at 0 when the slab is present is the trap that puts nozzles on the dome."
+        },
+        "generated_at": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 40,
+          "description": "ISO-8601 timestamp."
+        },
+        "notes": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "type": "string", "maxLength": 500 },
+          "description": "Free text — especially anything a downstream reviewer must not assume was measured."
+        },
+        "measurement": {
+          "type": ["object", "null"],
+          "description": "Free-form receipt of the measurement pass (axis, centre, band size, estimator percentiles, detected lobes). Unconstrained on purpose: it records, it does not restrict."
+        }
+      }
+    },
+    "material": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "base_color", "roughness", "metallic", "source"],
+      "properties": {
+        "slot": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 15,
+          "description": "Material slot index on the joined object. Slots must be unique and contiguous from 0 so the build order (and therefore the exported material order) is deterministic."
+        },
+        "base_color": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "type": "number", "minimum": 0, "maximum": 1 },
+          "description": "Linear RGBA. A colour sampled off the scan is SHADED albedo and reads darker than the real paint; lift it deliberately if you want the painted look."
+        },
+        "roughness": { "type": "number", "minimum": 0, "maximum": 1 },
+        "metallic": { "type": "number", "minimum": 0, "maximum": 1 },
+        "source": {
+          "enum": ["measured", "photo", "assumed", "manual"],
+          "description": "Where the colour came from. 'assumed' is legal but must be stated."
+        }
+      }
+    },
+    "profile_point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["r", "z"],
+      "properties": {
+        "r": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 50,
+          "description": "Radius from the axis, metres. 0 closes the solid (first and last point must be 0)."
+        },
+        "z": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Height above grade, metres. Non-decreasing along the array."
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Optional: why this control point is where it is."
+        }
+      }
+    },
+    "feature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name", "type", "azimuth_deg", "height_m", "tilt_deg", "inset_m",
+        "neck_radius_m", "neck_length_m", "collar_radius_scale", "collar_length_m",
+        "cap_radius_m", "cap_length_m", "nut_radius_m", "nut_length_m", "nut_sides",
+        "body_material", "cap_material", "nut_material", "derivation"
+      ],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$" },
+        "type": {
+          "enum": ["nozzle", "boss"],
+          "description": "'nozzle' = neck + collar + cap + nut. 'boss' = neck only; its cap_* and nut_* fields MUST be null."
+        },
+        "azimuth_deg": {
+          "type": "number",
+          "minimum": 0,
+          "exclusiveMaximum": 360,
+          "description": "CCW from +x in the model frame, degrees. From the scan's radial lobes."
+        },
+        "height_m": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Axis height of the feature centreline ABOVE GRADE. Must sit on the body: the profile radius there has to exceed the neck radius."
+        },
+        "tilt_deg": {
+          "type": "number",
+          "minimum": -60,
+          "maximum": 60,
+          "description": "Degrees above horizontal (positive = pointing up)."
+        },
+        "inset_m": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "How far inside the body surface the neck starts, so it merges instead of floating. ~1/3 of the local body radius works."
+        },
+        "neck_radius_m": { "type": "number", "exclusiveMinimum": 0, "maximum": 10 },
+        "neck_length_m": { "type": "number", "exclusiveMinimum": 0, "maximum": 10, "description": "Radial reach of the neck from the body surface." },
+        "collar_radius_scale": { "type": "number", "minimum": 1, "maximum": 3, "description": "Collar ridge radius as a multiple of the neck radius. 1.0 = no visible ridge." },
+        "collar_length_m": { "type": "number", "minimum": 0, "maximum": 1 },
+        "cap_radius_m": { "type": ["number", "null"], "exclusiveMinimum": 0, "maximum": 10 },
+        "cap_length_m": { "type": ["number", "null"], "exclusiveMinimum": 0, "maximum": 10 },
+        "nut_radius_m": { "type": ["number", "null"], "exclusiveMinimum": 0, "maximum": 10 },
+        "nut_length_m": { "type": ["number", "null"], "exclusiveMinimum": 0, "maximum": 10 },
+        "nut_sides": { "type": ["integer", "null"], "minimum": 3, "maximum": 64 },
+        "body_material": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$", "description": "Role name for the neck and collar. Must exist in materials." },
+        "cap_material": { "type": ["string", "null"], "pattern": "^[a-z][a-z0-9_]{0,31}$", "description": "Role name for the cap; null only for type 'boss'." },
+        "nut_material": { "type": ["string", "null"], "pattern": "^[a-z][a-z0-9_]{0,31}$", "description": "Role name for the cap nut; null only for type 'boss'." },
+        "derivation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "notes"],
+          "properties": {
+            "source": { "enum": ["measured", "photo", "assumed", "manual"] },
+            "notes": { "type": "string", "maxLength": 500 },
+            "evidence": {
+              "type": ["object", "null"],
+              "description": "Free-form: the lobe statistics this feature came from (bands, span, reach, prominence)."
+            }
+          }
+        }
+      }
+    },
+    "flange_bolts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "circle_radius_m", "head_radius_m", "head_height_m", "seat_height_m", "sides", "material", "derivation"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 2, "maximum": 64, "description": "A TSDF scan of a painted hydrant does not resolve individual bolt heads — this is normally a photo or operator value, so say so in derivation.source." },
+        "circle_radius_m": { "type": "number", "exclusiveMinimum": 0, "maximum": 10, "description": "Bolt-circle radius. Must fit inside the flange rim (circle + head <= max profile radius)." },
+        "head_radius_m": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "head_height_m": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "seat_height_m": { "type": "number", "minimum": 0, "maximum": 100, "description": "Height of the flange top face the heads stand on." },
+        "sides": { "type": "integer", "minimum": 3, "maximum": 64, "description": "6 = hex head." },
+        "material": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+        "derivation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "notes"],
+          "properties": {
+            "source": { "enum": ["measured", "photo", "assumed", "manual"] },
+            "notes": { "type": "string", "maxLength": 500 }
+          }
+        }
+      }
+    },
+    "crown_nut": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["radius_m", "height_m", "sides", "seat_inset_m", "material", "derivation"],
+      "properties": {
+        "radius_m": { "type": "number", "exclusiveMinimum": 0, "maximum": 10 },
+        "height_m": { "type": "number", "exclusiveMinimum": 0, "maximum": 10 },
+        "sides": { "type": "integer", "minimum": 3, "maximum": 64, "description": "5 = the pentagon operating nut on most municipal hydrants." },
+        "seat_inset_m": { "type": "number", "minimum": 0, "maximum": 1, "description": "How far below the profile apex the nut is seated so it does not float." },
+        "material": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+        "derivation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "notes"],
+          "properties": {
+            "source": { "enum": ["measured", "photo", "assumed", "manual"] },
+            "notes": { "type": "string", "maxLength": 500 }
+          }
+        }
+      }
+    }
+  }
+}
