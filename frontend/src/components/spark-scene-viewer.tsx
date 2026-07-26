@@ -327,6 +327,26 @@ export function SparkSceneViewer({
   const [classNotice, setClassNotice] = useState<string | null>(null);
   const [showClassLayer, setShowClassLayer] = useState(false);
 
+  useEffect(() => {
+    if (paintTarget === "class" && selectedClassId && taxonomy) {
+      const hex = taxonomy.find((c) => c.id === selectedClassId)?.color;
+      if (hex) {
+        paintTintRef.current = [
+          parseInt(hex.slice(1, 3), 16) / 255,
+          parseInt(hex.slice(3, 5), 16) / 255,
+          parseInt(hex.slice(5, 7), 16) / 255,
+        ];
+        paintCursorHexRef.current = parseInt(hex.slice(1), 16);
+        refreshModifierRef.current();
+        return;
+      }
+    }
+    paintTintRef.current = [0.13, 0.83, 0.93];
+    paintCursorHexRef.current = 0x22d3ee;
+    refreshModifierRef.current();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paintTarget, selectedClassId, taxonomy]);
+
   async function loadClassTaxonomy() {
     try {
       const data = await apiRequest<{ classes: { id: string; display: string; color: string; category: string }[] }>(
@@ -471,6 +491,22 @@ export function SparkSceneViewer({
     } finally {
       setRebuildBusy(false);
     }
+  }
+
+  // Log-scale slider mapping: fine steps at small radii, still reaches the
+  // whole scene — the linear slider was unusable in both directions at once.
+  function logSlider(current: number, min: number, max: number, onValue: (v: number) => void) {
+    const lmin = Math.log(min);
+    const lmax = Math.log(max);
+    const t = (Math.log(Math.min(Math.max(current, min), max)) - lmin) / (lmax - lmin);
+    return {
+      min: 0,
+      max: 1000,
+      step: 1,
+      value: Math.round(t * 1000),
+      onChange: (e: React.ChangeEvent<HTMLInputElement>) =>
+        onValue(Math.exp(lmin + (Number(e.target.value) / 1000) * (lmax - lmin))),
+    };
   }
 
   // Crop-slider ranges derived from the loaded scene's bbox (set once per
@@ -708,6 +744,12 @@ export function SparkSceneViewer({
   applyOverlayRef.current = () => refreshModifierRef.current();
 
   // ---- paint-the-embeddings ----------------------------------------------
+  // Selection tint follows the tool: cyan for field paint, the CLASS COLOR
+  // while class painting — so grass strokes look green, pavement grey, and
+  // switching chips re-tints the live selection instantly.
+  const paintTintRef = useRef<[number, number, number]>([0.13, 0.83, 0.93]);
+  const paintCursorHexRef = useRef(0x22d3ee);
+
   function previewSelection() {
     const mesh = meshRef.current;
     if (!mesh) return;
@@ -719,7 +761,7 @@ export function SparkSceneViewer({
     mesh.worldModifier = buildOverlayModifier({
       scalarArray,
       channelCount: 1,
-      channelColors: [[0.13, 0.83, 0.93]], // selection cyan
+      channelColors: [paintTintRef.current],
       channelEnabled: [dyno.dynoBool(true)],
       mode: "highlight",
       ramp: rampName,
@@ -1433,7 +1475,7 @@ export function SparkSceneViewer({
             : Math.min(...boxExtentsRef.current);
         brushCursor.scale.setScalar(Math.max(r, 1e-4));
         (brushCursor.material as THREE.MeshBasicMaterial).color.setHex(
-          paintArmed ? 0x22d3ee : 0xf87171,
+          paintArmed ? paintCursorHexRef.current : 0xf87171,
         );
         brushCursor.visible = true;
       } else {
@@ -1803,6 +1845,35 @@ export function SparkSceneViewer({
     function onKeyDown(e: KeyboardEvent) {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+      // Tool shortcuts (predictable-editor conventions, requested 2026-07-26):
+      // Esc = exit the armed tool · [ / ] = shrink/grow the active tool's
+      // sphere · Z = undo the last paint stroke while painting.
+      if (e.code === "Escape") {
+        if (paintModeRef.current || cropModeRef.current || boxModeRef.current || measureArmRef.current) {
+          setPaintMode(false);
+          setCropMode(false);
+          setBoxMode(false);
+          setMeasureArm(false);
+          brushCursor.visible = false;
+          e.preventDefault();
+        }
+        return;
+      }
+      if (e.code === "BracketLeft" || e.code === "BracketRight") {
+        const factor = e.code === "BracketRight" ? 1.25 : 0.8;
+        if (paintModeRef.current) setBrushRadius((r) => r * factor);
+        else if (cropModeRef.current) setCropRadius((r) => r * factor);
+        else if (boxModeRef.current) {
+          setBoxExtents((prev) => [prev[0] * factor, prev[1] * factor, prev[2] * factor]);
+        } else return;
+        e.preventDefault();
+        return;
+      }
+      if (e.code === "KeyZ" && !e.ctrlKey && !e.metaKey && paintModeRef.current) {
+        undoStroke();
+        e.preventDefault();
+        return;
+      }
       switch (e.code) {
         case "KeyW":
           panCamera(0, KEY_PAN_SPEED);
@@ -2458,12 +2529,8 @@ export function SparkSceneViewer({
                   <span className="shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">brush</span>
                   <input
                     type="range"
-                    min={sliderScale ? sliderScale.sphereMax / 400 : 0.02}
-                    max={sliderScale ? sliderScale.sphereMax / 8 : 0.4}
-                    step={sliderScale ? sliderScale.sphereMax / 400 : 0.01}
-                    value={brushRadius}
-                    onChange={(e) => setBrushRadius(Number(e.target.value))}
                     className="w-full"
+                    {...logSlider(brushRadius, (sliderScale?.sphereMax ?? 5) / 2000, (sliderScale?.sphereMax ?? 5) / 8, setBrushRadius)}
                   />
                   <span className="w-16 shrink-0 text-right text-zinc-400">
                     {metersPerUnit ? `${(brushRadius * metersPerUnit).toFixed(2)} m` : `${brushRadius.toFixed(2)} u`}
@@ -2769,12 +2836,8 @@ export function SparkSceneViewer({
                   <span className="shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">radius</span>
                   <input
                     type="range"
-                    min={sliderScale ? sliderScale.sphereMax / 200 : 0.05}
-                    max={sliderScale?.sphereMax ?? 5}
-                    step={sliderScale ? sliderScale.sphereMax / 200 : 0.05}
-                    value={cropRadius}
-                    onChange={(e) => setCropRadius(Number(e.target.value))}
                     className="w-full"
+                    {...logSlider(cropRadius, (sliderScale?.sphereMax ?? 5) / 2000, sliderScale?.sphereMax ?? 5, setCropRadius)}
                   />
                   <span className="w-16 shrink-0 text-right text-zinc-400">
                     {metersPerUnit ? `${(cropRadius * metersPerUnit).toFixed(2)} m` : `${cropRadius.toFixed(2)} u`}
@@ -2846,18 +2909,14 @@ export function SparkSceneViewer({
                     <span className="w-8 shrink-0 text-[10px] uppercase tracking-wide text-zinc-500">±{axis}</span>
                     <input
                       type="range"
-                      min={sliderScale ? sliderScale.boxMax[ai] / 200 : 0.05}
-                      max={sliderScale?.boxMax[ai] ?? 5}
-                      step={sliderScale ? sliderScale.boxMax[ai] / 200 : 0.05}
-                      value={boxExtents[ai]}
-                      onChange={(e) =>
+                      className="w-full"
+                      {...logSlider(boxExtents[ai], (sliderScale?.boxMax[ai] ?? 5) / 2000, sliderScale?.boxMax[ai] ?? 5, (v) =>
                         setBoxExtents((prev) => {
                           const next = [...prev] as [number, number, number];
-                          next[ai] = Number(e.target.value);
+                          next[ai] = v;
                           return next;
-                        })
-                      }
-                      className="w-full"
+                        }),
+                      )}
                     />
                     <span className="w-16 shrink-0 text-right text-zinc-400">
                       {metersPerUnit ? `${(boxExtents[ai] * metersPerUnit).toFixed(2)} m` : `${boxExtents[ai].toFixed(2)} u`}
