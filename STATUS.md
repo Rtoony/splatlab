@@ -2098,3 +2098,61 @@ Taxonomy fixed+extensible; first gen output = class-textured ground; testbed = b
   /scene/ground (paint precedence) → optionally solidify --shell-source voxel for the
   classed shell + /world walk. Worker note: language tools need
   `systemctl --user start splatlab-langfield` (on-demand by design, :3425).
+
+## SPARK EDITOR PROFESSIONALIZATION (2026-07-26 late; plan enchanted-shimmying-hollerith)
+RToony: "polish the edit tools + make it a more professional software experience,
+e.g. Esc should cancel paint mode." Frontend-only wave, `6081ee9..2fbb300`.
+Backend untouched — no restart window, `npm run build` alone deployed it.
+
+- **Baseline commit `6081ee9`**: the working tree already held an uncommitted first
+  cut from 15:41 (log-scale sliders, class-coloured brush tint, first-cut Esc/[/]/Z).
+  Landed alone as a rollback point before building on it. Also corrected a stale
+  receipt: recent commits claimed "eslint 0 errors" but HEAD actually had 1 (unused
+  `setStrokeBusy`) — proven by stashing the diff and re-running eslint.
+- **`lib/viewer-shortcuts.ts` (`e9cb5da`)** — pure `resolveShortcut` / `escapeAction` /
+  `stepRadius`. The input layer lives in ONE `useEffect([url])` and is unreachable
+  from a test; there is no DOM test runner here. 21 tests, **falsification-proven**
+  (inverted the Esc ladder + dropped the clamp → 3 failures; restored → green).
+- **Esc is a ladder, and never eats work**: cancel a pending confirm → clear an
+  unapplied placement → disarm. RToony's explicit call: an uncommitted paint
+  selection is NEVER discarded by Esc. So the new **ToolHud** (top-centre, solid
+  `#0a0f1a`) always shows `N splats selected · not committed [Discard]` even with no
+  tool armed — that state was previously invisible-but-live.
+- **Four disarm holes closed**: `measureArm` never disarmed paint (and `onClick`
+  tests paint FIRST, so arming the ruler silently kept painting); leaving Measure
+  left paint+ruler armed; the paint section could unmount on a stale langfield with
+  `paintMode` still true; `pointercancel` was unhandled so a cancelled drag left
+  `controls.enabled=false` **permanently** ("orbit broke"). Also: dblclick no longer
+  places a crop centre AND yanks the orbit pivot; Ctrl+S reaches the browser again.
+- **Keys**: `B`/`C`/`Shift+C`/`M` tools — and a tool key **switches to the tab that
+  owns the tool**, so a shortcut can never arm something invisible. `[ ]` size
+  (clamped to the slider's OWN bounds — one shared `brushBounds`/`cropBounds`/
+  `boxBounds` definition), `Ctrl+Z`/`Ctrl+Shift+Z` (new redo stack, invalidated by
+  any new stroke), `Enter` commits (arm-then-apply on destructive crops), `Del`
+  discards, `1`–`9` pick a class (taxonomy is exactly 9), `?` help, `0` reset view,
+  `H` hide chrome. Everything state-reading goes through a **ref trampoline** —
+  a direct binding acts on whatever was true when the scene last reloaded.
+- **ShortcutLegend rewritten**: it listed 3 camera lines and its comment claimed
+  `F/G` + `=/-` bindings **that never existed in Spark**. Every row is now wired and
+  tested. `Kbd` chip promoted out of world-view.
+- **SizeControl**: log slider + a typed exact box — you cannot land on 0.37 m twice
+  by dragging, and "same radius as last time" is a real need.
+- **One progress rail (`2fbb300`)**: the page rail already covered everything but 8
+  section-local rails were never removed → two identical rails at once. Deleting them
+  naively would have regressed (the page rail was only instant for viewer crops), so
+  `EditLane` now reports `onBusyChange` up and the page ORs it in; unmount reports
+  false so a mid-op tab switch can't strand it. Tab also syncs to `?tab=`.
+- **Gates**: eslint **1 error → 0**, vitest **14 → 35/35**, tsc-gated build green,
+  backend suite untouched at 699 passed / 6 skipped. Deploy confirmed structurally
+  (new UI strings present in the built bundle, serves HTTP 200).
+- ⚠️ **NOT driven in a real browser** — the Chrome extension is disconnected and
+  playwright has no chromium. The live pass is RToony's; see the plan file.
+- ⚠️ **PARKED: `POST /jobs/{id}/duplicate`** stays uncommitted in `splat_route.py`
+  (+ untracked `test_duplicate_route.py`). Before it ships, the hardlink set MUST be
+  fixed: `_DUP_HARDLINK_LANGFIELD = {gauss_emb.npz, ckpt_xyz.npy}` shares inodes and
+  `backend/langfield/langfield_v2.py:172` writes `gauss_emb.npz` with a plain
+  `np.savez_compressed` (truncating, in-place) — a language-field **re-lift** on
+  either copy would destroy **both** scenes' fields. (`langfield_realign.py` is safe:
+  tmp+replace, so the *rebuild* path is fine; only re-lift is lethal.) Secondary:
+  `_DUP_IGNORE` isn't applied to the `processed`/`colmap` hardlink branch. A
+  real-copy duplicate is ~5.8 GB/scene on a disk at 87%.
