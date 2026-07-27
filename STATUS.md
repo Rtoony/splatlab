@@ -2147,15 +2147,8 @@ Backend untouched — no restart window, `npm run build` alone deployed it.
   (new UI strings present in the built bundle, serves HTTP 200).
 - ⚠️ **NOT driven in a real browser** — the Chrome extension is disconnected and
   playwright has no chromium. The live pass is RToony's; see the plan file.
-- ⚠️ **PARKED: `POST /jobs/{id}/duplicate`** stays uncommitted in `splat_route.py`
-  (+ untracked `test_duplicate_route.py`). Before it ships, the hardlink set MUST be
-  fixed: `_DUP_HARDLINK_LANGFIELD = {gauss_emb.npz, ckpt_xyz.npy}` shares inodes and
-  `backend/langfield/langfield_v2.py:172` writes `gauss_emb.npz` with a plain
-  `np.savez_compressed` (truncating, in-place) — a language-field **re-lift** on
-  either copy would destroy **both** scenes' fields. (`langfield_realign.py` is safe:
-  tmp+replace, so the *rebuild* path is fine; only re-lift is lethal.) Secondary:
-  `_DUP_IGNORE` isn't applied to the `processed`/`colmap` hardlink branch. A
-  real-copy duplicate is ~5.8 GB/scene on a disk at 87%.
+- ✅ **SHIPPED instead (`096bece`) — see the DUPLICATE section below.** The parked
+  draft's hardlink optimisation was unsafe and was removed rather than repaired.
 
 ## LIVE-VERIFIED IN A REAL BROWSER (2026-07-26, same night) — the wave above is now proven
 RToony: "connect with playwright and install chromium. I want this feature for you."
@@ -2205,3 +2198,40 @@ keystrokes/clicks and asserts against the real DOM.
   `.disabled\:bg-accent\/30:disabled{...}`; in a real browser the nav computes
   `rgba(5,7,13,0.85)` (was transparent) while body is still `rgb(5,7,13)` — unchanged.
   vitest 35 → 49, live editor gate 23/23, screenshot reviewed.
+
+
+## DUPLICATE A SCENE SHIPPED + LIVE-PROVEN (2026-07-26 night) — edit the copy, keep the original
+`096bece`. RToony: "fix the hardlink hazard and wire up duplicate."
+
+- **The hazard was real and the fix was to delete the optimisation, not repair it.** The
+  parked draft hardlinked `processed/`, `colmap/` and `_langfield/gauss_emb.npz` on the
+  claim that they are only ever added to. False where it matters: **colmap opens
+  `colmap/database.db` read-write (SQLite, in place)** and
+  `backend/langfield/langfield_v2.py:172` writes `gauss_emb.npz` with a plain
+  `np.savez_compressed` — a **truncate-in-place** write. Either corrupts the ORIGINAL,
+  the exact disaster the feature prevents. Note `rm -rf` on a hardlink is SAFE (it
+  unlinks one name), so the reroute path that clears `processed/` was never the risk —
+  **in-place writes were**. ext4 here has no reflink, so there is no COW middle ground.
+- **The speed argument was hollow anyway**: real copy of splat_6b2e82e5 (486,960
+  gaussians) = **0.7 s / 1.50 GiB** on NVMe.
+- Also in the route: the **SOURCE's edit lock is held for the whole walk** (an
+  `/edit/apply` landing mid-copy would otherwise give a torn tree — splat.ply from after
+  the crop, derived artifacts from before); a **507 disk preflight** with a 20 GiB floor,
+  estimated with the same skip rules as the copy so it cannot under-count; `versions/`
+  skipped (restore points are the original's history — a working copy starts clean);
+  meta keeps scene truth (scale calibration, capture format, langfield flags) and
+  replaces only identity/lineage/lifecycle (`parents`, `duplicated_from`,
+  `"<original> (copy)"`, `pinned:false`).
+- **LIVE END-TO-END PROOF**: 0 shared inodes across 267 files, max `nlink` 1, and after
+  applying a real `crop_sphere` **to the copy** the ORIGINAL's `splat.ply` sha256 was
+  byte-identical (`a6fc2863eb75f267` before and after) while the copy's changed. Test
+  scene deleted after; source intact, disk back to 228 G free.
+- **Guard**: `test_duplicate_shares_no_inodes_with_source` is **falsification-proven** —
+  putting `copy_function=os.link` back fails that test and only that test.
+- **UI**: "Work on a copy" card FIRST in the Edit lane, above everything destructive,
+  two-click armed, states the disk cost and that history isn't carried; on success it
+  navigates to the copy (leaving you on the original is how the mistake happens).
+- Gates: suite 699 → **703**, ruff clean, tsc-gated build green, eslint 0 errors,
+  vitest 49/49, live editor gate 23/23, Duplicate card verified in a real browser
+  (first click arms, does not copy). Restart window taken; route confirmed in
+  `/openapi.json`.
