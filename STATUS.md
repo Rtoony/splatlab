@@ -2567,3 +2567,44 @@ smear. That is a pipeline change, not a tuning knob.
 The backup interlock (`nexus-backup.service` activating) correctly refused a
 rebuild mid-session — rails working. The bicycle shell is currently at 4096;
 the new panel resets it to 2048 in a click.
+
+### The appearance chain, traced (2026-07-27, later)
+Two of my own hypotheses died on the way, which is the useful part.
+
+1. **"The atlas is over-resolved."** Disproved: `coverage_rasterized` is flat at
+   0.60 across 1024/2048/4096 for 14x the cost. Resolution sharpens the observed
+   60%; it never shrinks the invented 40%.
+2. **"The class match radius is too tight."** Disproved: median distance from
+   shell surface to nearest classed gaussian is **3.44 scene units** in a ~6-unit
+   scene. Radius 0.15 -> 0.9% of surface, 2.0 -> 9.4%. No radius rescues it.
+   An auto-scale keyed to voxel size (0.07 -> 0.12) would have been below the
+   existing 0.15 default: a no-op dressed as a fix. Written, measured, removed.
+
+**The actual cause: the shell encloses far too much empty space.**
+
+| | centre | size | volume |
+|---|---|---|---|
+| classed ground gaussians | `[0.05, 0.00, -0.38]` | `[3.69, 4.77, 0.99]` | 17.4 |
+| shell (capture frame) | `[-1.40, 0.25, 2.09]` | `[10.52, 12.56, 7.37]` | 974 |
+
+The shell wraps ~56x the ground's volume. Most of its surface is out where the
+capture has neither colour nor class, so the bake dilates a smear over it — the
+blotchy olive/white. `room_box` uses `_mesh/mesh.ply` p0.1-p99.9 (that file
+exists here, 17 MB), which on an outdoor orbit capture still swallows far-field.
+
+What tighter bounds would give, measured on this mesh:
+
+| percentiles | shell size | volume |
+|---|---|---|
+| p0.1-p99.9 (current) | `[8.44, 9.89, 4.00]` | 334 |
+| p1-p99 | `[7.83, 8.66, 3.52]` | 239 |
+| p2-p98 | `[7.58, 8.37, 3.33]` | 211 |
+| p5-p95 | `[6.76, 7.48, 2.48]` | 125 |
+
+Note the on-disk shell (974) is ~3x even the p0.1-p99.9 box (334), so percentile
+tightening is necessary but not sufficient — something downstream of `room_box`
+(likely the voxel `close_radius: 2`) inflates it further. **That is the next
+thing to measure**, before any tuning.
+
+`--class-radius` is now reachable from scene_solidify for tuning, but the
+measurement above says it is a knob, not the fix.
