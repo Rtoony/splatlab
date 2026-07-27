@@ -24,6 +24,9 @@ import numpy as np
 import open3d as o3d
 from scipy.spatial import Delaunay
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ground_binning  # noqa: E402
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -52,58 +55,24 @@ def main() -> int:
         g["class_rel"].astype(np.float32)[keep] if "class_rel" in g.files else None
     )
 
-    # ── cell-bin (verbatim ground_extract.py algorithm, scene-unit XY) ───────
-    ij = np.floor(pts[:, :2] / args.cell_units).astype(np.int64)
-    order = np.lexsort((ij[:, 1], ij[:, 0]))
-    ij_sorted, z_sorted = ij[order], pts[order, 2]
-    keys, starts = np.unique(ij_sorted, axis=0, return_index=True)
-    cells: dict[tuple[int, int], float] = {}
-    cell_votes: dict[tuple[int, int], np.ndarray] = {}
-    rel_sorted = class_rel_kept[order] if class_rel_kept is not None else None
-    for k, (s, e) in enumerate(zip(starts, list(starts[1:]) + [len(z_sorted)])):
-        if e - s >= args.min_pts_cell:
-            key = tuple(keys[k])
-            cells[key] = float(np.percentile(z_sorted[s:e], 15))
-            if rel_sorted is not None:
-                # summed-score vote: every member gaussian's class evidence
-                # counts, not just its argmax — robust at class boundaries.
-                cell_votes[key] = rel_sorted[s:e].sum(axis=0)
-
-    kept_cells: dict[tuple[int, int], float] = {}
-    rejected = 0
-    for (i, j), z in cells.items():
-        neigh = [cells[(i + di, j + dj)] for di in (-1, 0, 1) for dj in (-1, 0, 1)
-                 if (di or dj) and (i + di, j + dj) in cells]
-        if len(neigh) >= 3 and abs(z - float(np.median(neigh))) > args.spike_tol_units:
-            rejected += 1
-            continue
-        kept_cells[(i, j)] = z
-
-    disconnected_dropped = 0
-    if kept_cells:
-        unvisited = set(kept_cells)
-        best_comp: set[tuple[int, int]] = set()
-        while unvisited:
-            seed = unvisited.pop()
-            comp = {seed}
-            frontier = [seed]
-            while frontier:
-                ci, cj = frontier.pop()
-                for di in (-1, 0, 1):
-                    for dj in (-1, 0, 1):
-                        nb = (ci + di, cj + dj)
-                        if nb in unvisited:
-                            unvisited.remove(nb)
-                            comp.add(nb)
-                            frontier.append(nb)
-            if len(comp) > len(best_comp):
-                best_comp = comp
-        disconnected_dropped = len(kept_cells) - len(best_comp)
-        kept_cells = {k: kept_cells[k] for k in best_comp}
+    # ── cell-bin + spike rejection + largest component ──────────────────────
+    # The algorithm is unchanged; it now lives in ground_binning.py so it can be
+    # unit-tested without open3d/scipy.spatial. See that module for why each of
+    # the three stages exists.
+    binned = ground_binning.build_ground_cells(
+        pts,
+        cell_units=args.cell_units,
+        min_pts_cell=args.min_pts_cell,
+        spike_tol_units=args.spike_tol_units,
+        class_relevancy=class_rel_kept,
+    )
+    kept_cells = binned["cells"]
+    cell_votes = binned["votes"]
+    rejected = binned["spikes_rejected"]
+    disconnected_dropped = binned["disconnected_dropped"]
 
     cell_keys = list(kept_cells.keys())
-    ground = np.array([((i + 0.5) * args.cell_units, (j + 0.5) * args.cell_units,
-                        kept_cells[(i, j)]) for (i, j) in cell_keys])
+    ground = ground_binning.cell_centres(kept_cells, cell_keys, args.cell_units)
     if len(ground) < args.min_ground_points:
         print(f"FATAL: only {len(ground)} ground cells after filtering "
               f"(floor: {args.min_ground_points})", file=sys.stderr)
