@@ -778,6 +778,7 @@ export function SparkSceneViewer({
     channelsRef.current = nextChannels;
     if (nextChannels.length === 0) {
       mesh.worldModifier = undefined;
+      appliedModifierRef.current = null;
       mesh.updateGenerator();
       return;
     }
@@ -791,6 +792,7 @@ export function SparkSceneViewer({
       dyno.dynoFloat(cutoffForTopPercent(c.bytes, topPctRef.current)),
     );
     const firstEnabled = Math.max(0, nextChannels.findIndex((c) => c.enabled));
+    appliedModifierRef.current = null; // query overlay owns the slot now
     mesh.worldModifier = buildOverlayModifier({
       scalarArray,
       channelCount: nextChannels.length,
@@ -812,24 +814,73 @@ export function SparkSceneViewer({
   const SELECTION_TINT: [number, number, number] = [0.13, 0.83, 0.93];
   const paintCursorHexRef = useRef(0x22d3ee);
 
+  // ---- persistent tool overlays -------------------------------------------
+  // MEASURED (1,457,228-gaussian bicycle scene, RTX 5090): every stroke used to
+  // allocate a fresh mask + a fresh 5.8MB RGBA buffer + a NEW RgbaArray texture
+  // + a NEW modifier object. The JS side of that is only ~6ms — but handing
+  // Spark a brand-new modifier makes it compile a new shader program and
+  // regenerate every splat on the NEXT frame, which showed up as 120ms frame
+  // stalls during a sweep and a 480ms freeze on the first stroke. Median frame
+  // time was a healthy 16.7ms throughout; the pain was entirely these hitches.
+  //
+  // So: build ONE texture and ONE modifier per (purpose, splat count) and then
+  // only ever mutate the bytes. Same pixels, no recompile.
+  type ToolOverlay = {
+    n: number;
+    rgba: Uint8Array;
+    array: RgbaArray;
+    modifier: ReturnType<typeof buildOverlayModifier>;
+  };
+  const overlaysRef = useRef<Record<string, ToolOverlay | undefined>>({});
+  const appliedModifierRef = useRef<unknown>(null);
+  const OVERLAY_TINT: Record<string, [number, number, number]> = {
+    selection: SELECTION_TINT,
+    removal: [0.97, 0.44, 0.44], // to-be-removed red
+  };
+
+  function ensureOverlay(purpose: "selection" | "removal", numSplats: number): ToolOverlay | null {
+    if (numSplats === 0) return null;
+    const cur = overlaysRef.current[purpose];
+    if (cur && cur.n === numSplats) return cur;
+    cur?.array.dispose();
+    const rgba = new Uint8Array(numSplats * 4);
+    const array = new RgbaArray({ array: rgba, count: numSplats });
+    const next: ToolOverlay = {
+      n: numSplats,
+      rgba,
+      array,
+      modifier: buildOverlayModifier({
+        scalarArray: array,
+        channelCount: 1,
+        channelColors: [OVERLAY_TINT[purpose]],
+        channelEnabled: [dyno.dynoBool(true)],
+        mode: "highlight",
+        ramp: rampName,
+        channelCutoffs: [dyno.dynoFloat(0.5)],
+      }),
+    };
+    overlaysRef.current[purpose] = next;
+    return next;
+  }
+
+  function applyOverlay(mesh: SplatMesh, ov: ToolOverlay) {
+    ov.array.needsUpdate = true; // re-upload the texel data, keep the texture
+    if (appliedModifierRef.current !== ov.modifier) {
+      mesh.worldModifier = ov.modifier; // only ever on a real change of purpose
+      appliedModifierRef.current = ov.modifier;
+    }
+    mesh.updateGenerator();
+  }
+
   function previewSelection() {
     const mesh = meshRef.current;
     if (!mesh) return;
     const numSplats = mesh.packedSplats?.numSplats ?? mesh.numSplats ?? 0;
-    if (numSplats === 0) return;
-    const bytes = new Uint8Array(numSplats);
-    for (const i of selSetRef.current) if (i < numSplats) bytes[i] = 255;
-    const scalarArray = new RgbaArray({ array: packChannelsRgba([bytes], numSplats), count: numSplats });
-    mesh.worldModifier = buildOverlayModifier({
-      scalarArray,
-      channelCount: 1,
-      channelColors: [SELECTION_TINT],
-      channelEnabled: [dyno.dynoBool(true)],
-      mode: "highlight",
-      ramp: rampName,
-      channelCutoffs: [dyno.dynoFloat(0.5)],
-    });
-    mesh.updateGenerator();
+    const ov = ensureOverlay("selection", numSplats);
+    if (!ov) return;
+    ov.rgba.fill(0);
+    for (const i of selSetRef.current) if (i < numSplats) ov.rgba[i * 4] = 255;
+    applyOverlay(mesh, ov);
   }
 
   function refreshModifier() {
@@ -852,25 +903,31 @@ export function SparkSceneViewer({
     if (!mesh || !packed) return null;
     const numSplats = packed.numSplats ?? 0;
     if (numSplats === 0) return null;
-    const bytes = new Uint8Array(numSplats);
+    const ov = ensureOverlay("removal", numSplats);
+    if (!ov) return null;
+    ov.rgba.fill(0);
     let removed = 0;
-    packed.forEachSplat((i, c) => {
-      if (shouldRemove(c.x, c.y, c.z)) {
-        bytes[i] = 255;
-        removed += 1;
+    // Prefer the cached position array the paint brush already builds: a tight
+    // typed-array sweep instead of forEachSplat's per-splat JS callback, which
+    // on a 1.4M scene is the difference between ~3ms and tens of ms.
+    const idx = ensurePaintIndex() ? paintIndexRef.current : null;
+    if (idx) {
+      const pos = idx.positions;
+      for (let i = 0; i < numSplats; i += 1) {
+        if (shouldRemove(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2])) {
+          ov.rgba[i * 4] = 255;
+          removed += 1;
+        }
       }
-    });
-    const scalarArray = new RgbaArray({ array: packChannelsRgba([bytes], numSplats), count: numSplats });
-    mesh.worldModifier = buildOverlayModifier({
-      scalarArray,
-      channelCount: 1,
-      channelColors: [[0.97, 0.44, 0.44]], // to-be-removed red
-      channelEnabled: [dyno.dynoBool(true)],
-      mode: "highlight",
-      ramp: rampName,
-      channelCutoffs: [dyno.dynoFloat(0.5)],
-    });
-    mesh.updateGenerator();
+    } else {
+      packed.forEachSplat((i, c) => {
+        if (shouldRemove(c.x, c.y, c.z)) {
+          ov.rgba[i * 4] = 255;
+          removed += 1;
+        }
+      });
+    }
+    applyOverlay(mesh, ov);
     return removed;
   }
 
@@ -1689,11 +1746,80 @@ export function SparkSceneViewer({
     let brushRayAt = 0;
     let paintDrag = false;
     let lastStroke: THREE.Vector3 | null = null;
+    // MEASURED, 1,457,228-gaussian scene: Spark's mesh.raycast() is a brute
+    // force sweep over every splat and costs ~102ms PER CALL. The old ~14Hz
+    // throttle asked for one every 70ms, so a call never finished before the
+    // next was due and simply MOVING THE MOUSE with a tool armed pinned the
+    // main thread — that, not rendering, was the 10fps. (Idle frame time was
+    // 16.7ms throughout; the render is fine.)
+    //
+    // Fix: raycast only on deliberate acts (pointerdown, click) and project
+    // everything continuous onto a camera-facing plane through the last real
+    // hit. A plane intersect is ~0.005ms. `mesh.raycastIndices` looks like the
+    // library's answer but is a trap: setting it makes Spark read from
+    // packedSplats.lodSplats, which only exists after createLodSplats(), so a
+    // subset silently returns ZERO hits. A hand-rolled grid picker was also
+    // tried and rejected — median 0.94 units off on an 11.5-unit scene,
+    // because nearest-splat-centre is not where accumulated gaussian opacity
+    // crosses threshold. Precision comes from Spark; the plane just carries it
+    // between picks.
+    const lastPick = new THREE.Vector3();
+    let hasPick = false;
+    // The pick pointerdown already paid for. A click is a pointerdown plus an
+    // unmoved pointerup, so re-raycasting in onClick bought the same answer
+    // twice at ~102ms each.
+    let downPick: THREE.Vector3 | null = null;
+    const pickPlane = new THREE.Plane();
+    const camDir = new THREE.Vector3();
+    let reseatTimer: number | null = null;
+
+    const planeNdc = new THREE.Vector2();
+    const planeCaster = new THREE.Raycaster();
+
+    function planePick(clientX: number, clientY: number): THREE.Vector3 | null {
+      if (!hasPick) return null;
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (!rect) return null;
+      planeNdc.set(
+        ((clientX - rect.left) / rect.width) * 2 - 1,
+        -((clientY - rect.top) / rect.height) * 2 + 1,
+      );
+      planeCaster.setFromCamera(planeNdc, camera);
+      camera.getWorldDirection(camDir);
+      pickPlane.setFromNormalAndCoplanarPoint(camDir, lastPick);
+      return planeCaster.ray.intersectPlane(pickPlane, new THREE.Vector3());
+    }
+
+    /** Authoritative pick. Costs ~102ms on a big scene — deliberate acts only. */
+    function exactPick(clientX: number, clientY: number): THREE.Vector3 | null {
+      const hit = raycastAt(clientX, clientY);
+      if (hit) {
+        lastPick.copy(hit);
+        hasPick = true;
+      }
+      return hit;
+    }
+
+    function scheduleReseat(clientX: number, clientY: number) {
+      if (reseatTimer !== null) window.clearTimeout(reseatTimer);
+      // Trailing: re-seat the plane once the pointer STOPS, so moving to a new
+      // part of the scene corrects itself without paying per move.
+      reseatTimer = window.setTimeout(() => {
+        reseatTimer = null;
+        if (paintDrag || !(paintModeRef.current || cropModeRef.current || boxModeRef.current)) return;
+        const hit = exactPick(clientX, clientY);
+        if (hit) {
+          brushCursor.position.copy(hit);
+          brushCursor.visible = true;
+        }
+      }, 180);
+    }
+
     function updateToolCursor(clientX: number, clientY: number): THREE.Vector3 | null {
       // One cursor, three owners: cyan brush while painting; a red preview
       // sphere while a crop tool is armed but UNPLACED (the "why is nothing
       // showing" moment — the crop sphere only used to appear after the first
-      // click). ~14 Hz raycast throttle so a 2M-splat scene doesn't hitch.
+      // click).
       const paintArmed = paintModeRef.current;
       const cropPlacing = cropModeRef.current && !cropCenterRef.current;
       const boxPlacing = boxModeRef.current && !boxCenterRef.current;
@@ -1702,9 +1828,13 @@ export function SparkSceneViewer({
         return null;
       }
       const now = performance.now();
-      if (now - brushRayAt < 70) return null;
+      if (now - brushRayAt < 16) return null; // one per frame is plenty now
       brushRayAt = now;
-      const hit = raycastAt(clientX, clientY);
+      // Free while moving; one exact pick when you settle, and the first ever
+      // pick has to be exact because there is no plane yet.
+      let hit = planePick(clientX, clientY);
+      if (!hit) hit = exactPick(clientX, clientY);
+      else scheduleReseat(clientX, clientY);
       if (hit) {
         brushCursor.position.copy(hit);
         const r = paintArmed
@@ -1851,6 +1981,7 @@ export function SparkSceneViewer({
         if (disposed) return;
         setSplatCount(mesh.packedSplats?.numSplats ?? mesh.numSplats ?? 0);
         paintIndexRef.current = null; // rows/positions changed — rebuild lazily
+        appliedModifierRef.current = null; // fresh mesh carries no modifier
         // One bbox pass so crop sliders scale to THIS scene: the old fixed
         // 0.05–5 range could never enclose a large capture and dwarfed tiny
         // ones. Floater-inflated bounds only lengthen the slider — harmless.
@@ -1932,10 +2063,14 @@ export function SparkSceneViewer({
     function onPointerDown(e: PointerEvent) {
       downX = e.clientX;
       downY = e.clientY;
+      downPick = null; // never reuse a pick from an earlier press
       if (e.button !== 0) return;
       // Armed brush owns left-drag: hold and sweep to paint. Right-drag still
       // orbits (see the paintMode effect). Single clicks stroke via onClick.
       if (paintModeRef.current) {
+        // ONE exact pick per stroke: it seats the plane the whole sweep then
+        // rides, so a 200-sample drag costs a single raycast instead of 200.
+        downPick = exactPick(e.clientX, e.clientY);
         // NOTE: controls stay ENABLED. Left-drag is unmapped from orbit while
         // the brush is armed (see the paintMode effect), so right-drag still
         // orbits and the wheel still zooms — you can frame the next stroke
@@ -2022,25 +2157,25 @@ export function SparkSceneViewer({
     function onClick(e: MouseEvent) {
       if (Math.hypot(e.clientX - downX, e.clientY - downY) > 6) return;
       if (cropModeRef.current) {
-        const hit = raycastAt(e.clientX, e.clientY);
+        const hit = downPick ?? exactPick(e.clientX, e.clientY);
         if (hit) setCropCenterFromHit([hit.x, hit.y, hit.z]);
         else flagPlacementMissRef.current();
         return;
       }
       if (boxModeRef.current) {
-        const hit = raycastAt(e.clientX, e.clientY);
+        const hit = downPick ?? exactPick(e.clientX, e.clientY);
         if (hit) setBoxCenterFromHit([hit.x, hit.y, hit.z]);
         else flagPlacementMissRef.current();
         return;
       }
       if (paintModeRef.current) {
-        const hit = raycastAt(e.clientX, e.clientY);
+        const hit = downPick ?? exactPick(e.clientX, e.clientY);
         if (hit) strokeAtRef.current(hit);
         else flagPlacementMissRef.current();
         return;
       }
       if (!measureArmRef.current) return;
-      const hit = raycastAt(e.clientX, e.clientY);
+      const hit = exactPick(e.clientX, e.clientY); // dimensions must be exact
       if (!hit) return;
       const pending = pendingPointRef.current;
       if (!pending) {
@@ -2192,6 +2327,7 @@ export function SparkSceneViewer({
       dimGroupRef.current = null;
       cropGroupRef.current = null;
       boxGroupRef.current = null;
+      if (reseatTimer !== null) window.clearTimeout(reseatTimer);
       if (cropPreviewTimeoutRef.current !== null) window.clearTimeout(cropPreviewTimeoutRef.current);
       if (boxPreviewTimeoutRef.current !== null) window.clearTimeout(boxPreviewTimeoutRef.current);
       enabledDynosRef.current = [];
