@@ -2411,8 +2411,25 @@ query for that term, so they self-heal rather than needing a sweep.
   cannot exercise.
 - `opregistry.prune()` and `operator_audit.prune()` exist but nothing schedules them;
   same for `_prune_old_jobs` on a timer. No periodic-maintenance mechanism exists yet.
+### World numerical cores — CLOSED (same day)
+The last third of trust gap #3. 46 tests over `world_collision.classify`,
+`world_shell` (`frame_check`, `room_box`, `build_probe`, `rank_key`) and ground-cell
+binning. `ground_mesh_build`'s three binning stages moved verbatim into
+`mesh/ground_binning.py` (numpy only, no open3d) so they are testable with nothing
+stubbed; the receipt is a refactor-equivalence test comparing the extracted module
+cell-for-cell against the pre-extraction inline algorithm over 6 randomised clouds.
+
+Two behaviours were **discovered while testing, not assumed**: a high cell sharing a
+square with ground is absorbed by the 15th percentile and never reaches spike
+rejection (the stages compose), and a cloud too sparse to be a room yields ~no
+footprint rather than a thin one that would pass the gates quietly — `build_probe`
+requires ~12 points per column at cell=0.1, area-scaled so gates mean the same region
+at any `--grid-res`.
+
 - Not attempted: `splat_route.py` split / `jobstore.py`, langfield VRAM halving (needs a
   live GPU run to verify), the `mcp==2.0.0b2` beta pin, lift-crop context margins
-  (a quality change that needs measurement, not a guess).
+  (a quality change that needs measurement, not a guess). `world_shell.evaluate`'s four
+  gates still need open3d + trimesh raycasting, so they remain untested — the ranking
+  and probe layers around them are now covered.
 - **R1–R7 interactive-worlds work is untouched** — advisory, and explicitly lane-opening
   rather than loop-closing. See `~/projects/nexus-planning/05-interactive-worlds-vision.md`.
