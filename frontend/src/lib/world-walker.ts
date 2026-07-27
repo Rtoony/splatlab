@@ -298,6 +298,7 @@ const MOVE_KEYS = new Set([
   "KeyW", "KeyA", "KeyS", "KeyD",
   "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
   "Space", "ShiftLeft", "ShiftRight", "KeyR", "BracketLeft", "BracketRight",
+  "KeyF", "KeyC",
   INTERACT_KEY,
 ]);
 
@@ -325,6 +326,10 @@ export class WorldWalker {
   private interactionState = new Map<string, string>();
   private lastTargetKey: string | null = null;
   private targetClock = 0;
+  /** Fly (noclip) — for inspecting a world you cannot yet walk. */
+  private flying = false;
+  /** Fired when fly mode toggles, so the HUD can say so. */
+  onFlyChange: ((flying: boolean) => void) | null = null;
 
   private readonly canvas: HTMLCanvasElement;
   private readonly velocity = new THREE.Vector3();
@@ -494,7 +499,14 @@ export class WorldWalker {
     // back to colliding against the visual shell, which is the pre-existing
     // (worse) behaviour rather than a blank screen.
     this.collisionShellGeom = null;
-    const csUrl = manifest.collision_shell?.glb;
+    // world_collision.py does NOT write collision_shell into world_manifest.json
+    // — only the merged /world/manifest route synthesizes that key, and this
+    // walker deliberately reads the raw file. So fall back to the conventional
+    // path: world_shell.py always writes _world/collision_shell.glb. Without
+    // this the watertight solid sits on disk unused and the player falls
+    // through the lace visual shell, which is exactly what it exists to fix.
+    const declaredCsUrl = manifest.collision_shell?.glb;
+    const csUrl = declaredCsUrl ?? "collision_shell.glb";
     if (csUrl) {
       opts.onProgress?.({ loaded: entries.length, total: entries.length, label: "collision solid" });
       try {
@@ -515,10 +527,15 @@ export class WorldWalker {
         }
         disposeObject(obj);
       } catch (err) {
-        warnings.push(
-          `Collision solid failed to load (${(err as Error).message || err}); ` +
-          `colliding against the visual shell instead.`,
-        );
+        // A missing file on the conventional path just means this world has no
+        // collision solid; only a DECLARED one failing to load is worth a
+        // warning, otherwise every pre-shell world gets a scary banner.
+        if (declaredCsUrl) {
+          warnings.push(
+            `Collision solid failed to load (${(err as Error).message || err}); ` +
+            `colliding against the visual shell instead.`,
+          );
+        }
       }
     }
 
@@ -907,6 +924,48 @@ export class WorldWalker {
     this.onInteract?.(hit.record.slug, next);
   }
 
+  /** Toggle noclip. Zeroes velocity so you do not inherit a fall on landing. */
+  setFlying(flying: boolean): void {
+    if (this.flying === flying) return;
+    this.flying = flying;
+    this.velocity.set(0, 0, 0);
+    this.grounded = false;
+    this.onFlyChange?.(flying);
+  }
+
+  get isFlying(): boolean {
+    return this.flying;
+  }
+
+  /**
+   * Free camera: no gravity, no collision, movement along the FULL look
+   * direction (not the yaw-only ground vector) so looking down and pressing W
+   * descends — which is the whole point when inspecting a world from outside.
+   */
+  private stepFly(dt: number): void {
+    if (!this.controls.isLocked) return;
+
+    this.camera.getWorldDirection(_forward);
+    _right.copy(_forward).cross(_up).normalize();
+
+    _move.set(0, 0, 0);
+    if (this.keys.has("KeyW") || this.keys.has("ArrowUp")) _move.add(_forward);
+    if (this.keys.has("KeyS") || this.keys.has("ArrowDown")) _move.sub(_forward);
+    if (this.keys.has("KeyD") || this.keys.has("ArrowRight")) _move.add(_right);
+    if (this.keys.has("KeyA") || this.keys.has("ArrowLeft")) _move.sub(_right);
+    if (this.keys.has("Space")) _move.add(_up);
+    if (this.keys.has("KeyC")) _move.sub(_up);
+
+    if (_move.lengthSq() === 0) return;
+    // Shift sprints here too; a scene you are inspecting is often large
+    // relative to a walking pace.
+    const sprint = this.keys.has("ShiftLeft") || this.keys.has("ShiftRight")
+      ? this.params.sprintMultiplier : 1;
+    const speed = this.params.walkSpeedMps * this.params.unitsPerMetre * sprint;
+    _move.normalize();
+    this.camera.position.addScaledVector(_move, speed * dt);
+  }
+
   private applyMaterialMode(): void {
     const unlit = this.params.unlit;
     this.worldGroup.traverse((o) => {
@@ -941,6 +1000,12 @@ export class WorldWalker {
 
     if (e.code === "KeyR") {
       this.respawn();
+      return;
+    }
+    // Fly / noclip. A world whose collider is wrong is otherwise impossible to
+    // inspect — you fall out of it before you can see what is wrong.
+    if (e.code === "KeyF") {
+      this.setFlying(!this.flying);
       return;
     }
     // Interact. Raycast on demand rather than reusing the throttled prompt
@@ -990,7 +1055,11 @@ export class WorldWalker {
     const raw = this.clock.getDelta();
     const dt = Math.min(raw, 0.1);
 
-    if (this.bvh) {
+    // Fly needs no collider — that is precisely when you want it, because a
+    // world with a broken or missing collider is otherwise uninspectable.
+    if (this.flying) {
+      this.stepFly(dt);
+    } else if (this.bvh) {
       const steps = 5;
       for (let i = 0; i < steps; i++) this.stepPlayer(dt / steps);
     }
@@ -1032,6 +1101,10 @@ export class WorldWalker {
    * correction back as both the new position and the ground test.
    */
   private stepPlayer(dt: number): void {
+    if (this.flying) {
+      this.stepFly(dt);
+      return;
+    }
     const g = -this.params.gravityMps2 * this.params.unitsPerMetre;
     if (this.grounded) {
       this.velocity.y = dt * g; // keep a little downward bias so slopes stick

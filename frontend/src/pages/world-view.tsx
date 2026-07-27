@@ -109,6 +109,7 @@ export default function WorldViewPage() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const walkerRef = useRef<WorldWalker | null>(null);
   const [target, setTarget] = useState<TargetInfo | null>(null);
+  const [flying, setFlying] = useState(false);
 
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -153,6 +154,9 @@ export default function WorldViewPage() {
     };
     walker.onTarget = (t) => {
       if (!cancelled) setTarget(t);
+    };
+    walker.onFlyChange = (f) => {
+      if (!cancelled) setFlying(f);
     };
     // Persist optimistically: the walker has already applied it locally, so a
     // failed save must not leave the world showing a state the server rejected.
@@ -299,6 +303,14 @@ export default function WorldViewPage() {
         </div>
       )}
 
+      {phase === "ready" && flying && (
+        <div className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2">
+          <span className="rounded bg-cyan-500/20 px-2 py-0.5 font-mono text-[11px] text-cyan-200 ring-1 ring-cyan-400/40">
+            FLY — no gravity, no collision · F to land
+          </span>
+        </div>
+      )}
+
       {/* Interaction prompt — pointer-events-none so it cannot eat click-to-lock */}
       {phase === "ready" && target && (
         <div className="pointer-events-none absolute left-1/2 top-1/2 mt-8 -translate-x-1/2 text-center">
@@ -420,6 +432,8 @@ export default function WorldViewPage() {
             <Key k="Space" v="jump" />
             <Key k="[ ]" v="scale down / up" />
             <Key k="R" v="respawn" />
+          <Key k="F" v="fly / noclip" />
+          <Key k="Space / C" v="fly up / down" />
             <Key k="Esc" v="release mouse" />
             <Key k="" v="" />
           </div>
