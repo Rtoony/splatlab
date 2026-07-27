@@ -2189,10 +2189,19 @@ keystrokes/clicks and asserts against the real DOM.
   3. `d39e9c1` — the new HUD was anchored top-centre, directly on top of the "In this
      scene" legend. Moved to bottom-centre above the search pill (it reads as a status
      bar there anyway).
-- ⚠️ **OPEN, deliberately not fixed here — the token-opacity failure is systemic.**
-  `bg-surface/85` (app nav), `bg-accent/30` (disabled primary buttons) and EVERY
-  `border-accent/NN` also emit no rule; `border-accent` never compiles at all. The real
-  fix is migrating the tokens to channel form (`--surface: 5 7 13` +
-  `rgb(var(--surface) / <alpha-value>)`), which touches every colour in the app and
-  needs its own change + visual pass. Verify any such change with
-  `grep -c 'bg-surface\\/' dist/assets/*.css` — it must stop being 0.
+- ✅ **RESOLVED same night (`3936714`) — the token-opacity failure was systemic and is
+  now fixed at the root.** `bg-surface/85` (app nav), `bg-accent/30` (disabled primary
+  buttons) and every `border-accent/NN` were also emitting nothing; `border-accent`
+  never compiled at all. Tokens migrated to channel triplets +
+  `rgb(var(--x) / <alpha-value>)`; the two raw `var(--x)` consumers in `body` became
+  `rgb(var(--x))` (a bare var now resolves to the literal "5 7 13" and paints nothing);
+  `surface-raised` stays bare on purpose (baked-alpha overlay, no `<alpha-value>` form).
+  Guarded by `src/lib/tokens.test.ts`, **falsification-proven** three ways (token back
+  to hex / config back to a bare var / a token consumed bare → exactly one failure
+  each). That test reads index.css with **fs, not `?raw`** — vitest stubs CSS imports
+  to `""`, and the first attempt asserted against an empty string and passed for the
+  wrong reason. Receipts: built CSS now has
+  `.bg-surface\/85{background-color:rgb(var(--surface) / .85)}` and
+  `.disabled\:bg-accent\/30:disabled{...}`; in a real browser the nav computes
+  `rgba(5,7,13,0.85)` (was transparent) while body is still `rgb(5,7,13)` — unchanged.
+  vitest 35 → 49, live editor gate 23/23, screenshot reviewed.
