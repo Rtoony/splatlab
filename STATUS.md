@@ -2235,3 +2235,55 @@ keystrokes/clicks and asserts against the real DOM.
   vitest 49/49, live editor gate 23/23, Duplicate card verified in a real browser
   (first click arms, does not copy). Restart window taken; route confirmed in
   `/openapi.json`.
+
+## PAINT → GENERATIVE WORLD, END TO END (2026-07-26 night) — RToony's classed world walks
+Long session, `6081ee9..0c96a33`, all pushed. The editor wave is in the section above;
+this records the pipeline run and the infrastructure it broke loose.
+
+### The loop closed
+RToony painted classes on the bicycle scene (grass 156,454 · pavement 108,887 ·
+vegetation 58,286 · dirt 4,774) and it drove the generative stages:
+- **`/scene/ground` with his paint beat the machine.** vs the 15:08 auto-classification:
+  pavement **1,223 → 2,893** cells (the machine badly under-detected the path), gravel
+  **601 → 99** (it had hallucinated gravel), grass ~flat. **Mean confidence 0.202 →
+  0.614.** Of the 270,247 gaussians clearing the class map's 0.6 floor, **270,115 are
+  his one-hot paint** — the machine's own guesses don't clear it.
+- **Walkable classed world**: shell `classed=true`, 24,268 tris, **4/4 collision gates**
+  (1 component / watertight / floor 1.0 / no holes), auto-picked from 4 candidate routes
+  (plain voxel scored 29 components, smooth 509; carve won). Props bicycle/bench-seat/
+  bicycle-2 all built + textured. 67.1 s.
+- **The chain is longer than the notes implied and nothing warns you up front**:
+  `scene/inventory` (279 s) → `scene/isolate` (12 s) → `scene_solidify --shell-source
+  voxel` (67 s) → `world_collision.py` (writes world_manifest.json). Solidify fails clean
+  with "not isolated yet (no object.ply)"; the viewer 404s until world_collision runs.
+
+### Three infrastructure defects this exposed, all fixed
+1. **The ground lane declared 6 GB for a 10 GB job** (`c512962`). semantic_ground loads
+   gauss_emb as a rows×dim FLOAT32 tensor — 2,351,565 × 1152 = **10.09 GiB** — against a
+   flat `SCENE_GROUND_VRAM_MB = 6_000`. The arbiter admitted it against 6.4 GB free and
+   it died with CUDA OOM. Now measured by peeking the .npz member header (a few hundred
+   bytes; np.load would pull 3.3 GB through zlib for two integers) → 14,417 MB.
+2. **`splatlab-langfield` was unregistered with the orchestrator** (`4c65454`). It had
+   ballooned to **22 GB of 32** and the arbiter could see the VRAM gone but had nothing
+   to evict. Now a catalog entry (priority 1, evictable) + splatlab **re-wakes it on
+   demand** — registering without that would have turned every eviction into a 503.
+3. **splatlab's arbiter ignored `evictable: false`** (`4c65454`). It drives its own
+   eviction loop and the orchestrator's manual evict endpoint is operator-only, so a
+   heavy splat job could have stopped RToony's **dictation**. The orchestrator now
+   reports `evictable`/`enabled` (it previously did not, so remote callers *could not*
+   have respected it) and splatlab filters on them.
+   Proof: worker warm / 9,668 MB free → arbiter evicted it, build finished in 42 s;
+   worker evicted → language query self-healed, 5 matches in 31 s, no 503.
+
+### Open
+- ⚠️ **You spawn on the shell's ROOF.** The shell is watertight, so the walker's respawn
+  ray-cast lands on the lid: y=14.4 in a 12.56-unit shell, `0 drawn`. The Elements
+  panel's **"Go" buttons** drop you inside (same frame → 42.6k drawn). `0c96a33` exposes
+  `collision_shell.spawn` (world_shell's proven-interior seed) but the VIEWER half is
+  NOT done: the seed is in the voxel-probe frame (floor −0.37 → top 3.04) while the
+  loaded GLB is 12.56 units tall — it needs converting, not passing through. A walker
+  change that just used it was reverted for having no effect.
+- Props are PASS-THROUGH: **coacd not installed** in the solidify env.
+- Scene still uncalibrated (`meters_per_unit: null`).
+- The langfield worker has **no VRAM ceiling** — eviction now reclaims it, but nothing
+  stops it reaching 22 GB again between evictions.
