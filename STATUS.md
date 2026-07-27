@@ -2671,3 +2671,33 @@ COLLIDES with. Since the walker was fixed to load `collision_shell.glb`, those
 gates were measuring the wrong artifact; that is what made `--drop-unobserved`
 look like a regression. They now grade the collision solid, fall back to the
 visual shell when there is none, and record `measured_mesh` in the verdict.
+
+---
+
+## 2026-07-27 — SESSION CLOSED: the shell approach is a recorded dead end
+
+RToony's verdict on the final screenshots: *"looks like nothing — green splats
+that resemble nothing real."* He asked for **an entirely new approach, outside
+this session's context**. Do not resume the tuning path.
+
+**The finding: a watertight mesh shell cannot represent an object-centric ORBIT
+capture.** 175/175 train cameras sit inside the shell bbox, so every render is a
+view of its interior walls. `mesh_gate`: 11.96 dB / SSIM 0.163 vs a 17.64 / 0.234
+reference. Four tuning hypotheses were disproved by measurement (texture
+resolution flat at 0.60 coverage across 4x; class radius vs a 3.44-unit median
+distance; unobserved-face dropping; shell-route detail) — **0.23 dB total spread
+across 4x geometry.**
+
+The most promising new direction is probably a **capture-methodology** change:
+a walkable world wants a walk-THROUGH capture, not an orbit of an object.
+
+Full detail, including every fixed bug worth keeping and the current blocker
+(the uncalibrated scale suggestion assumes an indoor storey height and gives
+2.83 u/m outdoors), is in memory:
+`~/.claude/projects/-home-rtoony/memory/splatlab-world-appearance-dead-end-2026-07-27.md`
+and `splatlab-r2-world-interactions-2026-07-27.md`.
+
+State at close: branch `r2-world-interactions`, 20 commits, UNPUSHED, clean
+tree; `main` level with origin; 1089 backend + 85 frontend tests passing; all
+three services active; `splat_3aaf8067` shell restored to its gate-passing
+config with a demo `interactions.json` still authored on it.
