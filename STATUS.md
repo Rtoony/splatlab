@@ -2433,3 +2433,66 @@ at any `--grid-res`.
   and probe layers around them are now covered.
 - **R1–R7 interactive-worlds work is untouched** — advisory, and explicitly lane-opening
   rather than loop-closing. See `~/projects/nexus-planning/05-interactive-worlds-vision.md`.
+
+---
+
+## 2026-07-27 — R2: world interactions and state (branch `r2-world-interactions`)
+
+First rung of the interactive-worlds direction. The world was furniture you could
+bump into; now elements can afford something and the world remembers what you did.
+
+**Not a `scene_manifest` v2, and the reason is the HITL — not just which file the
+walker reads.** `scene_assemble_approve` rewrites the manifest with
+`state: "approved"`, which means a human graded that assembly. Putting authored
+interactions in the same document forces a choice between "approved" quietly
+degrading to "approved at some point, with unknown edits since", or making someone
+re-approve geometry because they labelled a light switch. The slug spaces differ
+too: `_regen/` has `ground` and no `shell`; `_world/` has `shell`, no `ground`, and
+drops elements that failed to solidify. So interactions are **sidecars in the world
+lane**: `_world/interactions.json` + `_world/state.json`.
+
+### Design calls worth keeping
+- **`open` is not a verb.** It is `toggle` with the states `closed`/`open`.
+  Vocabulary is `inspect` / `toggle` / `pickup`; effect keys are a CLOSED set
+  (`visible`, `tint`) and an unknown one is rejected, not ignored.
+- **Staleness is per element, never a file stamp.** `world_collision.py` writes
+  `seconds: time.time()-t0` through a non-atomic `write_text`, and
+  `same_file_identity` compares `mtime_ns`/`inode` while ignoring `sha256` — so any
+  identity check reports a change on EVERY rebuild whether or not anything a save
+  depends on moved. Gating on it would mean never being able to rebuild a world
+  without losing the save. The stamp is advisory (`world_rebuilt`); each entry is
+  judged alone. Nineteen survivors are not discarded because one vanished.
+- **`job_id` mismatch IS a hard refusal.** `_DUP_SKIP_DIRS` is only `{"versions"}`,
+  so job duplication copies `_world/` wholesale — without the check a duplicated
+  scene silently inherits its parent's save.
+- **Only `tint` is wired, not `visible`.** `object.visible` already has one owner
+  (the HUD's per-element eye); a second writer would produce an object the panel
+  calls hidden.
+- **`E`, raycast from screen centre, 10 Hz prompt.** Under pointer lock the cursor
+  does not exist, and the canvas click already means "acquire lock". The prompt
+  poll is throttled because spark-scene-viewer measured 10 fps on a per-move
+  102 ms raycast. The interact raycasts on demand, so acting is always exact.
+  Reach is authored in metres and scaled by `unitsPerMetre`.
+- **`fetchManifest` still reads the raw `world_manifest.json`, deliberately.**
+  Repointing it at `/world/manifest` would win `collision_shell`/`calibration`/
+  `hull_urls`, but `role` is null there before the collision stage runs and the
+  walker defaults to `"prop"` — silently turning every static element
+  pass-through on an ungraded world. Left for a phase that can verify it.
+
+### Verified
+- `pytest backend/tests -q` → **1073 passed, 7 skipped** (was 990/6). Frontend
+  `npm run test` → **85 passed** (was 49); `npm run check` → 0 errors, no new
+  warnings; `npm run build` clean.
+- **Live, against the real bicycle world `splat_3aaf8067`** (services restarted,
+  nothing in flight): authored a toggle on `bench-seat` → set it `on` → fresh read
+  returned `on` from disk. Undeclared state → 400 listing the legal ones; unknown
+  slug → 400 listing the real ones. Simulated a rebuild that lost the element:
+  dropped with a reason, `world_rebuilt: true`, not resurrected. `world_manifest.json`
+  restored and both sidecars removed afterwards — the job dir is as found.
+
+### Open
+- `pickup` validates and persists but is not wired in the walker; the state
+  document reserves `player: {}` as its seam (a player-owned container is a second
+  state axis).
+- No affordance authoring UI — `PUT /world/interactions` is the only door. That is
+  R3 (LangField proposing affordances through the propose→gate→approve idiom).
