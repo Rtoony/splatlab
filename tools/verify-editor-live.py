@@ -65,6 +65,9 @@ def shot(page, name):
 
 
 def panel_text(page):
+    # NOTE: innerText returns CSS-UPPERCASED text for headings and labels
+    # (tracking-[0.28em] uppercase). Compare case-insensitively — this has
+    # produced three separate false failures in this file already.
     try:
         el = page.query_selector(".absolute.left-3.top-3")
         return el.inner_text() if el else ""
@@ -114,6 +117,48 @@ def lit_pixels(page, vw, vh):
         if g > 90 and b > 110 and g > r + 35 and b > r + 45:
             n += 1
     return n
+
+
+def click_when_enabled(page, selector, tries=6):
+    """Click a control once it stops being disabled, or give up and say so.
+    The lane toggles are deliberately disabled while paint is pending, so a
+    plain .click() here hangs for the full timeout instead of failing."""
+    for _ in range(tries):
+        el = page.query_selector(selector)
+        if el and not el.is_disabled():
+            el.click()
+            page.wait_for_timeout(900)
+            return True
+        discard_selection(page)
+        page.wait_for_timeout(400)
+    return False
+
+
+def _sel_from_hud(page):
+    for tok in hud_text(page).replace(chr(10), ' ').split():
+        t = tok.replace(',', '')
+        if t.isdigit():
+            return int(t)
+    return None
+
+
+def discard_selection(page):
+    """Clear any pending paint. The lane toggles are deliberately DISABLED
+    while a selection is live (switching would carry it into the wrong class),
+    so the gate has to finish a selection before it can change lanes."""
+    # Del is the discard shortcut and is separately asserted above, so it is
+    # the reliable path — the HUD button lives inside a pointer-events-none
+    # wrapper and is fussier to hit.
+    for _ in range(3):
+        if not _sel_from_hud(page):
+            return
+        # Move focus OFF any text field first: the viewer deliberately ignores
+        # shortcuts while you're typing, so a Delete sent from the label input
+        # is silently swallowed (which is correct, and cost a stalled run).
+        page.evaluate("() => (document.activeElement instanceof HTMLElement) && document.activeElement.blur()")
+        page.wait_for_timeout(150)
+        page.keyboard.press("Delete")
+        page.wait_for_timeout(900)
 
 
 def ensure_paint_armed(page):
@@ -367,6 +412,17 @@ with sync_playwright() as p:
                       after_px - before_px > 800, f"cyan px {before_px} -> {after_px}")
 
         ensure_paint_armed(page)
+        # Switching class with paint still selected must be INTERCEPTED - that
+        # is how a grass->asphalt->vegetation pass became one 293,004-splat
+        # vegetation commit that clobbered the earlier asphalt by precedence.
+        ensure_paint_armed(page)
+        if sel_count():
+            active_label = "paint · label" in panel_text(page).lower()
+            other = "Class" if active_label else "Label"
+            lane = page.query_selector(f"button:text-is('{other}')")
+            check("the OTHER lane toggle is blocked while paint is pending",
+                  lane is not None and lane.is_disabled(), f"other lane = {other}")
+
         # --- commit guards (added after a paint pass pinned 186,710 splats of
         # flat ground to a mistyped label without the operator noticing) ------
         ensure_paint_armed(page)
@@ -379,7 +435,7 @@ with sync_playwright() as p:
             check("commit block describes WHAT is selected", "About to label" in pt,
                   [l[:80] for l in pt.split("\n") if "About to label" in l][:1])
         lab = page.query_selector("input[placeholder*='Label']")
-        if lab:
+        if lab and not lab.is_disabled():
             lab.click()
             lab.fill("bikr")
             time.sleep(1.0)
@@ -396,9 +452,9 @@ with sync_playwright() as p:
         else:
             check("commit guards present", False, "label input not found")
 
-        cls = page.query_selector("button:text-is('Class')")
-        if cls:
-            cls.click()
+        # The Class toggle is deliberately disabled while paint is pending, so
+        # this waits for it rather than hanging on a plain .click().
+        if click_when_enabled(page, "button:text-is('Class')"):
             time.sleep(1.5)
             page.mouse.click(VW // 2, VH // 2 + 20)
             time.sleep(0.6)
@@ -415,7 +471,8 @@ with sync_playwright() as p:
                   "class-coloured selection is invisible on same-coloured scene content")
             shot(page, f"{JOB}-08-class-brush.png")
         else:
-            check("1-9 change the selected class", False, "Class toggle not found")
+            check("1-9 change the selected class", False,
+                  "Class lane never became clickable (selection stuck?)")
 
     real_errors = [e for e in console_errors if "favicon" not in e.lower()]
     check("no console/page errors", not real_errors, "; ".join(real_errors[:2])[:140])

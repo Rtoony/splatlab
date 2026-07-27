@@ -363,9 +363,17 @@ export function packClassColorsRgba(
 export function buildClassColorModifier({
   colorArray,
   strength = 0.85,
+  selectionArray,
+  selectionColor,
 }: {
   colorArray: RgbaArray;
   strength?: number;
+  // Optional live brush selection drawn ON TOP of the class colors. Without
+  // this the two are mutually exclusive: turning on the class layer hid the
+  // selection, and painting hid the classes — so while assigning a material
+  // you could not see which materials were already assigned.
+  selectionArray?: RgbaArray;
+  selectionColor?: [number, number, number];
 }) {
   return dyno.dynoBlock({ gsplat: dyno.Gsplat }, { gsplat: dyno.Gsplat }, ({ gsplat }) => {
     if (!gsplat) throw new Error("class modifier: no gsplat input");
@@ -374,7 +382,16 @@ export function buildClassColorModifier({
     const labeled = dyno.lessThan(dyno.dynoFloat(0.5), dyno.split(raw).outputs.w);
     const classColor = dyno.swizzle(raw, "xyz");
     const tinted = dyno.mix(rgb, classColor, dyno.dynoFloat(strength));
-    const outRgb = dyno.select(labeled, tinted, rgb);
+    let outRgb = dyno.select(labeled, tinted, rgb);
+    if (selectionArray) {
+      // Selection wins over the class color — it is the thing you are steering.
+      const sel = dyno.lessThan(
+        dyno.dynoFloat(0.5),
+        dyno.split(readRgbaArray(selectionArray.dyno, index)).outputs.x,
+      );
+      const selCol = dyno.dynoVec3(new THREE.Vector3(...(selectionColor ?? [0.13, 0.83, 0.93])));
+      outRgb = dyno.select(sel, dyno.mix(rgb, selCol, dyno.dynoFloat(0.85)), outRgb);
+    }
     return { gsplat: dyno.combineGsplat({ gsplat, rgb: outRgb }) };
   });
 }

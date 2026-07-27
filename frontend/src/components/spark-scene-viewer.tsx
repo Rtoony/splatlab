@@ -61,6 +61,30 @@ const M_PER_FT = 0.3048;
 const UNIT_TO_M: Record<string, number> = { m: 1, ft: M_PER_FT, in: M_PER_FT / 12 };
 const CHANNEL_PALETTE = ["#facc15", "#f472b6", "#22d3ee", "#a3e635"];
 // Naming the act, not just the count — see lib/paint-guards.ts.
+// The class layer exists to tell materials APART, so it needs a legible
+// palette, not a realistic one. The taxonomy's own colours are naturalistic —
+// pavement is #52525b grey, invisible against an actual grey path, and grass
+// green vanishes into grass. These are evenly spaced hues, deliberately
+// avoiding the 170-200 band so nothing competes with the cyan selection tint.
+// Falls back to the taxonomy colour for job-added classes.
+const CLASS_DISPLAY_COLOR: Record<string, string> = {
+  grass: "#22c55e",       // 140  green
+  vegetation: "#84cc16",  // 100  lime
+  concrete: "#eab308",    //  60  yellow
+  dirt: "#f97316",        //  30  orange
+  mulch: "#f43f5e",       // 355  rose
+  pavement: "#d946ef",    // 320  fuchsia
+  structure: "#a855f7",   // 280  purple
+  gravel: "#6366f1",      // 240  indigo
+  water: "#3b82f6",       // 210  blue
+};
+
+/** Legible overlay colour for a class — used by BOTH the chip dot and the
+ *  class layer, so what you pick is what you see on the scene. */
+function classDisplayColor(id: string, taxonomyHex?: string): string {
+  return CLASS_DISPLAY_COLOR[id] ?? taxonomyHex ?? "#ffffff";
+}
+
 const PAINT_OP_VERB: Record<"assign" | "boost" | "suppress", string> = {
   assign: "Pin",
   boost: "Boost",
@@ -364,6 +388,12 @@ export function SparkSceneViewer({
   const [classNeedsForce, setClassNeedsForce] = useState(false);
   const [classNotice, setClassNotice] = useState<string | null>(null);
   const [showClassLayer, setShowClassLayer] = useState(false);
+  const showClassLayerRef = useRef(false);
+  // A class chip clicked while paint is still selected — see the amber bar.
+  const [pendingClassSwitch, setPendingClassSwitch] = useState<string | null>(null);
+  // Last built class-colour texture, so the live selection can be composited
+  // over it instead of replacing it.
+  const classColorRef = useRef<{ array: RgbaArray; n: number } | null>(null);
   // "H" — hide every viewer-owned panel for a clean look/screenshot. Purely
   // visual: armed tools and the selection stay exactly as they were, which is
   // why the HUD is part of what hides.
@@ -380,7 +410,7 @@ export function SparkSceneViewer({
   useEffect(() => {
     const hex =
       paintTarget === "class" && selectedClassId && taxonomy
-        ? taxonomy.find((c) => c.id === selectedClassId)?.color
+        ? classDisplayColor(selectedClassId, taxonomy.find((c) => c.id === selectedClassId)?.color)
         : undefined;
     paintCursorHexRef.current = hex ? parseInt(hex.slice(1), 16) : 0x22d3ee;
     refreshModifierRef.current();
@@ -427,7 +457,7 @@ export function SparkSceneViewer({
     }
     const byId = new Map(taxonomy.map((c) => [c.id, c]));
     const palette = order.map((cid) => {
-      const hex = byId.get(cid)?.color ?? "#ffffff";
+      const hex = classDisplayColor(cid, byId.get(cid)?.color);
       return [
         parseInt(hex.slice(1, 3), 16) / 255,
         parseInt(hex.slice(3, 5), 16) / 255,
@@ -438,18 +468,33 @@ export function SparkSceneViewer({
       array: packClassColorsRgba(bytes, palette, numSplats),
       count: numSplats,
     });
-    mesh.worldModifier = buildClassColorModifier({ colorArray });
+    classColorRef.current = { array: colorArray, n: numSplats };
+    mesh.worldModifier = buildClassColorModifier({
+      colorArray,
+      ...selectionOverlayArgs(numSplats),
+    });
     mesh.updateGenerator();
   }
 
+  useEffect(() => {
+    if (!showClassLayer || !taxonomy || classColorRef.current) return;
+    void refreshClassLayer().catch(() => {
+      /* surfaced by toggleClassLayer's own error path */
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showClassLayer, taxonomy]);
+
   async function toggleClassLayer(on: boolean) {
     setShowClassLayer(on);
+    showClassLayerRef.current = on;
+    if (!on) classColorRef.current = null;
     setClassError(null);
     try {
       if (on) await refreshClassLayer();
       else rebuildOverlay(channelsRef.current, mode, rampName); // restore query overlay
     } catch (cause) {
       setShowClassLayer(false);
+      showClassLayerRef.current = false;
       setClassError(cause instanceof Error ? cause.message : "Class layer failed.");
     }
   }
@@ -483,6 +528,7 @@ export function SparkSceneViewer({
       setClassNotice(`Painted ${n.toLocaleString()} splats as ${display}. Survives crops (positions are snapshotted).`);
       clearSelection();
       void loadClassRecords();
+      if (showClassLayerRef.current) void refreshClassLayer();
       if (showClassLayer) void refreshClassLayer().catch(() => undefined);
     } catch (cause) {
       setClassError(cause instanceof Error ? cause.message : "Commit failed.");
@@ -845,10 +891,40 @@ export function SparkSceneViewer({
     mesh.updateGenerator();
   }
 
+  /** Selection mask as modifier args, or {} when nothing is selected. */
+  function selectionOverlayArgs(numSplats: number) {
+    if (selSetRef.current.size === 0 || numSplats === 0) return {};
+    const bytes = new Uint8Array(numSplats);
+    for (const i of selSetRef.current) if (i < numSplats) bytes[i] = 255;
+    return {
+      selectionArray: new RgbaArray({
+        array: packChannelsRgba([bytes], numSplats),
+        count: numSplats,
+      }),
+      selectionColor: SELECTION_TINT,
+    };
+  }
+
+  /** Class colours as the base, live selection composited on top. */
+  function previewClassLayerWithSelection() {
+    const mesh = meshRef.current;
+    const held = classColorRef.current;
+    const numSplats = mesh?.packedSplats?.numSplats ?? mesh?.numSplats ?? 0;
+    if (!mesh || !held || held.n !== numSplats) return false;
+    mesh.worldModifier = buildClassColorModifier({
+      colorArray: held.array,
+      ...selectionOverlayArgs(numSplats),
+    });
+    mesh.updateGenerator();
+    return true;
+  }
+
   function refreshModifier() {
     if (cropModeRef.current && cropCenterRef.current) previewCropRemoval();
     else if (boxModeRef.current && boxCenterRef.current) previewBoxRemoval();
-    else if (paintModeRef.current && selSetRef.current.size > 0) previewSelection();
+    else if (showClassLayerRef.current && previewClassLayerWithSelection()) {
+      // classes stay on screen while you paint the next material
+    } else if (paintModeRef.current && selSetRef.current.size > 0) previewSelection();
     else rebuildOverlay(channelsRef.current, mode, rampName);
   }
   refreshModifierRef.current = refreshModifier;
@@ -2926,7 +3002,12 @@ export function SparkSceneViewer({
                 size="sm"
                 variant={paintTarget === "field" ? "primary" : "outline"}
                 onClick={() => setPaintTarget("field")}
-                title="Pin/boost/suppress a search label on the brushed splats"
+                disabled={paintTarget !== "field" && selCount > 0}
+                title={
+                  paintTarget !== "field" && selCount > 0
+                    ? `Commit or discard the ${selCount.toLocaleString()} selected splats first — switching would carry them across`
+                    : "Pin/boost/suppress a search label on the brushed splats"
+                }
               >
                 Label
               </Button>
@@ -2934,12 +3015,19 @@ export function SparkSceneViewer({
                 type="button"
                 size="sm"
                 variant={paintTarget === "class" ? "primary" : "outline"}
+                disabled={paintTarget !== "class" && selCount > 0}
                 onClick={() => {
                   setPaintTarget("class");
                   if (!taxonomy) void loadClassTaxonomy();
                   void loadClassRecords();
+                  // Show what's already assigned, each in its own colour.
+                  if (!showClassLayer) void toggleClassLayer(true);
                 }}
-                title="Assign a surface class (grass/dirt/pavement/…) — feeds the generative stages"
+                title={
+                  paintTarget !== "class" && selCount > 0
+                    ? `Commit or discard the ${selCount.toLocaleString()} selected splats first — switching would carry them across`
+                    : "Assign a surface class (grass/dirt/pavement/…) — feeds the generative stages"
+                }
               >
                 Class
               </Button>
@@ -3015,6 +3103,45 @@ export function SparkSceneViewer({
                   orbits</b> and the wheel zooms without disarming. Everything stays local until you
                   press the commit button — that's the save.
                 </p>
+                {paintTarget === "class" && pendingClassSwitch && (
+                  <div className="rounded-lg border border-amber-300/30 bg-amber-300/10 p-2 text-[10px] leading-snug text-amber-100">
+                    <b>{selCount.toLocaleString()} splats are still selected</b> as{" "}
+                    {taxonomy?.find((c) => c.id === selectedClassId)?.display ?? selectedClassId}. Switching
+                    now would carry them into{" "}
+                    {taxonomy?.find((c) => c.id === pendingClassSwitch)?.display ?? pendingClassSwitch} and
+                    commit them under the wrong class.
+                    <div className="mt-1.5 flex flex-wrap gap-1.5">
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={classBusy}
+                        onClick={async () => {
+                          const next = pendingClassSwitch;
+                          setPendingClassSwitch(null);
+                          await commitClassPaint();
+                          if (selSetRef.current.size === 0 && next) setSelectedClassId(next);
+                        }}
+                      >
+                        {classBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null} Commit, then switch
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => {
+                          clearSelection();
+                          setSelectedClassId(pendingClassSwitch);
+                          setPendingClassSwitch(null);
+                        }}
+                      >
+                        Discard, then switch
+                      </Button>
+                      <Button type="button" size="sm" variant="ghost" onClick={() => setPendingClassSwitch(null)}>
+                        Stay here
+                      </Button>
+                    </div>
+                  </div>
+                )}
                 {paintTarget === "class" && (
                   <div className="space-y-1.5">
                     {taxonomy ? (
@@ -3023,7 +3150,11 @@ export function SparkSceneViewer({
                           <button
                             key={c.id}
                             type="button"
-                            onClick={() => setSelectedClassId(c.id)}
+                            onClick={() => {
+                              if (c.id === selectedClassId) return;
+                              if (selCount > 0) setPendingClassSwitch(c.id);
+                              else setSelectedClassId(c.id);
+                            }}
                             title={`${c.display} (${c.category})`}
                             className={`flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold transition ${
                               selectedClassId === c.id
@@ -3031,7 +3162,7 @@ export function SparkSceneViewer({
                                 : "border-white/15 text-zinc-400 hover:text-zinc-200"
                             }`}
                           >
-                            <span className="h-2 w-2 rounded-full" style={{ backgroundColor: c.color }} />
+                            <span className="h-2 w-2 rounded-full" style={{ backgroundColor: classDisplayColor(c.id, c.color) }} />
                             {c.display}
                           </button>
                         ))}
