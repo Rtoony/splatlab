@@ -6326,18 +6326,35 @@ async def get_splat_world_manifest(job_id: str):
     collision_shell = None
     if (world_dir / "collision_shell.glb").is_file():
         gates = {}
+        spawn = None
         report = world_dir / "collision_shell.json"
         if report.is_file():
             try:
                 doc = json.loads(report.read_text())
                 gates = doc.get("gates") or doc.get("winner", {}).get("gates") or {}
-            except (OSError, json.JSONDecodeError):
-                gates = {}
+                # A watertight shell has a LID. The walker's default respawn
+                # ray-casts down from above the scene box and therefore lands on
+                # that roof, outside the world, staring at sky — measured on the
+                # bicycle scene: y=14.4 in a 12.56-unit-tall shell, 0 triangles
+                # drawn. world_shell.py already proved an interior point (the
+                # seed it flood-filled from) and the floor height it found, so
+                # hand those to the viewer instead of making it guess.
+                probe = doc.get("probe") or {}
+                seed = (doc.get("params") or {}).get("seed_yup")
+                if isinstance(seed, list) and len(seed) == 3:
+                    spawn = {
+                        "seed_yup": [float(v) for v in seed],
+                        "floor_y": probe.get("floor_level_y"),
+                        "top_y": probe.get("top_level_y"),
+                    }
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                gates = gates or {}
         collision_shell = {
             "glb": _world_file_url(job_id, "collision_shell.glb"),
             "report": (_world_file_url(job_id, "collision_shell.json")
                        if report.is_file() else None),
             "gates": gates,
+            "spawn": spawn,
         }
 
     calibration = _world_calibration(world, meta)
