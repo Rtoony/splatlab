@@ -38,6 +38,7 @@ import {
   Footprints,
   Gauge,
   Hammer,
+  Layers,
   Loader2,
   MapPin,
   Ruler,
@@ -111,6 +112,7 @@ export default function WorldViewPage() {
   const walkerRef = useRef<WorldWalker | null>(null);
   const [target, setTarget] = useState<TargetInfo | null>(null);
   const [flying, setFlying] = useState(false);
+  const [backdrop, setBackdrop] = useState(true);
 
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -227,6 +229,22 @@ export default function WorldViewPage() {
           }
         } catch {
           /* no interactions authored, or the route is unavailable */
+        }
+
+        // The splat backdrop. The mesh is what you collide with and act on;
+        // the splat is what you look at. Measured: a shell that encloses the
+        // capture cameras cannot resemble it, and the ground TIN alone covers
+        // ~40% of a frame — trees, hedge and sky come from the splat or from
+        // nowhere.
+        if (source.kind === "api") {
+          void walker
+            .setBackdrop(
+              `/api/splat/jobs/${encodeURIComponent(jobId)}/preview/file?fmt=web`,
+              m.meters_per_unit ?? null,
+            )
+            .catch(() => {
+              if (!cancelled) setWarnings((w) => [...w, "Splat backdrop failed to load."]);
+            });
         }
 
         setPhase("ready");
@@ -391,6 +409,34 @@ export default function WorldViewPage() {
                 onCalibrateByHeight={calibrateByHeight}
               />
               <MovementPanel params={walkParams} onChange={updateParams} />
+              <Panel icon={<Layers className="h-3.5 w-3.5" />} title="Backdrop">
+                <label className="flex items-start gap-2 text-[11px] text-zinc-300">
+                  <input
+                    type="checkbox"
+                    checked={backdrop}
+                    onChange={(e) => {
+                      setBackdrop(e.target.checked);
+                      const w = walkerRef.current;
+                      if (!w) return;
+                      void w.setBackdrop(
+                        e.target.checked
+                          ? `/api/splat/jobs/${encodeURIComponent(jobId)}/preview/file?fmt=web`
+                          : null,
+                        sceneInfo?.metersPerUnit ?? null,
+                      );
+                    }}
+                    className="mt-0.5"
+                  />
+                  <span>
+                    Show the original splat
+                    <span className="block text-[10px] leading-snug text-zinc-500">
+                      The mesh is what you collide with; the splat is what you look
+                      at. Trees, hedge and sky exist only in the splat — a
+                      simplified mesh cannot carry them.
+                    </span>
+                  </span>
+                </label>
+              </Panel>
               <RebuildPanel jobId={jobId} onRebuilt={() => setReloadNonce((n) => n + 1)} />
             </div>
           )}

@@ -31,6 +31,7 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
 import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 import { MeshBVH } from "three-mesh-bvh";
+import { SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
 import {
   INTERACT_KEY,
   type InteractionRecord,
@@ -328,6 +329,8 @@ export class WorldWalker {
   private targetClock = 0;
   /** Fly (noclip) — for inspecting a world you cannot yet walk. */
   private flying = false;
+  private spark: SparkRenderer | null = null;
+  private backdrop: SplatMesh | null = null;
   /** Fired when fly mode toggles, so the HUD can say so. */
   onFlyChange: ((flying: boolean) => void) | null = null;
 
@@ -820,6 +823,55 @@ export class WorldWalker {
     if (patch.collideProps !== undefined && patch.collideProps !== before.collideProps) {
       this.rebuildCollider();
     }
+  }
+
+  /**
+   * Show the original splat behind the meshes.
+   *
+   * Why this exists, measured rather than assumed: a watertight shell built
+   * over an object-centric orbit capture encloses the camera ring, so it can
+   * never resemble the capture from any viewpoint (mesh_gate now reports
+   * `encloses_capture`). And even the correctly-shaped ground TIN only covers
+   * ~40% of a frame — the rest of what you actually SEE outdoors is trees,
+   * hedge and sky, which no simplified mesh carries. The splat carries all of
+   * it, at ~22 dB where the mesh scores ~12.
+   *
+   * So the mesh stops trying to be the whole world and becomes the part you
+   * collide with and act on, while the splat is the part you look at.
+   *
+   * Frame: the splat is in the CAPTURE frame (Z-up, scene units); the world is
+   * Y-up. A -90 degree rotation about X maps (x,y,z) -> (x, z, -y), which is
+   * exactly the conversion object_texture applies on export, so the two land in
+   * the same place. Scale matches the meshes: metres when calibrated, scene
+   * units otherwise.
+   */
+  async setBackdrop(url: string | null, metersPerUnit: number | null): Promise<void> {
+    this.clearBackdrop();
+    if (!url) return;
+    if (!this.spark) {
+      this.spark = new SparkRenderer({ renderer: this.renderer });
+      this.scene.add(this.spark);
+    }
+    const splat = new SplatMesh({ url, fileType: SplatFileType.PLY });
+    splat.rotation.x = -Math.PI / 2;
+    const scale = metersPerUnit && metersPerUnit > 0 ? metersPerUnit : 1;
+    splat.scale.setScalar(scale);
+    // Never collide with it and never let it capture a look — it is scenery.
+    splat.renderOrder = -1;
+    this.scene.add(splat);
+    this.backdrop = splat;
+  }
+
+  clearBackdrop(): void {
+    if (this.backdrop) {
+      this.scene.remove(this.backdrop);
+      this.backdrop.dispose?.();
+      this.backdrop = null;
+    }
+  }
+
+  get hasBackdrop(): boolean {
+    return this.backdrop !== null;
   }
 
   setElementVisible(slug: string, visible: boolean): void {
