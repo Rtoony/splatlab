@@ -102,6 +102,44 @@ RASTER_DILATE = 5
 RASTER_CLOSE = 9
 RASTER_MAX_POINTS = 120_000
 
+# Worker subprocess environment. This process is started by a shell that has had
+# the Vaultwarden secrets injected into it, so inheriting os.environ wholesale
+# would hand every API key and DB URL to three third-party model runtimes. Same
+# posture as dcc/blender_workflow._sanitized_env(), widened by exactly the
+# compute variables the model envs need. Anything not named here is dropped.
+WORKER_ENV_ALLOW = frozenset({
+    # session / shell
+    "DISPLAY", "HOME", "LANG", "LC_ALL", "LOGNAME", "PATH", "TMPDIR", "USER",
+    "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
+    # python
+    "PYTHONPATH", "PYTHONNOUSERSITE", "PYTHONUNBUFFERED",
+    # conda
+    "CONDA_DEFAULT_ENV", "CONDA_PREFIX",
+    # linker / caches the model envs resolve weights through
+    "LD_LIBRARY_PATH", "XDG_CACHE_HOME", "MPLCONFIGDIR",
+    "HF_HOME", "HF_HUB_OFFLINE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE",
+    # thread pools
+    "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+})
+
+# Prefixes for the GPU/tensor stacks. Deliberately narrow: no Nexus secret uses
+# any of these, so a prefix rule here cannot leak one.
+WORKER_ENV_ALLOW_PREFIXES = ("CUDA_", "NVIDIA_", "NCCL_", "TORCH_", "PYTORCH_", "OMP_")
+
+
+def worker_env(extra: dict | None = None) -> dict[str, str]:
+    """Allowlisted environment for a model subprocess. Never inherits secrets."""
+    env = {
+        key: value for key, value in os.environ.items()
+        if key in WORKER_ENV_ALLOW or key.startswith(WORKER_ENV_ALLOW_PREFIXES)
+    }
+    env.setdefault("HOME", str(Path.home()))
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    env["PYTHONNOUSERSITE"] = "1"
+    if extra:
+        env.update({str(k): str(v) for k, v in extra.items()})
+    return env
+
 
 class Fatal(RuntimeError):
     """Preflight or gate failure. Always actionable, never swallowed."""
@@ -622,11 +660,21 @@ def resolve_inputs(job: Path, slug: str) -> dict:
 
 def run_worker(python: Path, script: Path, args: list[str], cwd: Path,
                log_path: Path, env_extra: dict | None = None,
-               done_token: str = "", timeout: int = 5400) -> None:
-    env = dict(os.environ)
-    env["PYTHONNOUSERSITE"] = "1"
-    if env_extra:
-        env.update(env_extra)
+               done_token: str = "", timeout: int = 5400,
+               produces: Path | list[Path] | None = None) -> None:
+    """Run one model worker in its own conda env and prove it actually worked.
+
+    Success is established structurally, in order of decreasing strength:
+      1. exit code 0;
+      2. every file in `produces` exists and is non-empty (and parses, if .json)
+         -- the artifact IS the receipt;
+      3. `done_token` in the log tail, as a fallback for workers with no single
+         declarable output.
+    The token alone is weak: the tail is truncated to 4 KB, so a worker that
+    emits a late CUDA//torch warning after printing its token would be reported
+    as a failure despite having produced correct output.
+    """
+    env = worker_env(env_extra)
     log(f"run: {python.name} {script.name} {' '.join(args)}  (log: {log_path})")
     with open(log_path, "wb") as fh:
         proc = subprocess.run([str(python), str(script), *args], cwd=str(cwd),
@@ -635,7 +683,24 @@ def run_worker(python: Path, script: Path, args: list[str], cwd: Path,
     tail = log_path.read_text(errors="replace")[-4000:]
     if proc.returncode != 0:
         raise Fatal(f"{script.name} exited {proc.returncode}. Log tail:\n{tail}")
-    if done_token and done_token not in tail:
+
+    expected = [produces] if isinstance(produces, (str, Path)) else list(produces or [])
+    for path in expected:
+        path = Path(path)
+        if not path.is_file():
+            raise Fatal(f"{script.name} exited 0 but never wrote {path} "
+                        f"-- treat as failure. Log tail:\n{tail}")
+        if path.stat().st_size == 0:
+            raise Fatal(f"{script.name} exited 0 but {path} is empty "
+                        f"-- treat as failure. Log tail:\n{tail}")
+        if path.suffix == ".json":
+            try:
+                json.loads(path.read_text())
+            except Exception as exc:
+                raise Fatal(f"{script.name} exited 0 but {path} is not valid JSON "
+                            f"({exc}) -- treat as failure. Log tail:\n{tail}")
+
+    if not expected and done_token and done_token not in tail:
         raise Fatal(f"{script.name} exited 0 but never printed {done_token} "
                     f"-- treat as failure. Log tail:\n{tail}")
 
@@ -1120,7 +1185,8 @@ def main() -> int:
             run_worker(PROBE_PYTHON, work_root / "worker_cam.py",
                        [cfg, str(cm["cam"]), str(cam_json)], job,
                        Path(p["work_dir"]) / "worker_cam.log",
-                       done_token="WORKER_CAM_DONE", timeout=900)
+                       done_token="WORKER_CAM_DONE", timeout=900,
+                       produces=cam_json)
             p["camera"] = json.loads(cam_json.read_text())
             log(f"{p['slug']}: camera {cm['cam']} -> {Path(p['camera']['image_filename']).name}")
         except Exception as exc:
@@ -1167,7 +1233,8 @@ def main() -> int:
         jf = work_root / "jobs_sam3.json"
         jf.write_text(json.dumps(jobs, indent=2))
         run_worker(SAM3_PYTHON, work_root / "worker_sam3.py", [str(jf)], SAM3_ROOT,
-                   work_root / "worker_sam3.log", done_token="WORKER_SAM3_DONE")
+                   work_root / "worker_sam3.log", done_token="WORKER_SAM3_DONE",
+                   produces=[Path(c["out"]) for c in jobs["crops"]])
 
     gate_failures = []
     for p in plans:
@@ -1263,7 +1330,8 @@ def main() -> int:
                work_root / "worker_sam3d.log",
                env_extra={"SAM3D_ROOT": str(SAM3D_ROOT),
                           "CONDA_PREFIX": str(SAM3D_PYTHON.parent.parent)},
-               done_token="WORKER_SAM3D_DONE")
+               done_token="WORKER_SAM3D_DONE",
+               produces=work_root / "sam3d_results.json")
     results = {r["slug"]: r for r in json.loads((work_root / "sam3d_results.json").read_text())}
 
     # ---- verify what landed on disk, then place it -------------------------

@@ -1,0 +1,20 @@
+[Unit]
+Description=Splat Lab (standalone app)
+After=network.target rtoony-portal.service
+Wants=rtoony-portal.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/rtoony/projects/splatlab
+# Pull PORTAL_TOKEN from vault into RAM (zero-disk policy); proxy injects it as bearer.
+ExecStartPre=/home/rtoony/bin/nexus-svc-inject splatlab "Rtoony Portal" "Infrastructure"
+EnvironmentFile=-/dev/shm/nexus-env-splatlab
+ExecStart=/home/rtoony/projects/splatlab/.venv/bin/uvicorn backend.main:app --host 127.0.0.1 --port 3416
+ExecStopPost=/bin/rm -f /dev/shm/nexus-env-splatlab
+Restart=on-failure
+RestartSec=5
+Environment=PATH=/home/rtoony/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/rtoony
+
+[Install]
+WantedBy=default.target

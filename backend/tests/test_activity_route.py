@@ -19,6 +19,7 @@ import edit_ops  # noqa: E402
 import export_route  # noqa: E402
 import gpu_arbiter  # noqa: E402
 import main as splat_main  # noqa: E402
+import opregistry  # noqa: E402
 import splat_route  # noqa: E402
 
 _NO_HOLDER = {"lane": None, "job_id": None, "since": None, "locked": False}
@@ -37,22 +38,108 @@ def _held_lock() -> asyncio.Lock:
 
 
 @pytest.fixture()
-def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    # Hermetic: empty lock maps, no live Redis/holder bleed-through.
+def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
+    # Hermetic: empty lock maps, no live Redis/holder bleed-through, and an
+    # operation registry in a temp dir so tests never see the live one.
     monkeypatch.setattr(edit_ops, "_EDIT_LOCKS", {})
     monkeypatch.setattr(splat_route, "_PREVIEW_EXPORT_LOCKS", {})
     monkeypatch.setattr(splat_route, "_MESH_EXPORT_LOCKS", {})
     monkeypatch.setattr(export_route, "_export_locks", {})
     monkeypatch.setattr(gpu_arbiter, "holder_info", lambda: dict(_NO_HOLDER))
+    opregistry.configure_storage(tmp_path / "ops")
+    opregistry.init_db()
     app = FastAPI()
     app.include_router(activity_route.router, prefix="/api/splat")
-    return TestClient(app)
+    try:
+        yield TestClient(app)
+    finally:
+        opregistry.configure_storage(Path(opregistry.PROJECT_ROOT) / "data" / "ops")
 
 
 def test_activity_idle_shape(client: TestClient) -> None:
     r = client.get("/api/splat/activity")
     assert r.status_code == 200
-    assert r.json() == {"gpu": {"holder": None}, "jobs": {}, "edit_progress": {}}
+    assert r.json() == {
+        "gpu": {"holder": None}, "jobs": {}, "edit_progress": {}, "operations": {}}
+
+
+# ---------------------------------------------------------------------------
+# The persistent operation registry, over the wire
+# ---------------------------------------------------------------------------
+
+def test_activity_reports_live_registry_operations(client: TestClient) -> None:
+    op_id = opregistry.start("world_solidify", "splat_abc", step="shell")
+    opregistry.update(op_id, progress=0.25)
+
+    body = client.get("/api/splat/activity").json()
+
+    assert list(body["operations"]) == ["splat_abc"]
+    entry = body["operations"]["splat_abc"][0]
+    assert entry["id"] == op_id
+    assert entry["kind"] == "world_solidify"
+    assert entry["step"] == "shell"
+    assert entry["progress"] == 0.25
+
+
+def test_finished_operations_leave_the_activity_view(client: TestClient) -> None:
+    op_id = opregistry.start("mesh", "splat_abc")
+    opregistry.finish(op_id)
+    assert client.get("/api/splat/activity").json()["operations"] == {}
+
+
+def test_ops_endpoint_polls_a_single_operation(client: TestClient) -> None:
+    op_id = opregistry.start("mesh", "splat_abc", step="poisson")
+    opregistry.finish(op_id, result={"faces": 8000})
+
+    r = client.get(f"/api/splat/ops/{op_id}")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "succeeded"
+    assert body["result"] == {"faces": 8000}
+    assert body["active"] is False
+
+
+def test_ops_endpoint_404s_on_an_unknown_id(client: TestClient) -> None:
+    assert client.get("/api/splat/ops/nope").status_code == 404
+
+
+def test_ops_list_filters_and_orders(client: TestClient) -> None:
+    opregistry.start("mesh", "job_a")
+    opregistry.start("export", "job_a")
+    opregistry.start("mesh", "job_b")
+
+    listed = client.get("/api/splat/ops", params={"job_id": "job_a"}).json()["operations"]
+    assert {entry["kind"] for entry in listed} == {"mesh", "export"}
+
+    by_kind = client.get("/api/splat/ops", params={"kind": "mesh"}).json()["operations"]
+    assert {entry["job_id"] for entry in by_kind} == {"job_a", "job_b"}
+
+
+def test_ops_list_keeps_history_a_restart_would_otherwise_lose(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    op_id = opregistry.start("mesh", "splat_abc")
+    opregistry.finish(op_id, status=opregistry.FAILED, error="xatlas did not converge")
+    monkeypatch.setattr(opregistry, "RUNTIME_ID", "a-new-backend-process")
+
+    listed = client.get("/api/splat/ops", params={"job_id": "splat_abc"}).json()["operations"]
+
+    assert listed[0]["status"] == "failed"
+    assert "xatlas" in listed[0]["error"]
+
+
+def test_a_running_row_from_a_dead_process_is_not_reported_as_busy(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rail: persistence must not resurrect phantom in-flight work."""
+    opregistry.start("mesh", "splat_abc")
+    monkeypatch.setattr(opregistry, "RUNTIME_ID", "a-new-backend-process")
+
+    assert client.get("/api/splat/activity").json()["operations"] == {}
+    listed = client.get("/api/splat/ops", params={"job_id": "splat_abc"}).json()["operations"]
+    assert listed[0]["status"] == "abandoned"
+    assert listed[0]["active"] is False
 
 
 def test_activity_reports_gpu_holder(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

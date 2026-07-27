@@ -7,6 +7,17 @@ addon. It exposes only typed SplatLab operations and never accepts Python source
 
 - The server binds only to `127.0.0.1` and enables the MCP SDK's localhost DNS
   rebinding protection.
+- **Trust model, stated plainly:** loopback binding is a boundary against the
+  network, not against this host. By default any local process running as this
+  user can drive Blender through the endpoint, including the attended
+  `open_blender` GUI spawn. The typed-tool surface means such a caller cannot
+  execute arbitrary Python, but it can act on any job under the output root.
+  Set `SPLATLAB_MCP_TOKEN` (or `SPLATLAB_MCP_TOKEN_FILE`, pointing at the
+  RAM-only `/dev/shm/nexus-env-*` drop) to require
+  `Authorization: Bearer <token>` on every request. This is opt-in: unset means
+  today's behaviour, unchanged. A token shorter than 16 characters, or a token
+  file that is missing or empty, is a startup error rather than a silent
+  downgrade to no auth.
 - Job ids resolve only under the configured SplatLab output root.
 - Blender subprocesses receive an allowlisted environment, not injected vault
   credentials.

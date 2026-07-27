@@ -48,6 +48,8 @@ from pydantic import BaseModel, Field
 import class_taxonomy
 import gpu_arbiter
 import maintenance_gate
+import opregistry  # persistent heavy-operation registry (pollable, restart-truthful)
+import scale_calibration  # pure metric-scale math; imports nothing from this app
 from health.precheck import precheck_input
 from health.probe import probe_capture
 from operator_audit import audit_operator_event
@@ -157,7 +159,12 @@ SAM2_ENV_PYTHON = Path.home() / "miniconda3" / "envs" / "sam2" / "bin" / "python
 LANGFIELD_DIRNAME = "_langfield"          # per-job artifact dir (sibling of _preview)
 LANGFIELD_VRAM_MB = 10_000                # SAM2.1 ~5GB + SigLIP2 ~2.3GB + gsplat render
 QUERY_VRAM_MB = 4_000                     # per-query render reserve (lock held ~ms)
-LANGFIELD_WORKER_URL = os.environ.get("SPLAT_LANGFIELD_WORKER_URL", "http://127.0.0.1:3417")
+# 3425 is where the worker actually listens (see deploy/systemd/user/
+# splatlab-langfield.service.d/). The default used to be 3417, which nothing
+# has bound for a long time: if the drop-in supplying this variable ever went
+# missing, every language query would fail against a dead port instead of
+# falling back to the right one.
+LANGFIELD_WORKER_URL = os.environ.get("SPLAT_LANGFIELD_WORKER_URL", "http://127.0.0.1:3425")
 # ── Capture-health fog gate (report-only, Capture Coach Phase 0.5) ───────────────
 # Post-train reconstruction-health verdict (backend/health/fog_gate.py, calibrated
 # 2026-07-11 vs RToony-graded scenes — tools/gates/gate_p0_fog_calibration.sh).
@@ -2832,12 +2839,18 @@ async def _langfield_worker_json(path: str, payload: dict):
     return await _langfield_post(path, payload)
 
 
-async def _langfield_worker_inventory(config_path: str, lfdir: str) -> dict | None:
+async def _langfield_worker_inventory(config_path: str, lfdir: str,
+                                      refresh: bool = False) -> dict | None:
     """Ask the warm worker for the scene's top-N object inventory (cached per scene).
     Returns the worker JSON on success, else None (no cold fallback — inventory is a
-    warm-worker-only convenience)."""
+    warm-worker-only convenience).
+
+    `refresh` recomputes one scene even when a valid cache exists — how a single
+    scene is brought up to the current relevancy generation without forcing a GPU
+    recompute of every other scene."""
     require_heavy_work_admitted()
-    resp = await _langfield_post("/inventory", {"config": config_path, "lfdir": lfdir})
+    resp = await _langfield_post(
+        "/inventory", {"config": config_path, "lfdir": lfdir, "refresh": bool(refresh)})
     return resp.json() if resp is not None and resp.status_code == 200 else None
 
 
@@ -6085,6 +6098,162 @@ async def get_scene_assemble_file(job_id: str, fmt: Literal["report", "glb", "bl
 #      "scene-units (uncalibrated)"; a viewer that silently assumes metres puts a
 #      1.75-unit bicycle in the wrong world. Say scale is unknown out loud.
 WORLD_DIRNAME = "_world"
+SCENE_SOLIDIFY_SCRIPT = MESH_DIR / "scene_solidify.py"
+WORLD_COLLISION_SCRIPT = MESH_DIR / "world_collision.py"
+WORLD_GATE_SCRIPT = MESH_DIR / "world_gate.py"
+
+
+class WorldSolidifyBody(BaseModel):
+    """Knobs mirroring scene_solidify.py's CLI, plus the two follow-on stages."""
+    prop_faces: int = Field(default=8_000, ge=200, le=200_000)
+    shell_faces: int = Field(default=60_000, ge=1_000, le=1_000_000)
+    texture_size: int = Field(default=1024, ge=128, le=8192)
+    shell_texture_size: int = Field(default=2048, ge=128, le=8192)
+    min_gaussians: int = Field(default=200, ge=1, le=100_000)
+    only: str = Field(default="", max_length=2000)
+    shell_source: Literal["tsdf", "voxel"] = "tsdf"
+    skip_shell: bool = False
+    shell_only: bool = False
+    prefer_generated: bool = False
+    run_collision: bool = True
+    run_gate: bool = True
+
+
+@router.post("/jobs/{job_id}/world/solidify")
+async def world_solidify(job_id: str, body: WorldSolidifyBody):
+    """Build the walkable world: scene_solidify -> world_collision -> world_gate.
+
+    These three were CLI-only. A browser could read a world but never build one,
+    so the one artifact the whole interactive lane rests on had no admission
+    control, no lock, no progress and no receipt — and rebuilding it meant an
+    SSH session.
+
+    Runs under the same rails as every other heavy build: the maintenance/backup
+    admission gate and the per-job mesh lock (one heavy build per job). Progress
+    is recorded in the operation registry, so `GET /ops/{op_id}` and `/activity`
+    show which stage is running even though this POST blocks, and a failure
+    leaves a durable record instead of only a dropped connection.
+
+    world_gate is the acceptance suite, not a precondition: a world that fails
+    its gates is still returned, with the gate verdict attached. Refusing to
+    report a built-but-failing world would hide exactly what the gates exist to
+    surface.
+    """
+    require_heavy_work_admitted()
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    if meta.get("status") != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"World build requires a completed job. Current status: {meta.get('status')}")
+
+    output_dir = Path(meta["output_dir"])
+    scene_dir = output_dir / SCENE_DIRNAME
+    if not (scene_dir / "isolated").is_dir():
+        raise HTTPException(
+            status_code=409,
+            detail="World build needs isolated scene elements — run the scene "
+                   "inventory and isolate stages first.")
+    if not (SCENE_SOLIDIFY_SCRIPT.is_file() and MESH_ENV_PYTHON.is_file()):
+        raise HTTPException(status_code=400, detail="World-build toolchain unavailable.")
+
+    lock = _mesh_export_lock(job_id)
+    if lock.locked():
+        raise HTTPException(
+            status_code=409, detail=f"A mesh/object/scene build is already running for {job_id}.")
+
+    mpu = meta.get("meters_per_unit")
+    world_dir = output_dir / WORLD_DIRNAME
+
+    async with lock:
+        op_id = opregistry.start("world_solidify", job_id, step="solidify",
+                                 detail=f"shell_source={body.shell_source}")
+        try:
+            solidify_cmd = [
+                str(MESH_ENV_PYTHON), str(SCENE_SOLIDIFY_SCRIPT), str(output_dir),
+                "--prop-faces", str(body.prop_faces),
+                "--shell-faces", str(body.shell_faces),
+                "--texture-size", str(body.texture_size),
+                "--shell-texture-size", str(body.shell_texture_size),
+                "--min-gaussians", str(body.min_gaussians),
+                "--shell-source", body.shell_source,
+            ]
+            # An uncalibrated world is built anyway and reports itself as such;
+            # only pass the factor when there genuinely is one.
+            if isinstance(mpu, (int, float)) and math.isfinite(mpu) and mpu > 0:
+                solidify_cmd += ["--meters-per-unit", str(mpu)]
+            if body.only.strip():
+                solidify_cmd += ["--only", body.only.strip()]
+            if body.skip_shell:
+                solidify_cmd.append("--skip-shell")
+            if body.shell_only:
+                solidify_cmd.append("--shell-only")
+            if body.prefer_generated:
+                solidify_cmd.append("--prefer-generated")
+
+            rc, _out, stderr = await _run_capture_subprocess(solidify_cmd)
+            if rc != 0 or not (world_dir / "world.json").is_file():
+                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                raise HTTPException(
+                    status_code=500, detail=f"World solidify failed (exit {rc}): {tail}")
+
+            collision: dict[str, Any] | None = None
+            if body.run_collision and WORLD_COLLISION_SCRIPT.is_file():
+                opregistry.update(op_id, step="collision", progress=0.6)
+                rc, _out, stderr = await _run_capture_subprocess(
+                    [str(MESH_ENV_PYTHON), str(WORLD_COLLISION_SCRIPT), str(output_dir)])
+                collision = {"exit_code": rc}
+                if rc != 0:
+                    # Collision hulls are a follow-on: a world without them is
+                    # still a world, so this is reported, not fatal.
+                    collision["error"] = "\n".join(
+                        stderr.decode("utf-8", errors="replace").splitlines()[-4:])
+
+            gate: dict[str, Any] | None = None
+            if body.run_gate and WORLD_GATE_SCRIPT.is_file():
+                opregistry.update(op_id, step="gate", progress=0.85)
+                rc, _out, stderr = await _run_capture_subprocess(
+                    [str(MESH_ENV_PYTHON), str(WORLD_GATE_SCRIPT), str(output_dir)])
+                gate = {"exit_code": rc, "passed": rc == 0}
+                gate_report = world_dir / "world_gate.json"
+                if gate_report.is_file():
+                    with contextlib.suppress(Exception):
+                        gate["report"] = json.loads(gate_report.read_text())
+                elif rc != 0:
+                    gate["error"] = "\n".join(
+                        stderr.decode("utf-8", errors="replace").splitlines()[-4:])
+
+            result = {
+                "ok": True,
+                "job_id": job_id,
+                "op_id": op_id,
+                "world": json.loads((world_dir / "world.json").read_text()),
+                "collision": collision,
+                "gate": gate,
+                "meters_per_unit": mpu,
+                # The generation this world was built at; a later /scale bump
+                # makes that comparison the staleness signal.
+                "scale_generation": meta.get("scale_generation"),
+                "uncalibrated": not (isinstance(mpu, (int, float)) and mpu),
+            }
+            opregistry.finish(op_id, result={
+                "gate_passed": (gate or {}).get("passed"),
+                "collision_exit": (collision or {}).get("exit_code"),
+                "uncalibrated": result["uncalibrated"],
+            })
+            return result
+        except HTTPException as exc:
+            opregistry.finish(op_id, status=opregistry.FAILED, error=str(exc.detail)[:2000])
+            raise
+        except BaseException as exc:
+            opregistry.finish(op_id, status=opregistry.FAILED,
+                              error=f"{type(exc).__name__}: {exc}"[:2000])
+            raise
+
+
 # Media types for what a solidified world actually contains. Anything else under
 # the dir is stage scratch (_work/), served as an opaque download rather than
 # guessed at — the containment check below is what keeps that safe.
@@ -6849,10 +7018,14 @@ async def class_labels_summary(job_id: str):
 
 
 @router.get("/jobs/{job_id}/langfield/inventory")
-async def langfield_inventory(job_id: str):
+async def langfield_inventory(job_id: str, refresh: bool = False):
     """Top-N objects auto-detected in this scene (open-vocab), for the toggle-to-highlight
     legend. Warm-worker only + cached per scene; 404 if no field, 503 if the worker is
-    down (the UI just hides the legend). (Auth via the router mount.)"""
+    down (the UI just hides the legend). (Auth via the router mount.)
+
+    An inventory computed before unseen gaussians were excluded from relevancy is
+    still served, flagged `stale` with a reason, rather than silently triggering a
+    GPU recompute. `?refresh=true` recomputes THIS scene only."""
     require_heavy_work_admitted()
     if not _safe_job_id(job_id):
         raise HTTPException(status_code=404, detail="Splat job not found")
@@ -6864,10 +7037,17 @@ async def langfield_inventory(job_id: str):
     config_path = _find_latest_config(job_dir)
     if config_path is None:
         raise HTTPException(status_code=409, detail="Scene checkpoint missing")
-    result = await _langfield_worker_inventory(str(config_path), str(lfdir))
+    result = await _langfield_worker_inventory(str(config_path), str(lfdir), refresh=refresh)
     if result is None:
         raise HTTPException(status_code=503, detail="Inventory worker unavailable")
-    return {"job_id": job_id, "items": result.get("items", [])}
+    return {
+        "job_id": job_id,
+        "items": result.get("items", []),
+        "stale": bool(result.get("stale", False)),
+        "stale_reason": result.get("stale_reason", ""),
+        "relevancy_generation": result.get("relevancy_generation"),
+        "current_relevancy_generation": result.get("current_relevancy_generation"),
+    }
 
 
 @router.get("/jobs/{job_id}/langfield/heatmap/{name}")
@@ -6963,28 +7143,97 @@ async def pin_splat_job(job_id: str):
 
 @router.post("/jobs/{job_id}/scale")
 async def set_splat_scale(job_id: str, payload: dict[str, Any]):
-    """Survey-lane scale calibration: METERS PER SCENE UNIT, set by measuring a
-    reference of known real-world length in the viewer. nerfstudio scenes are
-    non-metric (poses auto-normalized to a unit box), so this stored factor is
-    the only bridge from scene units to real distances — measure/DXF/LandXML
-    all hang off it. Body {"meters_per_unit": <float>} sets; null clears.
-    Reaches clients via the **meta spread in _job_payload."""
+    """Survey-lane scale calibration: METERS PER SCENE UNIT. nerfstudio scenes
+    are non-metric (poses auto-normalized to a unit box), so this stored factor
+    is the only bridge from scene units to real distances — dimensions, the
+    world's 1.5 m prop rule, the scale_sanity gate and DXF/LandXML all hang
+    off it.
+
+    Two bodies are accepted:
+
+      {"meters_per_unit": <float>|null}
+          Direct set (or clear). Recorded with method "manual", or "map" when
+          `source` says the value was eyeballed off satellite tiles.
+
+      {"references": [{"dimension_id": str, "real_length_m": float}, ...]}
+          Preferred. The SERVER derives the factor from stored dimensions.json
+          measurements, averages several references, and records which
+          measurements produced it plus how well they agree. Scale stops being
+          an unsourced number.
+
+    Replacing a better-evidenced calibration with a weaker one (a measured
+    factor with a map-eyeballed one) requires `"force": true`, so an accuracy
+    downgrade is a choice rather than a side effect of dragging a map.
+
+    Every successful change bumps `scale_generation`, the counter downstream
+    artifacts compare against to know they were built at an older scale.
+    """
     if not _safe_job_id(job_id):
         raise HTTPException(status_code=404, detail="Splat job not found")
-    raw = payload.get("meters_per_unit")
-    if raw is None:
-        meta = _patch_meta(job_id, meters_per_unit=None)
-    else:
+    job_dir = _job_dir(job_id)
+    existing = _read_meta(job_id) or {}
+    if not existing:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+
+    references = payload.get("references")
+    forced = bool(payload.get("force"))
+    source = str(payload.get("source") or "")
+
+    if references is not None:
+        if not isinstance(references, list):
+            raise HTTPException(status_code=400, detail="references must be a list")
+        # Local import: dimensions_route imports this module, so a top-level
+        # import here would be circular.
+        import dimensions_route
+
         try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="meters_per_unit must be a number")
-        if not (math.isfinite(value) and 0.0 < value < 1e6):
-            raise HTTPException(status_code=400, detail="meters_per_unit must be finite and > 0")
-        meta = _patch_meta(job_id, meters_per_unit=value)
+            record = scale_calibration.calibrate_from_dimensions(
+                dimensions_route.load_dimensions(job_dir), references, source=source)
+        except scale_calibration.CalibrationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif payload.get("meters_per_unit") is None:
+        patched = _patch_meta(
+            job_id, meters_per_unit=None, scale_calibration=None,
+            scale_generation=int(existing.get("scale_generation") or 0) + 1)
+        if not patched:
+            raise HTTPException(status_code=404, detail="Splat job not found")
+        return {"ok": True, "job_id": job_id, "meters_per_unit": None,
+                "scale_calibration": None,
+                "scale_generation": patched.get("scale_generation")}
+    else:
+        method = (scale_calibration.METHOD_MAP if source == "map"
+                  else scale_calibration.METHOD_MANUAL)
+        try:
+            record = scale_calibration.calibrate_manual(
+                payload.get("meters_per_unit"), method=method, source=source)
+        except scale_calibration.CalibrationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    prior = existing.get("scale_calibration")
+    if not forced and scale_calibration.downgrades_evidence(prior, record):
+        raise HTTPException(
+            status_code=409,
+            detail=(f"refusing to replace a {prior.get('method')} calibration "
+                    f"({scale_calibration.describe(prior)}) with a weaker "
+                    f"{record['method']} one; resend with force: true to accept "
+                    f"the accuracy downgrade"))
+
+    meta = _patch_meta(
+        job_id,
+        meters_per_unit=record["meters_per_unit"],
+        scale_calibration=record,
+        scale_generation=int(existing.get("scale_generation") or 0) + 1,
+    )
     if not meta:
         raise HTTPException(status_code=404, detail="Splat job not found")
-    return {"ok": True, "job_id": job_id, "meters_per_unit": meta.get("meters_per_unit")}
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "meters_per_unit": meta.get("meters_per_unit"),
+        "scale_calibration": meta.get("scale_calibration"),
+        "scale_generation": meta.get("scale_generation"),
+        "detail": scale_calibration.describe(record),
+    }
 
 
 @router.post("/jobs/{job_id}/unpin")

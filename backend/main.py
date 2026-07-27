@@ -33,6 +33,7 @@ import export_route  # noqa: E402  (portable splat formats, collision, and Unrea
 import polish_route  # noqa: E402  (polished-GLB return leg: Blender/UE edits land back)
 import activity_route  # noqa: E402  (read-only busy-now snapshot: GPU holder + held per-job locks)
 import feedback  # noqa: E402  (small SQLite-backed in-app feedback loop)
+import opregistry  # noqa: E402  (persistent heavy-operation registry: pollable, restart-truthful)
 import thumb as thumbgen  # noqa: E402  (scene thumbnail generator)
 
 # Nothing is proxied to the portal anymore; PORTAL_ORIGIN stays because /healthz
@@ -58,6 +59,14 @@ async def _lifespan(_app: FastAPI):
         await splat_route.resume_orphan_jobs()
     with contextlib.suppress(Exception):
         feedback.init_db()
+    with contextlib.suppress(Exception):
+        # Any operation still marked running belongs to the process that just
+        # died. Say so plainly rather than leaving phantom work on /activity.
+        opregistry.init_db()
+        orphaned = opregistry.reconcile_orphans()
+        if orphaned:
+            print(f"[splatlab] marked {orphaned} interrupted operation(s) abandoned",
+                  flush=True)
     yield
 
 
@@ -65,6 +74,44 @@ app = FastAPI(title="SplatLab", lifespan=_lifespan)
 
 
 # ── auth ────────────────────────────────────────────────────────────────────
+# A signed cookie's timestamp is compared against this machine's clock; a little
+# skew must not log everyone out, but a far-future stamp is not a real session.
+_CLOCK_SKEW_S = 300
+
+# Login throttle. The app is publicly tunneled and the single shared token is
+# both the password and the HMAC key, so an unthrottled POST /login is an
+# offline-speed guessing oracle against the one secret that matters. Per-IP,
+# in-memory: it dies with the process, which is acceptable for a rate limit and
+# keeps this dependency-free.
+_LOGIN_MAX_ATTEMPTS = 8
+_LOGIN_WINDOW_S = 300
+_LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+
+
+def _client_ip(request: Request) -> str:
+    # Behind cloudflared, the tunnel is the peer; trust its forwarded header for
+    # rate-limiting purposes only. This never grants access, so a spoofed value
+    # can at worst throttle the spoofer.
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:64]
+    return (getattr(request.client, "host", "") or "unknown")[:64]
+
+
+def _login_throttled(ip: str) -> bool:
+    now = time.time()
+    attempts = [t for t in _LOGIN_ATTEMPTS.get(ip, []) if now - t < _LOGIN_WINDOW_S]
+    _LOGIN_ATTEMPTS[ip] = attempts
+    if len(_LOGIN_ATTEMPTS) > 4096:            # bound the map; oldest buckets go
+        for stale in [k for k, v in _LOGIN_ATTEMPTS.items() if not v][:2048]:
+            _LOGIN_ATTEMPTS.pop(stale, None)
+    return len(attempts) >= _LOGIN_MAX_ATTEMPTS
+
+
+def _record_failed_login(ip: str) -> None:
+    _LOGIN_ATTEMPTS.setdefault(ip, []).append(time.time())
+
+
 def _sign(ts: int) -> str:
     mac = hmac.new(PORTAL_TOKEN.encode(), str(ts).encode(), hashlib.sha256).hexdigest()
     return f"{ts}:{mac}"
@@ -75,9 +122,14 @@ def _valid_cookie(value: str) -> bool:
         return False
     ts_str, mac = value.rsplit(":", 1)
     try:
-        if time.time() - int(ts_str) > MAX_AGE:
-            return False
+        age = time.time() - int(ts_str)
     except ValueError:
+        return False
+    if age > MAX_AGE:
+        return False
+    # A future-dated timestamp used to pass: only `age > MAX_AGE` was checked, so
+    # a cookie stamped years ahead never expired. Small clock skew is tolerated.
+    if age < -_CLOCK_SKEW_S:
         return False
     expected = hmac.new(PORTAL_TOKEN.encode(), ts_str.encode(), hashlib.sha256).hexdigest()
     return hmac.compare_digest(mac, expected)
@@ -128,10 +180,17 @@ async def login_page():
 
 @app.post("/login")
 async def login_submit(request: Request):
+    ip = _client_ip(request)
+    if _login_throttled(ip):
+        return HTMLResponse(
+            _login_html("Too many attempts. Wait a few minutes and try again."),
+            status_code=429, headers={"Retry-After": str(_LOGIN_WINDOW_S)})
     form = await request.form()
     token = (form.get("portal_token") or "").strip()
     if not PORTAL_TOKEN or not hmac.compare_digest(token, PORTAL_TOKEN):
+        _record_failed_login(ip)
         return HTMLResponse(_login_html("Invalid token."), status_code=401)
+    _LOGIN_ATTEMPTS.pop(ip, None)              # a success clears the bucket
     resp = RedirectResponse("/", status_code=303)
     resp.set_cookie(COOKIE, _sign(int(time.time())), httponly=True, secure=True, samesite="lax", max_age=MAX_AGE, path="/")
     return resp
@@ -233,6 +292,12 @@ if (DIST / "assets").is_dir():
 
 @app.get("/{full_path:path}", response_class=HTMLResponse)
 async def spa(full_path: str, request: Request):
+    # An unmatched /api/* GET used to fall through to here and return the SPA's
+    # index.html with a 200, so a typo'd or removed endpoint looked like a
+    # working route serving HTML — which cost one live debugging session. API
+    # paths get an API answer.
+    if full_path.startswith("api/"):
+        raise HTTPException(status_code=404, detail="unknown API route")
     if not _authed(request):
         return RedirectResponse("/login", status_code=303)
     index = DIST / "index.html"

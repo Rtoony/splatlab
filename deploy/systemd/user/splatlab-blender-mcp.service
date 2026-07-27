@@ -1,0 +1,12 @@
+[Unit]
+Description=SplatLab restricted Blender MCP (loopback :9877, typed ops only)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/rtoony/projects/splatlab/integrations/blender/run-mcp.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
