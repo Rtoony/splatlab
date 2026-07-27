@@ -356,22 +356,20 @@ export function SparkSceneViewer({
   // why the HUD is part of what hides.
   const [chromeHidden, setChromeHidden] = useState(false);
 
+  // The SELECTION tint is always cyan, deliberately. Tinting it with the class
+  // colour (as this briefly did) makes the selection invisible exactly when you
+  // need it: painting Pavement (#52525b) puts grey on grey, and grass you
+  // mis-selected as pavement then looks identical to real pavement — you cannot
+  // see what you actually have. A selection highlight's job is contrast, not
+  // identity. The class is already stated three other ways: the brush cursor
+  // ring, the lit chip, and the commit button ("Paint N as Pavement / Asphalt").
+  // To see class colours ON the scene, that is what "Show class layer" is for.
   useEffect(() => {
-    if (paintTarget === "class" && selectedClassId && taxonomy) {
-      const hex = taxonomy.find((c) => c.id === selectedClassId)?.color;
-      if (hex) {
-        paintTintRef.current = [
-          parseInt(hex.slice(1, 3), 16) / 255,
-          parseInt(hex.slice(3, 5), 16) / 255,
-          parseInt(hex.slice(5, 7), 16) / 255,
-        ];
-        paintCursorHexRef.current = parseInt(hex.slice(1), 16);
-        refreshModifierRef.current();
-        return;
-      }
-    }
-    paintTintRef.current = [0.13, 0.83, 0.93];
-    paintCursorHexRef.current = 0x22d3ee;
+    const hex =
+      paintTarget === "class" && selectedClassId && taxonomy
+        ? taxonomy.find((c) => c.id === selectedClassId)?.color
+        : undefined;
+    paintCursorHexRef.current = hex ? parseInt(hex.slice(1), 16) : 0x22d3ee;
     refreshModifierRef.current();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paintTarget, selectedClassId, taxonomy]);
@@ -604,6 +602,31 @@ export function SparkSceneViewer({
     }
   }, [measureArm]);
 
+  // Orbit while painting. Left-drag belongs to the brush, so it is unmapped
+  // from OrbitControls and rotate moves to the RIGHT button (middle pans, wheel
+  // still zooms). The alternative — disabling controls outright — is what made
+  // you toggle the brush off every time you wanted to see the other side of the
+  // subject. Touch: one finger paints, two fingers orbit/zoom.
+  useEffect(() => {
+    const controls = controlsRef.current;
+    if (!controls) return;
+    if (paintMode) {
+      controls.mouseButtons = {
+        LEFT: null as unknown as THREE.MOUSE, // brush owns it
+        MIDDLE: THREE.MOUSE.PAN,
+        RIGHT: THREE.MOUSE.ROTATE,
+      };
+      controls.touches = { ONE: null as unknown as THREE.TOUCH, TWO: THREE.TOUCH.DOLLY_PAN };
+    } else {
+      controls.mouseButtons = {
+        LEFT: THREE.MOUSE.ROTATE,
+        MIDDLE: THREE.MOUSE.DOLLY,
+        RIGHT: THREE.MOUSE.PAN,
+      };
+      controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
+    }
+  }, [paintMode, ready]);
+
   useEffect(() => {
     paintModeRef.current = paintMode;
     if (paintMode) {
@@ -783,10 +806,10 @@ export function SparkSceneViewer({
   applyOverlayRef.current = () => refreshModifierRef.current();
 
   // ---- paint-the-embeddings ----------------------------------------------
-  // Selection tint follows the tool: cyan for field paint, the CLASS COLOR
-  // while class painting — so grass strokes look green, pavement grey, and
-  // switching chips re-tints the live selection instantly.
-  const paintTintRef = useRef<[number, number, number]>([0.13, 0.83, 0.93]);
+  // Fixed selection cyan — see the paintCursorHexRef effect for why this must
+  // NOT follow the class colour. The brush CURSOR does follow it, so you still
+  // know which class the next stroke assigns.
+  const SELECTION_TINT: [number, number, number] = [0.13, 0.83, 0.93];
   const paintCursorHexRef = useRef(0x22d3ee);
 
   function previewSelection() {
@@ -800,7 +823,7 @@ export function SparkSceneViewer({
     mesh.worldModifier = buildOverlayModifier({
       scalarArray,
       channelCount: 1,
-      channelColors: [paintTintRef.current],
+      channelColors: [SELECTION_TINT],
       channelEnabled: [dyno.dynoBool(true)],
       mode: "highlight",
       ramp: rampName,
@@ -1910,12 +1933,16 @@ export function SparkSceneViewer({
       downX = e.clientX;
       downY = e.clientY;
       if (e.button !== 0) return;
-      // Armed brush owns left-drag: hold and sweep to paint (disarm Painting
-      // to orbit again). Single clicks still stroke via onClick.
+      // Armed brush owns left-drag: hold and sweep to paint. Right-drag still
+      // orbits (see the paintMode effect). Single clicks stroke via onClick.
       if (paintModeRef.current) {
+        // NOTE: controls stay ENABLED. Left-drag is unmapped from orbit while
+        // the brush is armed (see the paintMode effect), so right-drag still
+        // orbits and the wheel still zooms — you can frame the next stroke
+        // without disarming. Disabling controls outright is what forced the
+        // old "toggle Painting off to navigate" dance.
         paintDrag = true;
         lastStroke = null;
-        controls.enabled = false;
         renderer.domElement.setPointerCapture(e.pointerId);
         return;
       }
@@ -1965,7 +1992,6 @@ export function SparkSceneViewer({
       if (paintDrag) {
         paintDrag = false;
         lastStroke = null;
-        controls.enabled = true;
         try {
           renderer.domElement.releasePointerCapture(e.pointerId);
         } catch {
@@ -2800,10 +2826,12 @@ export function SparkSceneViewer({
                   </label>
                 )}
                 <p className="text-[10px] leading-snug text-zinc-500">
-                  The cyan wireframe sphere is your brush. <b>Click</b> for one stroke or{" "}
-                  <b>hold and sweep</b> to paint ({selCount.toLocaleString()} splats selected, shown
-                  cyan). Everything stays local until you press the commit button — that's the save.
-                  Camera orbit is paused while Painting is armed — toggle it off to navigate.
+                  The wireframe sphere is your brush — it takes the class colour so you know what
+                  the next stroke assigns. <b>Click</b> for one stroke or <b>hold and sweep</b> to
+                  paint; the selection ({selCount.toLocaleString()} splats) is always shown{" "}
+                  <b>cyan</b> so it stays visible whatever you're painting it as. <b>Right-drag
+                  orbits</b> and the wheel zooms without disarming. Everything stays local until you
+                  press the commit button — that's the save.
                 </p>
                 {paintTarget === "class" && (
                   <div className="space-y-1.5">
@@ -3415,7 +3443,7 @@ function ToolHud({
 }) {
   if (!tool && selCount === 0) return null;
   const TOOL_COPY: Record<ToolName, { name: string; hint: string }> = {
-    paint: { name: "Paint", hint: "drag to brush · [ ] size · Ctrl+Z undo · Enter commit · Esc exit" },
+    paint: { name: "Paint", hint: "drag to brush · right-drag orbits · [ ] size · Ctrl+Z undo · Enter commit · Esc exit" },
     crop: { name: "Crop sphere", hint: "click to place · [ ] size · Enter applies · Esc backs out" },
     box: { name: "Crop box", hint: "click to place · [ ] size · Enter applies · Esc backs out" },
     measure: { name: "Dimension", hint: "click two points · Esc backs out" },
@@ -3474,6 +3502,7 @@ function ShortcutLegend() {
       "Camera",
       [
         ["drag / scroll", "orbit · zoom"],
+        ["right-drag", "orbit while painting"],
         ["W A S D", "pan"],
         ["← →", "roll"],
         ["dbl-click", "set orbit pivot"],

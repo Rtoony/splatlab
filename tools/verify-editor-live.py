@@ -82,6 +82,14 @@ def hud_text(page):
         return ""
 
 
+def ensure_paint_armed(page):
+    """`b` toggles, so pressing it blind can DISARM. Assert the end state."""
+    if "Painting" not in panel_text(page):
+        page.keyboard.press("b")
+        page.wait_for_timeout(1500)
+    return "Painting" in panel_text(page)
+
+
 def size_input(page, label_word):
     for el in page.query_selector_all("input[aria-label]"):
         if label_word in (el.get_attribute("aria-label") or ""):
@@ -269,8 +277,7 @@ with sync_playwright() as p:
                   "selected" in low and "not committed" in low, after[:80].replace("\n", " / "))
             shot(page, f"{JOB}-07-esc-keeps-selection.png")
 
-            page.keyboard.press("b")
-            time.sleep(1.2)
+            ensure_paint_armed(page)
             page.keyboard.press("Control+z")
             time.sleep(1.2)
             undone = sel_count()
@@ -285,6 +292,30 @@ with sync_playwright() as p:
             time.sleep(1.2)
             check("Del discards the selection", "selected" not in hud_text(page).lower())
 
+            # Orbit WHILE the brush is armed (RToony, 07-26): right-drag must
+            # move the camera and left-drag must still paint, so you can frame
+            # the next stroke without disarming.
+            check("brush re-arms for the orbit checks", ensure_paint_armed(page))
+            shot_a = page.screenshot(timeout=15_000)
+            page.mouse.move(VW // 2 + 60, VH // 2)
+            page.mouse.down(button="right")
+            for i in range(12):
+                page.mouse.move(VW // 2 + 60 - 14 * i, VH // 2, steps=1)
+            page.mouse.up(button="right")
+            time.sleep(1.5)
+            check("right-drag orbits while the brush is armed",
+                  page.screenshot(timeout=15_000) != shot_a)
+            n_before = sel_count() or 0
+            page.mouse.move(VW // 2, VH // 2 + 10)
+            page.mouse.down()
+            for i in range(10):
+                page.mouse.move(VW // 2 + 9 * i, VH // 2 + 10 + 5 * i, steps=1)
+            page.mouse.up()
+            time.sleep(2.5)
+            check("...and left-drag still paints rather than orbiting",
+                  (sel_count() or 0) > n_before, f"{n_before} -> {sel_count()}")
+
+        ensure_paint_armed(page)
         cls = page.query_selector("button:text-is('Class')")
         if cls:
             cls.click()
@@ -299,6 +330,9 @@ with sync_playwright() as p:
             t1 = panel_text(page)
             check("1-9 change the selected class", bool(t4) and bool(t1) and t4 != t1,
                   "panel differs between class 4 and class 1")
+            check("selection stays cyan, not the class colour",
+                  "shown" in panel_text(page).lower() and "cyan" in panel_text(page).lower(),
+                  "class-coloured selection is invisible on same-coloured scene content")
             shot(page, f"{JOB}-08-class-brush.png")
         else:
             check("1-9 change the selected class", False, "Class toggle not found")
