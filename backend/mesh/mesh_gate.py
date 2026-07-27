@@ -206,11 +206,33 @@ def main() -> int:
     # is the receipt that turns "I registered it" into "it rendered there".
     bb = mesh.get_axis_aligned_bounding_box()
     lo, hi = np.asarray(bb.min_bound), np.asarray(bb.max_bound)
+
+    # Do the cameras sit INSIDE the thing being scored?
+    #
+    # A watertight shell built over an object-centric orbit capture encloses the
+    # camera ring as well as the subject, because the cameras orbit outside the
+    # subject and the solid must close around everything. Every render is then a
+    # view of the mesh's own interior walls, which scores like noise and looks
+    # like a jumble of slabs. Measured on splat_3aaf8067: 175/175 cameras inside,
+    # PSNR 11.96 against a 17.64 reference, and no amount of texture resolution,
+    # class radius, face budget or unobserved-face dropping moved it (0.23 dB
+    # across 4x the geometry). It is not a tuning problem and it is invisible in
+    # the scores alone, so state it.
+    # lo/hi are measured AFTER --transform, i.e. in the frame the renderer saw,
+    # which is the same capture frame the cameras live in.
+    cam_pos = cams.camera_to_worlds[:, :3, 3].numpy()
+    inside = np.all((cam_pos >= lo) & (cam_pos <= hi), axis=1)
+    cameras_inside = float(inside.mean())
+
     report = {
         "v": 1,
         "cams": len(per_cam),
         "per_cam": per_cam,
         "median_coverage": round(float(np.median([e["coverage"] for e in per_cam])), 3),
+        # >0 means some renders look at the mesh from the inside. Near 1.0 means
+        # the mesh encloses the capture and cannot resemble it from any camera.
+        "cameras_inside_mesh_bbox": round(cameras_inside, 3),
+        "encloses_capture": bool(cameras_inside > 0.5),
         "median_psnr": round(float(np.median([e["psnr_covered"] for e in scored])), 2) if scored else None,
         "median_ssim": round(float(np.median([e["ssim_fullframe"] for e in scored])), 3) if scored else None,
         "convention": "o3d-unlit, psnr on covered px, ssim full-frame vs black-backed render",

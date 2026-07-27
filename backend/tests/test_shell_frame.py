@@ -179,3 +179,34 @@ def test_the_gates_still_fall_back_to_the_visual_shell():
 
     assert "walk_mesh, walk_source = shell_mesh, shell_glb.name" in block
     assert "if collision_glb.is_file():" in block
+
+
+# ---------------------------------------------------------------------------
+# mesh_gate reports whether the mesh encloses the cameras that score it
+# ---------------------------------------------------------------------------
+
+def test_mesh_gate_reports_camera_containment():
+    """A watertight shell over an object-centric orbit capture encloses the
+    camera ring, so every render looks at its own interior walls. That scores
+    like noise and is invisible in PSNR alone — measured on splat_3aaf8067,
+    175/175 cameras inside, 11.96 dB, and four different knobs moved it 0.23 dB
+    total. The gate has to say it out loud."""
+    source = (Path(__file__).resolve().parents[1] / "mesh" / "mesh_gate.py").read_text()
+
+    assert '"cameras_inside_mesh_bbox"' in source
+    assert '"encloses_capture"' in source
+    assert "cam_pos = cams.camera_to_worlds[:, :3, 3].numpy()" in source
+    # Must be measured in the frame the renderer saw, i.e. after --transform.
+    assert "lo/hi are measured AFTER --transform" in source
+
+
+def test_camera_containment_is_a_simple_bbox_test():
+    """The maths, isolated — the gate itself needs open3d and real cameras."""
+    lo, hi = np.array([-6.7, -6.4, -1.5]), np.array([3.8, 6.2, 5.9])
+    cameras = np.array([[-0.88, -0.98, -0.27], [0.89, 1.0, 0.30], [0.0, 0.0, 0.0]])
+    inside = np.all((cameras >= lo) & (cameras <= hi), axis=1)
+    assert inside.mean() == 1.0, "the shell case: every camera enclosed"
+
+    ground_lo, ground_hi = np.array([-2.1, -2.4, -0.5]), np.array([2.1, 2.4, 0.17])
+    outside = np.all((cameras >= ground_lo) & (cameras <= ground_hi), axis=1)
+    assert outside.mean() < 1.0, "the ground case: cameras look at it from outside"
