@@ -26,13 +26,18 @@ from matplotlib import cm                                     # noqa: E402
 from PIL import Image                                         # noqa: E402
 
 DEV = "cuda"
-SIGLIP_CKPT = "google/siglip2-so400m-patch16-384"
+# Shared with the warm worker and the isolation lane. relevancy_core is a sibling
+# file, so a bare import works whether this runs as a script or a module.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import relevancy_core                                         # noqa: E402
+
+SIGLIP_CKPT = relevancy_core.SIGLIP_CKPT
 CONFIG = Path(sys.argv[1])
 OUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("/home/rtoony/tools/langfield-spike/outputs_v2")
 QUERIES = sys.argv[3].split("|") if len(sys.argv) > 3 else [
     "green bushes", "a window", "brick wall", "a lamp post",
 ]
-NEGATIVES = ["object", "things", "stuff", "texture", "surface"]
+NEGATIVES = relevancy_core.NEGATIVES
 QW, QH = 640, 480
 
 # ── geometry (KEEP the spike load) ───────────────────────────────────────────────
@@ -50,6 +55,11 @@ CAM_VIEWS = sorted({0, n_cams // 3, (2 * n_cams) // 3, n_cams - 1})[:3]
 
 d = np.load(OUT / "gauss_emb.npz")
 feat_n = torch.tensor(d["gauss_emb"], device=DEV).float()   # already L2-normed (zeros for unseen)
+# Gaussians the lift never observed. Their all-zero rows score EXACTLY 0.5 against
+# every query, so without this they sat permanently mid-heatmap and could outrank
+# a real weak match. Written by langfield_v2 since the lift was built.
+seen = (torch.tensor(d["seen"], device=DEV).bool() if "seen" in d.files
+        else relevancy_core.observed_mask(feat_n))
 
 # ── SigLIP 2 text encoder (same joint space as the lift) ─────────────────────────
 siglip = AutoModel.from_pretrained(SIGLIP_CKPT, dtype=torch.float16, attn_implementation="sdpa").to(DEV).eval()
@@ -65,14 +75,10 @@ def text_emb(prompts):
 neg_p = text_emb(NEGATIVES)
 
 def relevancy_vec(query):
-    q = text_emb([query])[0]
-    sim_pos = feat_n @ q
-    sim_neg = feat_n @ neg_p.T
-    rel = torch.ones_like(sim_pos)
-    for k in range(neg_p.shape[0]):
-        pair = torch.stack([sim_pos, sim_neg[:, k]], dim=-1)
-        rel = torch.minimum(rel, torch.softmax(pair * 10.0, dim=-1)[:, 0])
-    return rel  # [N] in [0,1]
+    """Per-gaussian LERF min-softmax relevancy; unseen gaussians score 0.
+    The arithmetic now lives in relevancy_core, shared with langfield_worker.py
+    and mesh/object_isolate.py instead of being copied into each."""
+    return relevancy_core.relevancy_vec(feat_n, text_emb([query])[0], neg_p, seen=seen)
 
 # ── render helpers (KEEP verbatim from the spike) ────────────────────────────────
 def viewmat_for(i):

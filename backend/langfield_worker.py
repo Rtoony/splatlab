@@ -4,12 +4,14 @@ Keeps the SigLIP 2 text encoder + an LRU of 1-2 lifted scenes resident so a
 language query renders a relevancy heatmap-overlay strip in ~a second instead of
 re-paying the cold eval_setup + model-load every time.
 
-Relevancy + overlay math is COPIED VERBATIM from
-``backend/langfield/query_render_v2.py`` (the cold renderer) so the warm path's
-``q_<safe>.png`` is pixel-identical to the offline recipe. We copy rather than
-import because query_render_v2 runs a full render at module import (it's a
-script); copying the pure functions keeps the result identical with no side
-effects.
+Relevancy math is IMPORTED from ``backend/langfield/relevancy_core.py``, which
+the cold renderer (``query_render_v2.py``) uses too, so the warm path's
+``q_<safe>.png`` stays identical to the offline recipe by construction rather
+than by a keep-them-in-sync comment. It was previously copied verbatim —
+query_render_v2 renders at module import, so importing *it* was not an option —
+and the copies had already drifted: ``mesh/object_isolate.py`` zeroed unseen
+gaussians while this file scored them 0.5 against every query. Overlay/render
+helpers below are still local for that same import-side-effect reason.
 
 GPU SAFETY: startup, scene loading, SigLIP inference, relevancy computation, and
 gsplat rasterization all run through ``gpu_arbiter.run_sync_gpu_operation``.
@@ -47,12 +49,18 @@ except Exception:  # pragma: no cover - fallback for direct/script execution
     import gpu_arbiter  # type: ignore
     import maintenance_gate  # type: ignore
 
+# The shared relevancy math lives beside the cold renderer that used to own it.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "langfield"))
+import relevancy_core  # noqa: E402
+
 log = logging.getLogger("langfield_worker")
 
 # ── tunables ─────────────────────────────────────────────────────────────────────
 DEV = "cuda"
-SIGLIP_CKPT = "google/siglip2-so400m-patch16-384"
-NEGATIVES = ["object", "things", "stuff", "texture", "surface"]
+# Re-exported from relevancy_core so the checkpoint and the negative prompts have
+# exactly one definition; they were previously repeated across 6 and 4 files.
+SIGLIP_CKPT = relevancy_core.SIGLIP_CKPT
+NEGATIVES = relevancy_core.NEGATIVES
 
 # Curated open-vocabulary noun list for the "what's in this scene" inventory. We score
 # each word's per-gaussian relevancy against the scene, rank by presence, and keep the
@@ -148,24 +156,14 @@ except Exception as _e:  # pragma: no cover - lets py_compile / ast.parse pass a
     eval_setup = get_viewmat = rasterization = None  # type: ignore
     AutoModel = AutoProcessor = cm = Image = None  # type: ignore
 
-# ── relevancy + overlay math — COPIED VERBATIM from query_render_v2.py ────────────
-# These are the only numerical primitives that decide what q_<safe>.png looks like.
-# Keep byte-for-byte identical to the cold renderer.
-
-def relevancy_vec(feat_n, q_emb, neg_p):
-    """Per-gaussian LERF min-softmax relevancy in [0,1]. (query_render_v2.relevancy_vec)
-
-    feat_n: [N,1152] L2-normed gaussian embeddings (zeros for unseen)
-    q_emb:  [1152]   L2-normed query text embedding
-    neg_p:  [K,1152] L2-normed negative-prompt embeddings
-    """
-    sim_pos = feat_n @ q_emb
-    sim_neg = feat_n @ neg_p.T
-    rel = torch.ones_like(sim_pos)
-    for k in range(neg_p.shape[0]):
-        pair = torch.stack([sim_pos, sim_neg[:, k]], dim=-1)
-        rel = torch.minimum(rel, torch.softmax(pair * 10.0, dim=-1)[:, 0])
-    return rel  # [N] in [0,1]
+# ── relevancy math — now SHARED, not copied ──────────────────────────────────────
+# This used to be a verbatim copy of query_render_v2.relevancy_vec, kept in sync
+# by a comment. It had already drifted from mesh/object_isolate.py, which
+# correctly zeroed unseen gaussians while this copy scored them at exactly 0.5
+# against every query. langfield/relevancy_core.py is now the one definition.
+def relevancy_vec(feat_n, q_emb, neg_p, seen=None):
+    """Per-gaussian LERF min-softmax relevancy in [0,1]; unseen rows score 0."""
+    return relevancy_core.relevancy_vec(feat_n, q_emb, neg_p, seen=seen)
 
 
 def _make_render(means, quats, scales, opac, cams, fullW, fullH):
@@ -223,6 +221,17 @@ class Scene:
         # per-gaussian lifted SigLIP features (already L2-normed; zeros for unseen)
         d = np.load(lf_p / "gauss_emb.npz")
         self.feat_n = torch.tensor(d["gauss_emb"], device=DEV).float()
+
+        # Which gaussians the lift actually observed. Written by langfield_v2
+        # since the lift was first built, but only mesh/object_isolate.py ever
+        # read it: an unobserved row is all zeros, which scores exactly 0.5
+        # against EVERY query, so unseen geometry sat permanently mid-heatmap
+        # and could outrank a real weak match. Older scenes may predate the key,
+        # in which case the mask is derived from the embeddings themselves.
+        if "seen" in getattr(d, "files", []):
+            self.seen = torch.tensor(d["seen"], device=DEV).bool()
+        else:
+            self.seen = relevancy_core.observed_mask(self.feat_n)
 
         # ply->ckpt row map for the CLIENT-SIDE heatmap: gauss_emb rows follow the
         # checkpoint, but the client renders the exported ply and ns-export FILTERS
@@ -328,7 +337,7 @@ def _compute_relevancy(state: WorkerState, sc: Scene, text: str):
     """LOCKLESS: query text embed + per-gaussian LERF relevancy. Cheap, no gsplat,
     ~no extra VRAM beyond the resident text encoder. Returns rel3 = [N,3]."""
     q = state._text_emb([text])[0]
-    rel = relevancy_vec(sc.feat_n, q, state.neg_p)
+    rel = relevancy_vec(sc.feat_n, q, state.neg_p, seen=sc.seen)
     return rel[:, None].repeat(1, 3)
 
 
