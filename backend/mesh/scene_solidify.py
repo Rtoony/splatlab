@@ -234,7 +234,8 @@ def run_object_texture(py: Path, script: Path, mesh: Path, splat: Path, out_glb:
                        crop: bool, smooth: bool = True, timeout: int = 1800,
                        min_gaussians: int | None = None,
                        unwrap_chunks: int = 1,
-                       class_map: Path | None = None) -> dict:
+                       class_map: Path | None = None,
+                       class_radius: float | None = None) -> dict:
     cmd = [str(py), str(script), str(mesh), str(splat), str(out_glb),
            "--target-faces", str(faces), "--texture-size", str(tex)]
     if unwrap_chunks > 1:
@@ -242,6 +243,8 @@ def run_object_texture(py: Path, script: Path, mesh: Path, splat: Path, out_glb:
     if class_map is not None:
         taxonomy = Path(__file__).resolve().parents[1] / "class_taxonomy.json"
         cmd += ["--class-map", str(class_map), "--class-taxonomy", str(taxonomy)]
+        if class_radius:
+            cmd += ["--class-radius", str(round(float(class_radius), 4))]
     if mpu:
         cmd += ["--meters-per-unit", str(mpu)]
     if smooth:
@@ -378,10 +381,17 @@ def build_shell(job_dir: Path, args, instances, py: Path, script: Path, mpu) -> 
         # Chunked unwrap is what makes dense-shell budgets tractable
         # (13x measured at 400k faces); the layout change is confined to
         # the shell, whose consumers treat GLB+atlas as a regenerated pair.
+        # --class-radius was unreachable from here, so the shell always used
+        # object_texture's 0.15 default. It is exposed now, but note the
+        # measurement that came with it: on splat_3aaf8067 the median distance
+        # from shell surface to the nearest classed gaussian is 3.44 scene
+        # units, so NO radius rescues class coverage. See the STATUS entry:
+        # the shell encloses ~3x the volume of the ground. Knob, not the fix.
         res = run_object_texture(py, script, geom, splat, out, mpu=mpu,
                                  faces=args.shell_faces, tex=args.shell_texture_size,
                                  reconstruct=False, crop=False, timeout=3600,
-                                 unwrap_chunks=4, class_map=class_map)
+                                 unwrap_chunks=4, class_map=class_map,
+                                 class_radius=getattr(args, "class_radius", None))
         shell.update(cut=cut, built=res["ok"], seconds=res["seconds"],
                      glb=out.name if res["ok"] else None)
         if not res["ok"]:
@@ -408,6 +418,9 @@ def main() -> int:
     ap.add_argument("--shell-texture-size", type=int, default=2048)
     ap.add_argument("--only", default=None, help="comma-separated slugs")
     ap.add_argument("--skip-shell", action="store_true")
+    ap.add_argument("--class-radius", type=float, default=None,
+                    help="scene units a shell texel may reach for a class; "
+                         "default scales with the shell's voxel size")
     ap.add_argument("--shell-source", choices=["tsdf", "voxel"], default="tsdf",
                     help="voxel = bake colour onto world_shell.py's watertight "
                          "solid (gate-passing); tsdf = the original cut surface")
