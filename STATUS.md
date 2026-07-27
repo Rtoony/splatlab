@@ -2378,6 +2378,27 @@ wrong numbers), recomputes **bicycle `splat_3aaf8067`, garden `splat_32d926d9`,
 fire-hydrant `splat_513e89171d`** through the app's gated route, then asserts exactly
 those three sit at generation 1 and prints the rollback. Dry run verified.
 
+**First `--apply` run (05:06) failed loudly at its own verify gate — two real findings:**
+1. The script's token parse was wrong: `tr -d '\n' | sed 's/.*PORTAL_TOKEN=\([^ ]*\).*/\1/'`
+   joined the whole env file into one line, so the greedy `.*` matched
+   `MAXIMUS_PORTAL_TOKEN` and `[^ ]*` swallowed every following variable — a 1145-char
+   blob instead of the 64-char token, so all three calls 401'd. Now line-anchored
+   (`grep -m1 '^PORTAL_TOKEN='`), length/whitespace checked, and **proven against
+   `GET /api/splat/status` before anything is restarted** rather than merely non-empty.
+   The recompute step now reports the HTTP code and `detail`, not a bare `generation=None`.
+2. **The bicycle `splat_3aaf8067` has a STALE language field** (marker
+   `2026-07-27T04:57:20Z`, version `v2-20260727T045701Z`) — the scene was edited, so
+   every language route 409s. That is the stale guard working, not a fault, and it
+   predates this work. Its inventory cannot be refreshed until the field is realigned.
+   The script now detects it in preflight, SKIPS that scene by default, exits **2** so a
+   partial run is never mistaken for success, and `--realign` runs the documented cure
+   (`POST /langfield/rebuild` — exact-xyz row remap, paints carried across) first.
+
+The restart DID happen on that run, so the fix is live: garden and hydrant now return
+`stale: true, relevancy_generation: null, current_relevancy_generation: 1` — served and
+flagged, exactly as intended. The script now detects an already-fixed build and skips a
+redundant bounce.
+
 Noted in passing: `splat_aea04ab3` (Bonsai) is at `version: 3`, so it will hard-recompute
 on its next read via the pre-existing INVENTORY_VERSION path regardless.
 
