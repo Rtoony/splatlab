@@ -16,7 +16,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { TargetInfo } from "@/lib/world-interactions";
 import { Link, useRoute } from "wouter";
-import { uploadPolishedWorldElement , fetchWorldInteractions, setWorldElementState } from "@/lib/api";
+import { uploadPolishedWorldElement , fetchWorldInteractions, setWorldElementState, solidifyWorld} from "@/lib/api";
 import { PolishUploadZone } from "@/components/workspace/polish-upload";
 import {
   DEFAULT_WALK_PARAMS,
@@ -37,6 +37,7 @@ import {
   EyeOff,
   Footprints,
   Gauge,
+  Hammer,
   Loader2,
   MapPin,
   Ruler,
@@ -390,6 +391,7 @@ export default function WorldViewPage() {
                 onCalibrateByHeight={calibrateByHeight}
               />
               <MovementPanel params={walkParams} onChange={updateParams} />
+              <RebuildPanel jobId={jobId} onRebuilt={() => setReloadNonce((n) => n + 1)} />
             </div>
           )}
 
@@ -686,6 +688,96 @@ function ScalePanel({
           </dl>
         </>
       )}
+    </Panel>
+  );
+}
+
+/**
+ * Rebuilding the shell was API-only until now, so tuning how the world LOOKS
+ * meant a curl and a page reload. Shell-only is the safe knob: it patches the
+ * shell and its counts and never touches element records, so it can be re-run
+ * freely while dialling detail in.
+ */
+function RebuildPanel({ jobId, onRebuilt }: { jobId: string; onRebuilt: () => void }) {
+  const [faces, setFaces] = useState(60000);
+  const [tex, setTex] = useState(2048);
+  const [source, setSource] = useState<"voxel" | "tsdf">("voxel");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function run() {
+    setBusy(true);
+    setError(null);
+    setResult(null);
+    try {
+      const r = await solidifyWorld(jobId, {
+        shell_only: true,
+        shell_source: source,
+        shell_faces: faces,
+        shell_texture_size: tex,
+        run_collision: false,
+        run_gate: true,
+      });
+      // A world that fails its gates is still returned, with the verdict — that
+      // is the point of the gates, so report it rather than only "done".
+      setResult(r.gate ? (r.gate.passed ? "Rebuilt — gates passed" : "Rebuilt — GATES FAILED") : "Rebuilt");
+      onRebuilt();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Rebuild failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Panel icon={<Hammer className="h-3.5 w-3.5" />} title="Rebuild shell">
+      <p className="text-[10px] leading-snug text-zinc-400">
+        Re-bakes the shell only; props and their placements are untouched.
+      </p>
+      <label className="flex items-center justify-between text-[11px] text-zinc-300">
+        Source
+        <select
+          value={source}
+          onChange={(e) => setSource(e.target.value as "voxel" | "tsdf")}
+          className="rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[11px]"
+        >
+          <option value="voxel">voxel (watertight)</option>
+          <option value="tsdf">tsdf (accurate, lacy)</option>
+        </select>
+      </label>
+      <label className="flex items-center justify-between text-[11px] text-zinc-300">
+        Faces
+        <input
+          type="number" min={1000} max={200000} step={1000} value={faces}
+          onChange={(e) => setFaces(Number(e.target.value))}
+          className="w-24 rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-right text-[11px]"
+        />
+      </label>
+      <label className="flex items-center justify-between text-[11px] text-zinc-300">
+        Texture
+        <select
+          value={tex}
+          onChange={(e) => setTex(Number(e.target.value))}
+          className="rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[11px]"
+        >
+          {[512, 1024, 2048, 4096].map((n) => <option key={n} value={n}>{n}</option>)}
+        </select>
+      </label>
+      <button
+        type="button"
+        onClick={run}
+        disabled={busy}
+        className="mt-1 w-full rounded-lg bg-cyan-500/90 px-2 py-1.5 text-[11px] font-semibold text-[#04121a] disabled:opacity-50"
+      >
+        {busy ? "Rebuilding…" : "Rebuild shell"}
+      </button>
+      {result && (
+        <p className={`text-[10px] leading-snug ${result.includes("FAILED") ? "text-amber-300" : "text-emerald-300/90"}`}>
+          {result} — reload to see it.
+        </p>
+      )}
+      {error && <p className="text-[10px] leading-snug text-rose-300/90">{error}</p>}
     </Panel>
   );
 }

@@ -397,3 +397,30 @@ export function setWorldElementState(
     },
   );
 }
+
+export type WorldSolidifyResult = {
+  ok: boolean;
+  op_id: string;
+  gate: { passed: boolean; report?: Record<string, unknown> } | null;
+  collision: { exit_code: number; error?: string } | null;
+  uncalibrated: boolean;
+};
+
+/**
+ * Rebuild a job's walkable world. `shell_only` patches the shell and its counts
+ * and never touches element records, which is what makes it safe to re-run
+ * while tuning the shell's look.
+ */
+export function solidifyWorld(
+  jobId: string,
+  body: Record<string, unknown>,
+): Promise<WorldSolidifyResult> {
+  return apiRequest<WorldSolidifyResult>(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/world/solidify`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
