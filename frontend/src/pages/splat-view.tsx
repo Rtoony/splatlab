@@ -195,6 +195,9 @@ export default function SplatViewPage() {
     retry: false,
   });
   const invItems = inventory?.items ?? [];
+  // Label vocabulary this scene already knows — the viewer uses it to catch a
+  // typo before it becomes a committed override ("bikr" vs "bike").
+  const invLabels = useMemo(() => invItems.map((i) => i.label), [invItems]);
   const [activeLabels, setActiveLabels] = useState<Set<string>>(new Set());
   const colorFor = (label: string) => HL_PALETTE[Math.max(0, invItems.findIndex((i) => i.label === label)) % HL_PALETTE.length];
 
@@ -471,6 +474,7 @@ export default function SplatViewPage() {
                 onRequestPanelSection={setMode}
                 onToggleShortcutLegend={() => setShortcutLegendOpen((v) => !v)}
                 onResetView={resetToDefaultView}
+                knownLabels={invLabels}
               />
             )}
             {cameraOverlayOn && camerasError && (

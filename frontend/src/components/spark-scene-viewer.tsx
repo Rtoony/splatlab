@@ -1,8 +1,9 @@
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { dyno, RgbaArray, SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
 import { apiRequest, applyEditOps, rebuildLangfield, revertEdit } from "@/lib/api";
+import { describeSelection, suggestLabel } from "@/lib/paint-guards";
 import {
   type EscapeStep,
   type ShortcutAction,
@@ -59,6 +60,13 @@ const INITIAL_CAMERA_UP = new THREE.Vector3(0, 0, 1);
 const M_PER_FT = 0.3048;
 const UNIT_TO_M: Record<string, number> = { m: 1, ft: M_PER_FT, in: M_PER_FT / 12 };
 const CHANNEL_PALETTE = ["#facc15", "#f472b6", "#22d3ee", "#a3e635"];
+// Naming the act, not just the count — see lib/paint-guards.ts.
+const PAINT_OP_VERB: Record<"assign" | "boost" | "suppress", string> = {
+  assign: "Pin",
+  boost: "Boost",
+  suppress: "Suppress",
+};
+
 const MODES: { key: OverlayMode; label: string; hint: string }[] = [
   { key: "highlight", label: "Highlight", hint: "natural scene, matches take their query color" },
   { key: "isolate", label: "Isolate", hint: "only matches visible, natural colors" },
@@ -143,6 +151,7 @@ export function SparkSceneViewer({
   onRequestPanelSection,
   onToggleShortcutLegend,
   onResetView,
+  knownLabels = [],
 }: {
   job: SplatJob;
   safeMode?: boolean;
@@ -192,6 +201,10 @@ export function SparkSceneViewer({
   // "0" — the host's resetToDefaultView also clears overlays/legends, which is
   // what a reset should mean; the camera half comes back to us as resetViewToken.
   onResetView?: () => void;
+  // Labels this scene already knows (the language-field inventory). Used ONLY
+  // to catch typos at commit time — "bikr" one keystroke from "bike" is how
+  // 186,710 splats got pinned to a label nobody meant to create.
+  knownLabels?: string[];
 }) {
   // Bumped after every crop apply/revert: the preview URL string doesn't
   // otherwise change even though the file on disk did, so the mesh-load
@@ -952,6 +965,43 @@ export function SparkSceneViewer({
     cellSize: number;
     count: number;
   } | null>(null);
+
+  // What IS this selection? min/max is useless here — a handful of floater
+  // splats stretch it to the whole scene bbox (measured: a localised ground
+  // paint reported the full 64-unit extent). Mean +/- 2 sigma is one cheap
+  // pass and survives the outliers, which is all a shape judgement needs.
+  const selShape = useMemo(() => {
+    const idx = paintIndexRef.current;
+    if (!idx || selCount === 0) return null;
+    const { positions } = idx;
+    let n = 0;
+    const sum = [0, 0, 0];
+    const sumSq = [0, 0, 0];
+    for (const i of selSetRef.current) {
+      for (let a = 0; a < 3; a += 1) {
+        const v = positions[i * 3 + a];
+        sum[a] += v;
+        sumSq[a] += v * v;
+      }
+      n += 1;
+    }
+    if (n < 8) return null;
+    const extent = [0, 1, 2].map((a) => {
+      const mean = sum[a] / n;
+      return 4 * Math.sqrt(Math.max(sumSq[a] / n - mean * mean, 0));
+    }) as [number, number, number];
+    return describeSelection(extent, metersPerUnit);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selCount, metersPerUnit]);
+
+  const labelSuggestion = useMemo(
+    () => suggestLabel(paintLabel, knownLabels),
+    [paintLabel, knownLabels],
+  );
+  const labelIsKnown = useMemo(() => {
+    const q = paintLabel.trim().toLowerCase();
+    return q.length > 0 && knownLabels.some((l) => l.trim().toLowerCase() === q);
+  }, [paintLabel, knownLabels]);
 
   function ensurePaintIndex(): boolean {
     if (paintIndexRef.current) return true;
@@ -2570,6 +2620,13 @@ export function SparkSceneViewer({
       {!chromeHidden && (
         <ToolHud
           tool={activeTool}
+          toolLabel={
+            activeTool === "paint"
+              ? paintTarget === "class"
+                ? `Paint · Class${selectedClassId ? `: ${taxonomy?.find((c) => c.id === selectedClassId)?.display ?? selectedClassId}` : ""}`
+                : "Paint · Label (search)"
+              : undefined
+          }
           radiusLabel={
             activeTool === "paint"
               ? formatSize(brushRadius, metersPerUnit)
@@ -2857,9 +2914,12 @@ export function SparkSceneViewer({
         {job.langfield_available && !safeMode && !job.langfield_stale && (
           <>
             <div className="h-px bg-white/10" />
-            <SectionLabel>Paint the field</SectionLabel>
-            {/* One brush, two targets: "field" biases search embeddings,
-                "class" assigns surface classes the generative stages use. */}
+            <SectionLabel>
+              Paint · {paintTarget === "class" ? "Class" : "Label"}
+            </SectionLabel>
+            {/* One brush, two targets that do VERY different things, and they
+                used to look identical — which is exactly how a ground-class
+                pass ended up pinning a search label nobody meant to create. */}
             <div className="flex items-center gap-1.5">
               <Button
                 type="button"
@@ -2892,6 +2952,19 @@ export function SparkSceneViewer({
                 Show class layer
               </label>
             </div>
+            <p className="text-[10px] leading-snug text-zinc-500">
+              {paintTarget === "class" ? (
+                <>
+                  <b className="text-cyan-200">Class</b> — the surface type (grass, pavement…) the
+                  generative ground and shell stages consume. Does not touch search.
+                </>
+              ) : (
+                <>
+                  <b className="text-cyan-200">Label</b> — teaches <i>search</i> what to call these
+                  splats. Does not set a surface type.
+                </>
+              )}
+            </p>
             <div className="flex items-center gap-2">
               <Button
                 type="button"
@@ -3023,7 +3096,14 @@ export function SparkSceneViewer({
                       onChange={(e) => setPaintLabel(e.target.value)}
                       placeholder='Label — anything, e.g. "dad’s corner"'
                       size="xs"
+                      list="splatlab-known-labels"
+                      autoComplete="off"
                     />
+                    <datalist id="splatlab-known-labels">
+                      {knownLabels.map((l) => (
+                        <option key={l} value={l} />
+                      ))}
+                    </datalist>
                     <Input
                       value={paintAliases}
                       onChange={(e) => setPaintAliases(e.target.value)}
@@ -3034,6 +3114,33 @@ export function SparkSceneViewer({
                       <p className="text-[10px] leading-snug text-amber-300/90">
                         A paint with this exact label already exists — both will answer to it. Delete the old one
                         below if this is a re-do.
+                      </p>
+                    )}
+                    {selShape && (
+                      <p className="text-[10px] leading-snug text-zinc-400">
+                        About to label{" "}
+                        <b className="text-zinc-200">{selCount.toLocaleString()} splats</b> —{" "}
+                        <span className={selShape.flat ? "text-amber-300" : "text-zinc-300"}>{selShape.text}</span>
+                        {selShape.flat && ". That's a slab, not an object — if you meant a surface type, use the Class brush."}
+                      </p>
+                    )}
+                    {!labelSuggestion && paintLabel.trim().length > 1 && !labelIsKnown && (
+                      <p className="text-[10px] leading-snug text-zinc-500">
+                        “{paintLabel.trim()}” is <b className="text-zinc-300">new to this scene</b> — fine for
+                        something the AI hasn't named, worth a second look if it should already exist.
+                      </p>
+                    )}
+                    {labelSuggestion && (
+                      <p className="text-[10px] leading-snug text-amber-300">
+                        No “{paintLabel.trim()}” in this scene. Did you mean{" "}
+                        <button
+                          type="button"
+                          className="underline underline-offset-2 hover:text-amber-200"
+                          onClick={() => setPaintLabel(labelSuggestion)}
+                        >
+                          {labelSuggestion}
+                        </button>
+                        ? (Ignore this if it's a new label.)
                       </p>
                     )}
                     <div className="flex items-center gap-1.5">
@@ -3053,7 +3160,11 @@ export function SparkSceneViewer({
                         onClick={() => void commitPaint(false)}
                         disabled={paintBusy || !paintLabel.trim()}
                       >
-                        {paintBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : `Commit ${selCount.toLocaleString()}`}
+                        {paintBusy ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          `${PAINT_OP_VERB[paintOp]} ${selCount.toLocaleString()} as “${paintLabel.trim() || "…"}”`
+                        )}
                       </Button>
                       {paintNeedsForce && (
                         <Button type="button" size="sm" variant="outline" onClick={() => void commitPaint(true)}>
@@ -3537,6 +3648,7 @@ function SizeControl({
 // say the selection is still there. Solid, per the panel convention.
 function ToolHud({
   tool,
+  toolLabel,
   radiusLabel,
   selCount,
   confirmArmed,
@@ -3544,6 +3656,7 @@ function ToolHud({
   onDiscard,
 }: {
   tool: ToolName | null;
+  toolLabel?: string;
   radiusLabel: string | null;
   selCount: number;
   confirmArmed: boolean;
@@ -3557,7 +3670,7 @@ function ToolHud({
     box: { name: "Crop box", hint: "click to place · [ ] size · Enter applies · Esc backs out" },
     measure: { name: "Dimension", hint: "click two points · Esc backs out" },
   };
-  const copy = tool ? TOOL_COPY[tool] : null;
+  const copy = tool ? { ...TOOL_COPY[tool], name: toolLabel ?? TOOL_COPY[tool].name } : null;
   return (
     // Bottom-centre, not top: the top strip is already owned by the tool panel
     // (left-3, w-80) and the "In this scene" legend at left-[21.5rem], and a

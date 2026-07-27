@@ -367,6 +367,35 @@ with sync_playwright() as p:
                       after_px - before_px > 800, f"cyan px {before_px} -> {after_px}")
 
         ensure_paint_armed(page)
+        # --- commit guards (added after a paint pass pinned 186,710 splats of
+        # flat ground to a mistyped label without the operator noticing) ------
+        ensure_paint_armed(page)
+        pt = panel_text(page)
+        check("panel heading names the active paint target", "paint · " in pt.lower(),
+              [l for l in pt.split("\n") if "PAINT" in l][:1])
+        check("the active lane says what it actually does",
+              "teaches" in pt.lower() or "generative" in pt.lower())
+        if sel_count():
+            check("commit block describes WHAT is selected", "About to label" in pt,
+                  [l[:80] for l in pt.split("\n") if "About to label" in l][:1])
+        lab = page.query_selector("input[placeholder*='Label']")
+        if lab:
+            lab.click()
+            lab.fill("bikr")
+            time.sleep(1.0)
+            pt = panel_text(page)
+            check("an unknown label is flagged before commit", "new to this scene" in pt.lower())
+            btn = page.query_selector("button:has-text('Pin ')")
+            check("commit button names the act, not just a count", btn is not None,
+                  btn.inner_text().replace("\n", " ") if btn else "no Pin button")
+            opts = page.eval_on_selector_all(
+                "#splatlab-known-labels option", "els => els.map(e => e.value)")
+            check("label field autocompletes from the scene vocabulary", len(opts) > 0,
+                  f"{len(opts)} known labels")
+            lab.fill("")
+        else:
+            check("commit guards present", False, "label input not found")
+
         cls = page.query_selector("button:text-is('Class')")
         if cls:
             cls.click()
