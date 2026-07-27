@@ -5640,7 +5640,52 @@ SCENE_SEMANTIC_GROUND_SCRIPT = MESH_DIR / "semantic_ground.py"
 GROUND_MESH_BUILD_SCRIPT = MESH_DIR / "ground_mesh_build.py"
 GROUND_MESH_RECEIPT_SCRIPT = MESH_DIR / "ground_mesh_receipt.py"
 GROUND_TEXTURE_SCRIPT = MESH_DIR / "ground_texture.py"
-SCENE_GROUND_VRAM_MB = 6_000  # checkpoint load + SigLIP2 text encoder
+SCENE_GROUND_VRAM_MB = 6_000  # floor: SigLIP2 text encoder + workspace
+
+
+def _npz_member_shape(path: Path, member: str) -> tuple[int, ...] | None:
+    """Shape of one array inside an .npz WITHOUT decompressing it.
+
+    Reading the member's .npy header is a few hundred bytes; np.load()[member]
+    would pull the whole 3.3 GB through zlib just to learn two integers.
+    """
+    import zipfile
+
+    try:
+        from numpy.lib import format as npformat
+
+        with zipfile.ZipFile(path) as zf:
+            with zf.open(f"{member}.npy") as fh:
+                version = npformat.read_magic(fh)
+                if version == (1, 0):
+                    shape, _fortran, _dtype = npformat.read_array_header_1_0(fh)
+                elif version == (2, 0):
+                    shape, _fortran, _dtype = npformat.read_array_header_2_0(fh)
+                else:
+                    return None
+                return tuple(shape)
+    except (OSError, ValueError, KeyError, ImportError, zipfile.BadZipFile):
+        return None
+
+
+def _scene_ground_vram_mb(gauss_emb: Path) -> int:
+    """Real VRAM the semantic-ground pass needs, not a guess.
+
+    backend/mesh/semantic_ground.py does `torch.tensor(d["gauss_emb"]).float()`
+    then `.to(DEV)` — a rows x dim FLOAT32 tensor on the GPU. The old flat
+    6_000 MB under-declared that by 40% on the 1.46M-gaussian bicycle scene
+    (2,351,565 x 1152 x 4 B = 10.09 GiB), so the arbiter cheerfully admitted a
+    job against 6.4 GB of headroom and the job died with CUDA OOM. Admission
+    has to be measured against what the job will ACTUALLY allocate.
+    """
+    shape = _npz_member_shape(gauss_emb, "gauss_emb")
+    if not shape or len(shape) != 2:
+        return SCENE_GROUND_VRAM_MB
+    rows, dim = shape
+    tensor_mb = (rows * dim * 4) / (1024 * 1024)
+    # +25% for the transient half->float copy and torch's allocator slack,
+    # plus the text encoder and workspace that the old constant stood for.
+    return max(SCENE_GROUND_VRAM_MB, int(tensor_mb * 1.25) + 1_500)
 
 
 class SceneGroundBody(BaseModel):
@@ -5707,7 +5752,7 @@ async def scene_ground(request: Request, job_id: str, body: SceneGroundBody):
         try:
             rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
                 lane="scene-ground", operation_id=job_id,
-                vram_mb=SCENE_GROUND_VRAM_MB, operation=sem_operation,
+                vram_mb=_scene_ground_vram_mb(gauss_emb), operation=sem_operation,
             )
         except gpu_arbiter.GPUArbiterUnavailable as exc:
             raise HTTPException(status_code=503, detail=f"Semantic ground blocked: {exc}") from exc

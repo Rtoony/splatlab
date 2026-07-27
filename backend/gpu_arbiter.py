@@ -487,6 +487,41 @@ def holder_info() -> dict[str, Any]:
 
 
 # ── orchestrator helpers (already cross-process: HTTP to nexus-gpu-orchestrator) ──
+def _gpu_process_holders(limit: int = 3) -> str:
+    """Top VRAM consumers as 'name(pid) NNNN MB', or '' if unknown.
+
+    Purely diagnostic — the arbiter cannot evict these, it can only tell you
+    which one to stop."""
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,used_memory,process_name",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return ""
+        rows: list[tuple[int, str, str]] = []
+        for line in proc.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 3:
+                continue
+            try:
+                mb = int(parts[1])
+            except ValueError:
+                continue
+            rows.append((mb, parts[0], Path(parts[2]).name))
+        rows.sort(reverse=True)
+        return ", ".join(f"{name}(pid {pid}) {mb} MB" for mb, pid, name in rows[:limit])
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 async def gpu_status() -> dict[str, Any] | None:
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
@@ -550,10 +585,16 @@ async def acquire_gpu(needed_mb: int) -> tuple[bool, str]:
             return True, f"evicted {evicted}; {s2['vram_free_mb']} MB free"
     final = await gpu_status()
     free_mb = final.get("vram_free_mb", 0) if final else "unknown"
-    return (
-        False,
-        f"could not free {needed_mb} MB after evicting {evicted}; only {free_mb} MB free",
-    )
+    holders = _gpu_process_holders()
+    detail = f"could not free {needed_mb} MB after evicting {evicted}; only {free_mb} MB free"
+    if holders:
+        # The orchestrator can only evict services REGISTERED with it. A big
+        # unregistered holder (splatlab-langfield ballooned to 22 GB of 32 and
+        # is not in its service list) makes admission fail with nothing the
+        # arbiter can do — so name the process, or the operator is left
+        # guessing at "could not free X MB after evicting []".
+        detail += f". Largest GPU processes right now: {holders}"
+    return (False, detail)
 
 
 async def _finish_sync_task_before_cancelling(task: asyncio.Task[_T]) -> _T:
