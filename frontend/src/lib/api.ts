@@ -351,3 +351,49 @@ export function buildUnrealBundle(
 ): Promise<SplatUnrealBundle> {
   return postJSON<SplatUnrealBundle>(`/api/splat/jobs/${jobId}/unreal-bundle`, request);
 }
+
+/* ------------------------------------------------------------------ *
+ * Walkable-world interactions (R2)                                    *
+ * ------------------------------------------------------------------ */
+
+import type { InteractionRecord } from "@/lib/world-interactions";
+
+export type WorldInteractionsPayload = {
+  job_id: string;
+  interactions: { elements: InteractionRecord[] } | null;
+  state: { elements: Record<string, string> } | null;
+  resolved: {
+    applied: Record<string, string>;
+    dropped: { slug: string; saved: string; reason: string }[];
+    world_rebuilt: boolean;
+  } | null;
+  state_error: string;
+  known_slugs: string[];
+};
+
+/** Authored affordances plus the resolved player state, in one round trip. */
+export function fetchWorldInteractions(
+  jobId: string,
+  signal?: AbortSignal,
+): Promise<WorldInteractionsPayload> {
+  return apiRequest<WorldInteractionsPayload>(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/world/interactions`,
+    { signal },
+  );
+}
+
+/** Persist one element's new state. */
+export function setWorldElementState(
+  jobId: string,
+  slug: string,
+  state: string,
+): Promise<WorldInteractionsPayload> {
+  return apiRequest<WorldInteractionsPayload>(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/world/state`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ slug, state }),
+    },
+  );
+}

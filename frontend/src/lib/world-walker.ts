@@ -31,6 +31,17 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
 import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 import { MeshBVH } from "three-mesh-bvh";
+import {
+  INTERACT_KEY,
+  type InteractionRecord,
+  type TargetInfo,
+  effectFor,
+  isStateful,
+  maxReachInSceneUnits,
+  nextState as nextInteractionState,
+  reachInSceneUnits,
+  targetInfo,
+} from "./world-interactions";
 
 /* ------------------------------------------------------------------ *
  * Manifest types — declared LOCALLY on purpose.                       *
@@ -278,11 +289,16 @@ const _move = new THREE.Vector3();
 const _euler = new THREE.Euler(0, 0, 0, "YXZ");
 const _up = new THREE.Vector3(0, 1, 0);
 const _ray = new THREE.Ray();
+// Reused for interaction targeting. Allocated once beside the physics scratch
+// for the same reason: neither loop may hand the GC work per frame.
+const _interactRay = new THREE.Raycaster();
+const _screenCentre = new THREE.Vector2(0, 0);
 
 const MOVE_KEYS = new Set([
   "KeyW", "KeyA", "KeyS", "KeyD",
   "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
   "Space", "ShiftLeft", "ShiftRight", "KeyR", "BracketLeft", "BracketRight",
+  INTERACT_KEY,
 ]);
 
 export class WorldWalker {
@@ -300,6 +316,15 @@ export class WorldWalker {
   /** Fired when the engine itself changes params (the [ ] scale hotkeys). */
   onParams: ((p: WalkParams) => void) | null = null;
   onLockChange: ((locked: boolean) => void) | null = null;
+  /** Fired ONLY when the crosshair target or its state changes — not per frame. */
+  onTarget: ((target: TargetInfo | null) => void) | null = null;
+  /** Fired when the player acts; the page persists it. */
+  onInteract: ((slug: string, nextState: string) => void) | null = null;
+
+  private interactions = new Map<string, InteractionRecord>();
+  private interactionState = new Map<string, string>();
+  private lastTargetKey: string | null = null;
+  private targetClock = 0;
 
   private readonly canvas: HTMLCanvasElement;
   private readonly velocity = new THREE.Vector3();
@@ -787,6 +812,101 @@ export class WorldWalker {
     el.object.visible = visible;
   }
 
+  /* ---------------------------------------------------------------- *
+   * Interactions                                                     *
+   * ---------------------------------------------------------------- */
+
+  /** Install the authored affordances and the resolved starting state. */
+  setInteractions(records: InteractionRecord[], state: Record<string, string>): void {
+    this.interactions = new Map(records.map((r) => [r.slug, r]));
+    this.interactionState = new Map(Object.entries(state));
+    for (const [slug, value] of this.interactionState) this.applyElementState(slug, value);
+    this.lastTargetKey = null;
+    this.pollTarget();
+  }
+
+  /** Set one element's state locally (the page owns persistence). */
+  setElementState(slug: string, value: string): void {
+    if (!this.interactions.has(slug)) return;
+    this.interactionState.set(slug, value);
+    this.applyElementState(slug, value);
+    this.lastTargetKey = null;
+    this.pollTarget();
+  }
+
+  /**
+   * Apply an effect to loaded geometry.
+   *
+   * Only `tint` is wired. `object.visible` already has exactly one owner — the
+   * HUD's per-element eye — and a second writer would produce an object the
+   * panel claims is hidden. The colour goes into BOTH cached materials because
+   * the walker swaps between them for unlit mode, and MeshBasicMaterial.color
+   * multiplies the baseColor map, so a tint reads correctly on a textured prop.
+   */
+  private applyElementState(slug: string, value: string): void {
+    const record = this.interactions.get(slug);
+    const el = this.elements.find((e) => e.slug === slug);
+    if (!record || !el) return;
+
+    const tint = effectFor(record, value).tint;
+    el.object.traverse((node) => {
+      const mesh = node as THREE.Mesh;
+      if (!(mesh as { isMesh?: boolean }).isMesh) return;
+      for (const key of ["litMaterial", "unlitMaterial"] as const) {
+        const material = mesh.userData?.[key] as THREE.MeshStandardMaterial | undefined;
+        if (material?.color) material.color.set(tint ?? 0xffffff);
+      }
+    });
+  }
+
+  /** What the crosshair is on, or null. Only authored elements are candidates. */
+  private targetUnderCrosshair(): { record: InteractionRecord; state: string } | null {
+    if (!this.interactions.size) return null;
+
+    const candidates = this.elements
+      .filter((el) => el.visible && this.interactions.has(el.slug))
+      .map((el) => el.object);
+    if (!candidates.length) return null;
+
+    // One ray for every candidate at the largest authored reach, then the
+    // per-record range is checked on the hit — cheaper than a ray per element.
+    _interactRay.far = maxReachInSceneUnits([...this.interactions.values()], this.params.unitsPerMetre);
+    _interactRay.setFromCamera(_screenCentre, this.camera);
+
+    for (const hit of _interactRay.intersectObjects(candidates, true)) {
+      // The hit lands on a descendant Mesh; walk up to the element root, which
+      // is where loadWorld stamped the slug.
+      let node: THREE.Object3D | null = hit.object;
+      while (node && !node.userData?.slug) node = node.parent;
+      const slug = node?.userData?.slug as string | undefined;
+      if (!slug) continue;
+
+      const record = this.interactions.get(slug);
+      if (!record) continue;
+      if (hit.distance > reachInSceneUnits(record, this.params.unitsPerMetre)) continue;
+      return { record, state: this.interactionState.get(slug) ?? record.initial };
+    }
+    return null;
+  }
+
+  /** Emit the prompt, but only when it actually changed. */
+  private pollTarget(): void {
+    if (!this.onTarget) return;
+    const hit = this.controls.isLocked ? this.targetUnderCrosshair() : null;
+    const key = hit ? `${hit.record.slug}:${hit.state}` : null;
+    if (key === this.lastTargetKey) return;
+    this.lastTargetKey = key;
+    this.onTarget(hit ? targetInfo(hit.record, hit.state) : null);
+  }
+
+  private interact(): void {
+    const hit = this.targetUnderCrosshair();
+    if (!hit || !isStateful(hit.record)) return;
+    const next = nextInteractionState(hit.record, hit.state);
+    this.setElementState(hit.record.slug, next);
+    this.onInteract?.(hit.record.slug, next);
+  }
+
   private applyMaterialMode(): void {
     const unlit = this.params.unlit;
     this.worldGroup.traverse((o) => {
@@ -821,6 +941,12 @@ export class WorldWalker {
 
     if (e.code === "KeyR") {
       this.respawn();
+      return;
+    }
+    // Interact. Raycast on demand rather than reusing the throttled prompt
+    // result, so the act is always against what is under the crosshair NOW.
+    if (e.code === INTERACT_KEY) {
+      this.interact();
       return;
     }
     // Live scale dialling without leaving pointer lock — the whole point of a
@@ -870,6 +996,16 @@ export class WorldWalker {
     }
 
     this.renderer.render(this.scene, this.camera);
+
+    // Prompt polling is throttled deliberately. This repo has a measured prior
+    // on per-frame raycasting: spark-scene-viewer hit 10 fps on a 102 ms
+    // raycast until it stopped doing it every mouse move. 10 Hz is well inside
+    // "feels instant" for a prompt.
+    this.targetClock += raw;
+    if (this.targetClock >= 0.1) {
+      this.targetClock = 0;
+      this.pollTarget();
+    }
 
     this.frameCount++;
     this.statsClock += raw;

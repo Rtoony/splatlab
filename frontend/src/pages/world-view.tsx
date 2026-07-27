@@ -14,8 +14,9 @@
 // the HUD and the wiring.
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import type { TargetInfo } from "@/lib/world-interactions";
 import { Link, useRoute } from "wouter";
-import { uploadPolishedWorldElement } from "@/lib/api";
+import { uploadPolishedWorldElement , fetchWorldInteractions, setWorldElementState } from "@/lib/api";
 import { PolishUploadZone } from "@/components/workspace/polish-upload";
 import {
   DEFAULT_WALK_PARAMS,
@@ -107,6 +108,7 @@ export default function WorldViewPage() {
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const walkerRef = useRef<WorldWalker | null>(null);
+  const [target, setTarget] = useState<TargetInfo | null>(null);
 
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -149,6 +151,18 @@ export default function WorldViewPage() {
     walker.onParams = (p) => {
       if (!cancelled) setWalkParams({ ...p });
     };
+    walker.onTarget = (t) => {
+      if (!cancelled) setTarget(t);
+    };
+    // Persist optimistically: the walker has already applied it locally, so a
+    // failed save must not leave the world showing a state the server rejected.
+    walker.onInteract = (slug, next) => {
+      if (source.kind !== "api") return;
+      void setWorldElementState(jobId, slug, next).catch(() => {
+        if (cancelled) return;
+        setWarnings((w) => [...w, `Could not save the state of ${slug}.`]);
+      });
+    };
 
     setPhase("loading");
     setError(null);
@@ -187,6 +201,29 @@ export default function WorldViewPage() {
         setRows(result.elements.map(toRow));
         setHidden(new Set());
         setWarnings(result.frameWarnings);
+
+        // Interactions are optional: a world with none authored must still
+        // load, so every failure here is non-fatal.
+        try {
+          const authored = await fetchWorldInteractions(jobId, controller.signal);
+          if (!cancelled && authored) {
+            walker.setInteractions(
+              authored.interactions?.elements ?? [],
+              authored.resolved?.applied ?? {},
+            );
+            const lost = authored.resolved?.dropped ?? [];
+            if (lost.length) {
+              setWarnings((w) => [
+                ...w,
+                ...lost.map((d) => `Saved state for "${d.slug}" was dropped: ${d.reason}.`),
+              ]);
+            }
+            if (authored.state_error) setWarnings((w) => [...w, authored.state_error]);
+          }
+        } catch {
+          /* no interactions authored, or the route is unavailable */
+        }
+
         setPhase("ready");
         walker.start();
       } catch (err) {
@@ -259,6 +296,21 @@ export default function WorldViewPage() {
         <div className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">
           <div className="h-4 w-px bg-white/60" />
           <div className="absolute left-1/2 top-1/2 h-px w-4 -translate-x-1/2 -translate-y-1/2 bg-white/60" />
+        </div>
+      )}
+
+      {/* Interaction prompt — pointer-events-none so it cannot eat click-to-lock */}
+      {phase === "ready" && target && (
+        <div className="pointer-events-none absolute left-1/2 top-1/2 mt-8 -translate-x-1/2 text-center">
+          <div className="inline-flex items-center gap-2 rounded-lg bg-black/60 px-3 py-1.5 text-sm text-white/90 backdrop-blur-sm">
+            {target.nextState && <Kbd>E</Kbd>}
+            <span>{target.prompt}</span>
+          </div>
+          {target.text && (
+            <div className="mt-1.5 max-w-sm rounded-lg bg-black/50 px-3 py-1.5 text-xs text-white/70 backdrop-blur-sm">
+              {target.text}
+            </div>
+          )}
         </div>
       )}
 
