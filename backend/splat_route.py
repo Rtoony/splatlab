@@ -48,6 +48,7 @@ from pydantic import BaseModel, Field
 import class_taxonomy
 import gpu_arbiter
 import maintenance_gate
+import opregistry  # persistent heavy-operation registry (pollable, restart-truthful)
 import scale_calibration  # pure metric-scale math; imports nothing from this app
 from health.precheck import precheck_input
 from health.probe import probe_capture
@@ -6086,6 +6087,162 @@ async def get_scene_assemble_file(job_id: str, fmt: Literal["report", "glb", "bl
 #      "scene-units (uncalibrated)"; a viewer that silently assumes metres puts a
 #      1.75-unit bicycle in the wrong world. Say scale is unknown out loud.
 WORLD_DIRNAME = "_world"
+SCENE_SOLIDIFY_SCRIPT = MESH_DIR / "scene_solidify.py"
+WORLD_COLLISION_SCRIPT = MESH_DIR / "world_collision.py"
+WORLD_GATE_SCRIPT = MESH_DIR / "world_gate.py"
+
+
+class WorldSolidifyBody(BaseModel):
+    """Knobs mirroring scene_solidify.py's CLI, plus the two follow-on stages."""
+    prop_faces: int = Field(default=8_000, ge=200, le=200_000)
+    shell_faces: int = Field(default=60_000, ge=1_000, le=1_000_000)
+    texture_size: int = Field(default=1024, ge=128, le=8192)
+    shell_texture_size: int = Field(default=2048, ge=128, le=8192)
+    min_gaussians: int = Field(default=200, ge=1, le=100_000)
+    only: str = Field(default="", max_length=2000)
+    shell_source: Literal["tsdf", "voxel"] = "tsdf"
+    skip_shell: bool = False
+    shell_only: bool = False
+    prefer_generated: bool = False
+    run_collision: bool = True
+    run_gate: bool = True
+
+
+@router.post("/jobs/{job_id}/world/solidify")
+async def world_solidify(job_id: str, body: WorldSolidifyBody):
+    """Build the walkable world: scene_solidify -> world_collision -> world_gate.
+
+    These three were CLI-only. A browser could read a world but never build one,
+    so the one artifact the whole interactive lane rests on had no admission
+    control, no lock, no progress and no receipt — and rebuilding it meant an
+    SSH session.
+
+    Runs under the same rails as every other heavy build: the maintenance/backup
+    admission gate and the per-job mesh lock (one heavy build per job). Progress
+    is recorded in the operation registry, so `GET /ops/{op_id}` and `/activity`
+    show which stage is running even though this POST blocks, and a failure
+    leaves a durable record instead of only a dropped connection.
+
+    world_gate is the acceptance suite, not a precondition: a world that fails
+    its gates is still returned, with the gate verdict attached. Refusing to
+    report a built-but-failing world would hide exactly what the gates exist to
+    surface.
+    """
+    require_heavy_work_admitted()
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    if meta.get("status") != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"World build requires a completed job. Current status: {meta.get('status')}")
+
+    output_dir = Path(meta["output_dir"])
+    scene_dir = output_dir / SCENE_DIRNAME
+    if not (scene_dir / "isolated").is_dir():
+        raise HTTPException(
+            status_code=409,
+            detail="World build needs isolated scene elements — run the scene "
+                   "inventory and isolate stages first.")
+    if not (SCENE_SOLIDIFY_SCRIPT.is_file() and MESH_ENV_PYTHON.is_file()):
+        raise HTTPException(status_code=400, detail="World-build toolchain unavailable.")
+
+    lock = _mesh_export_lock(job_id)
+    if lock.locked():
+        raise HTTPException(
+            status_code=409, detail=f"A mesh/object/scene build is already running for {job_id}.")
+
+    mpu = meta.get("meters_per_unit")
+    world_dir = output_dir / WORLD_DIRNAME
+
+    async with lock:
+        op_id = opregistry.start("world_solidify", job_id, step="solidify",
+                                 detail=f"shell_source={body.shell_source}")
+        try:
+            solidify_cmd = [
+                str(MESH_ENV_PYTHON), str(SCENE_SOLIDIFY_SCRIPT), str(output_dir),
+                "--prop-faces", str(body.prop_faces),
+                "--shell-faces", str(body.shell_faces),
+                "--texture-size", str(body.texture_size),
+                "--shell-texture-size", str(body.shell_texture_size),
+                "--min-gaussians", str(body.min_gaussians),
+                "--shell-source", body.shell_source,
+            ]
+            # An uncalibrated world is built anyway and reports itself as such;
+            # only pass the factor when there genuinely is one.
+            if isinstance(mpu, (int, float)) and math.isfinite(mpu) and mpu > 0:
+                solidify_cmd += ["--meters-per-unit", str(mpu)]
+            if body.only.strip():
+                solidify_cmd += ["--only", body.only.strip()]
+            if body.skip_shell:
+                solidify_cmd.append("--skip-shell")
+            if body.shell_only:
+                solidify_cmd.append("--shell-only")
+            if body.prefer_generated:
+                solidify_cmd.append("--prefer-generated")
+
+            rc, _out, stderr = await _run_capture_subprocess(solidify_cmd)
+            if rc != 0 or not (world_dir / "world.json").is_file():
+                tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+                raise HTTPException(
+                    status_code=500, detail=f"World solidify failed (exit {rc}): {tail}")
+
+            collision: dict[str, Any] | None = None
+            if body.run_collision and WORLD_COLLISION_SCRIPT.is_file():
+                opregistry.update(op_id, step="collision", progress=0.6)
+                rc, _out, stderr = await _run_capture_subprocess(
+                    [str(MESH_ENV_PYTHON), str(WORLD_COLLISION_SCRIPT), str(output_dir)])
+                collision = {"exit_code": rc}
+                if rc != 0:
+                    # Collision hulls are a follow-on: a world without them is
+                    # still a world, so this is reported, not fatal.
+                    collision["error"] = "\n".join(
+                        stderr.decode("utf-8", errors="replace").splitlines()[-4:])
+
+            gate: dict[str, Any] | None = None
+            if body.run_gate and WORLD_GATE_SCRIPT.is_file():
+                opregistry.update(op_id, step="gate", progress=0.85)
+                rc, _out, stderr = await _run_capture_subprocess(
+                    [str(MESH_ENV_PYTHON), str(WORLD_GATE_SCRIPT), str(output_dir)])
+                gate = {"exit_code": rc, "passed": rc == 0}
+                gate_report = world_dir / "world_gate.json"
+                if gate_report.is_file():
+                    with contextlib.suppress(Exception):
+                        gate["report"] = json.loads(gate_report.read_text())
+                elif rc != 0:
+                    gate["error"] = "\n".join(
+                        stderr.decode("utf-8", errors="replace").splitlines()[-4:])
+
+            result = {
+                "ok": True,
+                "job_id": job_id,
+                "op_id": op_id,
+                "world": json.loads((world_dir / "world.json").read_text()),
+                "collision": collision,
+                "gate": gate,
+                "meters_per_unit": mpu,
+                # The generation this world was built at; a later /scale bump
+                # makes that comparison the staleness signal.
+                "scale_generation": meta.get("scale_generation"),
+                "uncalibrated": not (isinstance(mpu, (int, float)) and mpu),
+            }
+            opregistry.finish(op_id, result={
+                "gate_passed": (gate or {}).get("passed"),
+                "collision_exit": (collision or {}).get("exit_code"),
+                "uncalibrated": result["uncalibrated"],
+            })
+            return result
+        except HTTPException as exc:
+            opregistry.finish(op_id, status=opregistry.FAILED, error=str(exc.detail)[:2000])
+            raise
+        except BaseException as exc:
+            opregistry.finish(op_id, status=opregistry.FAILED,
+                              error=f"{type(exc).__name__}: {exc}"[:2000])
+            raise
+
+
 # Media types for what a solidified world actually contains. Anything else under
 # the dir is stage scratch (_work/), served as an opaque download rather than
 # guessed at — the containment check below is what keeps that safe.
