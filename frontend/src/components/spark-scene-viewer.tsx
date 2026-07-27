@@ -778,7 +778,6 @@ export function SparkSceneViewer({
     channelsRef.current = nextChannels;
     if (nextChannels.length === 0) {
       mesh.worldModifier = undefined;
-      appliedModifierRef.current = null;
       mesh.updateGenerator();
       return;
     }
@@ -792,7 +791,6 @@ export function SparkSceneViewer({
       dyno.dynoFloat(cutoffForTopPercent(c.bytes, topPctRef.current)),
     );
     const firstEnabled = Math.max(0, nextChannels.findIndex((c) => c.enabled));
-    appliedModifierRef.current = null; // query overlay owns the slot now
     mesh.worldModifier = buildOverlayModifier({
       scalarArray,
       channelCount: nextChannels.length,
@@ -814,73 +812,24 @@ export function SparkSceneViewer({
   const SELECTION_TINT: [number, number, number] = [0.13, 0.83, 0.93];
   const paintCursorHexRef = useRef(0x22d3ee);
 
-  // ---- persistent tool overlays -------------------------------------------
-  // MEASURED (1,457,228-gaussian bicycle scene, RTX 5090): every stroke used to
-  // allocate a fresh mask + a fresh 5.8MB RGBA buffer + a NEW RgbaArray texture
-  // + a NEW modifier object. The JS side of that is only ~6ms — but handing
-  // Spark a brand-new modifier makes it compile a new shader program and
-  // regenerate every splat on the NEXT frame, which showed up as 120ms frame
-  // stalls during a sweep and a 480ms freeze on the first stroke. Median frame
-  // time was a healthy 16.7ms throughout; the pain was entirely these hitches.
-  //
-  // So: build ONE texture and ONE modifier per (purpose, splat count) and then
-  // only ever mutate the bytes. Same pixels, no recompile.
-  type ToolOverlay = {
-    n: number;
-    rgba: Uint8Array;
-    array: RgbaArray;
-    modifier: ReturnType<typeof buildOverlayModifier>;
-  };
-  const overlaysRef = useRef<Record<string, ToolOverlay | undefined>>({});
-  const appliedModifierRef = useRef<unknown>(null);
-  const OVERLAY_TINT: Record<string, [number, number, number]> = {
-    selection: SELECTION_TINT,
-    removal: [0.97, 0.44, 0.44], // to-be-removed red
-  };
-
-  function ensureOverlay(purpose: "selection" | "removal", numSplats: number): ToolOverlay | null {
-    if (numSplats === 0) return null;
-    const cur = overlaysRef.current[purpose];
-    if (cur && cur.n === numSplats) return cur;
-    cur?.array.dispose();
-    const rgba = new Uint8Array(numSplats * 4);
-    const array = new RgbaArray({ array: rgba, count: numSplats });
-    const next: ToolOverlay = {
-      n: numSplats,
-      rgba,
-      array,
-      modifier: buildOverlayModifier({
-        scalarArray: array,
-        channelCount: 1,
-        channelColors: [OVERLAY_TINT[purpose]],
-        channelEnabled: [dyno.dynoBool(true)],
-        mode: "highlight",
-        ramp: rampName,
-        channelCutoffs: [dyno.dynoFloat(0.5)],
-      }),
-    };
-    overlaysRef.current[purpose] = next;
-    return next;
-  }
-
-  function applyOverlay(mesh: SplatMesh, ov: ToolOverlay) {
-    ov.array.needsUpdate = true; // re-upload the texel data, keep the texture
-    if (appliedModifierRef.current !== ov.modifier) {
-      mesh.worldModifier = ov.modifier; // only ever on a real change of purpose
-      appliedModifierRef.current = ov.modifier;
-    }
-    mesh.updateGenerator();
-  }
-
   function previewSelection() {
     const mesh = meshRef.current;
     if (!mesh) return;
     const numSplats = mesh.packedSplats?.numSplats ?? mesh.numSplats ?? 0;
-    const ov = ensureOverlay("selection", numSplats);
-    if (!ov) return;
-    ov.rgba.fill(0);
-    for (const i of selSetRef.current) if (i < numSplats) ov.rgba[i * 4] = 255;
-    applyOverlay(mesh, ov);
+    if (numSplats === 0) return;
+    const bytes = new Uint8Array(numSplats);
+    for (const i of selSetRef.current) if (i < numSplats) bytes[i] = 255;
+    const scalarArray = new RgbaArray({ array: packChannelsRgba([bytes], numSplats), count: numSplats });
+    mesh.worldModifier = buildOverlayModifier({
+      scalarArray,
+      channelCount: 1,
+      channelColors: [SELECTION_TINT],
+      channelEnabled: [dyno.dynoBool(true)],
+      mode: "highlight",
+      ramp: rampName,
+      channelCutoffs: [dyno.dynoFloat(0.5)],
+    });
+    mesh.updateGenerator();
   }
 
   function refreshModifier() {
@@ -903,31 +852,25 @@ export function SparkSceneViewer({
     if (!mesh || !packed) return null;
     const numSplats = packed.numSplats ?? 0;
     if (numSplats === 0) return null;
-    const ov = ensureOverlay("removal", numSplats);
-    if (!ov) return null;
-    ov.rgba.fill(0);
+    const bytes = new Uint8Array(numSplats);
     let removed = 0;
-    // Prefer the cached position array the paint brush already builds: a tight
-    // typed-array sweep instead of forEachSplat's per-splat JS callback, which
-    // on a 1.4M scene is the difference between ~3ms and tens of ms.
-    const idx = ensurePaintIndex() ? paintIndexRef.current : null;
-    if (idx) {
-      const pos = idx.positions;
-      for (let i = 0; i < numSplats; i += 1) {
-        if (shouldRemove(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2])) {
-          ov.rgba[i * 4] = 255;
-          removed += 1;
-        }
+    packed.forEachSplat((i, c) => {
+      if (shouldRemove(c.x, c.y, c.z)) {
+        bytes[i] = 255;
+        removed += 1;
       }
-    } else {
-      packed.forEachSplat((i, c) => {
-        if (shouldRemove(c.x, c.y, c.z)) {
-          ov.rgba[i * 4] = 255;
-          removed += 1;
-        }
-      });
-    }
-    applyOverlay(mesh, ov);
+    });
+    const scalarArray = new RgbaArray({ array: packChannelsRgba([bytes], numSplats), count: numSplats });
+    mesh.worldModifier = buildOverlayModifier({
+      scalarArray,
+      channelCount: 1,
+      channelColors: [[0.97, 0.44, 0.44]], // to-be-removed red
+      channelEnabled: [dyno.dynoBool(true)],
+      mode: "highlight",
+      ramp: rampName,
+      channelCutoffs: [dyno.dynoFloat(0.5)],
+    });
+    mesh.updateGenerator();
     return removed;
   }
 
@@ -1001,6 +944,8 @@ export function SparkSceneViewer({
   // and NOTHING is sent until the commit button ("save"). The commit already
   // posts final indices — the per-stroke /select/sphere round-trip (the
   // choppiness source) was never actually needed.
+  // Last real surface point a stroke landed on (see strokeAt).
+  const surfaceHintRef = useRef<[number, number, number] | null>(null);
   const paintIndexRef = useRef<{
     positions: Float32Array;
     grid: Map<string, number[]>;
@@ -1103,6 +1048,26 @@ export function SparkSceneViewer({
         selSetRef.current.add(i);
         delta.push(i);
       }
+    }
+    if (clipped.length) {
+      // Centroid of what this stroke actually hit = a free, exact surface
+      // sample. Feeding it back keeps the drag plane glued to the geometry as
+      // you sweep across receding ground; without it a long stroke slides off
+      // the surface and buries the paint behind it (selection count climbs,
+      // nothing appears — measured: 14,105 splats selected but 3x FEWER lit
+      // pixels than 129 splats from single clicks).
+      const idx = paintIndexRef.current;
+      if (idx) {
+        let cx = 0, cy = 0, cz = 0;
+        for (const i of clipped) {
+          cx += idx.positions[i * 3];
+          cy += idx.positions[i * 3 + 1];
+          cz += idx.positions[i * 3 + 2];
+        }
+        surfaceHintRef.current = [cx / clipped.length, cy / clipped.length, cz / clipped.length];
+      }
+    } else {
+      surfaceHintRef.current = null; // stroke hit nothing — the plane is off
     }
     if (delta.length) {
       strokesRef.current.push(Uint32Array.from(delta));
@@ -1981,7 +1946,6 @@ export function SparkSceneViewer({
         if (disposed) return;
         setSplatCount(mesh.packedSplats?.numSplats ?? mesh.numSplats ?? 0);
         paintIndexRef.current = null; // rows/positions changed — rebuild lazily
-        appliedModifierRef.current = null; // fresh mesh carries no modifier
         // One bbox pass so crop sliders scale to THIS scene: the old fixed
         // 0.05–5 range could never enclose a large capture and dwarfed tiny
         // ones. Floater-inflated bounds only lengthen the slider — harmless.
@@ -2093,7 +2057,16 @@ export function SparkSceneViewer({
         const hit = updateToolCursor(e.clientX, e.clientY);
         // Drag-to-paint: strokes enqueue (with path interpolation) while the
         // primary button is held — see enqueueStroke/pumpStrokes.
-        if (paintModeRef.current && paintDrag && hit) enqueueStroke(hit);
+        if (paintModeRef.current && paintDrag && hit) {
+          enqueueStroke(hit);
+          const hint = surfaceHintRef.current;
+          if (hint) {
+            lastPick.set(hint[0], hint[1], hint[2]); // plane follows the paint
+            hasPick = true;
+          } else {
+            exactPick(e.clientX, e.clientY); // drifted off — one pick to recover
+          }
+        }
         if (paintModeRef.current || cropModeRef.current || boxModeRef.current) return;
       }
       if (!drag) return;

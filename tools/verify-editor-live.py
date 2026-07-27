@@ -29,6 +29,10 @@ import sys
 import time
 from pathlib import Path
 
+try:  # optional: the paint-visibility check needs it, nothing else does
+    from PIL import Image
+except ImportError:  # pragma: no cover
+    Image = None
 from playwright.sync_api import Error as PWError
 from playwright.sync_api import sync_playwright
 
@@ -80,6 +84,36 @@ def hud_text(page):
         }""")
     except PWError:
         return ""
+
+
+def lit_pixels(page, vw, vh):
+    """Count selection-cyan pixels in the CANVAS area.
+
+    The gate used to assert only that the HUD count went up. This catches the
+    stronger failure: painting registers splats and draws NOTHING.
+
+    SCOPE, honestly: this does NOT catch depth-burying (a sweep whose plane
+    drifts off the surface so the paint lands behind it). Measured on
+    splat_6b2e82e5 the buggy and fixed builds BOTH clear this threshold,
+    because that scene has little depth variation. Catching that needs a scene
+    with strongly receding ground (splat_3aaf8067) and a check that the lit
+    pixels track the swept screen path — not yet written.
+
+    Read from Playwright's screenshot, never the canvas: a WebGL canvas drawn
+    into a 2D context reads back BLANK without preserveDrawingBuffer, which
+    produced a confident false alarm here.
+    """
+    if Image is None:
+        return None
+    import io
+
+    im = Image.open(io.BytesIO(page.screenshot(timeout=20_000))).convert("RGB")
+    im = im.crop((int(vw * 0.27), 110, im.width, im.height - 60))  # skip the tool panel
+    n = 0
+    for r, g, b in im.getdata():
+        if g > 90 and b > 110 and g > r + 35 and b > r + 45:
+            n += 1
+    return n
 
 
 def ensure_paint_armed(page):
@@ -314,6 +348,23 @@ with sync_playwright() as p:
             time.sleep(2.5)
             check("...and left-drag still paints rather than orbiting",
                   (sel_count() or 0) > n_before, f"{n_before} -> {sel_count()}")
+
+            # ...and it must be VISIBLE, not just counted.
+            ensure_paint_armed(page)
+            before_px = lit_pixels(page, VW, VH)
+            page.mouse.move(VW // 2 - 90, VH // 2 + 60)
+            page.mouse.down()
+            for i in range(26):
+                page.mouse.move(VW // 2 - 90 + 11 * i, VH // 2 + 60 + 4 * i, steps=1)
+                page.wait_for_timeout(45)
+            page.mouse.up()
+            time.sleep(2.5)
+            after_px = lit_pixels(page, VW, VH)
+            if before_px is None:
+                print("SKIP  swept paint is visible on screen   [Pillow not installed]", flush=True)
+            else:
+                check("swept paint is VISIBLE on screen, not buried behind the surface",
+                      after_px - before_px > 800, f"cyan px {before_px} -> {after_px}")
 
         ensure_paint_armed(page)
         cls = page.query_selector("button:text-is('Class')")
