@@ -567,7 +567,19 @@ async def acquire_gpu(needed_mb: int) -> tuple[bool, str]:
         return False, f"GPU maintenance gate active: {reason}"
     if status.get("vram_free_mb", 0) >= needed_mb:
         return True, f"sufficient headroom ({status['vram_free_mb']} MB free)"
-    resident = [s for s in status.get("services", []) if s.get("resident")]
+    # Honour the catalog's protection flags. The orchestrator's manual evict
+    # endpoint is operator-only and does NOT enforce them, and this loop picks
+    # its own candidates — so without this filter a heavy splat job could stop
+    # RToony's dictation (nexus-voice, `evictable: false`) to make room.
+    # Services from an orchestrator too old to report the flag default to
+    # evictable, preserving the previous behaviour.
+    resident = [
+        s
+        for s in status.get("services", [])
+        if s.get("resident")
+        and s.get("evictable", True) is not False
+        and s.get("enabled", True) is not False
+    ]
     # NB: `or 0` INSIDE the negation — a service can report idle_sec=None, and
     # `-None` crashes the whole acquire path (bad operand type for unary -).
     resident.sort(key=lambda s: (s.get("priority", 99), -(s.get("idle_sec") or 0)))

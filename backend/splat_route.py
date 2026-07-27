@@ -29,6 +29,7 @@ import os
 import re
 import secrets
 import shutil
+import time
 import signal
 import subprocess
 import sys
@@ -2724,16 +2725,8 @@ async def _langfield_worker_query(config_path: str, lfdir: str, clean_text: str)
     worker's JSON (incl. the 3D match `focus`/`radius`) on success, else None so the
     caller falls back to the cold path."""
     require_heavy_work_admitted()
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=1.5)) as client:
-            resp = await client.post(
-                f"{LANGFIELD_WORKER_URL}/query",
-                json={"config": config_path, "lfdir": lfdir, "text": clean_text},
-            )
-        return resp.json() if resp.status_code == 200 else None
-    except Exception:
-        return None
+    resp = await _langfield_post("/query", {"config": config_path, "lfdir": lfdir, "text": clean_text})
+    return resp.json() if resp is not None and resp.status_code == 200 else None
 
 
 # The worker's /relevancy response headers the proxy passes through to the client:
@@ -2750,16 +2743,85 @@ async def _langfield_worker_relevancy(config_path: str, lfdir: str, clean_text: 
     The generous read timeout covers the worker waiting behind another complete
     GPU operation; relevancy inference itself is normally sub-second."""
     require_heavy_work_admitted()
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=1.5)) as client:
-            resp = await client.post(
-                f"{LANGFIELD_WORKER_URL}/relevancy",
-                json={"config": config_path, "lfdir": lfdir, "text": clean_text},
+    resp = await _langfield_post("/relevancy", {"config": config_path, "lfdir": lfdir, "text": clean_text})
+    return resp if resp is not None and resp.status_code == 200 else None
+
+
+LANGFIELD_UNIT = os.environ.get("SPLAT_LANGFIELD_UNIT", "splatlab-langfield.service")
+_LANGFIELD_START_LOCK = asyncio.Lock()
+_langfield_started_at = 0.0
+
+
+async def _wake_langfield_worker() -> bool:
+    """Start the language-field worker if it is not running.
+
+    The worker is on-demand BY DESIGN and is now registered with the GPU
+    orchestrator as evictable — it caches per-scene SigLIP embeddings and was
+    measured holding 22 GB of 32, which starved the semantic-ground lane into a
+    CUDA OOM. Eviction is only safe if the thing comes back by itself, so every
+    worker call routes through here: a connection failure wakes the unit and
+    the caller retries once. Without this, an eviction turns every search and
+    paint into a 503 until someone runs systemctl by hand.
+    """
+    global _langfield_started_at
+    async with _LANGFIELD_START_LOCK:
+        # Someone else may have just started it while we waited on the lock.
+        if time.time() - _langfield_started_at < 90:
+            return False
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "--user", "start", LANGFIELD_UNIT,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
             )
-        return resp if resp.status_code == 200 else None
-    except Exception:
-        return None
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except (OSError, asyncio.TimeoutError) as exc:
+            log.warning("langfield wake failed: %s", exc)
+            return False
+        if proc.returncode != 0:
+            log.warning("langfield wake failed: %s", (err or b"").decode(errors="replace")[:200])
+            return False
+        _langfield_started_at = time.time()
+        log.info("langfield worker woken (was evicted or never started)")
+        return True
+
+
+async def _langfield_ready(deadline_sec: float = 75.0) -> bool:
+    """Wait until the worker is answering, not merely started.
+
+    `systemctl start` returns as soon as the unit is up; the worker then loads
+    SigLIP2 and the scene, which is ~25s. Retrying on a fixed short delay made
+    the caller fall through to the cold path and return ZERO matches on a scene
+    that has five — a silent wrong answer, which is worse than a slow one.
+    Any HTTP response at all (404 included) proves the socket is serving.
+    """
+    import httpx
+
+    end = time.time() + deadline_sec
+    while time.time() < end:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(4.0, connect=1.5)) as client:
+                await client.get(f"{LANGFIELD_WORKER_URL}/")
+            return True
+        except Exception:
+            await asyncio.sleep(1.5)
+    return False
+
+
+async def _langfield_post(path: str, payload: dict, timeout: float = 180.0):
+    """POST to the worker, waking it once if it is not answering."""
+    import httpx
+
+    for attempt in (0, 1):
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=1.5)) as client:
+                return await client.post(f"{LANGFIELD_WORKER_URL}{path}", json=payload)
+        except Exception:
+            if attempt == 1 or not await _wake_langfield_worker():
+                return None
+            # Wait for it to actually SERVE, not just to have been started.
+            if not await _langfield_ready():
+                return None
+    return None
 
 
 async def _langfield_worker_json(path: str, payload: dict):
@@ -2767,12 +2829,7 @@ async def _langfield_worker_json(path: str, payload: dict):
     None on transport failure (caller maps None -> 503). Worker-side HTTPErrors
     (4xx) pass through so guardrail messages reach the client verbatim."""
     require_heavy_work_admitted()
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=1.5)) as client:
-            return await client.post(f"{LANGFIELD_WORKER_URL}{path}", json=payload)
-    except Exception:
-        return None
+    return await _langfield_post(path, payload)
 
 
 async def _langfield_worker_inventory(config_path: str, lfdir: str) -> dict | None:
@@ -2780,16 +2837,8 @@ async def _langfield_worker_inventory(config_path: str, lfdir: str) -> dict | No
     Returns the worker JSON on success, else None (no cold fallback — inventory is a
     warm-worker-only convenience)."""
     require_heavy_work_admitted()
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=1.5)) as client:
-            resp = await client.post(
-                f"{LANGFIELD_WORKER_URL}/inventory",
-                json={"config": config_path, "lfdir": lfdir},
-            )
-        return resp.json() if resp.status_code == 200 else None
-    except Exception:
-        return None
+    resp = await _langfield_post("/inventory", {"config": config_path, "lfdir": lfdir})
+    return resp.json() if resp is not None and resp.status_code == 200 else None
 
 
 async def ensure_hero_thumb(output_dir: Path) -> Path | None:
