@@ -431,8 +431,10 @@ export default function WorldViewPage() {
                     Show the original splat
                     <span className="block text-[10px] leading-snug text-zinc-500">
                       The mesh is what you collide with; the splat is what you look
-                      at. Trees, hedge and sky exist only in the splat — a
-                      simplified mesh cannot carry them.
+                      at. Trees, hedge and sky exist only in the splat. While this
+                      is on, the shell is hidden — it is a blocky solid whose job
+                      is collision, and drawing it just boxes you in. You still
+                      cannot fall through it.
                     </span>
                   </span>
                 </label>

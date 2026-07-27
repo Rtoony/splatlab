@@ -860,9 +860,20 @@ export class WorldWalker {
     splat.renderOrder = -1;
     this.scene.add(splat);
     this.backdrop = splat;
+
+    // Hide the shell while the splat is showing. This is the whole point of the
+    // split: the shell is a 24k-tri blocky solid whose entire job is to be
+    // COLLIDED with, and drawing it on top of the splat replaces a photoreal
+    // park with white slabs that box the player in. Collision is untouched —
+    // rebuildCollider builds from collisionShellGeom, which is loaded but never
+    // added to the scene graph, so hiding the visual shell cannot let anyone
+    // fall through anything.
+    this.setElementVisible("shell", false);
   }
 
   clearBackdrop(): void {
+    // Put the shell back: with no splat it is the only environment there is.
+    if (this.backdrop) this.setElementVisible("shell", true);
     if (this.backdrop) {
       this.scene.remove(this.backdrop);
       this.backdrop.dispose?.();
