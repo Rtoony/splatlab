@@ -330,6 +330,11 @@ export class WorldWalker {
   /** Fly (noclip) — for inspecting a world you cannot yet walk. */
   private flying = false;
   private spark: SparkRenderer | null = null;
+  /** world_shell's PROVEN-interior point, Y-up. See respawn(). */
+  private spawnSeed: THREE.Vector3 | null = null;
+  /** Proven floor/ceiling of the solid, Y-up — the headroom the seed sits in. */
+  private spawnFloorY = 0;
+  private spawnTopY = 0;
   private backdrop: SplatMesh | null = null;
   /** Fired when fly mode toggles, so the HUD can say so. */
   onFlyChange: ((flying: boolean) => void) | null = null;
@@ -529,6 +534,30 @@ export class WorldWalker {
           if (solid) this.collisionShellGeom = solid;
         }
         disposeObject(obj);
+
+        // world_shell searched for a point it PROVED is inside the solid and
+        // recorded it as params.seed_yup, in the same Y-up frame as this GLB.
+        // Without it the walker falls back to a downward ray from the scene
+        // centre, which on a watertight shell lands on the LID — the
+        // long-standing "you spawn on the roof" complaint. The seed is not in
+        // world_manifest.json (only the merged route synthesises it), so read
+        // the shell's own report.
+        try {
+          const rep = await fetch(source.fileUrl("collision_shell.json"),
+                                  { credentials: "same-origin", signal: opts.signal });
+          if (rep.ok) {
+            const report = await rep.json();
+            const seed = report?.params?.seed_yup;
+            if (Array.isArray(seed) && seed.length === 3 && seed.every(Number.isFinite)) {
+              this.spawnSeed = new THREE.Vector3(seed[0], seed[1], seed[2]);
+              const probe = report?.probe ?? {};
+              this.spawnFloorY = Number(probe.floor_level_y ?? seed[1]);
+              this.spawnTopY = Number(probe.top_level_y ?? seed[1]);
+            }
+          }
+        } catch {
+          /* no report, or aborted — fall back to the ray */
+        }
       } catch (err) {
         // A missing file on the conventional path just means this world has no
         // collision solid; only a DECLARED one failing to load is worth a
@@ -729,6 +758,33 @@ export class WorldWalker {
 
   /** Drop the player onto the floor near the middle of the world. */
   respawn(): void {
+    // Prefer the seed world_shell proved is inside the solid. Casting down from
+    // the scene centre finds the first surface below, and on a watertight shell
+    // that is the roof.
+    if (this.spawnSeed) {
+      // The seed gives a proven-clear XZ; the height has to be chosen.
+      //
+      // Taking the seed's own y puts the camera in the grass — it is a
+      // floor-level sample. Adding eyeHeight blindly launches the player
+      // through the roof whenever the scale dial is off, which on an
+      // uncalibrated capture it usually is: at 2.83 u/m a 1.7 m eye height is
+      // 4.8 units, and the whole solid is 5.9 units tall, so the spawn landed
+      // outside and fell straight out (ground=air).
+      //
+      // So stand on the PROVEN floor at eye height, clamped into the headroom
+      // world_shell measured. A wrong scale then costs a bad-feeling eye level,
+      // never a fall out of the world.
+      const headroom = Math.max(1e-4, this.spawnTopY - this.spawnFloorY);
+      const eye = Math.min(this.eyeHeight, headroom * 0.6);
+      const seeded = this.spawnSeed.clone();
+      seeded.y = this.spawnFloorY + eye;
+      this.spawn.copy(seeded);
+      this.camera.position.copy(seeded);
+      this.velocity.set(0, 0, 0);
+      this.grounded = false;
+      if (this.bvh) this.resolveCollisions(1 / 60);
+      return;
+    }
     const point = this.findStandingPoint(this.sceneBox.getCenter(new THREE.Vector3()));
     this.spawn.copy(point);
     this.camera.position.copy(point);
