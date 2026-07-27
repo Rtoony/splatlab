@@ -27,6 +27,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -109,6 +110,14 @@ async def list_dimensions(job_id: str) -> dict[str, Any]:
 @router.post("/jobs/{job_id}/dimensions")
 async def add_dimension(job_id: str, body: DimensionBody) -> dict[str, Any]:
     job_dir = _require_job_dir(job_id)
+    # pydantic accepts NaN/Infinity for a bare float, and a non-finite endpoint
+    # silently poisons every length derived from it — including a scale
+    # calibration that cites this measurement as its evidence. Checked here
+    # rather than in a field_validator for the same reason geo_route does it
+    # this way: FastAPI's 422 body echoes the offending input, and NaN cannot
+    # be encoded into that response at all.
+    if not all(math.isfinite(c) for c in (*body.a, *body.b)):
+        raise HTTPException(status_code=400, detail="measurement endpoints must be finite")
     record = upsert_dimension(job_dir, dim_id=body.id, a=list(body.a), b=list(body.b), label=body.label)
     return {"job_id": job_id, "dimension": record}
 

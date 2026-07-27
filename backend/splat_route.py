@@ -48,6 +48,7 @@ from pydantic import BaseModel, Field
 import class_taxonomy
 import gpu_arbiter
 import maintenance_gate
+import scale_calibration  # pure metric-scale math; imports nothing from this app
 from health.precheck import precheck_input
 from health.probe import probe_capture
 from operator_audit import audit_operator_event
@@ -6963,28 +6964,97 @@ async def pin_splat_job(job_id: str):
 
 @router.post("/jobs/{job_id}/scale")
 async def set_splat_scale(job_id: str, payload: dict[str, Any]):
-    """Survey-lane scale calibration: METERS PER SCENE UNIT, set by measuring a
-    reference of known real-world length in the viewer. nerfstudio scenes are
-    non-metric (poses auto-normalized to a unit box), so this stored factor is
-    the only bridge from scene units to real distances — measure/DXF/LandXML
-    all hang off it. Body {"meters_per_unit": <float>} sets; null clears.
-    Reaches clients via the **meta spread in _job_payload."""
+    """Survey-lane scale calibration: METERS PER SCENE UNIT. nerfstudio scenes
+    are non-metric (poses auto-normalized to a unit box), so this stored factor
+    is the only bridge from scene units to real distances — dimensions, the
+    world's 1.5 m prop rule, the scale_sanity gate and DXF/LandXML all hang
+    off it.
+
+    Two bodies are accepted:
+
+      {"meters_per_unit": <float>|null}
+          Direct set (or clear). Recorded with method "manual", or "map" when
+          `source` says the value was eyeballed off satellite tiles.
+
+      {"references": [{"dimension_id": str, "real_length_m": float}, ...]}
+          Preferred. The SERVER derives the factor from stored dimensions.json
+          measurements, averages several references, and records which
+          measurements produced it plus how well they agree. Scale stops being
+          an unsourced number.
+
+    Replacing a better-evidenced calibration with a weaker one (a measured
+    factor with a map-eyeballed one) requires `"force": true`, so an accuracy
+    downgrade is a choice rather than a side effect of dragging a map.
+
+    Every successful change bumps `scale_generation`, the counter downstream
+    artifacts compare against to know they were built at an older scale.
+    """
     if not _safe_job_id(job_id):
         raise HTTPException(status_code=404, detail="Splat job not found")
-    raw = payload.get("meters_per_unit")
-    if raw is None:
-        meta = _patch_meta(job_id, meters_per_unit=None)
-    else:
+    job_dir = _job_dir(job_id)
+    existing = _read_meta(job_id) or {}
+    if not existing:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+
+    references = payload.get("references")
+    forced = bool(payload.get("force"))
+    source = str(payload.get("source") or "")
+
+    if references is not None:
+        if not isinstance(references, list):
+            raise HTTPException(status_code=400, detail="references must be a list")
+        # Local import: dimensions_route imports this module, so a top-level
+        # import here would be circular.
+        import dimensions_route
+
         try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="meters_per_unit must be a number")
-        if not (math.isfinite(value) and 0.0 < value < 1e6):
-            raise HTTPException(status_code=400, detail="meters_per_unit must be finite and > 0")
-        meta = _patch_meta(job_id, meters_per_unit=value)
+            record = scale_calibration.calibrate_from_dimensions(
+                dimensions_route.load_dimensions(job_dir), references, source=source)
+        except scale_calibration.CalibrationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif payload.get("meters_per_unit") is None:
+        patched = _patch_meta(
+            job_id, meters_per_unit=None, scale_calibration=None,
+            scale_generation=int(existing.get("scale_generation") or 0) + 1)
+        if not patched:
+            raise HTTPException(status_code=404, detail="Splat job not found")
+        return {"ok": True, "job_id": job_id, "meters_per_unit": None,
+                "scale_calibration": None,
+                "scale_generation": patched.get("scale_generation")}
+    else:
+        method = (scale_calibration.METHOD_MAP if source == "map"
+                  else scale_calibration.METHOD_MANUAL)
+        try:
+            record = scale_calibration.calibrate_manual(
+                payload.get("meters_per_unit"), method=method, source=source)
+        except scale_calibration.CalibrationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    prior = existing.get("scale_calibration")
+    if not forced and scale_calibration.downgrades_evidence(prior, record):
+        raise HTTPException(
+            status_code=409,
+            detail=(f"refusing to replace a {prior.get('method')} calibration "
+                    f"({scale_calibration.describe(prior)}) with a weaker "
+                    f"{record['method']} one; resend with force: true to accept "
+                    f"the accuracy downgrade"))
+
+    meta = _patch_meta(
+        job_id,
+        meters_per_unit=record["meters_per_unit"],
+        scale_calibration=record,
+        scale_generation=int(existing.get("scale_generation") or 0) + 1,
+    )
     if not meta:
         raise HTTPException(status_code=404, detail="Splat job not found")
-    return {"ok": True, "job_id": job_id, "meters_per_unit": meta.get("meters_per_unit")}
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "meters_per_unit": meta.get("meters_per_unit"),
+        "scale_calibration": meta.get("scale_calibration"),
+        "scale_generation": meta.get("scale_generation"),
+        "detail": scale_calibration.describe(record),
+    }
 
 
 @router.post("/jobs/{job_id}/unpin")
