@@ -352,3 +352,66 @@ def test_end_to_end_chunked_unwrap(tmp_path):
     assert report["texture"]["baked"] is True
     assert report["texture"]["unwrap_chunks"] == 2
     assert report["texture"]["coverage"] >= report["texture"]["coverage_rasterized"]
+
+
+# ---------------------------------------------------------------------------
+# observed_faces — honest rendering of a watertight shell
+# ---------------------------------------------------------------------------
+
+def test_observed_faces_keeps_only_what_the_capture_saw():
+    """An outdoor capture has no walls or ceiling, but a watertight shell must
+    invent them to close. Those faces can never have colour, so the bake smears
+    over them. Drawing them is a claim the capture does not support."""
+    size = 8
+    mask = np.zeros((size, size), dtype=bool)
+    mask[0, 0:4] = True                       # a strip of observed texels
+
+    uvs = np.array([
+        [0.0, 0.0], [0.2, 0.0], [0.4, 0.0],   # on the observed strip
+        [0.9, 0.9], [0.8, 0.9], [0.9, 0.8],   # nowhere near it
+    ])
+    faces = np.array([[0, 1, 2], [3, 4, 5]])
+
+    keep = ot.observed_faces(faces, uvs, mask, size)
+
+    assert keep.tolist() == [True, False]
+
+
+def test_a_face_with_a_majority_of_observed_corners_is_kept():
+    size = 8
+    mask = np.zeros((size, size), dtype=bool)
+    mask[0, 0:8] = True
+
+    uvs = np.array([[0.0, 0.0], [0.3, 0.0], [0.9, 0.9]])   # 2 of 3 observed
+    keep = ot.observed_faces(np.array([[0, 1, 2]]), uvs, mask, size)
+
+    assert keep.tolist() == [True]
+
+
+def test_a_face_with_one_observed_corner_is_dropped():
+    size = 8
+    mask = np.zeros((size, size), dtype=bool)
+    mask[0, 0:2] = True
+
+    uvs = np.array([[0.0, 0.0], [0.9, 0.9], [0.8, 0.9]])   # 1 of 3
+    keep = ot.observed_faces(np.array([[0, 1, 2]]), uvs, mask, size)
+
+    assert keep.tolist() == [False]
+
+
+def test_a_fully_observed_mesh_loses_nothing():
+    """Props hug the gaussians they are baked from; they must be untouched."""
+    size = 8
+    mask = np.ones((size, size), dtype=bool)
+    uvs = np.random.default_rng(0).random((12, 2))
+    faces = np.arange(12).reshape(4, 3)
+
+    assert ot.observed_faces(faces, uvs, mask, size).all()
+
+
+def test_uvs_at_the_edge_do_not_index_out_of_bounds():
+    size = 8
+    mask = np.ones((size, size), dtype=bool)
+    uvs = np.array([[1.0, 1.0], [0.0, 0.0], [1.0, 0.0]])
+
+    assert ot.observed_faces(np.array([[0, 1, 2]]), uvs, mask, size).tolist() == [True]

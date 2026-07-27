@@ -532,6 +532,28 @@ def bake_texture(verts_scene, faces, uvs, gx, gc, size: int, k: int = 24,
     return (np.clip(tex, 0, 1) * 255).astype(np.uint8), mask
 
 
+def observed_faces(faces, uvs, mask, size: int, min_ratio: float = 0.5):
+    """Which faces the capture actually SAW, from the pre-dilation bake mask.
+
+    `mask` marks texels a real gaussian projected onto; everything else is
+    dilation, i.e. a neighbour's colour smeared over surface with no evidence.
+    A face is kept when at least `min_ratio` of its three UV corners land on an
+    observed texel.
+
+    Why this matters for a watertight shell: an OUTDOOR capture has no walls and
+    no ceiling, but a watertight solid must invent them to close. Those invented
+    faces can never have colour, so the bake smears over them — which is the
+    blotchy look. Drawing them is a claim the capture does not support.
+
+    Dropping them makes the VISUAL mesh non-watertight, which is correct and
+    intended: the walker collides against `collision_shell.glb`, which stays
+    whole. Watertight for physics, honest for rendering.
+    """
+    uv_px = np.clip((uvs * (size - 1)).astype(np.int64), 0, size - 1)
+    hit = mask[uv_px[:, 1], uv_px[:, 0]]              # per-vertex observedness
+    return hit[faces].sum(axis=1) >= max(1, int(round(min_ratio * 3)))
+
+
 def dilate_atlas(tex, mask, passes: int = 24):
     """Bleed colour outward past chart borders.
 
@@ -661,6 +683,11 @@ def main() -> int:
     ap.add_argument("--class-map", default=None)
     ap.add_argument("--class-taxonomy", default=None,
                     help="taxonomy json for tile params (required with --class-map)")
+    ap.add_argument("--drop-unobserved", action="store_true",
+                    help="remove faces the capture never saw instead of "
+                         "dilating a smear over them; makes the VISUAL mesh "
+                         "non-watertight on purpose (collision_shell.glb is "
+                         "what the walker collides against)")
     ap.add_argument("--class-radius", type=float, default=0.15,
                     help="scene-unit match radius texel->classed position")
     ap.add_argument("--report", default=None)
@@ -816,6 +843,7 @@ def main() -> int:
 
     # ---- bake ----
     tex_img = None
+    unobserved_dropped = 0
     if uvs is not None:
         vn = trimesh.Trimesh(vertices=verts_scene, faces=faces,
                              process=False).vertex_normals
@@ -825,6 +853,15 @@ def main() -> int:
             texture_report = {"baked": False, "reason": "atlas rasterized zero texels"}
         else:
             coverage_rasterized = float(mask.mean())
+            if args.drop_unobserved:
+                keep = observed_faces(faces, uvs, mask, args.texture_size)
+                dropped = int((~keep).sum())
+                if keep.any() and dropped:
+                    faces = faces[keep]
+                    print(f"[object-texture] dropped {dropped} unobserved faces "
+                          f"({dropped / len(keep):.1%}) — not drawing surface the "
+                          f"capture never saw", flush=True)
+                    unobserved_dropped = dropped
             tex, shipped_mask = dilate_atlas(
                 tex, mask, passes=max(16, args.texture_size // 48))
             class_fractions = None
@@ -852,6 +889,7 @@ def main() -> int:
                 # both stops the shipped number masquerading as bake quality.
                 "coverage": round(float(shipped_mask.mean()), 4),
                 "coverage_rasterized": round(coverage_rasterized, 4),
+                "unobserved_faces_dropped": unobserved_dropped,
                 "unwrap_seconds": uv_seconds,
                 "unwrap_chunks": max(1, args.unwrap_chunks),
                 "class_texel_fractions": class_fractions,

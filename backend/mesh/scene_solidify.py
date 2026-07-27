@@ -235,7 +235,8 @@ def run_object_texture(py: Path, script: Path, mesh: Path, splat: Path, out_glb:
                        min_gaussians: int | None = None,
                        unwrap_chunks: int = 1,
                        class_map: Path | None = None,
-                       class_radius: float | None = None) -> dict:
+                       class_radius: float | None = None,
+                       drop_unobserved: bool = False) -> dict:
     cmd = [str(py), str(script), str(mesh), str(splat), str(out_glb),
            "--target-faces", str(faces), "--texture-size", str(tex)]
     if unwrap_chunks > 1:
@@ -245,6 +246,8 @@ def run_object_texture(py: Path, script: Path, mesh: Path, splat: Path, out_glb:
         cmd += ["--class-map", str(class_map), "--class-taxonomy", str(taxonomy)]
         if class_radius:
             cmd += ["--class-radius", str(round(float(class_radius), 4))]
+    if drop_unobserved:
+        cmd += ["--drop-unobserved"]
     if mpu:
         cmd += ["--meters-per-unit", str(mpu)]
     if smooth:
@@ -391,7 +394,8 @@ def build_shell(job_dir: Path, args, instances, py: Path, script: Path, mpu) -> 
                                  faces=args.shell_faces, tex=args.shell_texture_size,
                                  reconstruct=False, crop=False, timeout=3600,
                                  unwrap_chunks=4, class_map=class_map,
-                                 class_radius=getattr(args, "class_radius", None))
+                                 class_radius=getattr(args, "class_radius", None),
+                                 drop_unobserved=bool(getattr(args, "drop_unobserved", False)))
         shell.update(cut=cut, built=res["ok"], seconds=res["seconds"],
                      glb=out.name if res["ok"] else None)
         if not res["ok"]:
@@ -418,6 +422,13 @@ def main() -> int:
     ap.add_argument("--shell-texture-size", type=int, default=2048)
     ap.add_argument("--only", default=None, help="comma-separated slugs")
     ap.add_argument("--skip-shell", action="store_true")
+    ap.add_argument("--drop-unobserved", action="store_true",
+                    help="drop shell faces the capture never saw instead of "
+                         "dilating a smear over them. OPT-IN: measured on "
+                         "splat_3aaf8067 it removed 21.5%% of faces and made "
+                         "world_gate fail shell_connectivity and "
+                         "floor_continuity, because those gates measure the "
+                         "VISUAL shell. Collision is unaffected either way.")
     ap.add_argument("--class-radius", type=float, default=None,
                     help="scene units a shell texel may reach for a class; "
                          "default scales with the shell's voxel size")
