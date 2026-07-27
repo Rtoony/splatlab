@@ -38,7 +38,7 @@ import type {
   ViewerPoint,
 } from "@/components/viewer-types";
 import { Button, Input, SectionLabel } from "@/components/ui";
-import { Box, Download, Loader2, Paintbrush, Plus, Redo2, Ruler, Scissors, Trash2, Undo2, X } from "lucide-react";
+import { Box, Download, Loader2, Paintbrush, Plus, Redo2, RotateCcw, Ruler, Scissors, Trash2, Undo2, X } from "lucide-react";
 
 // SPARK BETA viewer for the /view page — the Wave-2 cutover surface.
 // - Multi-query language overlay: up to 4 simultaneous text searches, one
@@ -391,6 +391,7 @@ export function SparkSceneViewer({
   const showClassLayerRef = useRef(false);
   // A class chip clicked while paint is still selected — see the amber bar.
   const [pendingClassSwitch, setPendingClassSwitch] = useState<string | null>(null);
+  const [resetArmed, setResetArmed] = useState(false);
   // Last built class-colour texture, so the live selection can be composited
   // over it instead of replacing it.
   const classColorRef = useRef<{ array: RgbaArray; n: number } | null>(null);
@@ -534,6 +535,39 @@ export function SparkSceneViewer({
       setClassError(cause instanceof Error ? cause.message : "Commit failed.");
     } finally {
       setClassBusy(false);
+    }
+  }
+
+  // Start over. Iterating on a paint pass means wanting a clean slate, and the
+  // only way to get one was deleting records one × at a time — or asking me.
+  async function resetAllPaint() {
+    setClassBusy(true);
+    setClassError(null);
+    try {
+      clearSelection();
+      for (const r of classRecords) {
+        await fetch(`/api/splat/jobs/${job.job_id}/class-labels/${r.id}`, {
+          method: "DELETE",
+          credentials: "same-origin",
+        });
+      }
+      for (const o of overrides) {
+        await fetch(`/api/splat/jobs/${job.job_id}/langfield/overrides/${o.id}`, {
+          method: "DELETE",
+          credentials: "same-origin",
+        });
+      }
+      classColorRef.current = null;
+      void loadClassRecords();
+      void loadOverridesList();
+      if (showClassLayerRef.current) await refreshClassLayer().catch(() => undefined);
+      else refreshModifierRef.current();
+      setClassNotice("All paint cleared — classes and labels are back to empty.");
+    } catch (cause) {
+      setClassError(cause instanceof Error ? cause.message : "Reset failed.");
+    } finally {
+      setClassBusy(false);
+      setResetArmed(false);
     }
   }
 
@@ -3078,7 +3112,31 @@ export function SparkSceneViewer({
                   <Redo2 className="h-3.5 w-3.5" />
                 </Button>
               )}
+              {(classRecords.length > 0 || overrides.length > 0) && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={resetArmed ? "primary" : "ghost"}
+                  className="ml-auto"
+                  disabled={classBusy}
+                  onClick={() => (resetArmed ? void resetAllPaint() : setResetArmed(true))}
+                  title="Delete every committed class and label on this scene and start over"
+                >
+                  {classBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
+                  {resetArmed
+                    ? `Delete all ${classRecords.length + overrides.length} — sure?`
+                    : "Start over"}
+                </Button>
+              )}
             </div>
+            {resetArmed && (
+              <p className="text-[10px] leading-snug text-amber-300">
+                Clears every committed class and label on this scene ({classRecords.length} class
+                {classRecords.length === 1 ? "" : "es"}, {overrides.length} label
+                {overrides.length === 1 ? "" : "s"}). The scene geometry, dimensions and edits are
+                untouched — only paint. Not undoable; you'd repaint.
+              </p>
+            )}
             {paintMode && (
               <>
                 <SizeControl
