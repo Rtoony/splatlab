@@ -2287,3 +2287,90 @@ vegetation 58,286 · dirt 4,774) and it drove the generative stages:
 - Scene still uncalibrated (`meters_per_unit: null`).
 - The langfield worker has **no VRAM ceiling** — eviction now reclaims it, but nothing
   stops it reaching 22 GB again between evictions.
+
+---
+
+## 2026-07-27 — Trust pass from the Kimi k3 investigation (branch `kimi-report-hardening`)
+
+Acting on `~/reports/2026-07-27-splatlab-investigation/` (5 reports, read-only audit)
+plus the operator's own framing: **"your rails outrun your train"** — excellent
+guardrails, receipts and safety infrastructure, with the actual numerical cores
+untested and `meters_per_unit` the least evidenced artifact in the system. The
+instruction was *finish loops, don't open lanes*. Nine commits, all on a branch, all
+additive; **nothing under `~/.config/systemd` was touched and no service was
+restarted.**
+
+Test suite **708 → 933 passed**, 6 skipped. Baseline captured before the first change.
+
+### The three trust gaps, closed
+1. **Numerical cores now tested.** 44 CPU-only tests on `object_generate`'s gate
+   (`test_object_gate.py`): selection-by-agreement (the bonsai-in-the-bicycle case),
+   every refusal path, `passed` never diverging from `problems`, rotation helpers
+   staying proper rotations, and `derive_placement` end-to-end on a synthetic camera.
+   No extraction was needed — the module already imports under the test interpreter.
+2. **Scale is the spine** (`scale_calibration.py`). `POST /scale` now accepts
+   `{references:[{dimension_id, real_length_m}]}` and the SERVER derives the factor
+   from stored `dimensions.json`. Multiple references average; spread is reported
+   (stddev / relative / spread ratio / `disagreement` flag) with each reference's
+   deviation, so the STATUS.md:294 made-up-5-ft case shows up and the outlier is
+   identifiable. One reference reports uncertainty as **null, not 0.0**. Evidence is
+   ranked `dimension > manual > map`: a map-eyeballed factor replacing a measured one
+   now **409s** unless `force: true`. Every change bumps `scale_generation`.
+   The legacy `{meters_per_unit}` body still works unchanged.
+3. **`POST /jobs/{id}/world/solidify`** — solidify → collision → gate, behind the
+   heavy-work gate and the per-job mesh lock. A world that FAILS its gates is returned
+   with the verdict attached; suppressing it would hide what the gates exist to show.
+
+### Also shipped
+- **`opregistry.py`** — persistent operation registry. The design point is keeping the
+  truthfulness rail persistence would otherwise cost: rows carry a per-process
+  `runtime_id`, and a `running` row from a dead process reads as **abandoned**, never
+  as running. `GET /ops`, `GET /ops/{id}`, `/activity.operations`; startup reconciles
+  orphans and says how many.
+- **Unseen gaussians scored exactly 0.5 against every query.** A zero embedding row
+  makes both softmax logits equal. Four copies of the relevancy math existed;
+  `object_isolate`/`batch_isolate` zeroed unseen rows, and the two lanes serving every
+  interactive query did not. `langfield/relevancy_core.py` is now the one definition
+  (also the single `SIGLIP_CKPT` — was in 6 files — and the LERF negatives, 4 files).
+  Torch branch is operation-for-operation identical, verified against the numpy branch
+  inside the langfield-spike env: max abs diff < 1e-6, CUDA never initialised.
+- **Vault secrets no longer reach the model subprocesses.** `object_generate.run_worker`
+  built its env from `dict(os.environ)`, handing SAM 3.1 / SA-3DAO / the nerfstudio
+  probe every API key, `DATABASE_URL`, `REDIS_PASSWORD` and `BW_SESSION`. Now an
+  allowlist. Worker success is also structural: `produces=` requires the artifact to
+  exist, be non-empty and parse — the 4 KB done-token log-tail grep was the fallback
+  and could fail a correct run whose token was pushed out by late CUDA warnings.
+- **Blender MCP**: optional `SPLATLAB_MCP_TOKEN` bearer gate (unset = today's
+  behaviour, byte-for-byte) + the **first protocol-level test** — a real server spawned
+  from its isolated SDK venv: 401 without the token, then initialize → tools/list (all
+  9) → tools/call, and `../../etc` still refused over the wire.
+- **`operator_audit` is real** — 25 call sites were awaiting a no-op. Append-only JSONL,
+  never raises, and a request contributes only path + client host, never credentials.
+- **Auth**: per-IP `/login` throttle (8 / 5 min, blocks the correct token while tripped);
+  future-dated cookies rejected (only `age > MAX_AGE` was checked — a validly-signed
+  forever-session); unknown `/api/*` GETs return a JSON 404 instead of the SPA's HTML.
+- **Live systemd units captured** into `deploy/systemd/` with a README. Scanned for
+  secret values first — they reference the vault, never values.
+
+### Corrections to the investigation
+- The **langfield "port trio" is not three ports.** `90-supervised-port-3418.conf`
+  *contains* `--port 3425`. It is one live port + a misleading filename + a stale code
+  default. Both code defaults now say 3425; renaming the `.conf` is a live systemd
+  mutation, left to the operator with commands in `deploy/systemd/README.md`.
+- `pick_and_gate_mask`/`derive_placement` did **not** need extracting to be testable.
+- The `seen` mask was already written to `gauss_emb.npz`; only the consumers ignored it.
+
+### Open / deliberately not done
+- **`INVENTORY_VERSION` not bumped.** Inventories cached before the unseen-gaussian fix
+  keep their old scores until it is. Bumping forces a recompute for every scene — an
+  operator decision, not a side effect of a bug fix.
+- `mesh/object_isolate.py` and `mesh/batch_isolate.py` keep their own already-correct
+  inline relevancy copies. Consolidating them touches working GPU code this suite
+  cannot exercise.
+- `opregistry.prune()` and `operator_audit.prune()` exist but nothing schedules them;
+  same for `_prune_old_jobs` on a timer. No periodic-maintenance mechanism exists yet.
+- Not attempted: `splat_route.py` split / `jobstore.py`, langfield VRAM halving (needs a
+  live GPU run to verify), the `mcp==2.0.0b2` beta pin, lift-crop context margins
+  (a quality change that needs measurement, not a guess).
+- **R1–R7 interactive-worlds work is untouched** — advisory, and explicitly lane-opening
+  rather than loop-closing. See `~/projects/nexus-planning/05-interactive-worlds-vision.md`.
