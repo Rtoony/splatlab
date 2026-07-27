@@ -14,6 +14,7 @@ except ImportError:  # Compatibility with SDK packages that re-export protocol t
     from mcp.types import ToolAnnotations
 
 from dcc import blender_workflow as workflow
+from dcc import mcp_auth
 
 
 mcp = MCPServer("SplatLab Blender")
@@ -133,16 +134,58 @@ def main() -> None:
     if args.transport == "stdio":
         mcp.run(transport="stdio")
         return
+
+    # A misconfigured token is fatal here rather than a silent downgrade to no
+    # auth -- the operator who set it must not be left believing it took effect.
     try:
-        asyncio.run(
-            mcp.run_streamable_http_async(
-                host="127.0.0.1",
-                port=args.port,
-                streamable_http_path="/mcp",
-                json_response=True,
-                stateless_http=True,
-            )
+        token = mcp_auth.configured_token()
+    except mcp_auth.MCPAuthConfigError as exc:
+        parser.error(str(exc))
+
+    if token is None:
+        print(
+            f"[blender-mcp] listening on 127.0.0.1:{args.port}/mcp with loopback "
+            f"trust only; set {mcp_auth.TOKEN_ENV} to require a bearer token",
+            flush=True,
         )
+        try:
+            asyncio.run(
+                mcp.run_streamable_http_async(
+                    host="127.0.0.1",
+                    port=args.port,
+                    streamable_http_path="/mcp",
+                    json_response=True,
+                    stateless_http=True,
+                )
+            )
+        except KeyboardInterrupt:
+            pass
+        return
+
+    # Same construction run_streamable_http_async performs, with the auth gate
+    # wrapped around the ASGI app before it is served.
+    import uvicorn
+
+    app = mcp.streamable_http_app(
+        streamable_http_path="/mcp",
+        json_response=True,
+        stateless_http=True,
+        host="127.0.0.1",
+    )
+    print(
+        f"[blender-mcp] listening on 127.0.0.1:{args.port}/mcp; bearer token required",
+        flush=True,
+    )
+    server = uvicorn.Server(
+        uvicorn.Config(
+            mcp_auth.bearer_token_middleware(app, token),
+            host="127.0.0.1",
+            port=args.port,
+            log_level=mcp.settings.log_level.lower(),
+        )
+    )
+    try:
+        asyncio.run(server.serve())
     except KeyboardInterrupt:
         pass
 
