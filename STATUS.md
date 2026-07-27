@@ -2496,3 +2496,74 @@ lane**: `_world/interactions.json` + `_world/state.json`.
   state axis).
 - No affordance authoring UI — `PUT /world/interactions` is the only door. That is
   R3 (LangField proposing affordances through the propose→gate→approve idiom).
+
+---
+
+## 2026-07-27 — Why the world does not look real yet (measured, not guessed)
+
+### Fixed: the voxel shell was rotated twice and coloured from the wrong places
+`build_shell --shell-source voxel` fed `collision_shell.glb` — which
+`world_shell.py` writes in Y-up — into `object_texture.py`, which assumes
+CAPTURE-frame input and applies the capture→Y-up rotation itself,
+**unconditionally** (`object_texture.py:863-866`; only the SCALE depends on
+`meters_per_unit`). So the shell was rotated a second time AND every texel's
+colour was sampled from the wrong neighbourhood — the hazard
+`object_texture.py:460` warns about.
+
+Measured on `splat_3aaf8067`, thin-axis across the tree: capture cloud after
+`to_yup` → Y, `collision_shell.glb` → Y, `elements/bicycle.glb` → Y,
+`shell.glb` → **Z**. The shell was the only artifact in the wrong frame.
+After the fix: `[10.52, 12.56, 7.37]` → `[10.52, 7.37, 12.56]`, and bbox IoU
+against the collision solid **0.349 → 0.733**. TSDF path was always correct.
+
+### Disproved: texture size is NOT the blotchiness lever
+Sweep on the rebuilt shell, `coverage_rasterized` = fraction of atlas texels
+that got a real rasterizer hit rather than dilation:
+
+| texture | coverage_rasterized | build | atlas |
+|---|---|---|---|
+| 1024 | 0.5995 | 6.5 s | 1.2 MB |
+| 2048 | 0.6001 | 18.3 s | 3.4 MB |
+| 4096 | 0.6003 | 93.9 s | 9.6 MB |
+
+**Flat at 0.60 across 4× resolution for 14× the cost.** Resolution sharpens the
+observed 60% but never shrinks the invented 40%. So raising it does not touch
+the smeared look — that was my hypothesis and the data killed it.
+
+### The actual cause, and the lever
+40% of a **watertight** shell is surface the capture never saw — the lid, back
+and underside a solid must invent to close. Dilation fills it by smearing
+neighbours, which is exactly the blotchy olive/white.
+
+`class_textures.py` exists to fill precisely that with procedural material
+(grass/dirt/gravel/pavement from the taxonomy's PBR params). It is barely
+firing: `class_texel_fractions` = grass 0.002, dirt 0.0001, pavement 0.0009 —
+**~0.3% of texels**, because the shell texturing reads `_langfield/class_labels.json`
+(hand paints; this scene has 4 records) and nothing else.
+
+**Next lever, highest value for "looks real":** feed `semantic_ground.py`'s
+SigLIP auto-classification into the shell bake instead of relying on manual
+paints, so the unobserved 40% gets an honest procedural material rather than a
+smear. That is a pipeline change, not a tuning knob.
+
+### Also shipped
+- **Rebuild shell panel** in the world view (source / faces / texture), calling
+  `/world/solidify` with `shell_only`. Surfaces the gate verdict in amber when
+  gates fail rather than reporting a flat success. Rebuilding was API-only
+  before, which is the loop you are in most while tuning appearance.
+- **Fly mode** (`F`, `Space`/`C`) — a world you cannot walk was also a world you
+  could not inspect. Runs ahead of the collider branch so it works with no BVH.
+- **The walker never used the watertight collision shell.** It reads the raw
+  `world_manifest.json`, which has no `collision_shell` key (only the merged
+  route synthesizes it), so `csUrl` was always undefined and every world
+  collided against the lace visual shell. Now falls back to the conventional
+  `_world/collision_shell.glb`.
+- **Calibrate now sends the measurement, not the answer.** The Measure tab
+  divided client-side and POSTed a bare `meters_per_unit`; it now posts
+  `references: [{dimension_id, real_length_m}]` so the server records provenance
+  and uncertainty, and prints its own account of the result.
+
+### Note
+The backup interlock (`nexus-backup.service` activating) correctly refused a
+rebuild mid-session — rails working. The bicycle shell is currently at 4096;
+the new panel resets it to 2048 in a click.
