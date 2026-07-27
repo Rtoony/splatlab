@@ -703,6 +703,7 @@ function RebuildPanel({ jobId, onRebuilt }: { jobId: string; onRebuilt: () => vo
   const [tex, setTex] = useState(2048);
   const [source, setSource] = useState<"voxel" | "tsdf">("voxel");
   const [route, setRoute] = useState<"auto" | "voxel">("auto");
+  const [dropUnobserved, setDropUnobserved] = useState(false);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -716,6 +717,7 @@ function RebuildPanel({ jobId, onRebuilt }: { jobId: string; onRebuilt: () => vo
         shell_only: true,
         shell_source: source,
         shell_route: route,
+        drop_unobserved: dropUnobserved,
         shell_faces: faces,
         shell_texture_size: tex,
         run_collision: false,
@@ -781,6 +783,23 @@ function RebuildPanel({ jobId, onRebuilt }: { jobId: string; onRebuilt: () => vo
         >
           {[512, 1024, 2048, 4096].map((n) => <option key={n} value={n}>{n}</option>)}
         </select>
+      </label>
+      <label className="flex items-start gap-2 text-[11px] text-zinc-300">
+        <input
+          type="checkbox"
+          checked={dropUnobserved}
+          onChange={(e) => setDropUnobserved(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          Don&rsquo;t draw unseen surface
+          <span className="block text-[10px] leading-snug text-zinc-500">
+            An outdoor capture has no walls or ceiling, but a watertight shell
+            invents them and the bake smears colour over them. This drops those
+            faces (~21% here). Collision is unaffected — you still can&rsquo;t
+            fall out.
+          </span>
+        </span>
       </label>
       <button
         type="button"

@@ -612,8 +612,34 @@ def run(world: Path, strict: bool) -> dict:
             raise GateError(
                 f"world.json reports shell built=true but {shell_glb} does not exist")
         shell_mesh, _shell_scene = _scene_to_mesh(shell_glb)
-        gates["shell_connectivity"] = gate_shell_connectivity(shell_mesh)
-        gates["floor_continuity"] = gate_floor_continuity(shell_mesh, up_axis, units)
+
+        # shell_connectivity and floor_continuity ask WALKABILITY questions —
+        # is the surface one piece, can you stand anywhere without falling
+        # through. Those are questions about the mesh the player collides with,
+        # and world_shell.py exists precisely because that is NOT the render
+        # mesh ("render geometry != collision geometry; the TSDF shell is
+        # lace"). Measuring shell.glb asked them of the wrong artifact: a
+        # visual shell with holes scored as unwalkable even though the player
+        # collides against a watertight solid and cannot fall anywhere.
+        #
+        # Prefer the collision solid when one exists; fall back to the visual
+        # shell for worlds built before that stage. Which mesh was measured is
+        # recorded, because a gate that will not say what it looked at is not
+        # evidence.
+        collision_glb = world / "collision_shell.glb"
+        walk_mesh, walk_source = shell_mesh, shell_glb.name
+        if collision_glb.is_file():
+            try:
+                walk_mesh, _ = _scene_to_mesh(collision_glb)
+                walk_source = collision_glb.name
+            except Exception:
+                walk_mesh, walk_source = shell_mesh, shell_glb.name
+
+        gates["shell_connectivity"] = gate_shell_connectivity(walk_mesh)
+        gates["floor_continuity"] = gate_floor_continuity(walk_mesh, up_axis, units)
+        for name in ("shell_connectivity", "floor_continuity"):
+            if isinstance(gates.get(name), dict):
+                gates[name]["measured_mesh"] = walk_source
         measured_sizes.append(("shell", "shell", list(shell_mesh.extents)))
         shell_tex = shell_meta.get("texture")
         shell_tex = shell_tex if isinstance(shell_tex, dict) else {}

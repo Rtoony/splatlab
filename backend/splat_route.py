@@ -6113,6 +6113,7 @@ class WorldSolidifyBody(BaseModel):
     only: str = Field(default="", max_length=2000)
     shell_source: Literal["tsdf", "voxel"] = "tsdf"
     shell_route: Literal["auto", "splat-transform", "voxel"] = "auto"
+    drop_unobserved: bool = False
     skip_shell: bool = False
     shell_only: bool = False
     prefer_generated: bool = False
@@ -6190,6 +6191,8 @@ async def world_solidify(job_id: str, body: WorldSolidifyBody):
                 solidify_cmd += ["--only", body.only.strip()]
             if body.skip_shell:
                 solidify_cmd.append("--skip-shell")
+            if body.drop_unobserved:
+                solidify_cmd.append("--drop-unobserved")
             if body.shell_route != "auto":
                 solidify_cmd += ["--shell-route", body.shell_route]
             if body.shell_only:

@@ -145,3 +145,37 @@ def test_voxel_to_capture_frame_round_trips_a_real_mesh(tmp_path):
     original = np.asarray(box.vertices)
     assert np.asarray(back.vertices) == pytest.approx(_inverse(original))
     assert len(back.faces) == len(box.faces), "no geometry lost"
+
+
+# ---------------------------------------------------------------------------
+# world_gate measures the mesh the player actually stands on
+# ---------------------------------------------------------------------------
+
+def test_walkability_gates_prefer_the_collision_solid():
+    """shell_connectivity and floor_continuity ask WALKABILITY questions, so
+    they must be asked of the mesh the player collides with.
+
+    world_shell.py exists because render geometry != collision geometry (the
+    TSDF shell is lace). Measuring shell.glb asked those questions of the wrong
+    artifact: a visual shell with holes scored unwalkable even though the player
+    collides against a watertight solid and cannot fall anywhere. That is what
+    made --drop-unobserved look like a regression when it was not.
+    """
+    source = (Path(__file__).resolve().parents[1] / "mesh" / "world_gate.py").read_text()
+    block = source[source.index("collision_glb = world /"):]
+    block = block[:block.index("gates[\"prop_integrity\"]")] if "gates[\"prop_integrity\"]" in block else block[:2000]
+
+    assert 'collision_glb = world / "collision_shell.glb"' in block
+    assert "gate_shell_connectivity(walk_mesh)" in block
+    assert "gate_floor_continuity(walk_mesh" in block
+    # A gate that will not say what it looked at is not evidence.
+    assert '"measured_mesh"' in block
+
+
+def test_the_gates_still_fall_back_to_the_visual_shell():
+    """Worlds built before the collision-shell stage must still be gradeable."""
+    source = (Path(__file__).resolve().parents[1] / "mesh" / "world_gate.py").read_text()
+    block = source[source.index("collision_glb = world /"):][:1200]
+
+    assert "walk_mesh, walk_source = shell_mesh, shell_glb.name" in block
+    assert "if collision_glb.is_file():" in block
