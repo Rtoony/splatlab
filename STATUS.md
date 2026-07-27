@@ -2156,3 +2156,43 @@ Backend untouched — no restart window, `npm run build` alone deployed it.
   tmp+replace, so the *rebuild* path is fine; only re-lift is lethal.) Secondary:
   `_DUP_IGNORE` isn't applied to the `processed`/`colmap` hardlink branch. A
   real-copy duplicate is ~5.8 GB/scene on a disk at 87%.
+
+## LIVE-VERIFIED IN A REAL BROWSER (2026-07-26, same night) — the wave above is now proven
+RToony: "connect with playwright and install chromium. I want this feature for you."
+Installed `~/.cache/ms-playwright` (641 MB, chromium-headless-shell 148 + ffmpeg).
+New gate: **`tools/verify-editor-live.py`** — drives the real app with real
+keystrokes/clicks and asserts against the real DOM.
+
+- **Results: `splat_6b2e82e5` (486,960 gaussians, live langfield) 31/31 ·
+  `splat_7f98469203` (14k) 23/23.** Proven, not asserted: the Esc LADDER with a real
+  placement (#1 cleared the centre and STAYED in the tool, #2 disarmed); `C` from View
+  switching to `tab=edit` and arming; `[`/`]` clamping (90 presses bottomed at 0.0021,
+  40 topped at 4.23); paint → **Esc → "834 splats selected / NOT COMMITTED / Discard"**
+  (RToony's rule, verified); Ctrl+Z 834→591 and Ctrl+Shift+Z 591→834; Del discarding;
+  1–9 class pick; `?` card rows; `H`; Ctrl+S NOT swallowed; typing "0.42" in the radius
+  box firing no tool keys and committing on Enter; zero console/page errors.
+- ⚙️ **GPU, not SwiftShader.** Software raster is NOT viable here: a 487k-gaussian scene
+  pushed CDP round trips to **15 s** and a 900k one wedged the page outright (two runs
+  hung, one for 12 min). `--use-gl=angle --use-angle=gl` binds the RTX 5090 headlessly
+  (verified `ANGLE (NVIDIA ... RTX 5090, OpenGL 4.5.0)`) and the same page is instant.
+  A responsiveness probe now fails fast instead of hanging.
+- 🐛 **Three real bugs the browser caught that tsc/eslint could not:**
+  1. `860afb9` — every tool's lower bound is max/2000, so the small end of the brush,
+     crop-radius and box-extent ranges all printed as a flat **"0.00"**. Adaptive
+     `preciseSize()`; the floor now reads 0.0021.
+  2. `d39e9c1` — **the Edit/Export/Objects lane had NO background at all.** It was
+     `bg-surface/95`, but the colour tokens are hex-valued CSS vars
+     (`surface: "var(--surface)"`), so Tailwind cannot build their opacity variants —
+     the built CSS has **zero** `.bg-surface\/95` rules. Only a backdrop-blur was
+     rendering and the splat read straight through the floaters/decimate copy. Now
+     solid `bg-surface`.
+  3. `d39e9c1` — the new HUD was anchored top-centre, directly on top of the "In this
+     scene" legend. Moved to bottom-centre above the search pill (it reads as a status
+     bar there anyway).
+- ⚠️ **OPEN, deliberately not fixed here — the token-opacity failure is systemic.**
+  `bg-surface/85` (app nav), `bg-accent/30` (disabled primary buttons) and EVERY
+  `border-accent/NN` also emit no rule; `border-accent` never compiles at all. The real
+  fix is migrating the tokens to channel form (`--surface: 5 7 13` +
+  `rgb(var(--surface) / <alpha-value>)`), which touches every colour in the app and
+  needs its own change + visual pass. Verify any such change with
+  `grep -c 'bg-surface\\/' dist/assets/*.css` — it must stop being 0.
