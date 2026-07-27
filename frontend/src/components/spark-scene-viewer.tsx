@@ -325,6 +325,8 @@ export function SparkSceneViewer({
   const [measureArm, setMeasureArm] = useState(false);
   const [hasPending, setHasPending] = useState(false);
   const [metersPerUnit, setMetersPerUnit] = useState<number | null>(job.meters_per_unit ?? null);
+  // The server's one-line account of where the calibration came from.
+  const [scaleDetail, setScaleDetail] = useState<string | null>(null);
   const [calibDimId, setCalibDimId] = useState<number | null>(null);
   const [calibLen, setCalibLen] = useState("");
   const [calibUnit, setCalibUnit] = useState<"m" | "ft" | "in">("ft");
@@ -1476,12 +1478,32 @@ export function SparkSceneViewer({
     setSavingScale(true);
     setScaleError(null);
     try {
-      const mpu = (len * UNIT_TO_M[calibUnit]) / sceneDist;
-      const resp = await apiRequest<{ meters_per_unit: number | null }>(
+      // Send the MEASUREMENT, not a number we divided here. The server derives
+      // meters_per_unit from the stored dimension and records which measurement
+      // produced it, by what method, and how well multiple references agree —
+      // so a calibration can be audited later instead of being an unsourced
+      // scalar. Posting the dimension first makes this robust to the
+      // best-effort save in postDimension having failed.
+      await postDimension(dim);
+      const resp = await apiRequest<{
+        meters_per_unit: number | null;
+        detail?: string;
+        scale_calibration?: { uncertainty?: { n?: number; disagreement?: boolean } } | null;
+      }>(
         `/api/splat/jobs/${job.job_id}/scale`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ meters_per_unit: mpu }) },
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            references: [{
+              dimension_id: String(dim.id),
+              real_length_m: len * UNIT_TO_M[calibUnit],
+            }],
+          }),
+        },
       );
       setMetersPerUnit(resp.meters_per_unit);
+      setScaleDetail(resp.detail ?? null);
     } catch (cause) {
       setScaleError(cause instanceof Error ? cause.message : "Could not save scale.");
     } finally {
@@ -3490,6 +3512,11 @@ export function SparkSceneViewer({
               </Button>
             </div>
             {scaleError && <p className="text-[10px] leading-snug text-rose-300/90">{scaleError}</p>}
+            {/* Where the calibration came from, in the server's own words —
+                a scale you cannot audit is the failure this replaced. */}
+            {!scaleError && scaleDetail && (
+              <p className="text-[10px] leading-snug text-emerald-300/80">{scaleDetail}</p>
+            )}
             {metersPerUnit && (
               <p className="text-[10px] leading-snug text-zinc-500">
                 Scale: 1 scene unit = {metersPerUnit.toFixed(4)} m (stored on the scene).
