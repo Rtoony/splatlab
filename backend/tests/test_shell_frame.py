@@ -33,9 +33,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mesh"))
 
 # scene_solidify imports trimesh at module level; the frame maths under test is
 # pure numpy, so a stub keeps this runnable in the app's test interpreter.
-_REAL_TRIMESH = True
 try:
     import trimesh  # noqa: F401
+    # `import trimesh` succeeding is NOT proof it is real: test_world_numerical_cores
+    # inserts a types.ModuleType stub into sys.modules, and whether this file sees
+    # it depends on collection order. Probe for something only the real package has.
+    _REAL_TRIMESH = hasattr(trimesh, "creation")
 except ImportError:
     _REAL_TRIMESH = False
     sys.modules["trimesh"] = types.ModuleType("trimesh")
