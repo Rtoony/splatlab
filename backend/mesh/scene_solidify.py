@@ -308,6 +308,34 @@ def _materialize_class_map(job_dir: Path, conf_floor: float = 0.6) -> Path | Non
     return out
 
 
+def voxel_to_capture_frame(src: Path, dst: Path) -> Path:
+    """Undo world_shell.py's Y-up conversion so object_texture.py sees what it expects.
+
+    world_shell.py writes collision_shell.glb in the Y-up three.js frame
+    (documented at its module head). object_texture.py assumes CAPTURE-frame
+    input: it samples colour from the capture-frame splat, and applies the
+    capture->Y-up rotation itself on export (object_texture.py:863-866, applied
+    unconditionally — only the SCALE depends on meters_per_unit).
+
+    Handing it a Y-up mesh therefore did two wrong things at once: rotated the
+    shell a second time, so the visual shell sat 90 degrees off the props and
+    the collision solid it is supposed to coincide with; and sampled every
+    texel's colour from the wrong neighbourhood, which is why voxel shells came
+    out blotchy. object_texture.py:460 warns about exactly this hazard.
+
+    The TSDF path was always correct — it feeds _work/shell.ply, which is
+    capture-frame — so this only ever affected --shell-source voxel.
+
+    Forward is (x, y, z) -> (x, z, -y); the inverse is (X, Y, Z) -> (X, -Z, Y).
+    """
+    mesh = trimesh.load(str(src), force="mesh", process=False)
+    v = np.asarray(mesh.vertices, dtype=np.float64)
+    mesh.vertices = np.stack([v[:, 0], -v[:, 2], v[:, 1]], axis=1)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    mesh.export(str(dst))
+    return dst
+
+
 def build_shell(job_dir: Path, args, instances, py: Path, script: Path, mpu) -> dict:
     """The visual shell, from one of two geometry sources.
 
@@ -335,6 +363,9 @@ def build_shell(job_dir: Path, args, instances, py: Path, script: Path, mpu) -> 
                 if proc.returncode != 0 or not geom.is_file():
                     tail = "\n".join((proc.stderr or "").splitlines()[-4:])
                     raise RuntimeError(f"world_shell.py failed: {tail[:300]}")
+            # collision_shell.glb is Y-up; object_texture.py expects the capture
+            # frame both for colour sampling and for its own Y-up export.
+            geom = voxel_to_capture_frame(geom, world / "_work" / "shell_voxel_capture.ply")
             cut = None
         else:
             geom = world / "_work" / "shell.ply"
