@@ -3308,9 +3308,20 @@ export function SparkSceneViewer({
   );
 }
 
+// Adaptive precision. A fixed 2 decimals prints the small end of every tool's
+// range as a flat "0.00" — brush min is sphereMax/2000, so on a 5-unit scene
+// that is 0.0025 — which reads as broken and is impossible to type back in.
+function preciseSize(v: number): string {
+  const a = Math.abs(v);
+  if (a >= 10) return v.toFixed(1);
+  if (a >= 1) return v.toFixed(2);
+  if (a >= 0.01) return v.toFixed(3);
+  return v.toFixed(4);
+}
+
 /** Scene units rendered as metres once the scene is calibrated. */
 function formatSize(units: number, metersPerUnit: number | null): string {
-  return metersPerUnit ? `${(units * metersPerUnit).toFixed(2)} m` : `${units.toFixed(2)} u`;
+  return metersPerUnit ? `${preciseSize(units * metersPerUnit)} m` : `${preciseSize(units)} u`;
 }
 
 // Log-scale mapping for the radius sliders: fine steps at small radii while
@@ -3366,8 +3377,8 @@ function SizeControl({
         size="xs"
         inputMode="decimal"
         aria-label={`${label} size in ${metersPerUnit ? "metres" : "units"}`}
-        className="w-16 shrink-0 text-right"
-        value={draft ?? toDisplay(value).toFixed(2)}
+        className="w-20 shrink-0 text-right"
+        value={draft ?? preciseSize(toDisplay(value))}
         onChange={(e) => setDraft(e.target.value)}
         onBlur={commitDraft}
         onKeyDown={(e) => {
