@@ -3422,7 +3422,11 @@ function ToolHud({
   };
   const copy = tool ? TOOL_COPY[tool] : null;
   return (
-    <div className="pointer-events-none absolute left-1/2 top-3 z-30 flex max-w-[min(34rem,calc(100%-2rem))] -translate-x-1/2 flex-col items-center gap-1 rounded-xl border border-white/10 bg-[#0a0f1a] px-3 py-1.5 text-[11px] text-zinc-200 shadow">
+    // Bottom-centre, not top: the top strip is already owned by the tool panel
+    // (left-3, w-80) and the "In this scene" legend at left-[21.5rem], and a
+    // centred HUD landed straight on top of the legend. Sitting above the
+    // search pill also reads as a status bar, which is what it is.
+    <div className="pointer-events-none absolute bottom-14 left-1/2 z-30 flex max-w-[min(30rem,calc(100%-2rem))] -translate-x-1/2 flex-col items-center gap-1 rounded-xl border border-white/10 bg-[#0a0f1a] px-3 py-1.5 text-[11px] text-zinc-200 shadow">
       {copy && (
         <div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5">
           <span className="font-semibold text-cyan-200">{copy.name}</span>

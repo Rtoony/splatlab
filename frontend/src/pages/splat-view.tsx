@@ -531,7 +531,13 @@ export default function SplatViewPage() {
           </>
         )}
         {job && viewUrl && (mode === "edit" || mode === "export" || mode === "objects") && (
-          <aside className="absolute bottom-0 right-0 top-0 z-30 w-[24rem] max-w-full overflow-y-auto border-l border-white/10 bg-surface/95 backdrop-blur-md">
+          // SOLID, not bg-surface/95: the custom colour tokens are hex-valued
+          // CSS vars, so Tailwind cannot build their opacity variants and
+          // `bg-surface/95` compiled to NO background-color rule at all - the
+          // lane was fully transparent with only a blur, and the splat read
+          // straight through the floaters/decimate copy. Same solid-panel rule
+          // as the viewer tool panel and legends.
+          <aside className="absolute bottom-0 right-0 top-0 z-30 w-[24rem] max-w-full overflow-y-auto border-l border-white/10 bg-surface">
             {mode === "edit" && (
               <EditLane job={job} onEdited={handleLaneEdited} onBusyChange={setLanePending} />
             )}
