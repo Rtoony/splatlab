@@ -10,9 +10,17 @@ GET /activity reports two things, both from state the process already keeps:
   export), inspected via ``.locked()``. No task registry, no persistence, no
   progress percentages — just "an operation of this kind is in flight".
 
+- ``operations`` — the persistent registry (``opregistry``), which adds what the
+  locks cannot express: a stable id per operation, its current step, and its
+  outcome after the fact. ``GET /ops`` and ``GET /ops/{op_id}`` make a blocking
+  POST pollable and give ``/activity`` history across restarts.
+
 Truthfulness rail: the in-process locks die with a backend restart, but a
 restart also kills the operation each lock guarded, so the signal stays
-truthful — a fresh process correctly reports nothing in flight.
+truthful — a fresh process correctly reports nothing in flight. The registry
+keeps that property deliberately: rows are stamped with a per-process runtime
+id, and a ``running`` row from a dead process is reported as ``abandoned``,
+never as running.
 """
 
 from __future__ import annotations
@@ -20,12 +28,13 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Query
 
 import edit_ops
 import export_route
 import geo_route
 import gpu_arbiter
+import opregistry
 import splat_route
 
 router = APIRouter()
@@ -69,4 +78,29 @@ async def get_activity() -> dict[str, Any]:
         "gpu": {"holder": holder},
         "jobs": jobs,
         "edit_progress": {job_id: dict(entry) for job_id, entry in edit_ops.EDIT_PROGRESS.items()},
+        "operations": opregistry.active_by_job(),
     }
+
+
+@router.get("/ops")
+async def list_operations(
+    job_id: str | None = Query(default=None),
+    kind: str | None = Query(default=None),
+    active_only: bool = Query(default=False),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> dict[str, Any]:
+    """Recent operations, newest first — the history /activity cannot carry."""
+    return {
+        "operations": opregistry.list_ops(
+            job_id=job_id, kind=kind, active_only=active_only, limit=limit)
+    }
+
+
+@router.get("/ops/{op_id}")
+async def get_operation(op_id: str) -> dict[str, Any]:
+    """Poll one operation. This is what turns a blocking multi-minute POST into
+    something a reconnecting client can ask about."""
+    record = opregistry.get(op_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="unknown operation")
+    return record

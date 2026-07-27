@@ -33,6 +33,7 @@ import export_route  # noqa: E402  (portable splat formats, collision, and Unrea
 import polish_route  # noqa: E402  (polished-GLB return leg: Blender/UE edits land back)
 import activity_route  # noqa: E402  (read-only busy-now snapshot: GPU holder + held per-job locks)
 import feedback  # noqa: E402  (small SQLite-backed in-app feedback loop)
+import opregistry  # noqa: E402  (persistent heavy-operation registry: pollable, restart-truthful)
 import thumb as thumbgen  # noqa: E402  (scene thumbnail generator)
 
 # Nothing is proxied to the portal anymore; PORTAL_ORIGIN stays because /healthz
@@ -58,6 +59,14 @@ async def _lifespan(_app: FastAPI):
         await splat_route.resume_orphan_jobs()
     with contextlib.suppress(Exception):
         feedback.init_db()
+    with contextlib.suppress(Exception):
+        # Any operation still marked running belongs to the process that just
+        # died. Say so plainly rather than leaving phantom work on /activity.
+        opregistry.init_db()
+        orphaned = opregistry.reconcile_orphans()
+        if orphaned:
+            print(f"[splatlab] marked {orphaned} interrupted operation(s) abandoned",
+                  flush=True)
     yield
 
 
