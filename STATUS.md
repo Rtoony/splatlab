@@ -2608,3 +2608,66 @@ thing to measure**, before any tuning.
 
 `--class-radius` is now reachable from scene_solidify for tuning, but the
 measurement above says it is a knob, not the fix.
+
+---
+
+## 2026-07-27 — Why it does not look like reality: the cameras are inside the shell
+
+Stopped guessing and scored it. `mesh_gate.py` renders the mesh through real
+TRAIN cameras and compares against the actual photos — an executable realism
+metric that already existed and was never being used on the world lane.
+
+**Result on `splat_3aaf8067`: PSNR 11.96 dB, SSIM 0.163, coverage 0.835**, against
+the recorded lab reference of 17.64 / 0.234 / 0.746.
+
+The gate's side-by-side render explains it instantly, in a way no number did:
+the left half is the bench-and-bicycle photo; the right half is a jumble of
+white and green slabs at close range. **You are inside the geometry, looking at
+its interior walls.**
+
+Verified directly:
+
+```
+train cameras   [-0.88, -0.98, -0.27] .. [ 0.89, 1.00, 0.30]
+shell bbox      [-6.71, -6.39, -1.45] .. [ 3.81, 6.17, 5.92]
+CAMERAS INSIDE THE SHELL BBOX: 175 / 175  (100%)
+```
+
+The cameras occupy a ~2-unit region; the shell wraps a ~10-unit box around them.
+Rendering from any capture viewpoint therefore looks at the inside of a closed
+solid. **A watertight shell is the wrong primitive for an object-centric orbit
+capture**: the cameras orbit OUTSIDE the subject, so any solid enclosing the
+point cloud necessarily encloses the cameras too.
+
+### Every knob is irrelevant while that holds
+A/B on the realism metric, all through the gated route:
+
+| config | PSNR | SSIM | coverage | faces |
+|---|---|---|---|---|
+| auto, no drop | 11.80 | **0.222** | 1.00 | 24,268 |
+| auto + drop-unobserved | 11.96 | 0.163 | 0.835 | 19,040 |
+| voxel route + drop | **12.03** | 0.192 | 0.907 | 103,700 |
+
+**0.23 dB across 4x the geometry.** Noise. SSIM is actually best on the original
+default. Four hypotheses tested this session — texture resolution, class radius,
+unobserved-face dropping, shell-route detail — and none moves realism, because
+none addresses the camera containment.
+
+The world was restored to the best-SSIM configuration (auto route, no drop,
+24,268 faces): "all measurable gates passed".
+
+### What would actually move it
+Not a knob. The world lane needs to stop building an enclosing solid for
+object-centric captures and instead produce ground + objects viewed from
+outside — which is R1's hybrid rendering (splat as the world skin, mesh only
+where interaction demands it) rather than a mesh-everything shell. Detecting
+the case is cheap and now has a test: are the train cameras inside the candidate
+shell's bbox? If yes, the shell will never render like the capture.
+
+### Also corrected here
+`world_gate` graded `shell.glb` — the RENDER mesh — for `shell_connectivity` and
+`floor_continuity`, which are walkability questions about the mesh the player
+COLLIDES with. Since the walker was fixed to load `collision_shell.glb`, those
+gates were measuring the wrong artifact; that is what made `--drop-unobserved`
+look like a regression. They now grade the collision solid, fall back to the
+visual shell when there is none, and record `measured_mesh` in the verdict.
