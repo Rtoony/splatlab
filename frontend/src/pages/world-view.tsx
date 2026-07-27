@@ -702,6 +702,7 @@ function RebuildPanel({ jobId, onRebuilt }: { jobId: string; onRebuilt: () => vo
   const [faces, setFaces] = useState(60000);
   const [tex, setTex] = useState(2048);
   const [source, setSource] = useState<"voxel" | "tsdf">("voxel");
+  const [route, setRoute] = useState<"auto" | "voxel">("auto");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -714,6 +715,7 @@ function RebuildPanel({ jobId, onRebuilt }: { jobId: string; onRebuilt: () => vo
       const r = await solidifyWorld(jobId, {
         shell_only: true,
         shell_source: source,
+        shell_route: route,
         shell_faces: faces,
         shell_texture_size: tex,
         run_collision: false,
@@ -746,6 +748,22 @@ function RebuildPanel({ jobId, onRebuilt }: { jobId: string; onRebuilt: () => vo
           <option value="tsdf">tsdf (accurate, lacy)</option>
         </select>
       </label>
+      <label className="flex items-center justify-between text-[11px] text-zinc-300">
+        Detail
+        <select
+          value={route}
+          onChange={(e) => setRoute(e.target.value as "auto" | "voxel")}
+          className="rounded border border-white/10 bg-white/5 px-1.5 py-0.5 text-[11px]"
+        >
+          <option value="auto">walkable (auto)</option>
+          <option value="voxel">detailed (voxel)</option>
+        </select>
+      </label>
+      <p className="text-[10px] leading-snug text-zinc-500">
+        `auto` ranks shells on walkability alone and ignores detail — measured, it
+        picked a 24k-tri shell over a 120k-tri one. `detailed` is ~5x the geometry
+        and a tighter box, but can fail the floor-continuity gate.
+      </p>
       <label className="flex items-center justify-between text-[11px] text-zinc-300">
         Faces
         <input

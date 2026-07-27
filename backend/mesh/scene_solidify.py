@@ -360,12 +360,19 @@ def build_shell(job_dir: Path, args, instances, py: Path, script: Path, mpu) -> 
     try:
         if args.shell_source == "voxel":
             geom = world / "collision_shell.glb"
-            if not geom.is_file():
-                _log("  no collision_shell.glb — running world_shell.py first")
-                proc = subprocess.run(
-                    [str(py), str(Path(__file__).with_name("world_shell.py")),
-                     str(job_dir)],
-                    capture_output=True, text=True, timeout=1800)
+            route = getattr(args, "shell_route", "auto") or "auto"
+            # An explicit route must actually be honoured. Reusing an existing
+            # collision_shell.glb built by a DIFFERENT route silently ignores
+            # the request — which is what happened the first time this was
+            # wired: --shell-route voxel returned a splat-transform shell.
+            if not geom.is_file() or route != "auto":
+                _log(f"  building collision shell (route={route})")
+                shell_cmd = [str(py), str(Path(__file__).with_name("world_shell.py")),
+                             str(job_dir)]
+                if route != "auto":
+                    shell_cmd += ["--route", route]
+                proc = subprocess.run(shell_cmd, capture_output=True, text=True,
+                                      timeout=1800)
                 if proc.returncode != 0 or not geom.is_file():
                     tail = "\n".join((proc.stderr or "").splitlines()[-4:])
                     raise RuntimeError(f"world_shell.py failed: {tail[:300]}")
@@ -422,6 +429,15 @@ def main() -> int:
     ap.add_argument("--shell-texture-size", type=int, default=2048)
     ap.add_argument("--only", default=None, help="comma-separated slugs")
     ap.add_argument("--skip-shell", action="store_true")
+    ap.add_argument("--shell-route", choices=["auto", "splat-transform", "voxel"],
+                    default="auto",
+                    help="which collision-shell route to build the visual shell "
+                         "from. `auto` ranks candidates on WALKABILITY only "
+                         "(rank_key: walkable, gates_passed, walkable_frac, ...) "
+                         "and nothing in that key values geometric detail — "
+                         "measured on splat_3aaf8067 it chose a 24k-tri shell "
+                         "over a 338k-tri one for 3 points of standing room. "
+                         "Pick `voxel` when you want detail.")
     ap.add_argument("--drop-unobserved", action="store_true",
                     help="drop shell faces the capture never saw instead of "
                          "dilating a smear over them. OPT-IN: measured on "
