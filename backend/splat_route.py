@@ -6491,6 +6491,136 @@ async def langfield_overrides_delete(job_id: str, override_id: str):
     return resp.json()
 
 
+# A duplicate is a REAL copy. Not one hardlink, deliberately:
+#
+#   * this filesystem is ext4, so there is no reflink/copy-on-write option;
+#   * and a hardlink is only safe when NOTHING ever writes the file in place.
+#     That is false for the two files we would most want to link.
+#     `colmap/database.db` is a SQLite database COLMAP opens read-write, and
+#     `_langfield/gauss_emb.npz` is written by backend/langfield/langfield_v2.py
+#     with a plain np.savez_compressed() — a truncate-in-place write. Either one
+#     would corrupt the ORIGINAL scene, which is the precise thing this feature
+#     exists to prevent. (`rm -rf` on a hardlink IS safe — it unlinks one name —
+#     which is why the reroute path that clears processed/ is not the risk here.
+#     In-place writes are.)
+#
+# The cost is honest instead: a preflight refuses when the copy would eat the
+# disk, and the caller is told the byte count.
+_DUP_IGNORE = shutil.ignore_patterns(".building-*", ".edit-tmp*", "*.json.tmp")
+# Restore points are the ORIGINAL's edit history and are often the largest
+# directory after _langfield (up to 5 snapshots of splat.ply). A working copy
+# starts with a clean history, like a fresh branch.
+_DUP_SKIP_DIRS = {"versions"}
+# Refuse to leave the disk below this. A wedged disk takes down every service on
+# the box, not just SplatLab.
+_DUP_FREE_FLOOR_BYTES = 20 * 1024**3
+
+
+def _dup_payload_size(src: Path) -> int:
+    """Bytes the duplicate will actually occupy — same skip rules as the copy,
+    so the preflight cannot under-estimate what it is about to write."""
+    total = 0
+    for path in src.rglob("*"):
+        if any(part in _DUP_SKIP_DIRS for part in path.relative_to(src).parts):
+            continue
+        if path.is_file() and not path.is_symlink():
+            with contextlib.suppress(OSError):
+                total += path.stat().st_size
+    return total
+
+
+def _duplicate_job_tree(src: Path, dst: Path) -> None:
+    def _ignore(directory: str, names: list[str]) -> set[str]:
+        skip = set(_DUP_IGNORE(directory, names))
+        if Path(directory) == src:
+            skip |= _DUP_SKIP_DIRS
+        return skip
+
+    shutil.copytree(src, dst, ignore=_ignore, symlinks=True)
+
+
+@router.post("/jobs/{job_id}/duplicate")
+async def duplicate_job(request: Request, job_id: str) -> dict[str, Any]:
+    """Working copy of a completed scene: edit the duplicate, keep the original
+    pristine. Every byte is really copied (see _DUP_IGNORE above for why not
+    hardlinks), minus the original's restore points."""
+    import edit_ops  # local: edit_ops imports this module, so not at top level
+
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    if meta.get("status") != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Only completed scenes can be duplicated (status: {meta.get('status')})",
+        )
+    src = Path(meta["output_dir"])
+    if not src.is_dir():
+        raise HTTPException(status_code=410, detail=f"Scene directory is gone: {src}")
+
+    # Hold the SOURCE's edit lock for the whole copy. Without it an /edit/apply
+    # landing mid-walk would give the duplicate a torn tree — splat.ply from
+    # after the crop, derived artifacts from before it.
+    async with edit_ops._hold_edit_locks([job_id]):
+        size = await asyncio.to_thread(_dup_payload_size, src)
+        free = shutil.disk_usage(_job_dir(job_id).parent).free
+        if free - size < _DUP_FREE_FLOOR_BYTES:
+            raise HTTPException(
+                status_code=507,
+                detail=(
+                    f"Not enough disk: the copy needs {_human_size(size)} and only "
+                    f"{_human_size(free)} is free, which would leave less than "
+                    f"{_human_size(_DUP_FREE_FLOOR_BYTES)} headroom. Delete a scene first."
+                ),
+            )
+
+        new_id = f"splat_{secrets.token_hex(5)}"
+        dst = _job_dir(new_id)
+        if dst.exists():
+            raise HTTPException(status_code=500, detail="duplicate id collision — retry")
+        try:
+            await asyncio.to_thread(_duplicate_job_tree, src, dst)
+        except OSError as exc:
+            shutil.rmtree(dst, ignore_errors=True)
+            raise HTTPException(status_code=500, detail=f"duplicate failed: {exc}") from exc
+
+        try:
+            now = _utc_now()
+            new_meta = json.loads((dst / "meta.json").read_text())
+            # Keep the scene truth (capture format, iterations, scale calibration,
+            # langfield flags); replace only identity, lineage and lifecycle.
+            new_meta.update(
+                job_id=new_id,
+                output_dir=str(dst),
+                input_path=f"{Path(str(meta.get('input_path', job_id))).name} (copy)",
+                duplicated_from=job_id,
+                parents=[job_id],
+                created_at=now,
+                started_at=now,
+                completed_at=now,
+                pinned=False,
+                pid=None,
+                stop_requested=False,
+            )
+            _write_meta(new_id, new_meta)
+        except (OSError, ValueError) as exc:
+            shutil.rmtree(dst, ignore_errors=True)
+            raise HTTPException(status_code=500, detail=f"duplicate meta failed: {exc}") from exc
+
+    await audit_operator_event(
+        request=request,
+        title="Duplicated scene",
+        description=f"{job_id} -> {new_id} (working copy, {_human_size(size)})",
+        variant="success",
+        action="splat.duplicate",
+        target=meta.get("mode", "3d"),
+        metadata={"job_id": job_id, "new_job_id": new_id, "bytes": size},
+    )
+    return {"ok": True, "new_job_id": new_id, "bytes": size, "job": _job_payload(new_meta)}
+
+
 @router.get("/jobs/{job_id}/class-taxonomy")
 async def get_class_taxonomy(job_id: str):
     """Merged class taxonomy (built-ins + this job's extend-only extras).

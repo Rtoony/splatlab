@@ -896,6 +896,18 @@ export interface SplatEditApplyResponse {
   job: SplatJob;
 }
 
+// POST /jobs/{id}/duplicate — a full working copy of a completed scene, so
+// destructive edits land on the copy and the original stays pristine. Every
+// byte is really copied (no hardlinks: colmap's SQLite db and the langfield
+// npz are both written in place, and a shared inode would corrupt the
+// original), minus the source's restore points. `bytes` is what it occupies.
+export interface SplatDuplicateResponse {
+  ok: boolean;
+  new_job_id: string;
+  bytes: number;
+  job: SplatJob;
+}
+
 // upload_edited_ply response (edit_ops.py POST /jobs/{id}/edit/upload) —
 // apply's shape plus the gaussian count read from the validated PLY header.
 export interface SplatEditUploadResponse extends SplatEditApplyResponse {

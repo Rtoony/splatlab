@@ -9,13 +9,14 @@
 // roundtrip: an externally edited .ply comes back as a versioned edit.
 import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { applyEditOps, fetchEditVersions, revertEdit, uploadEditedPly } from "@/lib/api";
+import { useLocation } from "wouter";
+import { applyEditOps, duplicateScene, fetchEditVersions, revertEdit, uploadEditedPly } from "@/lib/api";
 import { relTime } from "@/lib/format";
 import { useActivity } from "@/lib/use-activity";
 import type { SplatEditApplyResponse, SplatEditOp, SplatJob } from "@/lib/contracts";
 import { SemanticEditPanel } from "@/components/edit/semantic-edit";
 import { Button, Input, SectionLabel, useToast } from "@/components/ui";
-import { Crosshair, ExternalLink, History, Loader2, Move3d, Shrink, Sparkles, Undo2, UploadCloud, Wand2, Wrench } from "lucide-react";
+import { Copy, Crosshair, ExternalLink, History, Loader2, Move3d, Shrink, Sparkles, Undo2, UploadCloud, Wand2, Wrench } from "lucide-react";
 
 // Backend rails (edit_ops.py pydantic models) — pre-validate so the user gets
 // a friendly message instead of a 422 blob.
@@ -64,6 +65,7 @@ export function EditLane({
 }) {
   const toast = useToast();
   const qc = useQueryClient();
+  const [, navigate] = useLocation();
   // Restore-point timeline (server keeps at most 5 snapshots).
   const versionsQuery = useQuery({
     queryKey: ["edit-versions", job.job_id],
@@ -118,6 +120,12 @@ export function EditLane({
   // server-truth banner below doesn't misfire ("started elsewhere") on an
   // edit that was in fact started right here in this lane.
   const [semanticBusy, setSemanticBusy] = useState(false);
+
+  // Duplicate-before-you-destroy. Armed like every other destructive control
+  // here, except this one is destructive in the opposite direction: it costs
+  // real disk, so the confirm states the price.
+  const [dupArmed, setDupArmed] = useState(false);
+  const [duplicating, setDuplicating] = useState(false);
 
   // Server-truth activity poll (fast while any local mutation is pending).
   // The per-job `editing` flag is the backend's own in-process edit lock, so
@@ -337,11 +345,57 @@ export function EditLane({
     }
   }
 
+  async function runDuplicate() {
+    setDuplicating(true);
+    setError(null);
+    try {
+      const resp = await duplicateScene(job.job_id);
+      setDupArmed(false);
+      toast(`Copy created (${fmtFileSize(resp.bytes)}) — opening it`, "success");
+      void qc.invalidateQueries({ queryKey: ["status"] });
+      // Land ON the copy: the whole point is that the next destructive edit
+      // hits the duplicate, so leaving you on the original invites the mistake.
+      navigate(`/view/${resp.new_job_id}?tab=edit`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Duplicate failed.");
+    } finally {
+      setDuplicating(false);
+    }
+  }
+
   return (
     <div className="space-y-4 p-4">
       <div className="flex items-center gap-2">
         <Wrench className="h-4 w-4 text-cyan-300" />
         <SectionLabel>Edit</SectionLabel>
+      </div>
+
+      {/* First, because everything below it is destructive. */}
+      <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-3">
+        <p className="flex items-center gap-1.5 text-sm font-semibold text-zinc-100">
+          <Copy className="h-3.5 w-3.5 text-cyan-200" /> Work on a copy
+        </p>
+        <p className="mt-1 text-xs leading-relaxed text-zinc-400">
+          Everything below permanently rewrites <em>this</em> scene. Duplicate it first and the
+          original stays exactly as it is — every byte is really copied, so the copy is fully
+          independent. Restore points aren't carried over; the copy starts with a clean history.
+        </p>
+        <Button
+          type="button"
+          size="sm"
+          variant={dupArmed ? "primary" : "outline"}
+          className="mt-2 w-full"
+          disabled={busy || duplicating}
+          onClick={() => (dupArmed ? void runDuplicate() : setDupArmed(true))}
+        >
+          {duplicating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Copy className="h-3.5 w-3.5" />}
+          {duplicating ? "Copying…" : dupArmed ? "Duplicate — sure?" : "Duplicate this scene"}
+        </Button>
+        {dupArmed && !duplicating && (
+          <p className="mt-1 text-[10px] leading-snug text-zinc-500">
+            Takes a few seconds and uses disk equal to the scene's size. You'll land on the copy.
+          </p>
+        )}
       </div>
 
       {error && (

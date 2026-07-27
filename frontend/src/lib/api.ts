@@ -12,6 +12,7 @@ import type {
   SplatCollisionRequest,
   SplatContoursRequest,
   SplatContoursResponse,
+  SplatDuplicateResponse,
   SplatEditApplyResponse,
   SplatEditOp,
   SplatEditRevertResponse,
@@ -188,6 +189,14 @@ export function isolateSplatObject(
 // revertEdit() for single-step undo.
 export function applyEditOps(jobId: string, ops: SplatEditOp[]): Promise<SplatEditApplyResponse> {
   return postJSON<SplatEditApplyResponse>(`/api/splat/jobs/${jobId}/edit/apply`, { ops });
+}
+
+// Full working copy of a completed scene — edit the copy, keep the original
+// pristine. Really copies every byte, so it is slow-ish and costs real disk;
+// the response reports how much. Details worth surfacing verbatim: 409 the
+// scene isn't completed or an edit is mid-flight, 507 not enough disk.
+export function duplicateScene(jobId: string): Promise<SplatDuplicateResponse> {
+  return postJSON<SplatDuplicateResponse>(`/api/splat/jobs/${jobId}/duplicate`, {});
 }
 
 // Text-driven edit: delete/isolate rewrite this scene (snapshot-versioned,
