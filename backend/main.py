@@ -33,6 +33,7 @@ import export_route  # noqa: E402  (portable splat formats, collision, and Unrea
 import polish_route  # noqa: E402  (polished-GLB return leg: Blender/UE edits land back)
 import activity_route  # noqa: E402  (read-only busy-now snapshot: GPU holder + held per-job locks)
 import feedback  # noqa: E402  (small SQLite-backed in-app feedback loop)
+import world_interactions_route  # noqa: E402  (walkable-world affordances + player state)
 import opregistry  # noqa: E402  (persistent heavy-operation registry: pollable, restart-truthful)
 import thumb as thumbgen  # noqa: E402  (scene thumbnail generator)
 
@@ -213,6 +214,9 @@ app.include_router(splat_route.router, prefix="/api/splat", dependencies=[Depend
 
 # Scene editing (destructive ops are snapshot-versioned) — same auth gate as the pipeline.
 app.include_router(edit_ops.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
+
+# Walkable-world interactions: authored affordances + player state (pure metadata).
+app.include_router(world_interactions_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
 
 # Locate-in-the-world (metadata + CPU-only footprint renders; never GPU-gated).
 app.include_router(geo_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
