@@ -635,6 +635,9 @@ class InventoryReq(BaseModel):
     config: str
     lfdir: str
     topn: int = 50
+    # Recompute even when a valid cache exists. This is how a single scene is
+    # brought up to the current relevancy generation without touching the rest.
+    refresh: bool = False
 
 
 class RelevancyReq(BaseModel):
@@ -1120,11 +1123,27 @@ async def inventory(req: InventoryReq) -> dict[str, Any]:
         raise HTTPException(404, f"config not found: {req.config}")
 
     cache = lf_p / "inventory.json"
-    if cache.is_file():
+    if cache.is_file() and not req.refresh:
         try:
             data = json.loads(cache.read_text())
             if data.get("version") == INVENTORY_VERSION and data.get("items"):
-                return {"ready": True, "cached": True, "items": data["items"]}
+                # A cached inventory from an older relevancy generation is still
+                # served — it is not wrong, it was computed when unseen gaussians
+                # scored 0.5 against every noun, which skews the ranking. Saying
+                # so beats silently forcing a GPU recompute of every scene the
+                # next time someone opens it.
+                generation = data.get("relevancy_generation")
+                stale = generation != relevancy_core.RELEVANCY_GENERATION
+                return {
+                    "ready": True, "cached": True, "items": data["items"],
+                    "stale": stale,
+                    "relevancy_generation": generation,
+                    "current_relevancy_generation": relevancy_core.RELEVANCY_GENERATION,
+                    "stale_reason": (
+                        "computed before unseen gaussians were excluded from "
+                        "relevancy; re-run with refresh=true to recompute"
+                    ) if stale else "",
+                }
         except Exception:  # pragma: no cover - stale/corrupt cache: recompute
             pass
 
@@ -1149,10 +1168,20 @@ async def inventory(req: InventoryReq) -> dict[str, Any]:
             sc.touch()
 
     try:
-        cache.write_text(json.dumps({"version": INVENTORY_VERSION, "items": items}))
+        cache.write_text(json.dumps({
+            "version": INVENTORY_VERSION,
+            "relevancy_generation": relevancy_core.RELEVANCY_GENERATION,
+            "computed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "items": items,
+        }))
     except Exception:  # pragma: no cover - cache write is best-effort
         pass
-    return {"ready": True, "cached": False, "items": items}
+    return {
+        "ready": True, "cached": False, "items": items, "stale": False,
+        "relevancy_generation": relevancy_core.RELEVANCY_GENERATION,
+        "current_relevancy_generation": relevancy_core.RELEVANCY_GENERATION,
+        "stale_reason": "",
+    }
 
 
 @app.post("/hero")

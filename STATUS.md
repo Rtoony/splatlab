@@ -2360,10 +2360,31 @@ Test suite **708 → 933 passed**, 6 skipped. Baseline captured before the first
 - `pick_and_gate_mask`/`derive_placement` did **not** need extracting to be testable.
 - The `seen` mask was already written to `gauss_emb.npz`; only the consumers ignored it.
 
+### Inventory staleness — per scene, not fleet-wide (operator decision, same day)
+`INVENTORY_VERSION` is deliberately **still 7**. It is a hard cache key: bumping it
+would silently force a multi-minute GPU recompute of every scene the next time anyone
+opened it. Instead `relevancy_core.RELEVANCY_GENERATION = 1` is a **soft** marker —
+an inventory from an older generation is still served and reports `stale: true` with a
+reason, and `?refresh=true` recomputes ONE scene.
+
+Absence of the key IS the stale signal, so no migration pass has to walk the job tree;
+every one of the 7 inventories on disk reads as out-of-date today.
+
+Staged (not applied): `~/scripts/splatlab-refresh-three-inventories.sh` — dry-run by
+default, `--apply` to act. It refuses to restart while heavy work is in flight, backs
+up all 7 inventories first, restarts the services (the fix is NOT live until they
+restart — recomputing against the running pre-fix code would just rewrite the same
+wrong numbers), recomputes **bicycle `splat_3aaf8067`, garden `splat_32d926d9`,
+fire-hydrant `splat_513e89171d`** through the app's gated route, then asserts exactly
+those three sit at generation 1 and prints the rollback. Dry run verified.
+
+Noted in passing: `splat_aea04ab3` (Bonsai) is at `version: 3`, so it will hard-recompute
+on its next read via the pre-existing INVENTORY_VERSION path regardless.
+
+Cached `q_<query>.png` heatmaps are also pre-fix, but each is overwritten by the next
+query for that term, so they self-heal rather than needing a sweep.
+
 ### Open / deliberately not done
-- **`INVENTORY_VERSION` not bumped.** Inventories cached before the unseen-gaussian fix
-  keep their old scores until it is. Bumping forces a recompute for every scene — an
-  operator decision, not a side effect of a bug fix.
 - `mesh/object_isolate.py` and `mesh/batch_isolate.py` keep their own already-correct
   inline relevancy copies. Consolidating them touches working GPU code this suite
   cannot exercise.

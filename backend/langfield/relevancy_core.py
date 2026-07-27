@@ -56,6 +56,17 @@ NEGATIVES = ["object", "things", "stuff", "texture", "surface"]  # LERF canon
 # every relevancy threshold in the app means.
 SOFTMAX_TEMP = 10.0
 
+# Bumped whenever the relevancy arithmetic changes in a way that alters stored
+# derived products (inventories, heatmaps). Generation 1 is the fix that stopped
+# unseen gaussians scoring 0.5 against every query.
+#
+# Deliberately SEPARATE from langfield_worker.INVENTORY_VERSION. That constant is
+# a hard cache key: changing it silently forces a full GPU recompute of every
+# scene the next time anyone opens it. This one is soft — a cached product from
+# an older generation is still served, and simply reports itself as out of date,
+# so recomputing stays a per-scene decision rather than a fleet-wide surprise.
+RELEVANCY_GENERATION = 1
+
 # The score an unseen gaussian would receive from the raw min-softmax: a zero
 # embedding row makes both logits equal. Kept named so the tests can assert the
 # bug is actually being prevented rather than accidentally absent.

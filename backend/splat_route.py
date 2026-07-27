@@ -2839,12 +2839,18 @@ async def _langfield_worker_json(path: str, payload: dict):
     return await _langfield_post(path, payload)
 
 
-async def _langfield_worker_inventory(config_path: str, lfdir: str) -> dict | None:
+async def _langfield_worker_inventory(config_path: str, lfdir: str,
+                                      refresh: bool = False) -> dict | None:
     """Ask the warm worker for the scene's top-N object inventory (cached per scene).
     Returns the worker JSON on success, else None (no cold fallback — inventory is a
-    warm-worker-only convenience)."""
+    warm-worker-only convenience).
+
+    `refresh` recomputes one scene even when a valid cache exists — how a single
+    scene is brought up to the current relevancy generation without forcing a GPU
+    recompute of every other scene."""
     require_heavy_work_admitted()
-    resp = await _langfield_post("/inventory", {"config": config_path, "lfdir": lfdir})
+    resp = await _langfield_post(
+        "/inventory", {"config": config_path, "lfdir": lfdir, "refresh": bool(refresh)})
     return resp.json() if resp is not None and resp.status_code == 200 else None
 
 
@@ -7012,10 +7018,14 @@ async def class_labels_summary(job_id: str):
 
 
 @router.get("/jobs/{job_id}/langfield/inventory")
-async def langfield_inventory(job_id: str):
+async def langfield_inventory(job_id: str, refresh: bool = False):
     """Top-N objects auto-detected in this scene (open-vocab), for the toggle-to-highlight
     legend. Warm-worker only + cached per scene; 404 if no field, 503 if the worker is
-    down (the UI just hides the legend). (Auth via the router mount.)"""
+    down (the UI just hides the legend). (Auth via the router mount.)
+
+    An inventory computed before unseen gaussians were excluded from relevancy is
+    still served, flagged `stale` with a reason, rather than silently triggering a
+    GPU recompute. `?refresh=true` recomputes THIS scene only."""
     require_heavy_work_admitted()
     if not _safe_job_id(job_id):
         raise HTTPException(status_code=404, detail="Splat job not found")
@@ -7027,10 +7037,17 @@ async def langfield_inventory(job_id: str):
     config_path = _find_latest_config(job_dir)
     if config_path is None:
         raise HTTPException(status_code=409, detail="Scene checkpoint missing")
-    result = await _langfield_worker_inventory(str(config_path), str(lfdir))
+    result = await _langfield_worker_inventory(str(config_path), str(lfdir), refresh=refresh)
     if result is None:
         raise HTTPException(status_code=503, detail="Inventory worker unavailable")
-    return {"job_id": job_id, "items": result.get("items", [])}
+    return {
+        "job_id": job_id,
+        "items": result.get("items", []),
+        "stale": bool(result.get("stale", False)),
+        "stale_reason": result.get("stale_reason", ""),
+        "relevancy_generation": result.get("relevancy_generation"),
+        "current_relevancy_generation": result.get("current_relevancy_generation"),
+    }
 
 
 @router.get("/jobs/{job_id}/langfield/heatmap/{name}")
