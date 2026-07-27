@@ -6,14 +6,26 @@
   color-scheme: dark;
 
   /* Design tokens — single source for surface/ink/accent colors and radii.
-     Tailwind maps these in tailwind.config.js (bg-surface, text-ink, rounded-*). */
-  --surface: #05070d;
+     Tailwind maps these in tailwind.config.js (bg-surface, text-ink, rounded-*).
+
+     CHANNEL TRIPLETS, not hex, and that is load-bearing: Tailwind can only
+     build the opacity variants (bg-surface/85, disabled:bg-accent/30,
+     hover:border-accent/50) when the value slots into
+     `rgb(var(--token) / <alpha-value>)`. While these were hex, every such
+     class compiled to NOTHING — silently, with no build error — and the
+     Edit lane shipped with no background at all. If you change one back to
+     hex, `npm run test` fails on purpose (tokens.test.ts).
+     Consume raw ones as rgb(var(--token)), never bare var(--token). */
+  --surface: 5 7 13;
+  --ink: 230 235 244;
+  --ink-muted: 161 161 170;
+  --accent: 34 211 238;
+  --accent-hover: 103 232 249;
+  --accent-ink: 4 18 26;
+  /* Deliberately NOT a triplet: this one is a translucent overlay by
+     definition (3% white), so it has no meaningful <alpha-value> form. It is
+     mapped bare in the config and must never take an opacity modifier. */
   --surface-raised: rgba(255, 255, 255, 0.03);
-  --ink: #e6ebf4;
-  --ink-muted: #a1a1aa;
-  --accent: #22d3ee;
-  --accent-hover: #67e8f9;
-  --accent-ink: #04121a;
   --radius-sm: 0.5rem;
   --radius-md: 0.75rem;
   --radius-lg: 1rem;
@@ -31,8 +43,8 @@ body {
   background:
     radial-gradient(circle at 12% 8%, rgba(34, 211, 238, 0.1), transparent 36%),
     radial-gradient(circle at 88% 6%, rgba(249, 115, 22, 0.08), transparent 30%),
-    var(--surface);
-  color: var(--ink);
+    rgb(var(--surface));
+  color: rgb(var(--ink));
   -webkit-font-smoothing: antialiased;
 }
 
