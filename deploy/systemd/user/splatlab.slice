@@ -1,0 +1,13 @@
+[Unit]
+Description=Shared resource budget for SplatLab workloads
+
+[Slice]
+CPUAccounting=yes
+CPUQuota=400%
+AllowedCPUs=8-15
+MemoryAccounting=yes
+MemoryHigh=32G
+MemoryMax=48G
+MemorySwapMax=8G
+TasksAccounting=yes
+TasksMax=512

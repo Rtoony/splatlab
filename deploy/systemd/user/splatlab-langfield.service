@@ -1,0 +1,28 @@
+[Unit]
+Description=Splat Lab Language Field — warm query worker (resident SigLIP + scene LRU)
+After=network.target splatlab.service
+Wants=splatlab.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/rtoony/projects/splatlab
+# Pull REDIS_PASSWORD (for the cross-process GPU lock) + portal token from vault
+# into RAM (zero-disk policy). Same nexus-svc-inject pattern as splatlab.service.
+ExecStartPre=/home/rtoony/bin/nexus-svc-inject splatlab-langfield "Rtoony Portal" "Infrastructure"
+EnvironmentFile=-/dev/shm/nexus-env-splatlab-langfield
+# Run uvicorn from the langfield-spike conda env (has torch/gsplat/nerfstudio/SigLIP).
+ExecStart=/home/rtoony/miniconda3/envs/langfield-spike/bin/uvicorn backend.langfield_worker:app --host 127.0.0.1 --port 3417
+ExecStopPost=/bin/rm -f /dev/shm/nexus-env-splatlab-langfield
+Restart=on-failure
+RestartSec=5
+Environment=PATH=/home/rtoony/bin:/home/rtoony/miniconda3/envs/langfield-spike/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/rtoony
+Environment=CUDA_HOME=/usr/local/cuda
+# Weights are cached locally — skip HuggingFace network checks at startup so the
+# worker loads instantly and survives HF being slow/unreachable (it was the ~40s
+# cold-start cost). If the SigLIP cache is ever cleared, run one online load first.
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+
+[Install]
+WantedBy=default.target

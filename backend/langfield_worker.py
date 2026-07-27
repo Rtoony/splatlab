@@ -117,7 +117,7 @@ QUERY_VRAM_MB = 4000            # headroom reserved by the canonical GPU runner
 SCENE_CACHE_MAX = int(os.environ.get("SPLAT_LANGFIELD_SCENE_CACHE", "2"))  # LRU size (1-2)
 IDLE_EVICT_SEC = float(os.environ.get("SPLAT_LANGFIELD_IDLE_SEC", str(10 * 60)))  # ~10 min
 IDLE_CHECK_SEC = 30.0
-PORT = int(os.environ.get("SPLAT_LANGFIELD_WORKER_PORT", "3417"))
+PORT = int(os.environ.get("SPLAT_LANGFIELD_WORKER_PORT", "3425"))  # matches the deployed unit
 HOST = "127.0.0.1"             # LAN-only
 WORKER_MAINTENANCE_REASON = os.environ.get("SPLAT_TRAINING_DISABLED_REASON", "").strip()
 
