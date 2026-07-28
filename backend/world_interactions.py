@@ -70,6 +70,9 @@ MAX_TEXT = 1000
 MAX_STATES = 8
 MAX_RANGE_M = 25.0
 MAX_ELEMENTS = 256
+# Physics-disturbed prop poses live under the reserved player seam; a scene
+# has at most MAX_ELEMENTS props, so this bound is generous, not tight.
+MAX_PLAYER_POSES = 256
 
 _STATE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 _TINT_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -312,6 +315,46 @@ def validate_state(document: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Resolution — the heart of this module
 # ---------------------------------------------------------------------------
+
+def validate_player_poses(raw: Any) -> dict[str, Any]:
+    """Validate the physics half of the player seam: prop poses.
+
+    The seam itself is schema-free by design (`player: {}` — reserved
+    2026-07-27), but the ROUTE that writes it must not be: an unbounded or
+    non-finite pose store would feed NaNs straight into every future physics
+    step and grow without limit. Position is three finite floats, quaternion
+    four finite floats of ~unit length, slug count bounded."""
+    if not isinstance(raw, dict):
+        raise InteractionsError("poses must be an object keyed by slug")
+    if len(raw) > MAX_PLAYER_POSES:
+        raise InteractionsError(
+            f"poses holds {len(raw)} entries; the cap is {MAX_PLAYER_POSES}")
+    out: dict[str, Any] = {}
+    for slug, pose in raw.items():
+        name = str(slug)
+        if not name or len(name) > 64 or any(ord(c) < 32 for c in name):
+            raise InteractionsError(f"invalid pose slug {name!r}")
+        if not isinstance(pose, dict):
+            raise InteractionsError(f"{name}: pose must be an object")
+        position = pose.get("position")
+        quaternion = pose.get("quaternion")
+        if (not isinstance(position, list) or len(position) != 3
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or not math.isfinite(v) for v in position)):
+            raise InteractionsError(f"{name}: position must be three finite numbers")
+        if (not isinstance(quaternion, list) or len(quaternion) != 4
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or not math.isfinite(v) for v in quaternion)):
+            raise InteractionsError(f"{name}: quaternion must be four finite numbers")
+        norm = sum(float(v) ** 2 for v in quaternion)
+        if abs(norm - 1.0) > 0.05:
+            raise InteractionsError(f"{name}: quaternion is not unit length")
+        out[name] = {
+            "position": [float(v) for v in position],
+            "quaternion": [float(v) for v in quaternion],
+        }
+    return out
+
 
 def resolve_state(interactions: dict[str, Any] | None,
                   state: dict[str, Any] | None,

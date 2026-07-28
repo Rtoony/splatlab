@@ -16,7 +16,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { TargetInfo } from "@/lib/world-interactions";
 import { Link, useRoute } from "wouter";
-import { uploadPolishedWorldElement , fetchWorldInteractions, setWorldElementState, solidifyWorld} from "@/lib/api";
+import { uploadPolishedWorldElement , fetchWorldInteractions, setWorldElementState, setWorldPlayerPoses, solidifyWorld} from "@/lib/api";
 import { PolishUploadZone } from "@/components/workspace/polish-upload";
 import {
   DEFAULT_WALK_PARAMS,
@@ -226,9 +226,39 @@ export default function WorldViewPage() {
               ]);
             }
             if (authored.state_error) setWarnings((w) => [...w, authored.state_error]);
+            // Physics save-game: put shoved props back where they were left.
+            const poses = authored.resolved?.player?.physics?.poses;
+            if (poses && Object.keys(poses).length) walker.applyPhysicsPoses(poses);
           }
         } catch {
           /* no interactions authored, or the route is unavailable */
+        }
+
+        // Persist disturbed prop poses: every 5 s when something changed, and
+        // best-effort on teardown. Deliberately quiet — a failed save shows up
+        // as a warning once, not a spam stream.
+        if (source.kind === "api") {
+          let lastSaved = "";
+          let warned = false;
+          const savePoses = () => {
+            const poses = walker.getPhysicsPoses();
+            if (!poses) return;
+            const encoded = JSON.stringify(poses);
+            if (encoded === lastSaved) return;
+            lastSaved = encoded;
+            void setWorldPlayerPoses(jobId, poses).catch(() => {
+              if (!warned) {
+                warned = true;
+                setWarnings((w) => [...w, "Prop positions could not be saved."]);
+              }
+            });
+          };
+          const poseTimer = window.setInterval(savePoses, 5000);
+          const stopSaving = () => {
+            window.clearInterval(poseTimer);
+            savePoses();
+          };
+          controller.signal.addEventListener("abort", stopSaving, { once: true });
         }
 
         // The splat backdrop. The mesh is what you collide with and act on;

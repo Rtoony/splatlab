@@ -150,6 +150,42 @@ async def set_world_element_state(job_id: str, body: StateBody) -> dict[str, Any
     return _payload(job_id, world_dir, world_manifest)
 
 
+class PlayerPhysicsBody(BaseModel):
+    poses: dict[str, Any] = {}
+
+
+@router.post("/jobs/{job_id}/world/player")
+async def set_world_player_physics(job_id: str, body: PlayerPhysicsBody) -> dict[str, Any]:
+    """Persist the physics half of the reserved player seam: disturbed prop
+    poses, so a shoved box is still where you left it after a reload.
+
+    The seam (`player: {}`) was reserved schema-free, but this route is not:
+    poses are bounded and validated (finite floats, ~unit quaternions) before
+    they land — see world_interactions.validate_player_poses. Carrying state
+    is deliberately NOT persisted: a prop in your hands drops where it was on
+    reload, which is honest and avoids restoring into a stale camera pose."""
+    _job_dir, world_dir, world_manifest = _require_world(job_id)
+    try:
+        poses = wi.validate_player_poses(body.poses)
+    except wi.InteractionsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        state = wi.read_state(world_dir, job_id)
+    except wi.InteractionsError:
+        state = None            # a foreign save is replaced, not merged into
+    document = state or wi.new_state(job_id, _world_identity(world_dir))
+    document["world"] = _world_identity(world_dir)
+    player = document.get("player")
+    if not isinstance(player, dict):
+        player = {}
+    player["physics"] = {"poses": poses}
+    document["player"] = player
+    wi.write_state(world_dir, document)
+
+    return _payload(job_id, world_dir, world_manifest)
+
+
 @router.delete("/jobs/{job_id}/world/state")
 async def reset_world_state(job_id: str) -> dict[str, Any]:
     """Drop the save; the world returns to its authored initials."""

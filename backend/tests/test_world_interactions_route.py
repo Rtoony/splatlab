@@ -275,3 +275,64 @@ def test_a_save_copied_in_by_job_duplication_is_reported_not_applied(client):
     assert body["state"] is None
     assert "belongs to job" in body["state_error"]
     assert body["resolved"]["applied"] == {"lamp": "off"}, "authored initial, not the copy"
+
+
+# ---------------------------------------------------------------------------
+# Player seam: physics poses (P1)
+# ---------------------------------------------------------------------------
+
+def _pose(x=1.0, y=2.0, z=3.0):
+    return {"position": [x, y, z], "quaternion": [0.0, 0.0, 0.0, 1.0]}
+
+
+def test_player_poses_round_trip_and_survive_element_state(client):
+    http, outputs = client
+    _mk_world(outputs, "lamp", "crate")
+    _author(http, _lamp())
+
+    saved = http.post(f"/api/splat/jobs/{JOB}/world/player",
+                      json={"poses": {"crate": _pose(4.5, -1.25, 0.5)}})
+    assert saved.status_code == 200, saved.text
+    resolved = saved.json()["resolved"]
+    assert resolved["player"]["physics"]["poses"]["crate"]["position"] == [4.5, -1.25, 0.5]
+
+    # An element-state write must not clobber the player seam...
+    assert http.post(f"/api/splat/jobs/{JOB}/world/state",
+                     json={"slug": "lamp", "state": "on"}).status_code == 200
+    payload = http.get(f"/api/splat/jobs/{JOB}/world/interactions").json()
+    assert payload["resolved"]["player"]["physics"]["poses"]["crate"]["position"] == [4.5, -1.25, 0.5]
+    assert payload["resolved"]["applied"]["lamp"] == "on"
+
+    # ...and a new player write replaces only the physics half.
+    assert http.post(f"/api/splat/jobs/{JOB}/world/player",
+                     json={"poses": {}}).status_code == 200
+    payload = http.get(f"/api/splat/jobs/{JOB}/world/interactions").json()
+    assert payload["resolved"]["player"]["physics"]["poses"] == {}
+    assert payload["resolved"]["applied"]["lamp"] == "on"
+
+
+def test_player_poses_are_validated(client):
+    http, outputs = client
+    _mk_world(outputs, "crate")
+    bad = [
+        {"poses": {"crate": {"position": [1, 2], "quaternion": [0, 0, 0, 1]}}},
+        {"poses": {"crate": {"position": [1, 2, float("nan")] if False else [1, 2, "x"],
+                             "quaternion": [0, 0, 0, 1]}}},
+        {"poses": {"crate": {"position": [1, 2, 3], "quaternion": [0, 0, 0, 2]}}},
+        {"poses": {"crate": {"position": [1, 2, 3], "quaternion": [0, 0, 0, True]}}},
+        {"poses": {"crate": "not-a-pose"}},
+        {"poses": {"": _pose()}},
+    ]
+    for payload in bad:
+        response = http.post(f"/api/splat/jobs/{JOB}/world/player", json=payload)
+        assert response.status_code == 400, payload
+
+
+def test_player_pose_count_is_bounded(client, monkeypatch):
+    http, outputs = client
+    _mk_world(outputs, "crate")
+    monkeypatch.setattr(wi, "MAX_PLAYER_POSES", 2)
+    over = {f"prop-{i}": _pose() for i in range(3)}
+    response = http.post(f"/api/splat/jobs/{JOB}/world/player", json={"poses": over})
+    assert response.status_code == 400
+    assert "cap" in response.json()["detail"]

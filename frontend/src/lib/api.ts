@@ -366,9 +366,17 @@ export type WorldInteractionsPayload = {
     applied: Record<string, string>;
     dropped: { slug: string; saved: string; reason: string }[];
     world_rebuilt: boolean;
+    player?: {
+      physics?: { poses?: Record<string, WorldPropPose> };
+    };
   } | null;
   state_error: string;
   known_slugs: string[];
+};
+
+export type WorldPropPose = {
+  position: [number, number, number];
+  quaternion: [number, number, number, number];
 };
 
 /** Authored affordances plus the resolved player state, in one round trip. */
@@ -379,6 +387,21 @@ export function fetchWorldInteractions(
   return apiRequest<WorldInteractionsPayload>(
     `/api/splat/jobs/${encodeURIComponent(jobId)}/world/interactions`,
     { signal },
+  );
+}
+
+/** Persist physics-disturbed prop poses under the reserved player seam. */
+export function setWorldPlayerPoses(
+  jobId: string,
+  poses: Record<string, WorldPropPose>,
+): Promise<WorldInteractionsPayload> {
+  return apiRequest<WorldInteractionsPayload>(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/world/player`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ poses }),
+    },
   );
 }
 
