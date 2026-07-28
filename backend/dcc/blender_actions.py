@@ -153,7 +153,17 @@ def _execute(request: dict) -> dict:
         if not meshes:
             raise ValueError("imported GLB contained no mesh objects")
         primary = max(meshes, key=lambda obj: len(obj.data.polygons))
-        primary.name = f"polish_{params['slug']}"
+        canonical = f"polish_{params['slug']}"
+        superseded = None
+        existing = bpy.data.objects.get(canonical)
+        if existing is not None and existing not in imported:
+            # Blender uniquifies the ASSIGNEE on name collision (.001), which
+            # would hand the documented name to the STALE import from an
+            # earlier version — rename the old object aside so the fresh
+            # import owns the contract name.
+            existing.name = f"{canonical}.superseded"
+            superseded = existing.name
+        primary.name = canonical
         polish_collection = bpy.data.collections.get("Polish")
         if polish_collection is None:
             polish_collection = bpy.data.collections.new("Polish")
@@ -167,6 +177,7 @@ def _execute(request: dict) -> dict:
             "imported": sorted(obj.name for obj in imported),
             "faces": len(primary.data.polygons),
             "materials": len(primary.data.materials),
+            "superseded": superseded,
         }
     elif action == "cleanup_mesh":
         obj = bpy.data.objects.get(params["object"])

@@ -310,7 +310,12 @@ def patch_world_doc(doc: dict, new_elements: list[dict], shell: dict | None) -> 
         else:
             elements.append(entry)
     doc["elements"] = elements
-    if shell is not None:
+    # A failed shell attempt must never displace a good record — replacing
+    # is only justified by a shell that actually BUILT (or when there is no
+    # usable existing record to protect).
+    if shell is not None and (
+        shell.get("built") or not (doc.get("shell") or {}).get("built")
+    ):
         doc["shell"] = shell
     built = [entry for entry in elements if entry.get("built")]
     counts = doc.setdefault("counts", {})
@@ -534,6 +539,12 @@ def main() -> int:
     world = job_dir / "_world"
     (world / "elements").mkdir(parents=True, exist_ok=True)
 
+    if args.shell_only and args.patch_elements:
+        print("FATAL: --shell-only and --patch-elements are mutually exclusive "
+              "(one patches the shell, the other patches elements)",
+              file=sys.stderr)
+        return 1
+
     if args.shell_only:
         # Patch the shell into the EXISTING world.json — never clobber the
         # element records a full solidify wrote.
@@ -574,6 +585,14 @@ def main() -> int:
             print("FATAL: --patch-elements needs an existing _world/world.json — "
                   "run the full solidify first", file=sys.stderr)
             return 1
+        # The flag PROMISES the shell record is preserved — so an element
+        # patch must never trigger the default shell rebuild (which writes
+        # over the live shell.glb and, on failure, would replace a good
+        # record with a failed one). Shell rebuilds have their own door:
+        # --shell-only.
+        if not args.skip_shell:
+            _log("  --patch-elements implies --skip-shell (element-only run)")
+            args.skip_shell = True
 
     elements = []
     for inst in instances:
@@ -686,7 +705,10 @@ def main() -> int:
         print(json.dumps({"patched": sorted(e.get("slug") for e in elements),
                           "counts": doc.get("counts"),
                           "seconds": round(time.time() - t0, 1)}, indent=2))
-        return 0 if (built or (shell and shell.get("built"))) else 1
+        # Patch mode was asked for SPECIFIC slugs — success means every one
+        # of them built. (The full-run rule "anything built = 0" would mask
+        # a failed requested element.)
+        return 0 if elements and len(built) == len(elements) else 1
 
     doc = {
         "v": 1,

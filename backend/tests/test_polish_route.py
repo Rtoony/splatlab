@@ -329,3 +329,40 @@ def test_world_polish_rejection_leaves_original(client) -> None:
     assert (world / "elements" / "crate.glb").read_bytes() == b"old-crate"
     assert not (world / "versions").exists()
     assert not list(world.glob(".building-*"))
+
+
+def _glb_from_doc(doc: dict) -> bytes:
+    payload = json.dumps(doc).encode()
+    payload += b" " * ((4 - len(payload) % 4) % 4)
+    body = struct.pack("<I4s", len(payload), b"JSON") + payload
+    total = 12 + len(body)
+    return struct.pack("<4sII", b"glTF", 2, total) + body
+
+
+def test_validate_glb_rejects_external_uris(tmp_path: Path) -> None:
+    """A validated GLB is later fed to full glTF loaders (Blender's importer,
+    trimesh) that dereference external URIs — self-containment is a security
+    property, not a style preference."""
+    base = {
+        "asset": {"version": "2.0", "generator": "splatlab-test"},
+        "meshes": [{"primitives": []}],
+        "nodes": [{}],
+    }
+    for section, uri in (
+        ("images", "/etc/passwd"),
+        ("images", "https://evil.example/pixel.png"),
+        ("buffers", "../../secrets.bin"),
+    ):
+        doc = {**base, section: [{"uri": uri}]}
+        path = tmp_path / "bad.glb"
+        path.write_bytes(_glb_from_doc(doc))
+        with pytest.raises(ValueError, match="self-contained"):
+            glb_check.validate_glb(path)
+
+    # data: URIs are inert and stay legal.
+    good = tmp_path / "good.glb"
+    good.write_bytes(_glb_from_doc({
+        **base,
+        "images": [{"uri": "data:image/png;base64,AAAA"}],
+    }))
+    assert glb_check.validate_glb(good)["meshes"] == 1

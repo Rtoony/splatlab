@@ -199,3 +199,12 @@ def test_headless_polish_primitives_end_to_end(
     assert exported.is_file()
     assert receipt["gltf"]["meshes"] == 1
     assert receipt["params"] == {"object": "polish_test-prop"}
+
+    # Re-importing the same slug must hand the canonical name to the FRESH
+    # import (the stale one is renamed aside), or slug-derived tool calls
+    # would silently target old geometry.
+    again = blender_workflow.run_action(
+        "splat_b1e998", "import_world_element", {"slug": "test-prop"}
+    )
+    assert again["result"]["object"] == "polish_test-prop"
+    assert again["result"]["superseded"] == "polish_test-prop.superseded"

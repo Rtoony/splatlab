@@ -134,7 +134,15 @@ def texture_generated_mesh(
     mesh, islands = drop_debris_islands(mesh, target_frac=target_frac)
 
     verts = np.asarray(mesh.vertices, dtype=np.float64)
-    colors = getattr(mesh.visual, "vertex_colors", None)
+    # trimesh SYNTHESIZES a default gray vertex_colors array for a colourless
+    # mesh (visual.kind is None then), so testing the array alone is inert —
+    # a colourless input would silently bake a uniform gray atlas that passes
+    # every gate. Only kind == "vertex" means the colours are real data.
+    if getattr(mesh.visual, "kind", None) != "vertex":
+        raise ValueError(
+            "generated mesh has no real per-vertex colours to bake from"
+        )
+    colors = mesh.visual.vertex_colors
     if colors is None or len(colors) != len(verts):
         raise ValueError("generated mesh has no per-vertex colours to bake from")
     gx = verts.copy()
@@ -168,7 +176,6 @@ def texture_generated_mesh(
     out_glb.parent.mkdir(parents=True, exist_ok=True)
     out.export(str(out_glb))
     atlas_path = out_glb.with_name(out_glb.stem + "_atlas.png")
-    image.save(atlas_path)
 
     back = trimesh.load(str(out_glb), force="mesh")
     if len(back.faces) != len(u_faces):
@@ -183,6 +190,10 @@ def texture_generated_mesh(
     if not has_uv or texture_back is None:
         out_glb.unlink(missing_ok=True)
         raise ValueError("GLB readback lost UVs or texture")
+    # The sidecar atlas lands only AFTER the readback gate — a failed bake
+    # must not leave a fresh _atlas.png beside an untextured fallback GLB
+    # (texture_coverage would grade the orphan as if it described the file).
+    image.save(atlas_path)
 
     return {
         "faces": int(len(back.faces)),

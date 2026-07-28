@@ -98,8 +98,11 @@ def test_patch_world_doc_replaces_only_matching_slugs() -> None:
     assert patched["counts"]["shell_built"] is True
 
 
-def test_patch_world_doc_appends_new_and_takes_new_shell() -> None:
+def test_patch_world_doc_appends_new_and_guards_the_shell_record() -> None:
     doc = _world_doc()
+    # A FAILED shell attempt must never displace a good record (the review
+    # finding: an element patch that accidentally triggered a shell rebuild
+    # could destroy a working shell).
     patched = scene_solidify.patch_world_doc(
         doc,
         [{"slug": "new-prop", "built": False, "reason": "boom"}],
@@ -108,7 +111,27 @@ def test_patch_world_doc_appends_new_and_takes_new_shell() -> None:
     assert patched["elements"][-1]["slug"] == "new-prop"
     assert patched["counts"]["props_built"] == 2
     assert patched["counts"]["props_failed"] == 2
-    assert patched["counts"]["shell_built"] is False
+    assert patched["shell"]["built"] is True  # good record preserved
+    assert patched["counts"]["shell_built"] is True
+
+    # A shell that actually BUILT does replace.
+    rebuilt = scene_solidify.patch_world_doc(
+        _world_doc(),
+        [],
+        shell={"role": "shell", "source": "voxel", "built": True, "faces": 9},
+    )
+    assert rebuilt["shell"]["faces"] == 9
+
+    # And a failed attempt may land only when there is no good record to lose.
+    doc_no_shell = _world_doc()
+    doc_no_shell["shell"] = {"role": "shell", "built": False}
+    fresh = scene_solidify.patch_world_doc(
+        doc_no_shell,
+        [],
+        shell={"role": "shell", "source": "voxel", "built": False, "reason": "x"},
+    )
+    assert fresh["shell"]["reason"] == "x"
+    assert fresh["counts"]["shell_built"] is False
 
 
 @pytest.mark.skipif(

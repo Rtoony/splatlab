@@ -32,7 +32,7 @@ def _make_job(outputs: Path, job_id: str = "splat_b1e001") -> Path:
     (job_dir / "_regen" / "scene.blend").write_bytes(b"BLENDER-v0")
     element = job_dir / "_world" / "elements" / "red-bicycle.glb"
     element.parent.mkdir(parents=True)
-    element.write_bytes(b"glTF-fake")
+    element.write_bytes(_minimal_glb_bytes())
     (job_dir / "meta.json").write_text(
         json.dumps({"job_id": job_id, "status": "completed",
                     "output_dir": str(job_dir)})

@@ -281,7 +281,7 @@ def test_import_world_element_resolves_path_host_side(
     job_dir = _make_job(workflow)
     element = job_dir / "_world" / "elements" / "red-bicycle.glb"
     element.parent.mkdir(parents=True)
-    element.write_bytes(b"glTF-fake")
+    element.write_bytes(_minimal_glb_bytes())
     requests = _fake_action_runner(monkeypatch)
 
     receipt = blender_workflow.run_action(

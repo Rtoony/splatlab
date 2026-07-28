@@ -414,6 +414,16 @@ def run_action(
                 f"no built world element '{slug}' — solidify the world first"
             ),
         )
+        # Defense in depth: the polish route validates uploads, but this file
+        # is about to be fed to Blender's full glTF importer — re-assert it is
+        # a self-contained GLB (glb_check rejects external buffer/image URIs)
+        # so a file that arrived by any other path gets the same gate.
+        try:
+            glb_check.validate_glb(import_glb)
+        except ValueError as exc:
+            raise BlenderWorkflowError(
+                f"world element '{slug}' failed GLB validation: {exc}"
+            ) from exc
 
     with _job_lock(job_dir):
         source, resolved_base = _source_blend(job_dir, base_version)

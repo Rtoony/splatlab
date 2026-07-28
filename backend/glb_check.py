@@ -83,6 +83,26 @@ def validate_glb(path: Path) -> dict[str, Any]:
     if not isinstance(meshes, list) or not meshes:
         raise ValueError("glTF declares no meshes — nothing to render")
 
+    # SELF-CONTAINMENT: a validated GLB is later handed to full glTF loaders
+    # (Blender's importer via import_world_element, trimesh in the mesh env)
+    # which happily dereference external buffer/image URIs — so an uploaded
+    # file with `"uri": "/etc/..."` or an http reference would make a
+    # server-side process read an arbitrary local or remote resource and
+    # potentially embed it into a later export. Only data: URIs are inert.
+    for section in ("buffers", "images"):
+        entries = doc.get(section)
+        if not isinstance(entries, list):
+            continue
+        for index, entry in enumerate(entries):
+            uri = entry.get("uri") if isinstance(entry, dict) else None
+            if uri is None:
+                continue
+            if not isinstance(uri, str) or not uri.startswith("data:"):
+                raise ValueError(
+                    f"{section}[{index}] references an external uri — a GLB "
+                    "must be self-contained (BIN chunk or data: URIs only)"
+                )
+
     bin_chunks = [c for c in chunks if c[0] == CHUNK_BIN]
     bin_len = bin_chunks[0][2] if bin_chunks else None
     buffers = doc.get("buffers")
