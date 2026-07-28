@@ -31,6 +31,12 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
 import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 import { MeshBVH } from "three-mesh-bvh";
+import {
+  WorldPhysics,
+  loadRapier,
+  reoriginObject,
+  type PropTransforms,
+} from "./world-physics";
 import { SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
 import {
   INTERACT_KEY,
@@ -56,6 +62,7 @@ export interface WorldCollisionBlock {
   ok?: boolean;
   strategy?: string;
   hulls?: number;
+  /** Bare hull filenames inside _world/collision/ (raw-manifest shape). */
   files?: string[];
   hull_faces_total?: number;
   capped?: boolean;
@@ -185,6 +192,12 @@ export interface WalkParams {
   jumpSpeedMps: number;
   /** Include role="prop" elements in the collider (statics always collide). */
   collideProps: boolean;
+  /**
+   * Props as Rapier rigid bodies: bump, carry, throw. Mutually exclusive with
+   * collideProps (a prop cannot be both baked-static and dynamic); when
+   * physics engages it wins and collideProps is forced off.
+   */
+  physicsProps: boolean;
   /** Baked atlases already contain lighting; unlit is the faithful default. */
   unlit: boolean;
   showCollider: boolean;
@@ -201,6 +214,7 @@ export const DEFAULT_WALK_PARAMS: WalkParams = {
   gravityMps2: 9.81,
   jumpSpeedMps: 4.4,
   collideProps: false,
+  physicsProps: true,
   unlit: true,
   showCollider: false,
   fovDeg: 75,
@@ -294,6 +308,28 @@ const _ray = new THREE.Ray();
 // for the same reason: neither loop may hand the GC work per frame.
 const _interactRay = new THREE.Raycaster();
 const _screenCentre = new THREE.Vector2(0, 0);
+const _zero = new THREE.Vector3(0, 0, 0);
+
+/**
+ * Stride-sampled vertex positions of an object minus `offset`, for convex
+ * hull building. Node transforms are identity by the exporter contract, so
+ * raw POSITION values are already world-space; `offset` maps them into a
+ * re-origined prop's local frame.
+ */
+function gatherPoints(object: THREE.Object3D, offset: THREE.Vector3, maxPoints = 2048): Float32Array {
+  const out: number[] = [];
+  object.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    const pos = (mesh.geometry as THREE.BufferGeometry).getAttribute("position");
+    if (!pos) return;
+    const stride = Math.max(1, Math.floor(pos.count / maxPoints));
+    for (let i = 0; i < pos.count; i += stride) {
+      out.push(pos.getX(i) - offset.x, pos.getY(i) - offset.y, pos.getZ(i) - offset.z);
+    }
+  });
+  return new Float32Array(out);
+}
 
 const MOVE_KEYS = new Set([
   "KeyW", "KeyA", "KeyS", "KeyD",
@@ -355,6 +391,13 @@ export class WorldWalker {
   private colliderTris = 0;
   private drawnTris = 0;
 
+  /** Rapier prop physics; null until enablePhysics() succeeds. */
+  private physics: WorldPhysics | null = null;
+  /** Fired when physics engages/disengages, so the HUD can say so. */
+  onPhysicsChange: ((active: boolean, propCount: number) => void) | null = null;
+  /** Fired when the carried prop changes (slug, or null on release). */
+  onCarryChange: ((slug: string | null) => void) | null = null;
+
   private grounded = false;
   private rafId = 0;
   private running = false;
@@ -392,6 +435,7 @@ export class WorldWalker {
     window.addEventListener("keydown", this.handleKeyDown);
     window.addEventListener("keyup", this.handleKeyUp);
     window.addEventListener("blur", this.handleBlur);
+    canvas.addEventListener("mousedown", this.handleMouseDown);
 
     if (typeof ResizeObserver !== "undefined") {
       this.resizeObserver = new ResizeObserver(() => this.resize());
@@ -575,6 +619,22 @@ export class WorldWalker {
     const suggested = guessUnitsPerMetre(manifest, shellHeight);
 
     this.applyMaterialMode();
+
+    // Prop physics — best-effort by design: a world without hulls, or a WASM
+    // init failure, degrades to the pre-physics walker rather than failing
+    // the load. Runs BEFORE rebuildCollider so the props-are-dynamic decision
+    // can force collideProps off (a prop cannot be baked-static AND dynamic).
+    if (this.params.physicsProps) {
+      try {
+        await this.enablePhysics(source, entries, opts.signal);
+      } catch (err) {
+        warnings.push(
+          `Prop physics unavailable (${(err as Error).message || err}); ` +
+          "props are display-only.",
+        );
+      }
+    }
+
     this.rebuildCollider();
     this.respawn();
 
@@ -593,6 +653,115 @@ export class WorldWalker {
       colliderSource: this.colliderSource,
       suggestedUnitsPerMetre: suggested,
     };
+  }
+
+  /**
+   * Stand up Rapier for the loaded props. Best-effort: throws only for
+   * whole-system failures (WASM init, no static geometry); a prop without
+   * usable hulls falls back to a convex hull of its render mesh, and a prop
+   * that yields no collider at all is simply left display-only.
+   */
+  private async enablePhysics(
+    source: WorldSource,
+    entries: Array<{ entry: WorldEntry; dir: string; role: WorldRole | "shell"; url: string }>,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const props = this.elements.filter((el) => el.role === "prop");
+    if (!props.length) return;
+    const rapier = await loadRapier();
+    if (signal?.aborted) throw new Error("aborted");
+
+    this.physics?.dispose();
+    this.physics = null;
+    const physics = new WorldPhysics(rapier, this.params.unitsPerMetre);
+
+    // Props rest on the same solid the capsule walks on. Without a dedicated
+    // collision shell, fall back to the merged shell+static visual geometry —
+    // the same degradation rebuildCollider() applies to the player.
+    let shellGeom = this.collisionShellGeom;
+    let owned = false;
+    if (!shellGeom) {
+      const geoms: THREE.BufferGeometry[] = [];
+      for (const el of this.elements) {
+        if (el.role !== "shell" && el.role !== "static") continue;
+        el.object.updateWorldMatrix(true, true);
+        el.object.traverse((o) => {
+          const mesh = o as THREE.Mesh;
+          if (!mesh.isMesh) return;
+          const g = positionOnly(mesh.geometry as THREE.BufferGeometry);
+          g.applyMatrix4(mesh.matrixWorld);
+          geoms.push(g);
+        });
+      }
+      if (geoms.length) {
+        shellGeom = geoms.length === 1 ? geoms[0] : mergeGeometries(geoms, false);
+        if (geoms.length > 1) for (const g of geoms) g.dispose();
+        owned = true;
+      }
+    }
+    if (!shellGeom) {
+      physics.dispose();
+      throw new Error("no static geometry for props to rest on");
+    }
+    physics.addStaticShell(shellGeom);
+    if (owned) shellGeom.dispose();
+
+    let registered = 0;
+    for (const el of props) {
+      const entry = entries.find((e) => e.entry.slug === el.slug)?.entry;
+      const files = entry?.collision?.files ?? [];
+      // Geometry arrives world-space-baked with identity node transforms
+      // (file-header contract); physics needs a local frame, so bake the
+      // AABB centre out once. Idempotent, preserves the world pose.
+      const centre = reoriginObject(el.object);
+      const hulls: Float32Array[] = [];
+      for (const file of files) {
+        if (signal?.aborted) throw new Error("aborted");
+        try {
+          const hullObj = await this.loadGlb(
+            source, source.fileUrl(`collision/${file}`), "collision/",
+          );
+          hulls.push(gatherPoints(hullObj, centre));
+          disposeObject(hullObj);
+        } catch {
+          // One vanished hull is not fatal — the render-mesh fallback below
+          // still gives the prop a body.
+        }
+      }
+      if (!hulls.some((h) => h.length >= 12)) {
+        hulls.length = 0;
+        hulls.push(gatherPoints(el.object, _zero));
+      }
+      if (physics.addProp(el.slug, el.object, hulls)) registered++;
+    }
+
+    if (!registered) {
+      physics.dispose();
+      return;
+    }
+    physics.installPlayer(this.capsuleRadius, this.eyeHeight);
+    this.physics = physics;
+    // Dynamic wins: a prop cannot also be baked into the static BVH.
+    this.params.collideProps = false;
+    this.onPhysicsChange?.(true, registered);
+  }
+
+  get physicsActive(): boolean {
+    return this.physics !== null;
+  }
+
+  get carryingSlug(): string | null {
+    return this.physics?.carrying ?? null;
+  }
+
+  /** Poses of props that moved from their authored placement (persistence). */
+  getPhysicsPoses(): PropTransforms | null {
+    return this.physics ? this.physics.disturbedTransforms() : null;
+  }
+
+  /** Restore persisted prop poses (a reload's saved game). */
+  applyPhysicsPoses(poses: PropTransforms): void {
+    this.physics?.applyTransforms(poses);
   }
 
   private async loadGlb(source: WorldSource, url: string, dir: string): Promise<THREE.Object3D> {
@@ -877,7 +1046,17 @@ export class WorldWalker {
       this.colliderWire.visible = this.params.showCollider;
     }
     if (patch.collideProps !== undefined && patch.collideProps !== before.collideProps) {
-      this.rebuildCollider();
+      // Dynamic props and baked-static props are mutually exclusive; while
+      // physics is live the checkbox is a no-op (forced back off).
+      if (this.physics && this.params.collideProps) this.params.collideProps = false;
+      else this.rebuildCollider();
+    }
+    if (this.physics && patch.unitsPerMetre !== undefined && patch.unitsPerMetre !== before.unitsPerMetre) {
+      this.physics.setUnitsPerMetre(this.params.unitsPerMetre);
+      this.physics.installPlayer(this.capsuleRadius, this.eyeHeight);
+    }
+    if (this.physics && (patch.radiusM !== undefined || patch.eyeHeightM !== undefined)) {
+      this.physics.installPlayer(this.capsuleRadius, this.eyeHeight);
     }
   }
 
@@ -1037,11 +1216,43 @@ export class WorldWalker {
 
   private interact(): void {
     const hit = this.targetUnderCrosshair();
-    if (!hit || !isStateful(hit.record)) return;
+    if (!hit) return;
+    // The pickup verb finally has its physical half: E lifts the prop into a
+    // kinematic carry (left-click throws it, E again puts it down). The state
+    // machine below still advances, so the authored held/placed state stays
+    // the persisted source of truth.
+    if (hit.record.verb === "pickup" && this.physics?.hasProp(hit.record.slug)) {
+      if (this.physics.carrying === hit.record.slug) {
+        this.physics.release(this.camera, false);
+        this.onCarryChange?.(null);
+      } else if (this.physics.carrying === null) {
+        if (!this.physics.pickUp(hit.record.slug)) return;
+        this.onCarryChange?.(hit.record.slug);
+      } else {
+        return; // hands full with a different prop
+      }
+    }
+    if (!isStateful(hit.record)) return;
     const next = nextInteractionState(hit.record, hit.state);
     this.setElementState(hit.record.slug, next);
     this.onInteract?.(hit.record.slug, next);
   }
+
+  /** Left-click while carrying = throw. Wired in the constructor. */
+  private handleMouseDown = (e: MouseEvent): void => {
+    if (!this.controls.isLocked || e.button !== 0 || !this.physics) return;
+    const slug = this.physics.carrying;
+    if (!slug) return;
+    this.physics.release(this.camera, true);
+    this.onCarryChange?.(null);
+    // A thrown prop is no longer held — flip the authored state back so the
+    // prompt and the persisted record agree with what just happened.
+    const record = this.interactions.get(slug);
+    if (record && isStateful(record)) {
+      this.setElementState(slug, record.initial);
+      this.onInteract?.(slug, record.initial);
+    }
+  };
 
   /** Toggle noclip. Zeroes velocity so you do not inherit a fall on landing. */
   setFlying(flying: boolean): void {
@@ -1182,6 +1393,10 @@ export class WorldWalker {
       const steps = 5;
       for (let i = 0; i < steps; i++) this.stepPlayer(dt / steps);
     }
+
+    // Props simulate in fly mode too — a shoved box keeps tumbling while you
+    // inspect it from the air.
+    this.physics?.step(dt, this.camera.position, this.eyeHeight, this.camera);
 
     this.renderer.render(this.scene, this.camera);
 
@@ -1335,6 +1550,8 @@ export class WorldWalker {
 
   private clearWorld(): void {
     this.disposeCollider();
+    this.physics?.dispose();
+    this.physics = null;
     for (const el of this.elements) {
       this.worldGroup.remove(el.object);
       disposeObject(el.object);
@@ -1350,6 +1567,7 @@ export class WorldWalker {
     window.removeEventListener("keydown", this.handleKeyDown);
     window.removeEventListener("keyup", this.handleKeyUp);
     window.removeEventListener("blur", this.handleBlur);
+    this.canvas.removeEventListener("mousedown", this.handleMouseDown);
     this.controls.removeEventListener("lock", this.handleLock);
     this.controls.removeEventListener("unlock", this.handleUnlock);
     this.controls.disconnect();
