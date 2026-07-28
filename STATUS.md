@@ -2754,3 +2754,20 @@ Gate: **prop_integrity PASS 5/5**, texture_coverage PASS. Remaining failures are
 pre-existing r2 walkability items (shell_connectivity 27>20, floor_continuity 0.8975<0.9)
 recorded in the entry above. Tests: 6/6 incl. opt-in mesh-env bake e2e (equal-sized
 components are refused by the max-single-drop guard — proven by the test's first draft).
+
+## 2026-07-28 — Phase 3: polish recipes (the loop is now a product feature)
+
+`dcc/polish_recipe.py` (81351e0): snapshot → import → cleanup → validated selective
+export as ONE typed call, composite receipt, partial receipts preserved on failure.
+MCP :9877 grew `run_polish_recipe` (**12 tools**). `tools/polish-element.py` closes the
+loop: dry-run by default, `--upload` drives the audited polish route and verifies the
+served identity TWICE (route-response sha + independent on-disk rehash vs the export
+receipt). Ingestion deliberately stays outside the recipe — the polish route remains
+the one audited door.
+
+**Batch applied live (bonsai):** plastic-storage-container → 6283bfff (frac 0.9999),
+cardboard-box-2 → 1ba9c3f5 (frac **1.0**, debris fully swept, 2,570 faces). Gate:
+prop_integrity 5/5 HOLDS, every texture survived the Blender round-trip.
+`_world/versions/` now archives rollback copies for red-bicycle,
+plastic-storage-container, cardboard-box-2. Verdict fails only the pre-existing r2
+walkability items (open item, recorded above).
