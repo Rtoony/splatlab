@@ -70,6 +70,14 @@ def _require_job(job_id: str) -> tuple[dict[str, Any], Path]:
     meta = splat_route._read_meta(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail="Splat job not found")
+    # A running training pipeline writes _preview/splat.ply IN PLACE without
+    # holding this lane's locks — editing under it would race the exporter.
+    if meta.get("status") != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"job is {meta.get('status')!r}; splat edits need a "
+                   "completed job",
+        )
     return meta, Path(meta["output_dir"])
 
 
@@ -227,42 +235,56 @@ async def edit_splat(job_id: str, body: SplatEditBody, request: Request) -> dict
     meta, job_dir = _require_job(job_id)
     extra = _engine_args(body.op, body.params)
 
+    # Both lock families: _mesh_export_lock serializes against mesh builds /
+    # exports / polish, edit_ops' edit lock against the in-viewer crop lane —
+    # the OTHER mutator of _preview/splat.ply (review finding: the two lanes
+    # interleaved on the same file). Always mesh lock first, edit lock second;
+    # edit_ops itself never takes them in the reverse order.
+    import edit_ops  # local: edit_ops imports splat_route at module level
+
     lock = splat_route._mesh_export_lock(job_id)
     if lock.locked():
         raise HTTPException(status_code=409,
                             detail="A mesh build or export is running for this "
                                    "scene — retry when it finishes")
     async with lock:
-        source, base = _source_ply(job_dir, body.base_version)
-        versions_dir = _versions_dir(job_dir)
-        versions_dir.mkdir(parents=True, exist_ok=True)
-        existing = [v["version"] for v in _list_versions(job_dir)]
-        number = (max(existing) + 1) if existing else 1
-        final = versions_dir / f"splat-v{number:04d}.ply"
-        staged = versions_dir / f".building-{uuid.uuid4().hex}.ply"
-        try:
-            report = await asyncio.to_thread(_run_engine, source, staged, extra)
-            os.replace(staged, final)
-        finally:
-            staged.unlink(missing_ok=True)
-        receipt = {
-            "schema": EDIT_SCHEMA,
-            "job_id": job_id,
-            "version": number,
-            "op": body.op,
-            "note": body.note[:500],
-            "engine": report,
-            "base": {
-                "version": base,
-                "path": manifests.relative_job_path(source, job_dir),
-                **manifests.file_identity(source),
-            },
-            "output": {
-                "path": manifests.relative_job_path(final, job_dir),
-                **manifests.file_identity(final),
-            },
-            "created_at": manifests.utc_now(),
-        }
+        async with edit_ops._hold_edit_locks([job_id]):
+            source, base = _source_ply(job_dir, body.base_version)
+            versions_dir = _versions_dir(job_dir)
+            versions_dir.mkdir(parents=True, exist_ok=True)
+            existing = [v["version"] for v in _list_versions(job_dir)]
+            number = (max(existing) + 1) if existing else 1
+            final = versions_dir / f"splat-v{number:04d}.ply"
+            staged = versions_dir / f".building-{uuid.uuid4().hex}.ply"
+            try:
+                report = await asyncio.to_thread(_run_engine, source, staged, extra)
+                base_identity = await asyncio.to_thread(
+                    manifests.file_identity, source
+                )
+                os.replace(staged, final)
+            finally:
+                staged.unlink(missing_ok=True)
+            output_identity = await asyncio.to_thread(
+                manifests.file_identity, final
+            )
+            receipt = {
+                "schema": EDIT_SCHEMA,
+                "job_id": job_id,
+                "version": number,
+                "op": body.op,
+                "note": body.note[:500],
+                "engine": report,
+                "base": {
+                    "version": base,
+                    "path": manifests.relative_job_path(source, job_dir),
+                    **base_identity,
+                },
+                "output": {
+                    "path": manifests.relative_job_path(final, job_dir),
+                    **output_identity,
+                },
+                "created_at": manifests.utc_now(),
+            }
         receipts_dir = _lane(job_dir) / "receipts"
         receipts_dir.mkdir(parents=True, exist_ok=True)
         manifests.atomic_write_json(
@@ -323,35 +345,59 @@ async def promote_splat_version(
                    "force=true to acknowledge, then rebuild them.",
         )
 
+    import shutil
+
+    import edit_ops  # local: edit_ops imports splat_route at module level
+
     lock = splat_route._mesh_export_lock(job_id)
     if lock.locked():
         raise HTTPException(status_code=409,
                             detail="A mesh build or export is running for this "
                                    "scene — retry when it finishes")
     async with lock:
-        original = _lane(job_dir) / "original.ply"
-        preserved_now = False
-        if not original.is_file():
-            staged_orig = original.with_name(f".building-{original.name}")
-            await asyncio.to_thread(__import__("shutil").copy2, live, staged_orig)
-            os.replace(staged_orig, original)
-            preserved_now = True
-        supersedes = manifests.file_identity(live)
-        staged = live.with_name(f".building-promote-{uuid.uuid4().hex}.ply")
-        await asyncio.to_thread(__import__("shutil").copy2, source, staged)
-        os.replace(staged, live)
-        receipt = {
-            "schema": PROMOTE_SCHEMA,
-            "job_id": job_id,
-            "promoted_version": body.version,
-            "note": body.note[:500],
-            "forced_over_consumers": consumers if body.force else [],
-            "original_preserved_now": preserved_now,
-            "supersedes": supersedes,
-            "created_at": manifests.utc_now(),
-            **manifests.file_identity(live),
-        }
-        manifests.atomic_write_json(_lane(job_dir) / "promote.json", receipt)
+        async with edit_ops._hold_edit_locks([job_id]):
+            original = _lane(job_dir) / "original.ply"
+            preserved_now = False
+            if not original.is_file():
+                staged_orig = original.with_name(f".building-{original.name}")
+                try:
+                    await asyncio.to_thread(shutil.copy2, live, staged_orig)
+                    os.replace(staged_orig, original)
+                finally:
+                    staged_orig.unlink(missing_ok=True)
+                preserved_now = True
+            supersedes = await asyncio.to_thread(manifests.file_identity, live)
+            staged = live.with_name(f".building-promote-{uuid.uuid4().hex}.ply")
+            try:
+                await asyncio.to_thread(shutil.copy2, source, staged)
+                os.replace(staged, live)
+            finally:
+                staged.unlink(missing_ok=True)
+
+            # The splat-mutation invalidation contract (edit_ops owns it): the
+            # viewer serves web.ply/langweb.ply/splat.spz PREFERENTIALLY, so a
+            # promote that replaced only splat.ply would report success while
+            # the viewer keeps rendering pre-edit geometry (review finding —
+            # proven stale on the live-proof job). Each failed regen unlinks
+            # its stale artifact so the viewer falls back to the raw ply.
+            derived_warnings = await edit_ops._regen_derived_artifacts(job_dir)
+            edit_ops._mark_langfield_stale(job_dir)
+            edit_ops._invalidate_previews(job_dir)
+
+            live_identity = await asyncio.to_thread(manifests.file_identity, live)
+            receipt = {
+                "schema": PROMOTE_SCHEMA,
+                "job_id": job_id,
+                "promoted_version": body.version,
+                "note": body.note[:500],
+                "forced_over_consumers": consumers if body.force else [],
+                "original_preserved_now": preserved_now,
+                "derived_regen_warnings": derived_warnings,
+                "supersedes": supersedes,
+                "created_at": manifests.utc_now(),
+                **live_identity,
+            }
+            manifests.atomic_write_json(_lane(job_dir) / "promote.json", receipt)
 
     await audit_operator_event(
         request=request,

@@ -147,3 +147,44 @@ def test_promote_missing_version_404s(client, monkeypatch) -> None:
     response = tc.post("/api/splat/jobs/splat_5e0001/splat/promote",
                        json={"version": 3})
     assert response.status_code == 404
+
+
+def test_promote_never_leaves_stale_derived_variants(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The viewer serves web.ply/langweb.ply/splat.spz PREFERENTIALLY — a
+    promote that leaves them stale reports success while the viewer renders
+    pre-edit geometry (the review finding). Without the transform binary the
+    regen must UNLINK the stale variants so the viewer falls back to the
+    freshly promoted raw ply."""
+    tc, outputs = client
+    job_dir = _mk_job(outputs)
+    _fake_engine(monkeypatch)
+    for name in ("web.ply", "langweb.ply", "splat.spz"):
+        (job_dir / "_preview" / name).write_bytes(b"STALE-PRE-EDIT")
+    (job_dir / "_preview" / "thumb.webp").write_bytes(b"STALE-THUMB")
+
+    assert tc.post("/api/splat/jobs/splat_5e0001/splat/edit", json={
+        "op": "clean", "params": {"min_opacity": 0.05}}).status_code == 200
+    promoted = tc.post("/api/splat/jobs/splat_5e0001/splat/promote",
+                       json={"version": 1})
+    assert promoted.status_code == 200, promoted.text
+    receipt = promoted.json()["receipt"]
+    assert receipt["derived_regen_warnings"]  # regen failed loudly, not silently
+    for name in ("web.ply", "langweb.ply", "splat.spz"):
+        assert not (job_dir / "_preview" / name).exists(), name
+    assert not (job_dir / "_preview" / "thumb.webp").exists()
+    assert (job_dir / "_preview" / "splat.ply").read_bytes().startswith(b"PLY-EDITED-")
+
+
+def test_edit_refused_on_incomplete_job(client, monkeypatch) -> None:
+    tc, outputs = client
+    job_dir = _mk_job(outputs)
+    meta = json.loads((job_dir / "meta.json").read_text())
+    meta["status"] = "running"
+    (job_dir / "meta.json").write_text(json.dumps(meta))
+    _fake_engine(monkeypatch)
+    response = tc.post("/api/splat/jobs/splat_5e0001/splat/edit", json={
+        "op": "clean", "params": {"min_opacity": 0.05}})
+    assert response.status_code == 409
+    assert "completed" in response.json()["detail"]

@@ -31,7 +31,8 @@ import numpy as np
 import trimesh
 import floor_support
 
-def room(hole_radius=0.0, furniture=False, drop_floor_under_furniture=False):
+def room(hole_radius=0.0, furniture=False, drop_floor_under_furniture=False,
+         floater=False):
     parts = []
     floor = trimesh.creation.box(extents=(10, 0.1, 10))
     if hole_radius > 0.0:
@@ -62,6 +63,12 @@ def room(hole_radius=0.0, furniture=False, drop_floor_under_furniture=False):
         parts.append(desk)
         if drop_floor_under_furniture:
             pass  # combined with hole_radius covering the same spot
+    if floater:
+        # A single far-field crumb ABOVE the roof — the bbox-inflating junk
+        # that must never lift the probe over the ceiling.
+        junk = trimesh.creation.box(extents=(0.3, 0.3, 0.3))
+        junk.apply_translation((0.0, 5.2, 0.0))
+        parts.append(junk)
     m = trimesh.util.concatenate(parts)
     return np.asarray(m.vertices), np.asarray(m.faces)
 
@@ -74,6 +81,10 @@ v, f = room(furniture=True)
 results["furniture_over_floor"] = floor_support.measure_floor_support(v, f, "Y")
 v, f = room(hole_radius=1.2, furniture=True)
 results["furniture_patching_hole"] = floor_support.measure_floor_support(v, f, "Y")
+v, f = room(hole_radius=1.2, floater=True)
+results["hole_with_floater"] = floor_support.measure_floor_support(v, f, "Y")
+v, f = room(floater=True)
+results["intact_with_floater"] = floor_support.measure_floor_support(v, f, "Y")
 print(json.dumps({{k: {{"coverage": r["coverage"],
                         "largest_gap_frac": r["largest_gap_frac"],
                         "ground_band_coverage": r["ground_band_coverage"]}}
@@ -115,3 +126,11 @@ def test_floor_support_semantics() -> None:
     #    surface in those columns is the desk, far above the ground band:
     assert (r["furniture_patching_hole"]["ground_band_coverage"]
             < r["furniture_patching_hole"]["coverage"])
+
+    # 5. Bbox-inflating junk must NOT lift the probe over the ceiling and
+    #    mask holes (review finding: one floater flipped FAIL to a false
+    #    all-green when the probe keyed off the raw span).
+    assert (r["hole_with_floater"]["coverage"]
+            == pytest.approx(r["hole_under_ceiling"]["coverage"], abs=0.01))
+    assert r["hole_with_floater"]["largest_gap_frac"] > 0.03
+    assert r["intact_with_floater"]["coverage"] >= 0.99

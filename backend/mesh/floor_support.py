@@ -34,10 +34,11 @@ import numpy as np
 
 GRID_CELLS = 128
 INTERIOR_ERODE = 2
-# Probe height as a fraction of the vertical span: unit-free, so the same
-# measurement works on calibrated (metres) and uncalibrated (scene-unit)
-# captures. 0.6 of a room's height is chest/head level for a single-storey
-# capture — below any ceiling, above any furniture.
+# Probe height as a fraction of the EFFECTIVE room height (median-of-tops
+# ceiling estimate minus ground — never the raw bbox span, which any floater
+# junk inflates): unit-free, so the same measurement works on calibrated and
+# uncalibrated captures. 0.6 of a room's height is chest/head level — below
+# the ceiling, above any furniture.
 PROBE_HEIGHT_FRAC = 0.6
 GROUND_BAND_FRAC = 0.15  # diagnostic band only
 
@@ -125,8 +126,30 @@ def measure_floor_support(
         raise ValueError("no interior column contains any surface; mesh is empty")
     ground = float(np.nanmedian(lowest_interior))
 
+    # The probe height must key off the ROOM, not the bbox: a single far-field
+    # floater above the roof (or tail below the floor) inflates the vertical
+    # span until ground + frac*span sits ABOVE the ceiling — and then every
+    # down-ray hits the ceiling and floor holes read as supported, the exact
+    # blind spot this measurement exists to avoid (review finding, proven by
+    # execution: one 0.3-unit floater flipped a holed room from FAIL to a
+    # false all-green). The ceiling estimate is the MEDIAN of per-column TOP
+    # surfaces over the interior: junk covers few columns, so the median stays
+    # on the roof; outdoors it lands on typical structure height.
+    t_top = _cast(float(hi[up] + pad), -1.0)
+    hit_top = np.isfinite(t_top)
+    top_all = np.where(hit_top, (hi[up] + pad) - t_top, np.nan).reshape(na, nb)
+    top_interior = top_all[interior]
+    ceiling = (
+        float(np.nanmedian(top_interior))
+        if np.isfinite(top_interior).any()
+        else float(hi[up])
+    )
+    effective_height = ceiling - ground
+    if not np.isfinite(effective_height) or effective_height <= 0:
+        effective_height = float(span[up])
+
     # THE measurement: support below a head-height probe.
-    probe_level = ground + probe_height_frac * float(span[up])
+    probe_level = ground + probe_height_frac * effective_height
     t_down = _cast(probe_level, -1.0)
     supported = np.isfinite(t_down).reshape(na, nb)
     coverage = float(supported[interior].mean())
@@ -148,6 +171,8 @@ def measure_floor_support(
         "void_regions": int(n_regions),
         "unsupported_cells": int(holes.sum()),
         "ground_level": round(ground, 4),
+        "ceiling_estimate": round(ceiling, 4),
+        "effective_height": round(float(effective_height), 4),
         "probe_level": round(float(probe_level), 4),
         "probe_height_frac": probe_height_frac,
         "grid": {

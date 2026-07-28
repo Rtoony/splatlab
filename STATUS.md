@@ -2887,3 +2887,20 @@ clean(min_opacity 0.02, max_scale 2.0, max_dist 20) swept **6,949 debris gaussia
 v0001; unforced promote correctly **409'd naming both consumers**; forced promote
 preserved the original and landed live sha == version sha (2cd368ab). Audit rows:
 splat.duplicate / splat.edit / splat.promote, 21:22Z.
+
+## 2026-07-28 pm — R4 review swarm: 8 confirmed findings, 0 refuted — all fixed
+
+Two HIGHs, both proven by execution before fixing:
+1. **floor probe keyed off raw bbox span** — one 0.3-unit floater above the roof lifted
+   the probe over the ceiling and flipped a holed room FAIL→false-PASS in BOTH graders.
+   Fix: probe keys off a robust ceiling estimate (median of per-column tops over the
+   interior); floater cases pinned in the synthetic suite. Bonsai stays all-green (0.9631).
+2. **promote skipped the splat-mutation invalidation contract** — the viewer serves
+   web.ply/langweb.ply/splat.spz preferentially, so promote "succeeded" while the viewer
+   rendered PRE-EDIT geometry (proven stale on the live-proof duplicate by mtime). Fix:
+   promote now runs edit_ops' regen-or-unlink contract + langfield STALE marker + thumb
+   invalidation, warnings in the receipt. Re-promoted the duplicate: all three variants
+   rebuilt fresh, zero warnings.
+Also fixed: dual-lock (mesh + edit lanes no longer interleave on splat.ply), staged-file
+try/finally on promote, status=completed admission (a running training's ns-export writes
+splat.ply in place), sha256 hashing off the event loop. Suites: 1108 backend green.

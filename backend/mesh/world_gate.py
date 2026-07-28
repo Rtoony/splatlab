@@ -304,6 +304,8 @@ def gate_floor_continuity(shell: trimesh.Trimesh, up_axis: str, units: str) -> d
         largest_gap_cells=m["largest_gap_cells"],
         largest_gap_span=m["largest_gap_span"],
         ground_level=m["ground_level"],
+        ceiling_estimate=m["ceiling_estimate"],
+        effective_height=m["effective_height"],
         probe_level=m["probe_level"],
         ground_band_coverage=m["ground_band_coverage"],
         ground_band_note=m["ground_band_note"],
