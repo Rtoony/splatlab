@@ -2865,3 +2865,25 @@ capsule/walkability internals; its ACCEPTED number is now the shared one.
 0.8968). **Bicycle regression: all measurable gates passed** (floor 1.0, unchanged).
 Suite 1102 green. Per the metric-trust doctrine this is the direction a metric earns
 gating rights: it now agrees with RToony's lived walk.
+
+## 2026-07-28 pm — R4: SPLAT EDITING GRADUATES INTO THE AUDITED WORKFLOW
+
+Branch `r4-splat-edit-lane` (gate reconciliation folded in per RToony's "Both").
+
+**The lane** (c441fbe, 97b04b4): `mesh/splat_edit.py` — typed, attribute-preserving ops
+on 3DGS PLYs (crop_box / clean / transform; opacity is a LOGIT, scales are LOGS —
+thresholds taken in real units; uniform scale shifts log scales by ln s, the KIRI
+validation lesson). Route layer `splat_edit_route.py`: POST /splat/edit lands immutable
+`_splat/versions/splat-vNNNN.ply` + receipt + audit row, chaining latest-version-first;
+GET /splat/versions; POST /splat/promote replaces the LIVE `_preview/splat.ply` with the
+pristine original preserved to `_splat/original.ply` on first promote and a HARD GUARD:
+index-keyed consumers (`_langfield/gauss_emb.npz`, `_scene/isolated`) 409 promotion
+without force=true — their per-gaussian indices silently desynchronise otherwise.
+`tools/splat-edit.py` CLI. Deliberately NOT MCP tools: live-adjacent mutations go
+through the audited HTTP door only (polish-upload doctrine).
+
+**Live proof on a real duplicate** (`splat_ccd678ed26`, 2.4 GB copy of bonsai):
+clean(min_opacity 0.02, max_scale 2.0, max_dist 20) swept **6,949 debris gaussians** →
+v0001; unforced promote correctly **409'd naming both consumers**; forced promote
+preserved the original and landed live sha == version sha (2cd368ab). Audit rows:
+splat.duplicate / splat.edit / splat.promote, 21:22Z.
