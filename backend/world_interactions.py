@@ -411,11 +411,35 @@ def resolve_state(interactions: dict[str, Any] | None,
         stamped and world_identity
         and stamped.get("sha256") != world_identity.get("sha256"))
 
+    # The player seam is schema-free, but what LEAVES it must be as clean as
+    # what an element state gets: physics poses are re-validated on the read
+    # path (a save copied in by duplication, or hand-edited, must not feed
+    # NaNs into the walker), and a pose for a slug the rebuilt world no
+    # longer has is dropped with a report — the same discipline the element
+    # loop above applies.
+    player = dict((state or {}).get("player") or {})
+    physics = player.get("physics")
+    if isinstance(physics, dict) and isinstance(physics.get("poses"), dict):
+        kept: dict[str, Any] = {}
+        for slug, pose in physics["poses"].items():
+            name = str(slug)[:64]
+            try:
+                kept.update(validate_player_poses({slug: pose}))
+            except InteractionsError:
+                dropped.append({"slug": name, "saved": "pose",
+                                "reason": "saved prop pose is invalid"})
+                continue
+            if present is not None and name not in present:
+                kept.pop(name, None)
+                dropped.append({"slug": name, "saved": "pose",
+                                "reason": "prop is not in the rebuilt world"})
+        player["physics"] = {**physics, "poses": kept}
+
     return {
         "applied": applied,
         "dropped": dropped,
         "world_rebuilt": world_rebuilt,
-        "player": dict((state or {}).get("player") or {}),
+        "player": player,
     }
 
 

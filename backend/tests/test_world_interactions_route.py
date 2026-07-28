@@ -336,3 +336,30 @@ def test_player_pose_count_is_bounded(client, monkeypatch):
     response = http.post(f"/api/splat/jobs/{JOB}/world/player", json={"poses": over})
     assert response.status_code == 400
     assert "cap" in response.json()["detail"]
+
+
+def test_stale_and_invalid_player_poses_are_dropped_on_read(client):
+    http, outputs = client
+    world = _mk_world(outputs, "crate")
+
+    # The WRITE path accepts any well-formed pose; world membership is a READ
+    # concern (the world may be rebuilt after the save).
+    assert http.post(f"/api/splat/jobs/{JOB}/world/player", json={
+        "poses": {"crate": _pose(1, 1, 1), "ghost": _pose(9, 9, 9)}},
+    ).status_code == 200
+
+    payload = http.get(f"/api/splat/jobs/{JOB}/world/interactions").json()
+    poses = payload["resolved"]["player"]["physics"]["poses"]
+    assert set(poses) == {"crate"}
+    reasons = {d["slug"]: d["reason"] for d in payload["resolved"]["dropped"]}
+    assert "ghost" in reasons and "rebuilt world" in reasons["ghost"]
+
+    # A hand-corrupted / duplicated-in save must be dropped, never served.
+    state_file = wi.state_path(world)
+    document = json.loads(state_file.read_text())
+    document["player"]["physics"]["poses"]["crate"]["position"] = [1, 2, "x"]
+    state_file.write_text(json.dumps(document))
+    payload = http.get(f"/api/splat/jobs/{JOB}/world/interactions").json()
+    assert payload["resolved"]["player"]["physics"]["poses"] == {}
+    reasons = [d for d in payload["resolved"]["dropped"] if d["slug"] == "crate"]
+    assert reasons and "invalid" in reasons[0]["reason"]

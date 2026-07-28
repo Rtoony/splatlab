@@ -238,20 +238,29 @@ export default function WorldViewPage() {
         // best-effort on teardown. Deliberately quiet — a failed save shows up
         // as a warning once, not a spam stream.
         if (source.kind === "api") {
-          let lastSaved = "";
+          // "{}" not "": opening a world must never fire a gratuitous save —
+          // on a duplicated job that first write would replace the copied
+          // foreign save before the player touched anything (review finding).
+          let lastSaved = "{}";
           let warned = false;
           const savePoses = () => {
             const poses = walker.getPhysicsPoses();
             if (!poses) return;
             const encoded = JSON.stringify(poses);
             if (encoded === lastSaved) return;
-            lastSaved = encoded;
-            void setWorldPlayerPoses(jobId, poses).catch(() => {
-              if (!warned) {
-                warned = true;
-                setWarnings((w) => [...w, "Prop positions could not be saved."]);
-              }
-            });
+            void setWorldPlayerPoses(jobId, poses)
+              .then(() => {
+                // Commit the dedupe key only on SUCCESS: a transient failure
+                // must retry on the next tick, not silently drop the pose
+                // for the rest of the session (review finding).
+                lastSaved = encoded;
+              })
+              .catch(() => {
+                if (!warned) {
+                  warned = true;
+                  setWarnings((w) => [...w, "Prop positions could not be saved."]);
+                }
+              });
           };
           const poseTimer = window.setInterval(savePoses, 5000);
           const stopSaving = () => {

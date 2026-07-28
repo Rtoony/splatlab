@@ -266,8 +266,12 @@ export class WorldPhysics {
     if (throwIt) {
       camera.getWorldDirection(this._fwd);
       const speed = THROW_SPEED_MPS * this.unitsPerMetre;
+      // The arc bias is a velocity too — it scales with the scene's units
+      // like every other m/s quantity here (review finding: a raw constant
+      // becomes a 10 m/s launch on a drone-scale capture).
+      const arcBias = 0.5 * this.unitsPerMetre;
       prop.body.setLinvel(
-        { x: this._fwd.x * speed, y: this._fwd.y * speed + 0.5, z: this._fwd.z * speed },
+        { x: this._fwd.x * speed, y: this._fwd.y * speed + arcBias, z: this._fwd.z * speed },
         true,
       );
       prop.body.setAngvel({ x: 0.5, y: 0.3, z: 0.5 }, true);
@@ -314,8 +318,14 @@ export class WorldPhysics {
       if (!prop || !validTransform(pose)) continue;
       const [x, y, z] = pose.position;
       const [qx, qy, qz, qw] = pose.quaternion;
-      prop.body.setTranslation({ x, y, z }, false);
-      prop.body.setRotation({ x: qx, y: qy, z: qz, w: qw }, false);
+      // Wake on restore: a settled pose re-settles for free, while a pose
+      // saved MID-AIR (carried when the save tick fired, or a throw in
+      // flight) must fall — the persistence contract is "drops where it
+      // was", not "hangs frozen until bumped" (review finding, reproduced:
+      // a sleeping body teleported to y=3 never fell).
+      prop.body.setTranslation({ x, y, z }, true);
+      prop.body.setRotation({ x: qx, y: qy, z: qz, w: qw }, true);
+      prop.body.wakeUp();
       prop.object.position.set(x, y, z);
       prop.object.quaternion.set(qx, qy, qz, qw);
       prop.disturbed = true;

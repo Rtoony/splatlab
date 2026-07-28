@@ -674,6 +674,7 @@ export class WorldWalker {
     this.physics?.dispose();
     this.physics = null;
     const physics = new WorldPhysics(rapier, this.params.unitsPerMetre);
+    try {
 
     // Props rest on the same solid the capsule walks on. Without a dedicated
     // collision shell, fall back to the merged shell+static visual geometry —
@@ -735,7 +736,10 @@ export class WorldWalker {
       if (physics.addProp(el.slug, el.object, hulls)) registered++;
     }
 
-    if (!registered) {
+    if (!registered || this.disposed) {
+      // Zero usable props, or the walker was torn down while hulls loaded
+      // (job switch, StrictMode remount): a World assigned now would never
+      // be freed, since dispose() is once-only. Free it here instead.
       physics.dispose();
       return;
     }
@@ -744,6 +748,12 @@ export class WorldWalker {
     // Dynamic wins: a prop cannot also be baked into the static BVH.
     this.params.collideProps = false;
     this.onPhysicsChange?.(true, registered);
+    } catch (err) {
+      // Any throw on the way up (abort mid-hull-fetch, shell failure) must
+      // free the WASM-side World — review finding: the abort path leaked it.
+      physics.dispose();
+      throw err;
+    }
   }
 
   get physicsActive(): boolean {

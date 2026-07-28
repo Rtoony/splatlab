@@ -123,6 +123,46 @@ describe("WorldPhysics (real Rapier)", () => {
     physics2.dispose();
   });
 
+  it("restored mid-air poses FALL instead of freezing (the drop contract)", async () => {
+    const rapier = await loadRapier();
+    const physics = new WorldPhysics(rapier, 1);
+    physics.addStaticShell(groundGeometry());
+    const object = propObject(new THREE.Vector3(0, 0.5, 0));
+    reoriginObject(object);
+    physics.addProp("crate", object, [cubePoints()]);
+
+    // A pose saved while carried: 1.7 up, hanging in the air.
+    physics.applyTransforms({
+      crate: { position: [0, 1.7, -1.2], quaternion: [0, 0, 0, 1] },
+    });
+    settle(physics, new THREE.Vector3(50, 2, 50), 2);
+    // Sleeping-teleport would leave it at 1.7 forever (the review repro);
+    // the wake-on-restore contract drops it onto the floor.
+    expect(object.position.y).toBeLessThan(1.0);
+    expect(object.position.y).toBeGreaterThan(0.2);
+    physics.dispose();
+  });
+
+  it("scales the throw arc bias with the scene's units", async () => {
+    const rapier = await loadRapier();
+    const unitsPerMetre = 0.05; // drone-scale capture
+    const physics = new WorldPhysics(rapier, unitsPerMetre);
+    physics.addStaticShell(groundGeometry());
+    const object = propObject(new THREE.Vector3(0, 0.5, -1));
+    reoriginObject(object);
+    const prop = physics.addProp("crate", object, [cubePoints()]);
+
+    const cam = new THREE.PerspectiveCamera();
+    cam.position.set(0, 1.7 * unitsPerMetre, 0);
+    cam.lookAt(0, 1.7 * unitsPerMetre, -1); // level: forward has no vertical part
+    cam.updateMatrixWorld(true);
+    expect(physics.pickUp("crate")).toBe(true);
+    physics.release(cam, true);
+    // Level throw: vertical velocity is exactly the arc bias, in scene units.
+    expect(prop!.body.linvel().y).toBeCloseTo(0.5 * unitsPerMetre, 6);
+    physics.dispose();
+  });
+
   it("is deterministic for identical runs", async () => {
     const rapier = await loadRapier();
     const run = () => {
