@@ -15,6 +15,7 @@ except ImportError:  # Compatibility with SDK packages that re-export protocol t
 
 from dcc import blender_workflow as workflow
 from dcc import mcp_auth
+from dcc import polish_recipe
 
 
 mcp = MCPServer("SplatLab Blender")
@@ -163,6 +164,30 @@ def export_blend_glb(
     polish-upload route."""
     return workflow.export_glb(
         job_id, base_version=version, object_name=object_name, note=note
+    )
+
+
+@mcp.tool(title="Run polish recipe", annotations=ADDITIVE)
+def run_polish_recipe(
+    job_id: str,
+    slug: str,
+    merge_distance: float | None = 1e-4,
+    decimate_ratio: float | None = None,
+    min_component_frac: float | None = 0.02,
+    shade_smooth: bool = True,
+    note: str = "",
+) -> dict[str, Any]:
+    """Snapshot -> import element -> cleanup -> validated selective export,
+    as one composite receipt. Ingestion stays a separate audited step: the
+    receipt names the polish-upload route for the exported GLB."""
+    return polish_recipe.run_recipe(
+        job_id,
+        slug,
+        merge_distance=merge_distance,
+        decimate_ratio=decimate_ratio,
+        min_component_frac=min_component_frac,
+        shade_smooth=shade_smooth,
+        note=note,
     )
 
 
