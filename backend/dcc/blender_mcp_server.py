@@ -96,16 +96,74 @@ def transform_object(
     )
 
 
+@mcp.tool(title="Import world element for polish", annotations=ADDITIVE)
+def import_world_element(
+    job_id: str, slug: str, base_version: int | None = None, note: str = ""
+) -> dict[str, Any]:
+    """Import a solidified world element GLB (or 'shell') into the workflow
+    scene as polish_<slug> inside a Polish collection, saving a new version.
+
+    The GLB path is resolved and containment-checked host-side; Blender never
+    receives a free-form path."""
+    return workflow.run_action(
+        job_id,
+        "import_world_element",
+        {"slug": slug},
+        base_version=base_version,
+        note=note,
+    )
+
+
+@mcp.tool(title="Clean up mesh object", annotations=ADDITIVE)
+def cleanup_mesh(
+    job_id: str,
+    object_name: str,
+    merge_distance: float | None = None,
+    decimate_ratio: float | None = None,
+    min_component_frac: float | None = None,
+    shade_smooth: bool | None = None,
+    base_version: int | None = None,
+    note: str = "",
+) -> dict[str, Any]:
+    """Apply typed mesh cleanup to one object and save a new version.
+
+    merge_distance welds near-coincident vertices (scene units, max 0.1);
+    decimate_ratio reduces faces (0-1]; min_component_frac drops floating
+    debris islands below that fraction of total faces (largest island is
+    always kept); shade_smooth sets smooth shading. The receipt records
+    faces/verts before and after plus components removed."""
+    return workflow.run_action(
+        job_id,
+        "cleanup_mesh",
+        {
+            "object": object_name,
+            "merge_distance": merge_distance,
+            "decimate_ratio": decimate_ratio,
+            "min_component_frac": min_component_frac,
+            "shade_smooth": shade_smooth,
+        },
+        base_version=base_version,
+        note=note,
+    )
+
+
 @mcp.tool(title="Export Blender scene as GLB", annotations=ADDITIVE)
 def export_blend_glb(
-    job_id: str, version: int | None = None, note: str = ""
+    job_id: str,
+    version: int | None = None,
+    object_name: str | None = None,
+    note: str = "",
 ) -> dict[str, Any]:
     """Export a blend version as a validated GLB under _blender/exports/.
 
     Versions are untouched; the artifact is readback-validated (glb_check)
-    before it lands. Feeding it back into the app stays a separate, audited
-    step via the polish-upload route."""
-    return workflow.export_glb(job_id, base_version=version, note=note)
+    before it lands. With object_name set, only that object is exported and
+    the filename gains a slug suffix so whole-scene exports are preserved.
+    Feeding it back into the app stays a separate, audited step via the
+    polish-upload route."""
+    return workflow.export_glb(
+        job_id, base_version=version, object_name=object_name, note=note
+    )
 
 
 @mcp.tool(title="Restore Blender version", annotations=ADDITIVE)

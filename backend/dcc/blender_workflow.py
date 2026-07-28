@@ -27,8 +27,17 @@ BLENDER_BIN = Path(
 )
 ACTION_SCRIPT = Path(__file__).with_name("blender_actions.py")
 VERSION_RE = re.compile(r"^scene-v(?P<version>\d{4})\.blend$")
-MUTATING_ACTIONS = {"snapshot", "toggle_collection", "transform_object"}
+MUTATING_ACTIONS = {
+    "snapshot",
+    "toggle_collection",
+    "transform_object",
+    "import_world_element",
+    "cleanup_mesh",
+}
 READ_ACTIONS = {"inspect"}
+# World-element slugs come from splat_route._object_slug output: lowercase
+# kebab, max 40 chars. Re-validated here so the dcc layer never trusts input.
+ELEMENT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 MAX_NAME_LENGTH = 256
 BLENDER_TIMEOUT_S = 10 * 60
 OUTPUT_ROOT = Path(
@@ -89,7 +98,12 @@ def _version_path(job_dir: Path, version: int) -> Path:
     return _versions_dir(job_dir) / f"scene-v{version:04d}.blend"
 
 
-def _contained_scene_file(job_dir: Path, path: Path) -> Path:
+def _contained_scene_file(
+    job_dir: Path,
+    path: Path,
+    *,
+    missing: str = "assembled scene.blend is missing; build the scene assembly first",
+) -> Path:
     try:
         relative = path.relative_to(job_dir)
     except ValueError as exc:
@@ -100,9 +114,7 @@ def _contained_scene_file(job_dir: Path, path: Path) -> Path:
         if cursor.is_symlink():
             raise BlenderWorkflowError("symlinked Blender scene inputs are not allowed")
     if not path.is_file():
-        raise BlenderWorkflowError(
-            "assembled scene.blend is missing; build the scene assembly first"
-        )
+        raise BlenderWorkflowError(missing)
     try:
         path.resolve(strict=True).relative_to(job_dir)
     except (OSError, ValueError) as exc:
@@ -191,9 +203,80 @@ def _vec3(
     return result
 
 
+def _bounded_float(
+    value: Any,
+    field: str,
+    *,
+    minimum: float,
+    maximum: float,
+    exclusive_min: bool = False,
+    exclusive_max: bool = False,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BlenderWorkflowError(f"{field} must be a number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise BlenderWorkflowError(f"{field} must be a finite number")
+    below = result <= minimum if exclusive_min else result < minimum
+    above = result >= maximum if exclusive_max else result > maximum
+    if below or above:
+        lo = "(" if exclusive_min else "["
+        hi = ")" if exclusive_max else "]"
+        raise BlenderWorkflowError(
+            f"{field} must be in {lo}{minimum}, {maximum}{hi}"
+        )
+    return result
+
+
+def _element_slug(value: Any) -> str:
+    slug = str(value or "").strip()
+    if slug != "shell" and not ELEMENT_SLUG_RE.fullmatch(slug):
+        raise BlenderWorkflowError(
+            "slug must be a lowercase kebab-case world element name or 'shell'"
+        )
+    return slug
+
+
 def _sanitize_params(action: str, params: dict[str, Any]) -> dict[str, Any]:
     if action == "inspect" or action == "snapshot":
         return {}
+    if action == "import_world_element":
+        return {"slug": _element_slug(params.get("slug"))}
+    if action == "cleanup_mesh":
+        result = {"object": _safe_name(str(params.get("object", "")), "object")}
+        if params.get("merge_distance") is not None:
+            result["merge_distance"] = _bounded_float(
+                params["merge_distance"],
+                "merge_distance",
+                minimum=0.0,
+                maximum=0.1,
+                exclusive_min=True,
+            )
+        if params.get("decimate_ratio") is not None:
+            result["decimate_ratio"] = _bounded_float(
+                params["decimate_ratio"],
+                "decimate_ratio",
+                minimum=0.0,
+                maximum=1.0,
+                exclusive_min=True,
+            )
+        if params.get("min_component_frac") is not None:
+            result["min_component_frac"] = _bounded_float(
+                params["min_component_frac"],
+                "min_component_frac",
+                minimum=0.0,
+                maximum=0.5,
+                exclusive_max=True,
+            )
+        if params.get("shade_smooth") is not None:
+            if not isinstance(params["shade_smooth"], bool):
+                raise BlenderWorkflowError("shade_smooth must be boolean")
+            result["shade_smooth"] = params["shade_smooth"]
+        if len(result) == 1:
+            raise BlenderWorkflowError(
+                "cleanup_mesh requires at least one cleanup operation"
+            )
+        return result
     if action == "toggle_collection":
         if not isinstance(params.get("visible"), bool):
             raise BlenderWorkflowError("visible must be boolean")
@@ -318,6 +401,20 @@ def run_action(
     safe_params = _sanitize_params(action, params or {})
     job_dir = _job_dir(job_id)
 
+    # Host-side path resolution: the Blender process never receives a
+    # free-form path, only one resolved and containment-checked here.
+    import_glb: Path | None = None
+    if action == "import_world_element":
+        slug = safe_params["slug"]
+        relative = "shell.glb" if slug == "shell" else f"elements/{slug}.glb"
+        import_glb = _contained_scene_file(
+            job_dir,
+            job_dir / "_world" / relative,
+            missing=(
+                f"no built world element '{slug}' — solidify the world first"
+            ),
+        )
+
     with _job_lock(job_dir):
         source, resolved_base = _source_blend(job_dir, base_version)
         version = None
@@ -342,6 +439,8 @@ def run_action(
                 "source_blend": str(source),
                 "output_blend": str(staged_output) if staged_output else None,
             }
+            if import_glb is not None:
+                request_payload["import_glb"] = str(import_glb)
             request_path.write_text(json.dumps(request_payload))
             os.chmod(request_path, 0o600)
             command = [
@@ -410,7 +509,11 @@ def _exports_dir(job_dir: Path) -> Path:
 
 
 def export_glb(
-    job_id: str, *, base_version: int | None = None, note: str = ""
+    job_id: str,
+    *,
+    base_version: int | None = None,
+    object_name: str | None = None,
+    note: str = "",
 ) -> dict[str, Any]:
     """Export a blend version (or the assembled scene) as a GLB artifact.
 
@@ -419,17 +522,31 @@ def export_glb(
     with a MANDATORY glb_check readback (the open3d lesson: never trust an
     exporter's exit code) and a receipt beside it. Re-exporting the same base
     version replaces the derived artifact and its receipt — versions are
-    immutable, exports are derived. The exported file feeds the polish-upload
-    route; ingestion stays a separate, audited step.
+    immutable, exports are derived. With object_name set, only that object is
+    exported and the stem gains a slug suffix so the whole-scene export is
+    never clobbered. The exported file feeds the polish-upload route;
+    ingestion stays a separate, audited step.
     """
     if not BLENDER_BIN.is_file() or not ACTION_SCRIPT.is_file():
         raise BlenderWorkflowError("Blender 4.5 LTS workflow toolchain is unavailable")
+    export_params: dict[str, Any] = {}
+    stem_suffix = ""
+    if object_name is not None:
+        export_params["object"] = _safe_name(str(object_name), "object_name")
+        object_slug = re.sub(
+            r"[^a-z0-9]+", "-", export_params["object"].lower()
+        ).strip("-")[:40]
+        if not object_slug:
+            raise BlenderWorkflowError(
+                "object_name has no filename-safe characters"
+            )
+        stem_suffix = f"-{object_slug}"
     job_dir = _job_dir(job_id)
     with _job_lock(job_dir):
         source, resolved_base = _source_blend(job_dir, base_version)
         exports_dir = _exports_dir(job_dir)
         exports_dir.mkdir(parents=True, exist_ok=True)
-        stem = f"scene-v{(resolved_base or 0):04d}"
+        stem = f"scene-v{(resolved_base or 0):04d}{stem_suffix}"
         final_output = exports_dir / f"{stem}.glb"
         # The stage name must still END in .glb — suffix-dispatching consumers
         # (the splat-transform lesson) and glb_check both key on it.
@@ -446,7 +563,7 @@ def export_glb(
                         "schema": "dev.splatlab.blender-action/v1",
                         "job_id": job_id,
                         "action": "export_glb",
-                        "params": {},
+                        "params": export_params,
                         "source_blend": str(source),
                         "output_blend": None,
                         "output_glb": str(staged_output),
@@ -490,6 +607,7 @@ def export_glb(
             "schema": "dev.splatlab.blender-export-receipt/v1",
             "job_id": job_id,
             "action": "export_glb",
+            "params": export_params,
             "note": note[:500],
             "base": {
                 "version": resolved_base,

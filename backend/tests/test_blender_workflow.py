@@ -206,6 +206,152 @@ def test_typed_parameters_reject_implicit_boolean_and_vector_coercion() -> None:
         )
 
 
+def test_cleanup_mesh_parameters_are_range_checked() -> None:
+    for params in (
+        {"object": "polish_x", "merge_distance": 0.0},
+        {"object": "polish_x", "merge_distance": 0.2},
+        {"object": "polish_x", "decimate_ratio": 0.0},
+        {"object": "polish_x", "decimate_ratio": 1.5},
+        {"object": "polish_x", "min_component_frac": 0.5},
+        {"object": "polish_x", "min_component_frac": -0.1},
+    ):
+        with pytest.raises(blender_workflow.BlenderWorkflowError, match="must be in"):
+            blender_workflow._sanitize_params("cleanup_mesh", params)
+    with pytest.raises(blender_workflow.BlenderWorkflowError, match="number"):
+        blender_workflow._sanitize_params(
+            "cleanup_mesh", {"object": "polish_x", "merge_distance": True}
+        )
+    with pytest.raises(blender_workflow.BlenderWorkflowError, match="boolean"):
+        blender_workflow._sanitize_params(
+            "cleanup_mesh", {"object": "polish_x", "shade_smooth": "yes"}
+        )
+    with pytest.raises(
+        blender_workflow.BlenderWorkflowError, match="at least one"
+    ):
+        blender_workflow._sanitize_params("cleanup_mesh", {"object": "polish_x"})
+    sanitized = blender_workflow._sanitize_params(
+        "cleanup_mesh",
+        {"object": "polish_x", "merge_distance": 1e-4, "shade_smooth": True},
+    )
+    assert sanitized == {
+        "object": "polish_x",
+        "merge_distance": 1e-4,
+        "shade_smooth": True,
+    }
+
+
+def test_import_world_element_slug_is_validated() -> None:
+    for bad in ("", "../shell", "Red Bicycle", "a" * 41, "UPPER"):
+        with pytest.raises(blender_workflow.BlenderWorkflowError, match="slug"):
+            blender_workflow._sanitize_params("import_world_element", {"slug": bad})
+    assert blender_workflow._sanitize_params(
+        "import_world_element", {"slug": "red-bicycle"}
+    ) == {"slug": "red-bicycle"}
+    assert blender_workflow._sanitize_params(
+        "import_world_element", {"slug": "shell"}
+    ) == {"slug": "shell"}
+
+
+def _fake_action_runner(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    requests: list[dict] = []
+
+    def fake_run(command: list[str], timeout: int = 0) -> tuple[int, str]:
+        request = json.loads(Path(command[-2]).read_text())
+        requests.append(request)
+        if request["output_blend"]:
+            Path(request["output_blend"]).write_bytes(b"BLENDER-out")
+        Path(command[-1]).write_text(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "result": request["params"],
+                    "blender": {"version": "4.5.11 LTS", "background": True},
+                }
+            )
+        )
+        return 0, "ok"
+
+    monkeypatch.setattr(blender_workflow, "_run_process", fake_run)
+    return requests
+
+
+def test_import_world_element_resolves_path_host_side(
+    workflow: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_dir = _make_job(workflow)
+    element = job_dir / "_world" / "elements" / "red-bicycle.glb"
+    element.parent.mkdir(parents=True)
+    element.write_bytes(b"glTF-fake")
+    requests = _fake_action_runner(monkeypatch)
+
+    receipt = blender_workflow.run_action(
+        "splat_b1e001", "import_world_element", {"slug": "red-bicycle"}
+    )
+    assert receipt["version"] == 1
+    assert receipt["params"] == {"slug": "red-bicycle"}
+    assert requests[0]["import_glb"] == str(element)
+
+
+def test_import_world_element_missing_or_symlinked_is_rejected(
+    workflow: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_dir = _make_job(workflow)
+    _fake_action_runner(monkeypatch)
+    with pytest.raises(blender_workflow.BlenderWorkflowError, match="solidify"):
+        blender_workflow.run_action(
+            "splat_b1e001", "import_world_element", {"slug": "red-bicycle"}
+        )
+
+    outside = tmp_path / "outside.glb"
+    outside.write_bytes(b"glTF-outside")
+    element = job_dir / "_world" / "elements" / "red-bicycle.glb"
+    element.parent.mkdir(parents=True)
+    element.symlink_to(outside)
+    with pytest.raises(blender_workflow.BlenderWorkflowError, match="symlink"):
+        blender_workflow.run_action(
+            "splat_b1e001", "import_world_element", {"slug": "red-bicycle"}
+        )
+
+
+def test_selective_export_gets_distinct_stem_and_receipt(
+    workflow: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_dir = _make_job(workflow)
+
+    def fake_run(command: list[str], timeout: int = 0) -> tuple[int, str]:
+        request = json.loads(Path(command[-2]).read_text())
+        assert request["action"] == "export_glb"
+        Path(request["output_glb"]).write_bytes(_minimal_glb_bytes(meshes=1))
+        Path(command[-1]).write_text(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "result": {"exported": True, "objects": 1},
+                    "blender": {"version": "4.5.11 LTS", "background": True},
+                }
+            )
+        )
+        return 0, "ok"
+
+    monkeypatch.setattr(blender_workflow, "_run_process", fake_run)
+    whole = blender_workflow.export_glb("splat_b1e001")
+    selective = blender_workflow.export_glb(
+        "splat_b1e001", object_name="polish_red-bicycle"
+    )
+    exports = job_dir / "_blender" / "exports"
+    assert (exports / "scene-v0000.glb").is_file()
+    assert (exports / "scene-v0000-polish-red-bicycle.glb").is_file()
+    assert whole["params"] == {}
+    assert selective["params"] == {"object": "polish_red-bicycle"}
+    assert selective["output"]["path"] == (
+        "_blender/exports/scene-v0000-polish-red-bicycle.glb"
+    )
+    receipt = json.loads(
+        (exports / "scene-v0000-polish-red-bicycle.json").read_text()
+    )
+    assert receipt["params"] == {"object": "polish_red-bicycle"}
+
+
 def _minimal_glb_bytes(meshes: int = 1) -> bytes:
     import struct
 

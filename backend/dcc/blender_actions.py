@@ -8,6 +8,7 @@ import sys
 import traceback
 from pathlib import Path
 
+import bmesh
 import bpy
 
 
@@ -16,8 +17,53 @@ ALLOWED_ACTIONS = {
     "snapshot",
     "toggle_collection",
     "transform_object",
+    "import_world_element",
+    "cleanup_mesh",
     "export_glb",
 }
+
+
+def _drop_small_islands(bm: bmesh.types.BMesh, min_frac: float) -> int:
+    """Delete connected components below min_frac of total faces.
+
+    The largest island is always kept, so a degenerate threshold can never
+    empty the mesh."""
+    total_faces = len(bm.faces)
+    if total_faces == 0:
+        return 0
+    visited: set[int] = set()
+    islands: list[list[bmesh.types.BMVert]] = []
+    bm.verts.index_update()
+    for seed in bm.verts:
+        if seed.index in visited:
+            continue
+        stack, component = [seed], []
+        visited.add(seed.index)
+        while stack:
+            vert = stack.pop()
+            component.append(vert)
+            for edge in vert.link_edges:
+                other = edge.other_vert(vert)
+                if other.index not in visited:
+                    visited.add(other.index)
+                    stack.append(other)
+        islands.append(component)
+    face_counts = [
+        len({face.index for vert in component for face in vert.link_faces})
+        for component in islands
+    ]
+    largest = max(range(len(islands)), key=lambda i: face_counts[i])
+    doomed_verts: list[bmesh.types.BMVert] = []
+    removed = 0
+    for index, component in enumerate(islands):
+        if index == largest:
+            continue
+        if face_counts[index] < min_frac * total_faces:
+            doomed_verts.extend(component)
+            removed += 1
+    if doomed_verts:
+        bmesh.ops.delete(bm, geom=doomed_verts, context="VERTS")
+    return removed
 
 
 def _inspect() -> dict:
@@ -94,6 +140,73 @@ def _execute(request: dict) -> dict:
             "rotation_degrees": [math.degrees(value) for value in obj.rotation_euler],
             "scale": list(obj.scale),
         }
+    elif action == "import_world_element":
+        # The path is host-resolved and containment-checked; params carry only
+        # the sanitized slug used for naming.
+        import_path = request.get("import_glb")
+        if not isinstance(import_path, str) or not import_path.endswith(".glb"):
+            raise ValueError("import_world_element requires a host-resolved GLB")
+        before = set(bpy.data.objects)
+        bpy.ops.import_scene.gltf(filepath=import_path)
+        imported = [obj for obj in bpy.data.objects if obj not in before]
+        meshes = [obj for obj in imported if obj.type == "MESH"]
+        if not meshes:
+            raise ValueError("imported GLB contained no mesh objects")
+        primary = max(meshes, key=lambda obj: len(obj.data.polygons))
+        primary.name = f"polish_{params['slug']}"
+        polish_collection = bpy.data.collections.get("Polish")
+        if polish_collection is None:
+            polish_collection = bpy.data.collections.new("Polish")
+            bpy.context.scene.collection.children.link(polish_collection)
+        for obj in imported:
+            for collection in list(obj.users_collection):
+                collection.objects.unlink(obj)
+            polish_collection.objects.link(obj)
+        result = {
+            "object": primary.name,
+            "imported": sorted(obj.name for obj in imported),
+            "faces": len(primary.data.polygons),
+            "materials": len(primary.data.materials),
+        }
+    elif action == "cleanup_mesh":
+        obj = bpy.data.objects.get(params["object"])
+        if obj is None or obj.type != "MESH":
+            raise ValueError(f"mesh object not found: {params['object']!r}")
+        mesh = obj.data
+        faces_before = len(mesh.polygons)
+        verts_before = len(mesh.vertices)
+        components_removed = 0
+        if "merge_distance" in params or "min_component_frac" in params:
+            bm = bmesh.new()
+            bm.from_mesh(mesh)
+            if "merge_distance" in params:
+                bmesh.ops.remove_doubles(
+                    bm, verts=list(bm.verts), dist=params["merge_distance"]
+                )
+            if "min_component_frac" in params:
+                components_removed = _drop_small_islands(
+                    bm, params["min_component_frac"]
+                )
+            bm.to_mesh(mesh)
+            bm.free()
+        if "decimate_ratio" in params and params["decimate_ratio"] < 1.0:
+            modifier = obj.modifiers.new(name="splatlab_decimate", type="DECIMATE")
+            modifier.ratio = params["decimate_ratio"]
+            with bpy.context.temp_override(
+                object=obj, active_object=obj, selected_objects=[obj]
+            ):
+                bpy.ops.object.modifier_apply(modifier=modifier.name)
+        if params.get("shade_smooth"):
+            mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
+        mesh.update()
+        result = {
+            "object": obj.name,
+            "faces_before": faces_before,
+            "faces_after": len(mesh.polygons),
+            "verts_before": verts_before,
+            "verts_after": len(mesh.vertices),
+            "components_removed": components_removed,
+        }
     elif action == "inspect":
         return _inspect()
     elif action == "export_glb":
@@ -109,16 +222,26 @@ def _execute(request: dict) -> dict:
         # assembled scene's splat geometry lives behind Geometry Nodes —
         # without export_apply the glTF has zero meshes, caught by the
         # readback gate on the first real run), keep provenance extras, Y-up.
-        bpy.ops.export_scene.gltf(
-            filepath=str(output_path),
-            export_format="GLB",
-            export_apply=True,
-            export_extras=True,
-            export_yup=True,
-        )
+        export_kwargs = {
+            "filepath": str(output_path),
+            "export_format": "GLB",
+            "export_apply": True,
+            "export_extras": True,
+            "export_yup": True,
+        }
+        selected_name = params.get("object")
+        if selected_name:
+            target = bpy.data.objects.get(selected_name)
+            if target is None:
+                raise ValueError(f"object not found: {selected_name!r}")
+            for obj in bpy.context.view_layer.objects:
+                obj.select_set(False)
+            target.select_set(True)
+            export_kwargs["use_selection"] = True
+        bpy.ops.export_scene.gltf(**export_kwargs)
         return {
             "exported": True,
-            "objects": len(bpy.data.objects),
+            "objects": 1 if selected_name else len(bpy.data.objects),
             "meshes": len(bpy.data.meshes),
             "bytes": output_path.stat().st_size,
         }
