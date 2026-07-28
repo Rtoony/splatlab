@@ -1,716 +1,900 @@
 {
-  "schema": "dev.splatlab.research-catalog/v1",
-  "reviewed_at": "2026-07-24",
-  "policy": {
-    "permissive_spdx": [
-      "Apache-2.0",
-      "BSD-3-Clause",
-      "MIT"
+ "schema": "dev.splatlab.research-catalog/v1",
+ "reviewed_at": "2026-07-28",
+ "policy": {
+  "permissive_spdx": [
+   "Apache-2.0",
+   "BSD-3-Clause",
+   "MIT"
+  ],
+  "restricted_code_location": "outside-the-splatlab-repository",
+  "restricted_results_label": "research-only",
+  "production_rule": "Only independently implemented ideas or dependencies with verified compatible licenses may ship."
+ },
+ "candidates": [
+  {
+   "id": "niantic-geometry-first",
+   "title": "Ground Truth: Geometrically Accurate Reconstructions",
+   "kind": "industry-pipeline",
+   "source_url": "https://www.nianticspatial.com/en/blog/geometrically-accurate-reconstruction",
+   "repository_url": null,
+   "license": {
+    "spdx": "UNKNOWN",
+    "commercial_use": null,
+    "verified": false
+   },
+   "code_status": "no-code",
+   "maturity": "deployed-system-description",
+   "relevance": "high",
+   "decision": "implemented",
+   "integration_mode": "paper-inspired-independent",
+   "priority": "P0",
+   "techniques": [
+    "treat-camera-pose-quality-as-a-hard-upstream-gate",
+    "regularize-splats-with-depth-and-surface-constraints",
+    "keep-splats-meshes-and-localization-in-one-coordinate-frame",
+    "preserve-real-world-scale-and-georeference-provenance",
+    "compress-and-stream-city-scale-assets"
+   ],
+   "incorporation": {
+    "implemented": [
+     "SPZ-v4-export",
+     "streamed-SOG-export",
+     "coordinate-and-georeference-manifest",
+     "separate-collision-artifacts",
+     "checksummed-Unreal-handoff"
     ],
-    "restricted_code_location": "outside-the-splatlab-repository",
-    "restricted_results_label": "research-only",
-    "production_rule": "Only independently implemented ideas or dependencies with verified compatible licenses may ship."
+    "next": [
+     "geometry-quality-gates-before-photometric-training",
+     "depth-normal-prior-benchmark"
+    ]
+   },
+   "gates": [],
+   "risks": [
+    "article-describes-a-proprietary-pipeline",
+    "visual-fidelity-must-not-be-presented-as-survey-accuracy"
+   ]
   },
-  "candidates": [
-    {
-      "id": "niantic-geometry-first",
-      "title": "Ground Truth: Geometrically Accurate Reconstructions",
-      "kind": "industry-pipeline",
-      "source_url": "https://www.nianticspatial.com/en/blog/geometrically-accurate-reconstruction",
-      "repository_url": null,
-      "license": {
-        "spdx": "UNKNOWN",
-        "commercial_use": null,
-        "verified": false
-      },
-      "code_status": "no-code",
-      "maturity": "deployed-system-description",
-      "relevance": "high",
-      "decision": "implemented",
-      "integration_mode": "paper-inspired-independent",
-      "priority": "P0",
-      "techniques": [
-        "treat-camera-pose-quality-as-a-hard-upstream-gate",
-        "regularize-splats-with-depth-and-surface-constraints",
-        "keep-splats-meshes-and-localization-in-one-coordinate-frame",
-        "preserve-real-world-scale-and-georeference-provenance",
-        "compress-and-stream-city-scale-assets"
-      ],
-      "incorporation": {
-        "implemented": [
-          "SPZ-v4-export",
-          "streamed-SOG-export",
-          "coordinate-and-georeference-manifest",
-          "separate-collision-artifacts",
-          "checksummed-Unreal-handoff"
-        ],
-        "next": [
-          "geometry-quality-gates-before-photometric-training",
-          "depth-normal-prior-benchmark"
-        ]
-      },
-      "gates": [],
-      "risks": [
-        "article-describes-a-proprietary-pipeline",
-        "visual-fidelity-must-not-be-presented-as-survey-accuracy"
-      ]
-    },
-    {
-      "id": "mvsanywhere",
-      "title": "MVSAnywhere: Zero-Shot Multi-View Stereo",
-      "kind": "depth-prior",
-      "source_url": "https://arxiv.org/abs/2503.02663",
-      "repository_url": "https://github.com/nianticlabs/mvsanywhere",
-      "license": {
-        "spdx": "LicenseRef-Niantic-NonCommercial",
-        "commercial_use": false,
-        "verified": true
-      },
-      "code_status": "available",
-      "maturity": "research-release",
-      "relevance": "high",
-      "decision": "evaluate",
-      "integration_mode": "isolated-research",
-      "priority": "P1",
-      "techniques": [
-        "zero-shot-multi-view-depth",
-        "depth-regularized-splat-training",
-        "explicit-camera-frame-conventions",
-        "depth-fusion-for-mesh-and-collision"
-      ],
-      "incorporation": {
-        "implemented": [],
-        "next": [
-          "run-only-in-a-separate-noncommercial-environment",
-          "compare-depth-and-mesh-metrics-against-current-baseline"
-        ]
-      },
-      "gates": [
-        "no-source-or-weights-in-shipped-SplatLab",
-        "metric-scale-error",
-        "depth-accuracy-and-completeness",
-        "peak-VRAM-and-runtime"
-      ],
-      "risks": [
-        "noncommercial-license",
-        "coordinate-prior-is-trained-around-ScanNet-conventions",
-        "large-model-GPU-cost"
-      ]
-    },
-    {
-      "id": "acezero",
-      "title": "ACE0 Scene Coordinate Reconstruction",
-      "kind": "camera-pose",
-      "source_url": "https://arxiv.org/abs/2404.14351",
-      "repository_url": "https://github.com/nianticlabs/acezero",
-      "license": {
-        "spdx": "LicenseRef-Niantic-Research",
-        "commercial_use": false,
-        "verified": true
-      },
-      "code_status": "available",
-      "maturity": "research-release",
-      "relevance": "medium",
-      "decision": "evaluate",
-      "integration_mode": "isolated-research",
-      "priority": "P2",
-      "techniques": [
-        "learned-structure-from-motion",
-        "scene-coordinate-relocation",
-        "rgbd-pose-reconstruction",
-        "pose-recovery-for-low-feature-captures"
-      ],
-      "incorporation": {
-        "implemented": [],
-        "next": [
-          "benchmark-only-on-current-COLMAP-failure-cases"
-        ]
-      },
-      "gates": [
-        "registered-image-count",
-        "pose-reprojection-error",
-        "global-scale-drift",
-        "no-runtime-download-prompts"
-      ],
-      "risks": [
-        "restricted-license",
-        "runtime-may-download-third-party-code-and-weights",
-        "learned-pose-output-needs-independent-validation"
-      ]
-    },
-    {
-      "id": "glam-slam",
-      "title": "GLAM-SLAM",
-      "kind": "large-scale-online-slam",
-      "source_url": "https://arxiv.org/abs/2607.21416",
-      "repository_url": "https://github.com/pmermigkas/GLAM-SLAM",
-      "license": {
-        "spdx": "UNKNOWN",
-        "commercial_use": null,
-        "verified": false
-      },
-      "code_status": "placeholder",
-      "maturity": "paper-only",
-      "relevance": "high",
-      "decision": "watch",
-      "integration_mode": "watch-only",
-      "priority": "P1",
-      "techniques": [
-        "decouple-lightweight-tracking-from-Gaussian-mapping",
-        "sparse-anchor-grid",
-        "epipolar-flow-densification",
-        "spatial-scene-partitioning",
-        "localized-Gaussian-generators"
-      ],
-      "incorporation": {
-        "implemented": [
-          "streamed-large-scene-export"
-        ],
-        "next": [
-          "recheck-when-code-and-license-are-published",
-          "use-spatial-partitioning-as-a-render-and-export-design-rule"
-        ]
-      },
-      "gates": [],
-      "risks": [
-        "linked-project-page-currently-serves-a-Nerfies-template",
-        "repository-currently-contains-only-a-readme",
-        "no-license-published"
-      ]
-    },
-    {
-      "id": "subsplat",
-      "title": "SubSplat",
-      "kind": "feedforward-reparameterization",
-      "source_url": "https://arxiv.org/abs/2607.20813",
-      "repository_url": null,
-      "license": {
-        "spdx": "UNKNOWN",
-        "commercial_use": null,
-        "verified": false
-      },
-      "code_status": "no-code",
-      "maturity": "paper-only",
-      "relevance": "medium",
-      "decision": "watch",
-      "integration_mode": "watch-only",
-      "priority": "P3",
-      "techniques": [
-        "subpixel-Gaussian-reparameterization",
-        "low-resolution-feature-compute",
-        "multi-view-high-frequency-feature-aggregation"
-      ],
-      "incorporation": {
-        "implemented": [],
-        "next": [
-          "consider-only-if-SplatLab-adds-a-generalizable-feedforward-model"
-        ]
-      },
-      "gates": [],
-      "risks": [
-        "targets-pixel-aligned-feedforward-models-not-per-scene-training",
-        "no-code-or-implementation-license"
-      ]
-    },
-    {
-      "id": "3d-gimp",
-      "title": "3D-GIMP",
-      "kind": "object-removal",
-      "source_url": "https://arxiv.org/abs/2607.20789",
-      "repository_url": null,
-      "license": {
-        "spdx": "UNKNOWN",
-        "commercial_use": null,
-        "verified": false
-      },
-      "code_status": "no-code",
-      "maturity": "paper-only",
-      "relevance": "high",
-      "decision": "evaluate",
-      "integration_mode": "paper-inspired-independent",
-      "priority": "P1",
-      "techniques": [
-        "single-key-view-generative-inpaint",
-        "three-dimensional-PatchMatch-propagation",
-        "deterministic-multi-view-correspondence",
-        "avoid-frame-by-frame-diffusion-drift"
-      ],
-      "incorporation": {
-        "implemented": [],
-        "next": [
-          "prototype-key-view-selection-and-correspondence-receipts",
-          "compare-one-inpaint-plus-propagation-to-current-multi-view-editing"
-        ]
-      },
-      "gates": [
-        "held-out-view-consistency",
-        "edge-sharpness",
-        "wall-time",
-        "number-of-generative-model-calls"
-      ],
-      "risks": [
-        "paper-has-no-code",
-        "independent-implementation-required",
-        "appearance-propagation-must-not-alter-unmasked-geometry"
-      ]
-    },
-    {
-      "id": "hypergs",
-      "title": "HyperGS",
-      "kind": "two-dimensional-video-Gaussians",
-      "source_url": "https://arxiv.org/abs/2607.11500",
-      "repository_url": null,
-      "license": {
-        "spdx": "UNKNOWN",
-        "commercial_use": null,
-        "verified": false
-      },
-      "code_status": "no-code",
-      "maturity": "paper-only",
-      "relevance": "low",
-      "decision": "deprioritize",
-      "integration_mode": "watch-only",
-      "priority": "P3",
-      "techniques": [
-        "feedforward-video-encoding",
-        "factorized-spatiotemporal-attention",
-        "adaptive-rank-regularization-against-needle-degeneration"
-      ],
-      "incorporation": {
-        "implemented": [],
-        "next": [
-          "retain-rank-degeneration-check-as-a-future-quality-signal"
-        ]
-      },
-      "gates": [],
-      "risks": [
-        "represents-video-frames-with-2D-Gaussians",
-        "does-not-produce-the-3D-scene-assets-SplatLab-needs"
-      ]
-    },
-    {
-      "id": "mono-stereo-soft-priors",
-      "title": "Rethinking Monocular Depth Embedding for Generalized Stereo Matching",
-      "kind": "stereo-depth",
-      "source_url": "https://arxiv.org/abs/2607.09284",
-      "repository_url": "https://github.com/linliboabc-maker/stereo-matching-digital",
-      "license": {
-        "spdx": "MIT",
-        "commercial_use": true,
-        "verified": true
-      },
-      "code_status": "available",
-      "maturity": "early-research-release",
-      "relevance": "medium",
-      "decision": "evaluate",
-      "integration_mode": "isolated-research",
-      "priority": "P2",
-      "techniques": [
-        "soft-monocular-depth-constraints",
-        "reduced-branch-coupling",
-        "depth-gradient-guided-disparity-updates",
-        "edge-confidence-weighted-loss"
-      ],
-      "incorporation": {
-        "implemented": [],
-        "next": [
-          "use-only-for-calibrated-stereo-capture-profiles",
-          "test-soft-confidence-weighting-in-depth-prior-fusion"
-        ]
-      },
-      "gates": [
-        "cross-dataset-disparity-error",
-        "edge-error",
-        "calibration-sensitivity",
-        "runtime-and-VRAM"
-      ],
-      "risks": [
-        "two-commit-early-release",
-        "stereo-only-input",
-        "model-weights-and-dataset-terms-need-separate-review"
-      ]
-    },
-    {
-      "id": "anything-reality",
-      "title": "AnythingReality",
-      "kind": "online-semantic-slam",
-      "source_url": "https://arxiv.org/abs/2607.09260v2",
-      "repository_url": null,
-      "license": {
-        "spdx": "UNKNOWN",
-        "commercial_use": null,
-        "verified": false
-      },
-      "code_status": "no-code",
-      "maturity": "paper-only",
-      "relevance": "medium",
-      "decision": "watch",
-      "integration_mode": "watch-only",
-      "priority": "P2",
-      "techniques": [
-        "feature-SLAM-poses-for-noisy-input",
-        "incremental-online-Gaussian-mapping",
-        "quality-speed-profiles",
-        "open-vocabulary-points-of-interest",
-        "VR-exploration-of-partial-reconstructions"
-      ],
-      "incorporation": {
-        "implemented": [],
-        "next": [
-          "keep-semantic-POIs-as-sidecar-data-not-baked-geometry",
-          "recheck-when-code-and-license-appear"
-        ]
-      },
-      "gates": [],
-      "risks": [
-        "no-code-or-license",
-        "ORB-SLAM3-copyleft-boundary-needs-review",
-        "voice-and-VLM-features-are-not-core-reconstruction-quality"
-      ]
-    },
-    {
-      "id": "gsplat",
-      "title": "gsplat",
-      "kind": "Gaussian-training-library",
-      "source_url": "https://docs.gsplat.studio/main/apis/strategy.html",
-      "repository_url": "https://github.com/nerfstudio-project/gsplat",
-      "license": {
-        "spdx": "Apache-2.0",
-        "commercial_use": true,
-        "verified": true
-      },
-      "code_status": "available",
-      "maturity": "maintained-library",
-      "relevance": "high",
-      "decision": "evaluate",
-      "integration_mode": "production-permissive",
-      "priority": "P0",
-      "techniques": [
-        "MCMC-densification-strategy",
-        "packed-rasterization",
-        "sparse-gradients",
-        "absolute-gradient-densification",
-        "selective-Adam"
-      ],
-      "incorporation": {
-        "implemented": [
-          "gsplat-1.5.3-is-used-by-current-Nerfstudio-training",
-          "absolute-gradient-densification-is-already-enabled"
-        ],
-        "next": [
-          "capability-detect-installed-strategies",
-          "add-opt-in-MCMC-and-memory-efficient-training-profiles",
-          "benchmark-before-changing-defaults"
-        ]
-      },
-      "gates": [
-        "installed-Nerfstudio-compatibility",
-        "PSNR-SSIM-LPIPS",
-        "peak-VRAM",
-        "wall-time",
-        "Gaussian-count-and-export-size"
-      ],
-      "risks": [
-        "strategy-APIs-vary-by-version",
-        "MCMC-quality-depends-on-a-deliberate-Gaussian-budget"
-      ]
-    },
-    {
-      "id": "dn-splatter",
-      "title": "DN-Splatter and AGS-Mesh",
-      "kind": "depth-normal-regularization",
-      "source_url": "https://arxiv.org/abs/2403.17822",
-      "repository_url": "https://github.com/maturk/dn-splatter",
-      "license": {
-        "spdx": "Apache-2.0",
-        "commercial_use": true,
-        "verified": true
-      },
-      "code_status": "available",
-      "maturity": "research-release",
-      "relevance": "high",
-      "decision": "evaluate",
-      "integration_mode": "isolated-research",
-      "priority": "P0",
-      "techniques": [
-        "depth-supervision",
-        "normal-supervision",
-        "depth-normal-filtering",
-        "surface-oriented-Gaussians",
-        "mesh-quality-optimization"
-      ],
-      "incorporation": {
-        "implemented": [],
-        "next": [
-          "benchmark-on-white-wall-and-low-texture-scenes",
-          "separate-model-code-evaluation-from-depth-model-weights"
-        ]
-      },
-      "gates": [
-        "mesh-accuracy-and-completeness",
-        "normal-consistency",
-        "floater-rate",
-        "photometric-quality",
-        "third-party-weight-license-review"
-      ],
-      "risks": [
-        "depth-model-weights-have-independent-terms",
-        "geometry-gains-can-trade-off-against-view-dependent-appearance"
-      ]
-    },
-    {
-      "id": "splatreg",
-      "title": "splatreg",
-      "kind": "splat-registration",
-      "source_url": "https://pypi.org/project/splatreg/",
-      "repository_url": "https://github.com/Archerkattri/splatreg",
-      "license": {
-        "spdx": "BSD-3-Clause",
-        "commercial_use": true,
-        "verified": true
-      },
-      "code_status": "available",
-      "maturity": "versioned-library",
-      "relevance": "high",
-      "decision": "evaluate",
-      "integration_mode": "isolated-research",
-      "priority": "P0",
-      "techniques": [
-        "direct-Gaussian-SE3-registration",
-        "direct-Gaussian-Sim3-registration",
-        "spherical-harmonic-aware-alignment",
-        "composable-registration-backends"
-      ],
-      "incorporation": {
-        "implemented": [],
-        "next": [
-          "add-a-receipted-registration-proposal-step-before-scene-merge",
-          "never-apply-a-transform-without-operator-preview"
-        ]
-      },
-      "gates": [
-        "rotation-translation-and-scale-error",
-        "overlap-confidence",
-        "registration-runtime",
-        "non-overlap-rejection",
-        "undo-and-transform-receipt"
-      ],
-      "risks": [
-        "new-project-with-limited-field-validation",
-        "false-alignment-can-corrupt-a-merge",
-        "optional-solver-dependencies-have-separate-licenses"
-      ]
-    },
-    {
-      "id": "brush",
-      "title": "Brush",
-      "kind": "cross-platform-trainer",
-      "source_url": "https://github.com/ArthurBrussee/brush",
-      "repository_url": "https://github.com/ArthurBrussee/brush",
-      "license": {
-        "spdx": "Apache-2.0",
-        "commercial_use": true,
-        "verified": true
-      },
-      "code_status": "available",
-      "maturity": "active-experimental-tool",
-      "relevance": "medium",
-      "decision": "evaluate",
-      "integration_mode": "isolated-research",
-      "priority": "P2",
-      "techniques": [
-        "cross-platform-Rust-WGPU-training",
-        "MCMC-derived-growing-strategy",
-        "interactive-training-and-inspection",
-        "lower-installation-friction"
-      ],
-      "incorporation": {
-        "implemented": [],
-        "next": [
-          "compare-as-an-alternate-worker-not-a-backend-replacement",
-          "test-CPU-RAM-and-VRAM-behavior-on-a-small-scene"
-        ]
-      },
-      "gates": [
-        "output-format-compatibility",
-        "quality-parity",
-        "runtime-and-memory",
-        "deterministic-headless-operation"
-      ],
-      "risks": [
-        "rapidly-changing-experimental-interfaces",
-        "interactive-tooling-may-not-provide-a-stable-headless-contract"
-      ]
-    },
-    {
-      "id": "splat-slam",
-      "title": "Splat-SLAM",
-      "kind": "rgb-only-Gaussian-slam",
-      "source_url": "https://arxiv.org/abs/2405.16544",
-      "repository_url": "https://github.com/google-research/Splat-SLAM",
-      "license": {
-        "spdx": "Apache-2.0",
-        "commercial_use": true,
-        "verified": true
-      },
-      "code_status": "available",
-      "maturity": "research-release",
-      "relevance": "medium",
-      "decision": "evaluate",
-      "integration_mode": "isolated-research",
-      "priority": "P2",
-      "techniques": [
-        "separate-tracking-and-mapping-processes",
-        "global-pose-optimization",
-        "rgb-only-online-reconstruction",
-        "tracking-only-degraded-mode"
-      ],
-      "incorporation": {
-        "implemented": [],
-        "next": [
-          "measure-camera-trajectory-quality-before-considering-online-mapping"
-        ]
-      },
-      "gates": [
-        "absolute-and-relative-trajectory-error",
-        "tracking-loss-rate",
-        "mapping-lag",
-        "peak-VRAM",
-        "full-dependency-license-audit"
-      ],
-      "risks": [
-        "research-stack-has-many-native-and-model-dependencies",
-        "online-output-may-be-less-suitable-than-offline-quality-mode"
-      ]
-    },
-    {
-      "id": "milo",
-      "title": "MILo Mesh-In-the-Loop Gaussian Splatting",
-      "kind": "surface-reconstruction",
-      "source_url": "https://arxiv.org/abs/2506.24096",
-      "repository_url": "https://github.com/Anttwo/MILo",
-      "license": {
-        "spdx": "LicenseRef-GaussianSplatting-Research",
-        "commercial_use": false,
-        "verified": true
-      },
-      "code_status": "available",
-      "maturity": "research-release",
-      "relevance": "high",
-      "decision": "evaluate",
-      "integration_mode": "isolated-research",
-      "priority": "P1",
-      "techniques": [
-        "differentiable-mesh-extraction-in-the-training-loop",
-        "bidirectional-splat-surface-consistency",
-        "Delaunay-surface-pivots",
-        "frustum-culling-for-mesh-loss",
-        "mesh-proxy-editing-in-Blender"
-      ],
-      "incorporation": {
-        "implemented": [],
-        "next": [
-          "benchmark-surface-quality-in-a-quarantined-environment",
-          "use-results-only-to-inform-an-independent-permissive-design"
-        ]
-      },
-      "gates": [
-        "no-code-copy-into-SplatLab",
-        "mesh-accuracy-and-vertex-count",
-        "training-runtime-and-VRAM",
-        "Blender-transform-round-trip"
-      ],
-      "risks": [
-        "inherits-research-only-Gaussian-Splatting-license",
-        "submodules-have-independent-license-terms",
-        "recommended-Blender-version-differs-from-SplatLab"
-      ]
-    },
-    {
-      "id": "colmap-global-mapper",
-      "title": "COLMAP Global Mapper",
-      "kind": "structure-from-motion",
-      "source_url": "https://colmap.github.io/",
-      "repository_url": "https://github.com/colmap/colmap",
-      "license": {
-        "spdx": "BSD-3-Clause",
-        "commercial_use": true,
-        "verified": true
-      },
-      "code_status": "available",
-      "maturity": "maintained-production-tool",
-      "relevance": "high",
-      "decision": "implemented",
-      "integration_mode": "production-permissive",
-      "priority": "P0",
-      "techniques": [
-        "global-structure-from-motion",
-        "view-graph-calibration",
-        "global-positioning",
-        "structure-refinement",
-        "higher-throughput-large-scene-pose-solving"
-      ],
-      "incorporation": {
-        "implemented": [
-          "COLMAP-based-preprocessing",
-          "COLMAP-4.1-global-mapper-rescue",
-          "rig-constrained-equirectangular-solving",
-          "automatic-solver-escalation"
-        ],
-        "next": [
-          "retain-global-versus-incremental-regression-receipts",
-          "do-not-replace-the-incremental-default-without-scene-class-evidence"
-        ]
-      },
-      "gates": [
-        "registered-image-count",
-        "reprojection-error",
-        "trajectory-loop-closure",
-        "pose-runtime",
-        "downstream-splat-quality"
-      ],
-      "risks": [
-        "global-mapping-can-be-less-robust-on-some-capture-graphs",
-        "COLMAP-third-party-dependencies-are-separately-licensed"
-      ]
-    },
-    {
-      "id": "gluemap",
-      "title": "GLUEMAP",
-      "kind": "hybrid-feedforward-SfM",
-      "source_url": "https://github.com/colmap/gluemap",
-      "repository_url": "https://github.com/colmap/gluemap",
-      "license": {
-        "spdx": "UNKNOWN",
-        "commercial_use": null,
-        "verified": false
-      },
-      "code_status": "available",
-      "maturity": "early-research-release",
-      "relevance": "high",
-      "decision": "watch",
-      "integration_mode": "watch-only",
-      "priority": "P2",
-      "techniques": [
-        "feedforward-local-star-reconstructions",
-        "global-rotation-and-similarity-averaging",
-        "global-bundle-adjustment",
-        "SIFT-track-snapping",
-        "resumable-pipeline-stages"
-      ],
-      "incorporation": {
-        "implemented": [],
-        "next": [
-          "review-top-level-and-submodule-licenses-before-testing",
-          "compare-only-after-COLMAP-global-mapper"
-        ]
-      },
-      "gates": [],
-      "risks": [
-        "multiple-large-model-checkpoints",
-        "submodule-and-weight-license-matrix-not-yet-reviewed",
-        "substantially-more-complex-than-current-SfM-path"
-      ]
-    }
-  ]
+  {
+   "id": "mvsanywhere",
+   "title": "MVSAnywhere: Zero-Shot Multi-View Stereo",
+   "kind": "depth-prior",
+   "source_url": "https://arxiv.org/abs/2503.02663",
+   "repository_url": "https://github.com/nianticlabs/mvsanywhere",
+   "license": {
+    "spdx": "LicenseRef-Niantic-NonCommercial",
+    "commercial_use": false,
+    "verified": true
+   },
+   "code_status": "available",
+   "maturity": "research-release",
+   "relevance": "high",
+   "decision": "evaluate",
+   "integration_mode": "isolated-research",
+   "priority": "P1",
+   "techniques": [
+    "zero-shot-multi-view-depth",
+    "depth-regularized-splat-training",
+    "explicit-camera-frame-conventions",
+    "depth-fusion-for-mesh-and-collision"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "run-only-in-a-separate-noncommercial-environment",
+     "compare-depth-and-mesh-metrics-against-current-baseline"
+    ]
+   },
+   "gates": [
+    "no-source-or-weights-in-shipped-SplatLab",
+    "metric-scale-error",
+    "depth-accuracy-and-completeness",
+    "peak-VRAM-and-runtime"
+   ],
+   "risks": [
+    "noncommercial-license",
+    "coordinate-prior-is-trained-around-ScanNet-conventions",
+    "large-model-GPU-cost"
+   ]
+  },
+  {
+   "id": "acezero",
+   "title": "ACE0 Scene Coordinate Reconstruction",
+   "kind": "camera-pose",
+   "source_url": "https://arxiv.org/abs/2404.14351",
+   "repository_url": "https://github.com/nianticlabs/acezero",
+   "license": {
+    "spdx": "LicenseRef-Niantic-Research",
+    "commercial_use": false,
+    "verified": true
+   },
+   "code_status": "available",
+   "maturity": "research-release",
+   "relevance": "medium",
+   "decision": "evaluate",
+   "integration_mode": "isolated-research",
+   "priority": "P2",
+   "techniques": [
+    "learned-structure-from-motion",
+    "scene-coordinate-relocation",
+    "rgbd-pose-reconstruction",
+    "pose-recovery-for-low-feature-captures"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "benchmark-only-on-current-COLMAP-failure-cases"
+    ]
+   },
+   "gates": [
+    "registered-image-count",
+    "pose-reprojection-error",
+    "global-scale-drift",
+    "no-runtime-download-prompts"
+   ],
+   "risks": [
+    "restricted-license",
+    "runtime-may-download-third-party-code-and-weights",
+    "learned-pose-output-needs-independent-validation"
+   ]
+  },
+  {
+   "id": "glam-slam",
+   "title": "GLAM-SLAM",
+   "kind": "large-scale-online-slam",
+   "source_url": "https://arxiv.org/abs/2607.21416",
+   "repository_url": "https://github.com/pmermigkas/GLAM-SLAM",
+   "license": {
+    "spdx": "UNKNOWN",
+    "commercial_use": null,
+    "verified": false
+   },
+   "code_status": "placeholder",
+   "maturity": "paper-only",
+   "relevance": "high",
+   "decision": "watch",
+   "integration_mode": "watch-only",
+   "priority": "P1",
+   "techniques": [
+    "decouple-lightweight-tracking-from-Gaussian-mapping",
+    "sparse-anchor-grid",
+    "epipolar-flow-densification",
+    "spatial-scene-partitioning",
+    "localized-Gaussian-generators"
+   ],
+   "incorporation": {
+    "implemented": [
+     "streamed-large-scene-export"
+    ],
+    "next": [
+     "recheck-when-code-and-license-are-published",
+     "use-spatial-partitioning-as-a-render-and-export-design-rule"
+    ]
+   },
+   "gates": [],
+   "risks": [
+    "linked-project-page-currently-serves-a-Nerfies-template",
+    "repository-currently-contains-only-a-readme",
+    "no-license-published"
+   ]
+  },
+  {
+   "id": "subsplat",
+   "title": "SubSplat",
+   "kind": "feedforward-reparameterization",
+   "source_url": "https://arxiv.org/abs/2607.20813",
+   "repository_url": null,
+   "license": {
+    "spdx": "UNKNOWN",
+    "commercial_use": null,
+    "verified": false
+   },
+   "code_status": "no-code",
+   "maturity": "paper-only",
+   "relevance": "medium",
+   "decision": "watch",
+   "integration_mode": "watch-only",
+   "priority": "P3",
+   "techniques": [
+    "subpixel-Gaussian-reparameterization",
+    "low-resolution-feature-compute",
+    "multi-view-high-frequency-feature-aggregation"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "consider-only-if-SplatLab-adds-a-generalizable-feedforward-model"
+    ]
+   },
+   "gates": [],
+   "risks": [
+    "targets-pixel-aligned-feedforward-models-not-per-scene-training",
+    "no-code-or-implementation-license"
+   ]
+  },
+  {
+   "id": "3d-gimp",
+   "title": "3D-GIMP",
+   "kind": "object-removal",
+   "source_url": "https://arxiv.org/abs/2607.20789",
+   "repository_url": null,
+   "license": {
+    "spdx": "UNKNOWN",
+    "commercial_use": null,
+    "verified": false
+   },
+   "code_status": "no-code",
+   "maturity": "paper-only",
+   "relevance": "high",
+   "decision": "evaluate",
+   "integration_mode": "paper-inspired-independent",
+   "priority": "P1",
+   "techniques": [
+    "single-key-view-generative-inpaint",
+    "three-dimensional-PatchMatch-propagation",
+    "deterministic-multi-view-correspondence",
+    "avoid-frame-by-frame-diffusion-drift"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "prototype-key-view-selection-and-correspondence-receipts",
+     "compare-one-inpaint-plus-propagation-to-current-multi-view-editing"
+    ]
+   },
+   "gates": [
+    "held-out-view-consistency",
+    "edge-sharpness",
+    "wall-time",
+    "number-of-generative-model-calls"
+   ],
+   "risks": [
+    "paper-has-no-code",
+    "independent-implementation-required",
+    "appearance-propagation-must-not-alter-unmasked-geometry"
+   ]
+  },
+  {
+   "id": "hypergs",
+   "title": "HyperGS",
+   "kind": "two-dimensional-video-Gaussians",
+   "source_url": "https://arxiv.org/abs/2607.11500",
+   "repository_url": null,
+   "license": {
+    "spdx": "UNKNOWN",
+    "commercial_use": null,
+    "verified": false
+   },
+   "code_status": "no-code",
+   "maturity": "paper-only",
+   "relevance": "low",
+   "decision": "deprioritize",
+   "integration_mode": "watch-only",
+   "priority": "P3",
+   "techniques": [
+    "feedforward-video-encoding",
+    "factorized-spatiotemporal-attention",
+    "adaptive-rank-regularization-against-needle-degeneration"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "retain-rank-degeneration-check-as-a-future-quality-signal"
+    ]
+   },
+   "gates": [],
+   "risks": [
+    "represents-video-frames-with-2D-Gaussians",
+    "does-not-produce-the-3D-scene-assets-SplatLab-needs"
+   ]
+  },
+  {
+   "id": "mono-stereo-soft-priors",
+   "title": "Rethinking Monocular Depth Embedding for Generalized Stereo Matching",
+   "kind": "stereo-depth",
+   "source_url": "https://arxiv.org/abs/2607.09284",
+   "repository_url": "https://github.com/linliboabc-maker/stereo-matching-digital",
+   "license": {
+    "spdx": "MIT",
+    "commercial_use": true,
+    "verified": true
+   },
+   "code_status": "available",
+   "maturity": "early-research-release",
+   "relevance": "medium",
+   "decision": "evaluate",
+   "integration_mode": "isolated-research",
+   "priority": "P2",
+   "techniques": [
+    "soft-monocular-depth-constraints",
+    "reduced-branch-coupling",
+    "depth-gradient-guided-disparity-updates",
+    "edge-confidence-weighted-loss"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "use-only-for-calibrated-stereo-capture-profiles",
+     "test-soft-confidence-weighting-in-depth-prior-fusion"
+    ]
+   },
+   "gates": [
+    "cross-dataset-disparity-error",
+    "edge-error",
+    "calibration-sensitivity",
+    "runtime-and-VRAM"
+   ],
+   "risks": [
+    "two-commit-early-release",
+    "stereo-only-input",
+    "model-weights-and-dataset-terms-need-separate-review"
+   ]
+  },
+  {
+   "id": "anything-reality",
+   "title": "AnythingReality",
+   "kind": "online-semantic-slam",
+   "source_url": "https://arxiv.org/abs/2607.09260v2",
+   "repository_url": null,
+   "license": {
+    "spdx": "UNKNOWN",
+    "commercial_use": null,
+    "verified": false
+   },
+   "code_status": "no-code",
+   "maturity": "paper-only",
+   "relevance": "medium",
+   "decision": "watch",
+   "integration_mode": "watch-only",
+   "priority": "P2",
+   "techniques": [
+    "feature-SLAM-poses-for-noisy-input",
+    "incremental-online-Gaussian-mapping",
+    "quality-speed-profiles",
+    "open-vocabulary-points-of-interest",
+    "VR-exploration-of-partial-reconstructions"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "keep-semantic-POIs-as-sidecar-data-not-baked-geometry",
+     "recheck-when-code-and-license-appear"
+    ]
+   },
+   "gates": [],
+   "risks": [
+    "no-code-or-license",
+    "ORB-SLAM3-copyleft-boundary-needs-review",
+    "voice-and-VLM-features-are-not-core-reconstruction-quality"
+   ]
+  },
+  {
+   "id": "gsplat",
+   "title": "gsplat",
+   "kind": "Gaussian-training-library",
+   "source_url": "https://docs.gsplat.studio/main/apis/strategy.html",
+   "repository_url": "https://github.com/nerfstudio-project/gsplat",
+   "license": {
+    "spdx": "Apache-2.0",
+    "commercial_use": true,
+    "verified": true
+   },
+   "code_status": "available",
+   "maturity": "maintained-library",
+   "relevance": "high",
+   "decision": "evaluate",
+   "integration_mode": "production-permissive",
+   "priority": "P0",
+   "techniques": [
+    "MCMC-densification-strategy",
+    "packed-rasterization",
+    "sparse-gradients",
+    "absolute-gradient-densification",
+    "selective-Adam"
+   ],
+   "incorporation": {
+    "implemented": [
+     "gsplat-1.5.3-is-used-by-current-Nerfstudio-training",
+     "absolute-gradient-densification-is-already-enabled"
+    ],
+    "next": [
+     "capability-detect-installed-strategies",
+     "add-opt-in-MCMC-and-memory-efficient-training-profiles",
+     "benchmark-before-changing-defaults"
+    ]
+   },
+   "gates": [
+    "installed-Nerfstudio-compatibility",
+    "PSNR-SSIM-LPIPS",
+    "peak-VRAM",
+    "wall-time",
+    "Gaussian-count-and-export-size"
+   ],
+   "risks": [
+    "strategy-APIs-vary-by-version",
+    "MCMC-quality-depends-on-a-deliberate-Gaussian-budget"
+   ]
+  },
+  {
+   "id": "dn-splatter",
+   "title": "DN-Splatter and AGS-Mesh",
+   "kind": "depth-normal-regularization",
+   "source_url": "https://arxiv.org/abs/2403.17822",
+   "repository_url": "https://github.com/maturk/dn-splatter",
+   "license": {
+    "spdx": "Apache-2.0",
+    "commercial_use": true,
+    "verified": true
+   },
+   "code_status": "available",
+   "maturity": "research-release",
+   "relevance": "high",
+   "decision": "evaluate",
+   "integration_mode": "isolated-research",
+   "priority": "P0",
+   "techniques": [
+    "depth-supervision",
+    "normal-supervision",
+    "depth-normal-filtering",
+    "surface-oriented-Gaussians",
+    "mesh-quality-optimization"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "benchmark-on-white-wall-and-low-texture-scenes",
+     "separate-model-code-evaluation-from-depth-model-weights"
+    ]
+   },
+   "gates": [
+    "mesh-accuracy-and-completeness",
+    "normal-consistency",
+    "floater-rate",
+    "photometric-quality",
+    "third-party-weight-license-review"
+   ],
+   "risks": [
+    "depth-model-weights-have-independent-terms",
+    "geometry-gains-can-trade-off-against-view-dependent-appearance"
+   ]
+  },
+  {
+   "id": "splatreg",
+   "title": "splatreg",
+   "kind": "splat-registration",
+   "source_url": "https://pypi.org/project/splatreg/",
+   "repository_url": "https://github.com/Archerkattri/splatreg",
+   "license": {
+    "spdx": "BSD-3-Clause",
+    "commercial_use": true,
+    "verified": true
+   },
+   "code_status": "available",
+   "maturity": "versioned-library",
+   "relevance": "high",
+   "decision": "evaluate",
+   "integration_mode": "isolated-research",
+   "priority": "P0",
+   "techniques": [
+    "direct-Gaussian-SE3-registration",
+    "direct-Gaussian-Sim3-registration",
+    "spherical-harmonic-aware-alignment",
+    "composable-registration-backends"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "add-a-receipted-registration-proposal-step-before-scene-merge",
+     "never-apply-a-transform-without-operator-preview"
+    ]
+   },
+   "gates": [
+    "rotation-translation-and-scale-error",
+    "overlap-confidence",
+    "registration-runtime",
+    "non-overlap-rejection",
+    "undo-and-transform-receipt"
+   ],
+   "risks": [
+    "new-project-with-limited-field-validation",
+    "false-alignment-can-corrupt-a-merge",
+    "optional-solver-dependencies-have-separate-licenses"
+   ]
+  },
+  {
+   "id": "brush",
+   "title": "Brush",
+   "kind": "cross-platform-trainer",
+   "source_url": "https://github.com/ArthurBrussee/brush",
+   "repository_url": "https://github.com/ArthurBrussee/brush",
+   "license": {
+    "spdx": "Apache-2.0",
+    "commercial_use": true,
+    "verified": true
+   },
+   "code_status": "available",
+   "maturity": "active-experimental-tool",
+   "relevance": "medium",
+   "decision": "evaluate",
+   "integration_mode": "isolated-research",
+   "priority": "P2",
+   "techniques": [
+    "cross-platform-Rust-WGPU-training",
+    "MCMC-derived-growing-strategy",
+    "interactive-training-and-inspection",
+    "lower-installation-friction"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "compare-as-an-alternate-worker-not-a-backend-replacement",
+     "test-CPU-RAM-and-VRAM-behavior-on-a-small-scene"
+    ]
+   },
+   "gates": [
+    "output-format-compatibility",
+    "quality-parity",
+    "runtime-and-memory",
+    "deterministic-headless-operation"
+   ],
+   "risks": [
+    "rapidly-changing-experimental-interfaces",
+    "interactive-tooling-may-not-provide-a-stable-headless-contract"
+   ]
+  },
+  {
+   "id": "splat-slam",
+   "title": "Splat-SLAM",
+   "kind": "rgb-only-Gaussian-slam",
+   "source_url": "https://arxiv.org/abs/2405.16544",
+   "repository_url": "https://github.com/google-research/Splat-SLAM",
+   "license": {
+    "spdx": "Apache-2.0",
+    "commercial_use": true,
+    "verified": true
+   },
+   "code_status": "available",
+   "maturity": "research-release",
+   "relevance": "medium",
+   "decision": "evaluate",
+   "integration_mode": "isolated-research",
+   "priority": "P2",
+   "techniques": [
+    "separate-tracking-and-mapping-processes",
+    "global-pose-optimization",
+    "rgb-only-online-reconstruction",
+    "tracking-only-degraded-mode"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "measure-camera-trajectory-quality-before-considering-online-mapping"
+    ]
+   },
+   "gates": [
+    "absolute-and-relative-trajectory-error",
+    "tracking-loss-rate",
+    "mapping-lag",
+    "peak-VRAM",
+    "full-dependency-license-audit"
+   ],
+   "risks": [
+    "research-stack-has-many-native-and-model-dependencies",
+    "online-output-may-be-less-suitable-than-offline-quality-mode"
+   ]
+  },
+  {
+   "id": "milo",
+   "title": "MILo Mesh-In-the-Loop Gaussian Splatting",
+   "kind": "surface-reconstruction",
+   "source_url": "https://arxiv.org/abs/2506.24096",
+   "repository_url": "https://github.com/Anttwo/MILo",
+   "license": {
+    "spdx": "LicenseRef-GaussianSplatting-Research",
+    "commercial_use": false,
+    "verified": true
+   },
+   "code_status": "available",
+   "maturity": "research-release",
+   "relevance": "high",
+   "decision": "evaluate",
+   "integration_mode": "isolated-research",
+   "priority": "P1",
+   "techniques": [
+    "differentiable-mesh-extraction-in-the-training-loop",
+    "bidirectional-splat-surface-consistency",
+    "Delaunay-surface-pivots",
+    "frustum-culling-for-mesh-loss",
+    "mesh-proxy-editing-in-Blender"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "benchmark-surface-quality-in-a-quarantined-environment",
+     "use-results-only-to-inform-an-independent-permissive-design"
+    ]
+   },
+   "gates": [
+    "no-code-copy-into-SplatLab",
+    "mesh-accuracy-and-vertex-count",
+    "training-runtime-and-VRAM",
+    "Blender-transform-round-trip"
+   ],
+   "risks": [
+    "inherits-research-only-Gaussian-Splatting-license",
+    "submodules-have-independent-license-terms",
+    "recommended-Blender-version-differs-from-SplatLab"
+   ]
+  },
+  {
+   "id": "colmap-global-mapper",
+   "title": "COLMAP Global Mapper",
+   "kind": "structure-from-motion",
+   "source_url": "https://colmap.github.io/",
+   "repository_url": "https://github.com/colmap/colmap",
+   "license": {
+    "spdx": "BSD-3-Clause",
+    "commercial_use": true,
+    "verified": true
+   },
+   "code_status": "available",
+   "maturity": "maintained-production-tool",
+   "relevance": "high",
+   "decision": "implemented",
+   "integration_mode": "production-permissive",
+   "priority": "P0",
+   "techniques": [
+    "global-structure-from-motion",
+    "view-graph-calibration",
+    "global-positioning",
+    "structure-refinement",
+    "higher-throughput-large-scene-pose-solving"
+   ],
+   "incorporation": {
+    "implemented": [
+     "COLMAP-based-preprocessing",
+     "COLMAP-4.1-global-mapper-rescue",
+     "rig-constrained-equirectangular-solving",
+     "automatic-solver-escalation"
+    ],
+    "next": [
+     "retain-global-versus-incremental-regression-receipts",
+     "do-not-replace-the-incremental-default-without-scene-class-evidence"
+    ]
+   },
+   "gates": [
+    "registered-image-count",
+    "reprojection-error",
+    "trajectory-loop-closure",
+    "pose-runtime",
+    "downstream-splat-quality"
+   ],
+   "risks": [
+    "global-mapping-can-be-less-robust-on-some-capture-graphs",
+    "COLMAP-third-party-dependencies-are-separately-licensed"
+   ]
+  },
+  {
+   "id": "gluemap",
+   "title": "GLUEMAP",
+   "kind": "hybrid-feedforward-SfM",
+   "source_url": "https://github.com/colmap/gluemap",
+   "repository_url": "https://github.com/colmap/gluemap",
+   "license": {
+    "spdx": "UNKNOWN",
+    "commercial_use": null,
+    "verified": false
+   },
+   "code_status": "available",
+   "maturity": "early-research-release",
+   "relevance": "high",
+   "decision": "watch",
+   "integration_mode": "watch-only",
+   "priority": "P2",
+   "techniques": [
+    "feedforward-local-star-reconstructions",
+    "global-rotation-and-similarity-averaging",
+    "global-bundle-adjustment",
+    "SIFT-track-snapping",
+    "resumable-pipeline-stages"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "review-top-level-and-submodule-licenses-before-testing",
+     "compare-only-after-COLMAP-global-mapper"
+    ]
+   },
+   "gates": [],
+   "risks": [
+    "multiple-large-model-checkpoints",
+    "submodule-and-weight-license-matrix-not-yet-reviewed",
+    "substantially-more-complex-than-current-SfM-path"
+   ]
+  },
+  {
+   "id": "kiri-3dgs-render-blender",
+   "title": "3DGS Render by KIRI Engine v5.0.0 (Blender add-on)",
+   "kind": "open-source-tool",
+   "source_url": "https://github.com/Kiri-Innovation/3dgs-render-blender-addon",
+   "repository_url": "https://github.com/Kiri-Innovation/3dgs-render-blender-addon",
+   "license": {
+    "spdx": "Apache-2.0",
+    "commercial_use": true,
+    "verified": true
+   },
+   "code_status": "released",
+   "maturity": "v5.0.0-release",
+   "relevance": "high",
+   "decision": "spike",
+   "integration_mode": "opt-in-standalone-blender",
+   "priority": "P1",
+   "techniques": [
+    "native-3dgs-ply-import-into-blender",
+    "geometry-nodes-splat-render-and-edit",
+    "dual-edit-render-modes"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "90-min-spike-on-bonsai-splat-ply",
+     "headless-driveability-check",
+     "edited-splat-reexport-check"
+    ]
+   },
+   "gates": [
+    "blender-5.1.x-only-(local-5.1.2-matches;-5.2-unsupported;-4.5.11-pipeline-untouched)"
+   ],
+   "risks": [
+    "n-panel-operators-may-resist-headless-context",
+    "no-verified-edited-splat-ply-reexport"
+   ]
+  },
+  {
+   "id": "blendsplat-toolkit",
+   "title": "BlendSplat \u2014 Blender Gaussian Splat Toolkit v2 (v0.6.0-core)",
+   "kind": "open-source-tool",
+   "source_url": "https://codeberg.org/soerensc/BlendSplat-Library",
+   "repository_url": "https://codeberg.org/soerensc/BlendSplat-Library",
+   "license": {
+    "spdx": "CC-BY-4.0",
+    "commercial_use": true,
+    "verified": true
+   },
+   "code_status": "released",
+   "maturity": "v0.6.0-core",
+   "relevance": "medium",
+   "decision": "watch",
+   "integration_mode": "opt-in-standalone-blender",
+   "priority": "P2",
+   "techniques": [
+    "geometry-nodes-splat-import",
+    "splat-attr-convert",
+    "eevee-splat-render"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "secondary-spike-only-if-kiri-fails"
+    ]
+   },
+   "gates": [
+    "blender-5.1-assets-cannot-open-in-the-4.5.11-studio-loop"
+   ],
+   "risks": [
+    "sh-degree-2-ceiling-vs-local-sh3-plys",
+    "camera-pose-glue-must-be-hand-built"
+   ]
+  },
+  {
+   "id": "umi3d-sfc-attn",
+   "title": "UMI3D: Multi-Image 3D Generation via SFC-Attn Routing (arXiv 2607.24298)",
+   "kind": "paper",
+   "source_url": "https://arxiv.org/abs/2607.24298",
+   "repository_url": "https://github.com/quzefan/UMI3D",
+   "license": {
+    "spdx": "UNKNOWN",
+    "commercial_use": null,
+    "verified": false
+   },
+   "code_status": "placeholder-repo",
+   "maturity": "paper-only",
+   "relevance": "high",
+   "decision": "design-doc",
+   "integration_mode": "paper-inspired-independent",
+   "priority": "P2",
+   "techniques": [
+    "training-free-multi-image-conditioning-for-single-image-3d-dits",
+    "voxel-reference-score-routing",
+    "per-voxel-image-assignment-in-cross-attention"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "watch-repo-for-code-and-license",
+     "highest-conceptual-fit:-fixes-sam3d-single-image-prop-distortion-using-capture-photos-already-on-disk"
+    ]
+   },
+   "gates": [
+    "no-code",
+    "no-license"
+   ],
+   "risks": [
+    "reimplementing-dit-attention-hooks-without-reference-code-is-a-multi-day-effort"
+   ]
+  },
+  {
+   "id": "geostereo-stereo-normals",
+   "title": "GeoStereo: Unified Stereo Disparity + Surface Normals (arXiv 2607.24024)",
+   "kind": "paper",
+   "source_url": "https://arxiv.org/abs/2607.24024",
+   "repository_url": "https://github.com/qz-wei/GeoStereo",
+   "license": {
+    "spdx": "UNKNOWN",
+    "commercial_use": false,
+    "verified": false
+   },
+   "code_status": "released-weights-unverified",
+   "maturity": "acm-mm-2026",
+   "relevance": "low",
+   "decision": "rejected",
+   "integration_mode": "none",
+   "priority": "P3",
+   "techniques": [
+    "diffusion-normal-branch-with-disparity-init",
+    "warped-view-controlnet-conditioning"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "if-normal-priors-wanted:-trial-a-monocular-estimator-(stablenormal/dsine/metric3d)-instead"
+    ]
+   },
+   "gates": [
+    "no-top-level-license",
+    "torch-2.4.1-pin-has-no-sm_120-kernels-for-the-5090",
+    "hf-weights-401",
+    "requires-rectified-stereo-pairs-we-do-not-have"
+   ],
+   "risks": [
+    "vendored-foundationstereo-is-nvidia-nc-research-only"
+   ]
+  },
+  {
+   "id": "gensplatcodec",
+   "title": "GenSplatCodec: Feed-Forward 3DGS Compression via One-Step Diffusion (arXiv 2607.24403)",
+   "kind": "paper",
+   "source_url": "https://arxiv.org/abs/2607.24403",
+   "repository_url": null,
+   "license": {
+    "spdx": "UNKNOWN",
+    "commercial_use": null,
+    "verified": false
+   },
+   "code_status": "no-code",
+   "maturity": "preprint-1-day-old",
+   "relevance": "low",
+   "decision": "rejected",
+   "integration_mode": "none",
+   "priority": "P3",
+   "techniques": [
+    "rd-guided-gaussian-compaction",
+    "gpcc-centers-plus-entropy-coded-attributes"
+   ],
+   "incorporation": {
+    "implemented": [],
+    "next": [
+     "watch-mediax-sjtu-org-(track-record-of-releasing-code)",
+     "compaction-idea-could-inform-sog-spz-lane-tuning"
+    ]
+   },
+   "gates": [
+    "decoder-is-a-diffusion-unet-the-spark-viewer-can-never-run",
+    "no-ingest-path-for-dense-optimized-splats"
+   ],
+   "risks": [
+    "quality-regime-is-20-23db-streaming,-far-below-optimized-capture-fidelity"
+   ]
+  }
+ ]
 }
