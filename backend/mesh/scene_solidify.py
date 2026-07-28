@@ -209,6 +209,21 @@ def place_generated(gen: dict, out_glb: Path, *, mpu, faces: int, tex: int) -> d
                 vertex_colors=(np.clip(np.asarray(om.vertex_colors), 0, 1) * 255).astype(np.uint8)
                 if om.has_vertex_colors() else None,
                 process=False)
+        # Texture leg: UVs + a baked atlas from the mesh's own vertex colours.
+        # prop_integrity requires has_uv/has_base_color_texture per prop, and a
+        # vertex-coloured export fails that gate by construction — this is what
+        # the `tex` parameter was always meant to buy.
+        texture_error = None
+        try:
+            import generated_texture
+            report = generated_texture.texture_generated_mesh(
+                mesh, out_glb, mpu=mpu, tex_size=tex)
+            return {"ok": True, "seconds": round(time.time() - t0, 1),
+                    "faces": report["faces"], "extent": report["extent"],
+                    "texture": True, "texture_report": report["texture"],
+                    "islands": report["islands"]}
+        except Exception as exc:  # noqa: BLE001 — untextured beats absent
+            texture_error = f"{type(exc).__name__}: {exc}"[:200]
         if mpu:
             # Elements are exported in metres, Y-up — the same convention
             # object_texture.py uses — so the capture-frame result is scaled and
@@ -223,7 +238,8 @@ def place_generated(gen: dict, out_glb: Path, *, mpu, faces: int, tex: int) -> d
             return {"ok": False, "error": f"readback mismatch {len(back.faces)} != {len(mesh.faces)}"}
         return {"ok": True, "seconds": round(time.time() - t0, 1),
                 "faces": int(len(back.faces)),
-                "extent": [round(float(x), 3) for x in back.extents]}
+                "extent": [round(float(x), 3) for x in back.extents],
+                "texture": False, "texture_error": texture_error}
     except Exception as exc:  # noqa: BLE001 — fall back to captured geometry
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200],
                 "seconds": round(time.time() - t0, 1)}
@@ -273,6 +289,35 @@ def run_object_texture(py: Path, script: Path, mesh: Path, splat: Path, out_glb:
         except (OSError, json.JSONDecodeError):
             pass
     return {"ok": True, "seconds": round(time.time() - t, 1), "report": report}
+
+
+def patch_world_doc(doc: dict, new_elements: list[dict], shell: dict | None) -> dict:
+    """Replace matching-slug entries in an existing world.json document.
+
+    Pure function: the full-solidify path REWRITES world.json from only the
+    elements it just built, so a bare `--only a,b` run silently destroys the
+    records of every other element and the shell (the same rewrite class as
+    the recorded 07-26 drift). Patch mode edits in place instead. counts are
+    recomputed over the merged element list; the shell record is preserved
+    unless a new shell was built this run.
+    """
+    elements = list(doc.get("elements") or [])
+    index = {entry.get("slug"): i for i, entry in enumerate(elements)}
+    for entry in new_elements:
+        slug = entry.get("slug")
+        if slug in index:
+            elements[index[slug]] = entry
+        else:
+            elements.append(entry)
+    doc["elements"] = elements
+    if shell is not None:
+        doc["shell"] = shell
+    built = [entry for entry in elements if entry.get("built")]
+    counts = doc.setdefault("counts", {})
+    counts["props_built"] = len(built)
+    counts["props_failed"] = len(elements) - len(built)
+    counts["shell_built"] = bool((doc.get("shell") or {}).get("built"))
+    return doc
 
 
 def _shell_colour_source(job_dir: Path) -> Path:
@@ -454,6 +499,11 @@ def main() -> int:
     ap.add_argument("--shell-only", action="store_true",
                     help="rebuild ONLY the shell and patch it into the existing "
                          "world.json — elements are untouched")
+    ap.add_argument("--patch-elements", action="store_true",
+                    help="rebuild ONLY the --only slugs and patch them into the "
+                         "existing world.json — every other element and the "
+                         "shell record are preserved. A bare --only run "
+                         "REWRITES world.json with just the filtered slugs.")
     ap.add_argument("--prefer-generated", action="store_true",
                     help="use a placed generative reconstruction in place of the captured "
                          "geometry when one exists (render lane only; survey still refuses it)")
@@ -512,6 +562,18 @@ def main() -> int:
               "inventory first", file=sys.stderr)
         return 1
     only = {s.strip() for s in args.only.split(",")} if args.only else None
+    if args.patch_elements:
+        if not only:
+            print("FATAL: --patch-elements requires --only <slugs>", file=sys.stderr)
+            return 1
+        if args.report:
+            print("FATAL: --patch-elements edits _world/world.json in place; "
+                  "--report conflicts with that", file=sys.stderr)
+            return 1
+        if not (world / "world.json").is_file():
+            print("FATAL: --patch-elements needs an existing _world/world.json — "
+                  "run the full solidify first", file=sys.stderr)
+            return 1
 
     elements = []
     for inst in instances:
@@ -564,7 +626,24 @@ def main() -> int:
                 entry["faces"] = res.get("faces")
                 entry["extent"] = res.get("extent")
                 entry["provenance"] = "generative render-only"
-                _log(f"  prop {slug}: GENERATED (placement iou {gen['iou']:.3f})")
+                entry["texture"] = bool(res.get("texture"))
+                if res.get("texture_error"):
+                    entry["texture_error"] = res["texture_error"]
+                # Fresh sidecar beside the GLB: the gate's texture_coverage
+                # reads GLB+sidecar as a pair, and a stale sidecar from an
+                # earlier gaussian build describes an artifact that no longer
+                # exists (the recorded 07-26 drift).
+                out.with_suffix(".json").write_text(json.dumps({
+                    "provenance": "generative render-only",
+                    "generated": gen["report"],
+                    "faces": res.get("faces"),
+                    "extent": res.get("extent"),
+                    "islands": res.get("islands"),
+                    "texture": res.get("texture_report")
+                    if res.get("texture") else {"baked": False},
+                }, indent=2))
+                _log(f"  prop {slug}: GENERATED (placement iou {gen['iou']:.3f}, "
+                     f"texture={'baked' if res.get('texture') else 'MISSING'})")
                 elements.append(entry)
                 continue
             # Fall through to the captured path rather than losing the element.
@@ -594,6 +673,21 @@ def main() -> int:
         shell = build_shell(job_dir, args, instances, py, script, mpu)
 
     built = [e for e in elements if e.get("built")]
+    if args.patch_elements:
+        world_json = world / "world.json"
+        try:
+            doc = json.loads(world_json.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"FATAL: could not read existing world.json: {exc}",
+                  file=sys.stderr)
+            return 1
+        doc = patch_world_doc(doc, elements, shell)
+        world_json.write_text(json.dumps(doc, indent=2))
+        print(json.dumps({"patched": sorted(e.get("slug") for e in elements),
+                          "counts": doc.get("counts"),
+                          "seconds": round(time.time() - t0, 1)}, indent=2))
+        return 0 if (built or (shell and shell.get("built"))) else 1
+
     doc = {
         "v": 1,
         "job_id": job_dir.name,
