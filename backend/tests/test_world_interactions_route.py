@@ -443,3 +443,69 @@ def test_regrade_persists_sticky_decision_and_reruns_collision(
     assert http.post(f"/api/splat/jobs/{JOB}/world/regrade",
                      json={"slug": "bench", "role": "melted", "why": "nah"},
                      ).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Affordance proposals (P2 — R3)
+# ---------------------------------------------------------------------------
+
+def _manifest_with(world: Path, elements: list[dict], mpu=1.0) -> None:
+    (world / "world_manifest.json").write_text(json.dumps({
+        "v": 1, "job_id": JOB, "meters_per_unit": mpu,
+        "elements": elements,
+        "shell": {"slug": "shell", "role": "static"},
+    }))
+
+
+def test_affordance_rules_are_deterministic_and_explained(client):
+    http, outputs = client
+    world = _mk_world(outputs, "bottle")
+    _manifest_with(world, [
+        {"slug": "bottle", "label": "water bottle", "role": "prop",
+         "extent": [0.26, 0.11, 0.23]},
+        {"slug": "desk-lamp", "label": "desk lamp", "role": "prop",
+         "extent": [0.3, 0.5, 0.3]},
+        {"slug": "sofa", "label": "sofa", "role": "prop",
+         "extent": [2.1, 0.9, 1.0]},
+        {"slug": "wall-unit", "label": "wall unit", "role": "static",
+         "extent": [3.0, 2.4, 0.5]},
+    ])
+    r = http.post(f"/api/splat/jobs/{JOB}/world/affordances/propose", json={})
+    assert r.status_code == 200, r.text
+    got = {p["record"]["slug"]: p for p in r.json()["proposals"]}
+    assert got["bottle"]["record"]["verb"] == "pickup"
+    assert "small enough to carry" in got["bottle"]["rationale"]
+    assert got["desk-lamp"]["record"]["verb"] == "toggle"
+    assert got["sofa"]["record"]["verb"] == "inspect"
+    assert "too large" in got["sofa"]["rationale"]
+    assert got["wall-unit"]["record"]["verb"] == "inspect"
+    assert "static" in got["wall-unit"]["rationale"]
+    assert r.json()["applied"] is False  # propose is the default, not apply
+
+
+def test_affordance_apply_merges_without_clobbering_authored(client):
+    http, outputs = client
+    world = _mk_world(outputs, "lamp", "bottle")
+    _manifest_with(world, [
+        {"slug": "lamp", "label": "lamp", "role": "prop", "extent": [0.3, 0.5, 0.3]},
+        {"slug": "bottle", "label": "bottle", "role": "prop",
+         "extent": [0.26, 0.11, 0.23]},
+    ])
+    # Hand-author the lamp with a custom prompt first.
+    custom = _lamp()
+    custom["prompt"] = "grandma's lamp"
+    assert _author(http, custom).status_code == 200
+
+    r = http.post(f"/api/splat/jobs/{JOB}/world/affordances/propose",
+                  json={"apply": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["applied"] is True
+    assert {s["slug"] for s in r.json()["skipped"]} == {"lamp", "shell"} - {"shell"} \
+        or any(s["slug"] == "lamp" for s in r.json()["skipped"])
+
+    payload = http.get(f"/api/splat/jobs/{JOB}/world/interactions").json()
+    records = {e["slug"]: e for e in payload["interactions"]["elements"]}
+    assert records["lamp"]["prompt"] == "grandma's lamp"  # authored survives
+    assert records["bottle"]["verb"] == "pickup"          # proposal landed
+    # E on the bottle would advance placed -> held through the normal gate.
+    assert records["bottle"]["states"] == ["placed", "held"]

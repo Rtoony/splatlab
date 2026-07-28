@@ -150,6 +150,51 @@ async def set_world_element_state(job_id: str, body: StateBody) -> dict[str, Any
     return _payload(job_id, world_dir, world_manifest)
 
 
+class AffordanceProposeBody(BaseModel):
+    apply: bool = False
+
+
+@router.post("/jobs/{job_id}/world/affordances/propose")
+async def propose_world_affordances(
+    job_id: str, body: AffordanceProposeBody
+) -> dict[str, Any]:
+    """R3: propose an interaction for every named element, rule-driven and
+    explained; `apply: true` merges the proposals through the SAME gate the
+    PUT route enforces. Authored records are never clobbered — proposals
+    cover only slugs without one, so re-running after hand-edits is safe."""
+    import world_affordances
+
+    _job_dir, world_dir, world_manifest = _require_world(job_id)
+    if not world_manifest:
+        raise HTTPException(status_code=409,
+                            detail="No collision-graded world manifest — run "
+                                   "the world build (with collision) first")
+    interactions = wi.read_interactions(world_dir)
+    existing = [r for r in ((interactions or {}).get("elements") or [])]
+    proposed = world_affordances.propose_affordances(
+        world_manifest, {r["slug"] for r in existing})
+
+    applied = False
+    if body.apply and proposed["proposals"]:
+        document = wi.new_interactions(job_id)
+        document["elements"] = existing + [
+            p["record"] for p in proposed["proposals"]]
+        known = wi.world_slugs(world_manifest)
+        try:
+            wi.write_interactions(world_dir, document, known)
+        except wi.InteractionsError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        applied = True
+
+    return {
+        "job_id": job_id,
+        "proposals": proposed["proposals"],
+        "skipped": proposed["skipped"],
+        "applied": applied,
+        "payload": _payload(job_id, world_dir, world_manifest) if applied else None,
+    }
+
+
 class PlayerPhysicsBody(BaseModel):
     poses: dict[str, Any] = {}
 
