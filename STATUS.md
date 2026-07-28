@@ -2799,3 +2799,13 @@ before any user-facing use of EDITED splats. Export also adds harmless extras
 programmatically edit the SPLAT itself (crop, attribute-select, paint, animate — the op
 surface is scriptable) in a license-clean add-on. Graduating it into the audited
 workflow is a deliberate future step, not part of this wave.
+
+## 2026-07-28 — R3 WAVE CLOSED (automode run, ~2.5 h active)
+
+13 commits on `r3-polish-return-leg`, PUSHED — merge to main awaits RToony. Suites:
+backend 1102 / frontend 85 / real-Blender 3/3 / mesh-env 6/6, all green. Adversarial
+review swarm (3 lenses → skeptic-per-finding): 7 confirmed, 0 refuted, all fixed
+(28b1489) — headline: --patch-elements shell-clobber (HIGH), inert colour guard,
+glb_check self-containment (security). Return digest:
+`~/reports/2026-07-28-splatlab-r3-automode-digest.md`. Memory:
+`splatlab-r3-polish-return-leg-2026-07-28`.
