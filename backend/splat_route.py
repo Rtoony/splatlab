@@ -6103,6 +6103,97 @@ WORLD_COLLISION_SCRIPT = MESH_DIR / "world_collision.py"
 WORLD_GATE_SCRIPT = MESH_DIR / "world_gate.py"
 
 
+class WorldRegradeBody(BaseModel):
+    slug: str = Field(..., min_length=1, max_length=64)
+    role: Literal["prop", "static"]
+    why: str = Field(..., min_length=3, max_length=200)
+
+
+@router.post("/jobs/{job_id}/world/regrade")
+async def regrade_world_element(request: Request, job_id: str, body: WorldRegradeBody):
+    """R5: static<->prop reclassification as an audited, STICKY decision.
+
+    The 16%/1.5 m heuristic will misgrade (a parked car is a prop, a boulder
+    is static), and in a walkable world a wrong call is immediately physical
+    — you walk through the chair, or cannot pick up the cup. The regrade is
+    recorded in _world/regrades.json (world_collision.py replays it on every
+    rebuild, so a later solidify never silently reverts the operator's call),
+    then collision is regenerated so hulls appear/disappear to match the new
+    role. Who/why lands in the manifest's classification reasons and the
+    operator audit feed."""
+    require_heavy_work_admitted()
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    output_dir = Path(meta["output_dir"])
+    world_dir = output_dir / WORLD_DIRNAME
+    world_json = world_dir / "world.json"
+    if not world_json.is_file():
+        raise HTTPException(status_code=409,
+                            detail="No world is built — solidify first")
+    try:
+        world = json.loads(world_json.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500,
+                            detail=f"world.json unreadable: {exc}") from exc
+    element = next((e for e in world.get("elements") or []
+                    if e.get("slug") == body.slug), None)
+    if element is None or not element.get("built"):
+        raise HTTPException(status_code=404,
+                            detail=f"no built element {body.slug!r} in this world")
+
+    lock = _mesh_export_lock(job_id)
+    if lock.locked():
+        raise HTTPException(status_code=409,
+                            detail="A mesh build or export is running for this "
+                                   "scene — retry when it finishes")
+    async with lock:
+        regrades_path = world_dir / "regrades.json"
+        try:
+            document = json.loads(regrades_path.read_text()) \
+                if regrades_path.is_file() else {}
+        except (OSError, json.JSONDecodeError):
+            document = {}
+        regrades = document.get("regrades")
+        if not isinstance(regrades, dict):
+            regrades = {}
+        regrades[body.slug] = {"role": body.role, "why": body.why.strip(),
+                               "at": _utc_now()}
+        regrades_path.write_text(json.dumps(
+            {"v": 1, "regrades": regrades}, indent=2))
+
+        rc, _out, stderr = await _run_capture_subprocess(
+            [str(MESH_ENV_PYTHON), str(WORLD_COLLISION_SCRIPT), str(output_dir)])
+        if rc != 0:
+            raise HTTPException(
+                status_code=502,
+                detail="collision regrade run failed: " + "\n".join(
+                    stderr.decode("utf-8", errors="replace").splitlines()[-4:]))
+        manifest_path = world_dir / "world_manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=500,
+                                detail=f"manifest unreadable after regrade: {exc}") from exc
+        record = next((e for e in manifest.get("elements") or []
+                       if e.get("slug") == body.slug), None)
+
+    await audit_operator_event(
+        request=request,
+        title="World element regraded",
+        description=f"{job_id}/{body.slug}: -> {body.role} ({body.why.strip()})",
+        variant="success",
+        action="splat.world_regrade",
+        target=meta.get("mode", "3d"),
+        metadata={"job_id": job_id, "slug": body.slug, "role": body.role},
+    )
+    return {"ok": True, "element": record,
+            "counts": manifest.get("counts"),
+            "regrades": regrades}
+
+
 class WorldSolidifyBody(BaseModel):
     """Knobs mirroring scene_solidify.py's CLI, plus the two follow-on stages."""
     prop_faces: int = Field(default=8_000, ge=200, le=200_000)

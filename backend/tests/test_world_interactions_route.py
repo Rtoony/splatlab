@@ -378,3 +378,68 @@ def test_restamp_world_scale_respects_baked_geometry(tmp_path):
     assert restamped == ["world.json"]
     assert json.loads((world / "world.json").read_text())["meters_per_unit"] == 0.5
     assert json.loads((world / "world_manifest.json").read_text())["meters_per_unit"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Regrade route (P2 — R5)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def regrade_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    outputs = tmp_path / "outputs"
+    monkeypatch.setattr(splat_route, "DEFAULT_3D_ROOT", outputs)
+    app = FastAPI()
+    app.include_router(splat_route.router, prefix="/api/splat")
+    return TestClient(app), outputs
+
+
+def _mk_regrade_world(outputs: Path) -> Path:
+    job = outputs / JOB
+    world = job / "_world"
+    world.mkdir(parents=True)
+    (job / "meta.json").write_text(json.dumps(
+        {"job_id": JOB, "output_dir": str(job), "status": "completed"}))
+    (world / "world.json").write_text(json.dumps({
+        "v": 1, "job_id": JOB,
+        "elements": [{"slug": "bench", "built": True, "extent": [2, 1, 1]}],
+    }))
+    return world
+
+
+def test_regrade_persists_sticky_decision_and_reruns_collision(
+    regrade_client, monkeypatch: pytest.MonkeyPatch
+):
+    http, outputs = regrade_client
+    world = _mk_regrade_world(outputs)
+    calls: list[list[str]] = []
+
+    async def fake_run(command):
+        calls.append([str(c) for c in command])
+        # The real run rewrites the manifest; emulate the observable output.
+        (world / "world_manifest.json").write_text(json.dumps({
+            "elements": [{"slug": "bench", "role": "prop",
+                          "classification": ["forced prop by operator: it moves"]}],
+            "counts": {"props": 1, "static": 0},
+        }))
+        return 0, b"", b""
+
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", fake_run)
+    monkeypatch.setattr(splat_route, "require_heavy_work_admitted", lambda: None)
+
+    r = http.post(f"/api/splat/jobs/{JOB}/world/regrade",
+                  json={"slug": "bench", "role": "prop", "why": "it moves"})
+    assert r.status_code == 200, r.text
+    assert r.json()["element"]["role"] == "prop"
+    assert calls and "world_collision.py" in calls[0][1]
+
+    saved = json.loads((world / "regrades.json").read_text())
+    assert saved["regrades"]["bench"]["role"] == "prop"
+    assert saved["regrades"]["bench"]["why"] == "it moves"
+
+    # Unknown element and unbuilt worlds are refused.
+    assert http.post(f"/api/splat/jobs/{JOB}/world/regrade",
+                     json={"slug": "ghost", "role": "static", "why": "nope"},
+                     ).status_code == 404
+    assert http.post(f"/api/splat/jobs/{JOB}/world/regrade",
+                     json={"slug": "bench", "role": "melted", "why": "nah"},
+                     ).status_code == 422

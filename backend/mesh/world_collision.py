@@ -217,6 +217,23 @@ def main() -> int:
     force_prop = {s.strip() for s in args.force_prop.split(",") if s.strip()}
     force_static = {s.strip() for s in args.force_static.split(",") if s.strip()}
 
+    # Operator regrades are STICKY: the audited route records them in
+    # _world/regrades.json precisely so a later rebuild does not silently
+    # revert a human's static<->prop call back to the heuristic's.
+    regrades: dict = {}
+    regrades_path = job_dir / "_world" / "regrades.json"
+    if regrades_path.is_file():
+        try:
+            raw = json.loads(regrades_path.read_text()).get("regrades") or {}
+            regrades = {k: v for k, v in raw.items() if isinstance(v, dict)}
+        except (OSError, json.JSONDecodeError):
+            _log("  WARNING: regrades.json unreadable — ignoring it")
+    for slug, r in regrades.items():
+        if r.get("role") == "prop":
+            force_prop.add(slug)
+        elif r.get("role") == "static":
+            force_static.add(slug)
+
     hull_dir = job_dir / "_world" / "collision"
     out = []
     for el in world.get("elements", []):
@@ -227,9 +244,13 @@ def main() -> int:
         role, reasons = classify(el["extent"], scene_extent, mpu,
                                  args.prop_max_frac, args.prop_max_metres)
         if slug in force_prop:
-            role, reasons = "prop", reasons + ["forced prop by operator"]
+            why = (regrades.get(slug) or {}).get("why")
+            role = "prop"
+            reasons = reasons + [f"forced prop by operator{': ' + why if why else ''}"]
         elif slug in force_static:
-            role, reasons = "static", reasons + ["forced static by operator"]
+            why = (regrades.get(slug) or {}).get("why")
+            role = "static"
+            reasons = reasons + [f"forced static by operator{': ' + why if why else ''}"]
 
         rec = {"slug": slug, "label": el.get("label"), "role": role,
                "extent": el["extent"], "faces": el.get("faces"),
