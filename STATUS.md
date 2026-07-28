@@ -2771,3 +2771,31 @@ prop_integrity 5/5 HOLDS, every texture survived the Blender round-trip.
 `_world/versions/` now archives rollback copies for red-bicycle,
 plastic-storage-container, cardboard-box-2. Verdict fails only the pre-existing r2
 walkability items (open item, recorded above).
+
+## 2026-07-28 — Phase 4 spike: KIRI 3DGS Render — SPLATS are now Blender-editable headless
+
+The research swarm's #1 (Apache-2.0, zero blockers) proven in a ~35-minute spike, far
+inside the 90-min box. Blender **5.1.2** + extension `dgs_render_by_kiri_engine` v5.0.0 —
+fully isolated from the 4.5.11 studio-loop toolchain (untouched).
+
+**Receipts:** bonsai `_preview/splat.ply` → headless import **605,391 splats in 6.6 s**
+(full 3DGS attribute set + 4 KIRI GN modifiers) → uniform-scale edit via the splat-aware
+apply-transforms op → PLY export → **605,391 splats out, bbox ratio exactly [2,2,2],
+canonical layout intact (SH3, all 45 f_rest coeffs)**. Re-proven end-to-end through the
+checked-in driver at 0.5x.
+
+**Two headless gotchas, now encoded in `integrations/blender/kiri_headless_driver.py`:**
+(1) the add-on is Serpens-generated — operators live under `bpy.ops.sna.*` with hash
+suffixes; (2) export DEFERS through bpy.app.timers and --background quits before timers
+tick → `{'FINISHED'}` with **no file** (silent). Fix: monkeypatch timers.register, drain
+the chain synchronously (2 ticks).
+
+**⚠️ Open validation item (ledger-gated):** exported `scale_*` shifts 1.621 under 2x
+(ln 2 = 0.693) — KIRI may reparametrize gaussian scale on export. Render-compare in Spark
+before any user-facing use of EDITED splats. Export also adds harmless extras
+(red/green/blue/Col_*/normals/Shadeless) beside the canonical fields.
+
+**What this buys the pipeline:** the Blender loop handled MESHES only; SplatLab can now
+programmatically edit the SPLAT itself (crop, attribute-select, paint, animate — the op
+surface is scriptable) in a license-clean add-on. Graduating it into the audited
+workflow is a deliberate future step, not part of this wave.
