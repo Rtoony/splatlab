@@ -2701,3 +2701,34 @@ State at close: branch `r2-world-interactions`, 20 commits, UNPUSHED, clean
 tree; `main` level with origin; 1089 backend + 85 frontend tests passing; all
 three services active; `splat_3aaf8067` shell restored to its gate-passing
 config with a demo `interactions.json` still authored on it.
+
+## 2026-07-28 — R3: THE POLISH RETURN-LEG FIRED (first real content through the loop)
+
+Wave branch `r3-polish-return-leg` (off main after the r2 ff-merge+push, RToony-approved).
+
+**G2 (01af54e, 9e40a77):** the restricted workflow gained the ops a real polish needs —
+`import_world_element` (host-resolved, containment-checked; Blender never sees a free-form
+path), `cleanup_mesh` (weld / decimate / debris-island drop with the largest island always
+kept / smooth; receipts carry faces+verts before/after), and selective `export_glb
+object_name=` with a suffixed stem so whole-scene exports are never clobbered. MCP :9877
+now 11 tools (restarted, verified via tools/list). Real-Blender lane grew a polish-primitives
+e2e test (glTF triangulates: factory cube imports as 12 faces — the fake runner can't see that).
+
+**G1 — first-ever polish upload, bonsai `red-bicycle` (splat_aea04ab3):** snapshot v3 →
+import v4 → cleanup v5 (8000→7884 faces: exactly the 116-face crumb; weld 6296→4008 verts;
+the 502-face island deliberately KEPT — could be real detached geometry) → selective export
+`scene-v0005-polish-red-bicycle.glb` (1 mesh, 1 material, **1 image — texture survived the
+round-trip**) → POST /world/elements/red-bicycle/polish → 200. Receipts, all verified:
+supersedes sha a3e03024 == prior file; `_world/versions/red-bicycle-v0001.glb` created
+(first fire — the dir never existed); marker `red-bicycle.polish.json` v1 schema; manifest
+`polished` non-null; served sha == uploaded sha d18fca12; audit row
+`splat.polish_world_element` 13:45:03Z. Gate: frac 0.9227→**0.9363**, uv/tex TRUE, still PASS.
+Rollback: `cp _world/versions/red-bicycle-v0001.glb _world/elements/red-bicycle.glb` + rm marker.
+
+**⚠️ Finding (pre-existing, surfaced — NOT caused by the polish):** re-running world_gate
+under the post-r2 code (610e93d grades what you STAND on) fails bonsai on
+`shell_connectivity` (27 collision components vs ≤20) and `floor_continuity` (coverage
+0.8975 vs ≥0.9). Proof of innocence: the PRE-r2 gate on the SAME post-polish tree fails only
+prop_integrity, identical to the stored 07-26 report. The r2 wave only ever re-graded the
+bicycle job (splat_3aaf8067). Bonsai's collision shell needs a walkability pass some day —
+recorded as an open item, deliberately not chased this wave (not scoped; not appearance work).
