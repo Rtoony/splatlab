@@ -291,6 +291,55 @@ def run_object_texture(py: Path, script: Path, mesh: Path, splat: Path, out_glb:
     return {"ok": True, "seconds": round(time.time() - t, 1), "report": report}
 
 
+AUTO_GEN_MIN_FRAC = 0.8          # prop_integrity's own floor — the gate IS the trigger
+AUTO_GEN_MIN_GAUSSIANS = 1000    # below this the capture simply lacks evidence
+                                 # (bicycle-2: 240 dabs "describing" a bicycle;
+                                 # the hydrant lesson at 17.96% source LCC)
+
+
+def auto_generate_trigger(built_ok: bool, frac, gaussians,
+                          min_gaussians: int = AUTO_GEN_MIN_GAUSSIANS):
+    """Should this captured prop be regenerated? (decision, reason).
+
+    Deliberately conservative and receipt-based: a build that failed, a
+    connectivity fraction the prop gate would fail anyway, or too few source
+    gaussians to describe the object. A mesh that PASSES these but still
+    looks wrong (the big shard-bicycle: frac 0.93 from 25k gaussians) is a
+    known gap — catching it needs a render-agreement metric, not a guess.
+    """
+    if not built_ok:
+        return True, "captured build failed"
+    if frac is not None and frac < AUTO_GEN_MIN_FRAC:
+        return True, (f"largest_component_frac {frac:.3f} < {AUTO_GEN_MIN_FRAC} "
+                      "(the prop gate would fail it)")
+    if gaussians is not None and gaussians < min_gaussians:
+        return True, (f"only {gaussians} source gaussians (< {min_gaussians}): "
+                      "not enough capture evidence for this object")
+    return False, ""
+
+
+def mesh_component_frac(glb_path: Path):
+    """Welded largest-component fraction of a GLB, world_gate's own measure."""
+    try:
+        mesh = trimesh.load(str(glb_path), force="mesh", process=False)
+        if not len(mesh.faces):
+            return None
+        welded = mesh.copy()
+        # merge_tex/merge_norm: without them the weld respects UV seams and a
+        # textured mesh shatters into per-chart "components" (measured live:
+        # 0.06 for a mesh the gate scores 0.93 — the exact trap world_gate's
+        # own weld documents). Positions decide connectivity, not charts.
+        welded.merge_vertices(merge_tex=True, merge_norm=True)
+        import trimesh.graph as tg
+        comps = tg.connected_components(welded.face_adjacency,
+                                        nodes=np.arange(len(welded.faces)))
+        if not comps:
+            return None
+        return float(max(len(c) for c in comps) / len(welded.faces))
+    except Exception:  # noqa: BLE001 — a measurement failure must not kill the build
+        return None
+
+
 def world_scale_fields(mpu) -> dict:
     """The scale record for a world document, describing the GEOMETRY.
 
@@ -342,6 +391,37 @@ def patch_world_doc(doc: dict, new_elements: list[dict], shell: dict | None) -> 
     counts["props_failed"] = len(elements) - len(built)
     counts["shell_built"] = bool((doc.get("shell") or {}).get("built"))
     return doc
+
+
+def _generate_refusal(job_dir: Path, slug: str, proc) -> str:
+    """A gate refusal is a decision, not a crash — record it in the gate's
+    own words (e.g. 'mask/captured-object IoU 0.057 < 0.35') rather than a
+    stderr tail of truncated JSON."""
+    report_path = job_dir / "_regen" / "objects" / slug / "generate_report.json"
+    try:
+        report = json.loads(report_path.read_text())
+        problems = (report.get("mask_alignment_gate") or {}).get("problems") or []
+        if problems:
+            return "refused by the generation gates: " + "; ".join(problems)[:220]
+    except (OSError, json.JSONDecodeError):
+        pass
+    tail = "\n".join((proc.stderr or "").splitlines()[-3:])
+    return f"generation failed (exit {proc.returncode}): {tail[:200]}"
+
+
+def _write_generated_sidecar(out: Path, gen: dict, res: dict) -> None:
+    """Fresh sidecar beside a generated GLB: the gate's texture_coverage reads
+    GLB+sidecar as a pair, and a stale sidecar from an earlier gaussian build
+    describes an artifact that no longer exists (the recorded 07-26 drift)."""
+    out.with_suffix(".json").write_text(json.dumps({
+        "provenance": "generative render-only",
+        "generated": gen["report"],
+        "faces": res.get("faces"),
+        "extent": res.get("extent"),
+        "islands": res.get("islands"),
+        "texture": res.get("texture_report")
+        if res.get("texture") else {"baked": False},
+    }, indent=2))
 
 
 def _shell_colour_source(job_dir: Path) -> Path:
@@ -531,6 +611,14 @@ def main() -> int:
     ap.add_argument("--prefer-generated", action="store_true",
                     help="use a placed generative reconstruction in place of the captured "
                          "geometry when one exists (render lane only; survey still refuses it)")
+    ap.add_argument("--auto-generate", action="store_true",
+                    help="when a captured prop trips a measured quality floor "
+                         "(build failed / gate-failing connectivity / too few "
+                         "source gaussians), run object_generate for it and use "
+                         "the result IF its placement+mask gates pass; the "
+                         "substitution and trigger are recorded in world.json")
+    ap.add_argument("--auto-gen-min-gaussians", type=int,
+                    default=AUTO_GEN_MIN_GAUSSIANS)
     ap.add_argument("--min-gaussians", type=int, default=200,
                     help="floor for reconstructing a prop from its gaussians")
     ap.add_argument("--python", default=str(DEFAULT_PY))
@@ -681,19 +769,7 @@ def main() -> int:
                 entry["texture"] = bool(res.get("texture"))
                 if res.get("texture_error"):
                     entry["texture_error"] = res["texture_error"]
-                # Fresh sidecar beside the GLB: the gate's texture_coverage
-                # reads GLB+sidecar as a pair, and a stale sidecar from an
-                # earlier gaussian build describes an artifact that no longer
-                # exists (the recorded 07-26 drift).
-                out.with_suffix(".json").write_text(json.dumps({
-                    "provenance": "generative render-only",
-                    "generated": gen["report"],
-                    "faces": res.get("faces"),
-                    "extent": res.get("extent"),
-                    "islands": res.get("islands"),
-                    "texture": res.get("texture_report")
-                    if res.get("texture") else {"baked": False},
-                }, indent=2))
+                _write_generated_sidecar(out, gen, res)
                 _log(f"  prop {slug}: GENERATED (placement iou {gen['iou']:.3f}, "
                      f"texture={'baked' if res.get('texture') else 'MISSING'})")
                 elements.append(entry)
@@ -718,6 +794,61 @@ def main() -> int:
             entry["faces"] = r.get("faces")
             entry["extent"] = r.get("extent")
             entry["texture"] = (r.get("texture") or {}).get("baked")
+
+        # AUTO-GENERATE UNDER GATES: when the captured result trips a measured
+        # quality floor, try a generative replacement — used only if
+        # object_generate's own mask/placement gates pass, always recorded.
+        if args.auto_generate:
+            report = res.get("report") or {}
+            frac = mesh_component_frac(out) if res["ok"] else None
+            gaussians = report.get("solid_gaussians")
+            triggered, why = auto_generate_trigger(
+                res["ok"], frac, gaussians, args.auto_gen_min_gaussians)
+            if triggered:
+                entry["auto_generate"] = {"reason": why, "frac": frac,
+                                          "gaussians": gaussians}
+                _log(f"  prop {slug}: AUTO-GENERATE ({why})")
+                gen_cmd = [str(py),
+                           str(Path(__file__).with_name("object_generate.py")),
+                           str(job_dir), "--object", slug]
+                try:
+                    proc = subprocess.run(gen_cmd, capture_output=True,
+                                          text=True, timeout=1800)
+                    if proc.returncode != 0:
+                        entry["auto_generate"]["outcome"] = \
+                            _generate_refusal(job_dir, slug, proc)
+                except subprocess.TimeoutExpired:
+                    entry["auto_generate"]["outcome"] = "generation timed out"
+                gen = (_generated_candidate(job_dir, slug)
+                       if "outcome" not in entry["auto_generate"] else None)
+                if gen is None:
+                    entry["auto_generate"].setdefault(
+                        "outcome", "no placed candidate — the mask/placement "
+                                   "gates refused; keeping the captured mesh")
+                    _log(f"  prop {slug}: {entry['auto_generate']['outcome']}")
+                else:
+                    res2 = place_generated(gen, out, mpu=mpu,
+                                           faces=args.prop_faces,
+                                           tex=args.texture_size)
+                    if res2["ok"]:
+                        entry.pop("reason", None)
+                        entry.update(
+                            geometry_source="generated", generated=gen["report"],
+                            built=True, seconds=res2.get("seconds"), glb=out.name,
+                            faces=res2.get("faces"), extent=res2.get("extent"),
+                            provenance="generative render-only (auto)",
+                            texture=bool(res2.get("texture")))
+                        if res2.get("texture_error"):
+                            entry["texture_error"] = res2["texture_error"]
+                        entry["auto_generate"]["outcome"] = \
+                            "generated asset replaced the captured mesh"
+                        _write_generated_sidecar(out, gen, res2)
+                        _log(f"  prop {slug}: AUTO-GENERATED replacement placed "
+                             f"(iou {gen['iou']:.3f})")
+                    else:
+                        entry["auto_generate"]["outcome"] = \
+                            f"placement failed: {res2.get('error')}"
+                        _log(f"  prop {slug}: {entry['auto_generate']['outcome']}")
         elements.append(entry)
 
     shell = None

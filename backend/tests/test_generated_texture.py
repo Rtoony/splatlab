@@ -197,3 +197,53 @@ def test_world_scale_fields_describe_the_baked_geometry() -> None:
         "units": "scene-units (uncalibrated)",
         "meters_per_unit": None,
     }
+
+
+def test_auto_generate_trigger_is_receipt_based() -> None:
+    trigger = scene_solidify.auto_generate_trigger
+    # A failed build always triggers.
+    assert trigger(False, None, None) == (True, "captured build failed")
+    # Gate-failing connectivity triggers with the gate's own floor.
+    fired, why = trigger(True, 0.71, 25000)
+    assert fired and "0.710" in why
+    # Too little source evidence triggers (the 240-gaussian bicycle-2 class).
+    fired, why = trigger(True, 0.99, 240)
+    assert fired and "240 source gaussians" in why
+    # A healthy prop does not trigger — including the known gap: the shard
+    # bicycle (frac 0.93, 25k gaussians) passes every measured floor. That
+    # gap is deliberate and recorded; catching it needs a render-agreement
+    # metric, not a guessed threshold.
+    assert trigger(True, 0.93, 25528) == (False, "")
+    # Missing measurements never fire on their own.
+    assert trigger(True, None, None) == (False, "")
+
+
+@pytest.mark.skipif(
+    os.environ.get("SPLATLAB_RUN_MESH_ENV_TESTS") != "1",
+    reason="set SPLATLAB_RUN_MESH_ENV_TESTS=1 for the real mesh-env frac test",
+)
+def test_mesh_component_frac_ignores_uv_seams(tmp_path: Path) -> None:
+    """A textured, UV-unwrapped mesh must not shatter into per-chart
+    components (measured live: 0.06 vs the gate's 0.93 before the fix)."""
+    if not MESH_ENV_PYTHON.is_file():
+        pytest.skip("dn-splatter-probe env is unavailable")
+    script = f"""
+import sys
+sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "mesh")!r})
+import numpy as np
+import trimesh
+import scene_solidify
+
+box = trimesh.creation.box(extents=(1, 1, 1))
+# Give every face its own UV island — the worst-case chart layout.
+uv = np.random.default_rng(1).random((len(box.vertices), 2))
+box.visual = trimesh.visual.TextureVisuals(uv=uv)
+path = {str(tmp_path / "seamy.glb")!r}
+box.export(path)
+frac = scene_solidify.mesh_component_frac(__import__("pathlib").Path(path))
+assert frac is not None and frac > 0.99, f"UV seams shattered the weld: {{frac}}"
+print("ok", frac)
+"""
+    proc = subprocess.run([str(MESH_ENV_PYTHON), "-c", script],
+                          capture_output=True, text=True, timeout=300)
+    assert proc.returncode == 0, proc.stderr[-1500:]

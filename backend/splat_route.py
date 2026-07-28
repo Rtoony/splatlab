@@ -6208,6 +6208,10 @@ class WorldSolidifyBody(BaseModel):
     skip_shell: bool = False
     shell_only: bool = False
     prefer_generated: bool = False
+    # Auto-heal by default on the product path: a captured prop that trips a
+    # measured quality floor is regenerated under object_generate's own gates,
+    # with the trigger and outcome recorded in world.json either way.
+    auto_generate: bool = True
     run_collision: bool = True
     run_gate: bool = True
 
@@ -6290,6 +6294,8 @@ async def world_solidify(job_id: str, body: WorldSolidifyBody):
                 solidify_cmd.append("--shell-only")
             if body.prefer_generated:
                 solidify_cmd.append("--prefer-generated")
+            if body.auto_generate:
+                solidify_cmd.append("--auto-generate")
 
             rc, _out, stderr = await _run_capture_subprocess(solidify_cmd)
             if rc != 0 or not (world_dir / "world.json").is_file():
