@@ -181,3 +181,19 @@ print(json.dumps(report))
     assert report["texture"]["baked"] is True
     assert report["texture"]["coverage"] > 0.1
     assert (tmp_path / "prop_atlas.png").is_file()
+
+
+def test_world_scale_fields_describe_the_baked_geometry() -> None:
+    # Calibrated bake: exports are METRES, so the world's own mpu is 1.0 and
+    # the capture factor is provenance (the old behaviour recorded the capture
+    # factor as mpu, double-applying calibration in every consumer).
+    calibrated = scene_solidify.world_scale_fields(0.9497)
+    assert calibrated == {
+        "units": "meters",
+        "meters_per_unit": 1.0,
+        "calibrated_from_meters_per_unit": 0.9497,
+    }
+    assert scene_solidify.world_scale_fields(None) == {
+        "units": "scene-units (uncalibrated)",
+        "meters_per_unit": None,
+    }

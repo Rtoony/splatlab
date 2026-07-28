@@ -363,3 +363,18 @@ def test_stale_and_invalid_player_poses_are_dropped_on_read(client):
     assert payload["resolved"]["player"]["physics"]["poses"] == {}
     reasons = [d for d in payload["resolved"]["dropped"] if d["slug"] == "crate"]
     assert reasons and "invalid" in reasons[0]["reason"]
+
+
+def test_restamp_world_scale_respects_baked_geometry(tmp_path):
+    """/scale back-stamps scene-unit worlds; metre-baked worlds are immutable
+    (their GLBs are baked — scale_generation flags the staleness instead)."""
+    world = tmp_path / "_world"
+    world.mkdir()
+    (world / "world.json").write_text(json.dumps(
+        {"units": "scene-units (uncalibrated)", "meters_per_unit": None}))
+    (world / "world_manifest.json").write_text(json.dumps(
+        {"units": "meters", "meters_per_unit": 1.0}))
+    restamped = splat_route._restamp_world_scale(tmp_path, 0.5)
+    assert restamped == ["world.json"]
+    assert json.loads((world / "world.json").read_text())["meters_per_unit"] == 0.5
+    assert json.loads((world / "world_manifest.json").read_text())["meters_per_unit"] == 1.0

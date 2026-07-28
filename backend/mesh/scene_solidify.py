@@ -291,6 +291,25 @@ def run_object_texture(py: Path, script: Path, mesh: Path, splat: Path, out_glb:
     return {"ok": True, "seconds": round(time.time() - t, 1), "report": report}
 
 
+def world_scale_fields(mpu) -> dict:
+    """The scale record for a world document, describing the GEOMETRY.
+
+    When a calibration exists the exports are baked to metres — so the
+    world's own meters_per_unit is 1.0 (one GLB unit IS one metre), and the
+    capture factor is kept as provenance. Recording the capture factor as
+    the world's mpu (the old behaviour) made every consumer that scales by
+    it — the walker, the 1.5 m prop rule, scale_sanity — double-apply the
+    calibration.
+    """
+    if mpu:
+        return {
+            "units": "meters",
+            "meters_per_unit": 1.0,
+            "calibrated_from_meters_per_unit": float(mpu),
+        }
+    return {"units": "scene-units (uncalibrated)", "meters_per_unit": None}
+
+
 def patch_world_doc(doc: dict, new_elements: list[dict], shell: dict | None) -> dict:
     """Replace matching-slug entries in an existing world.json document.
 
@@ -585,6 +604,20 @@ def main() -> int:
             print("FATAL: --patch-elements needs an existing _world/world.json — "
                   "run the full solidify first", file=sys.stderr)
             return 1
+        # Patched elements must bake at the SAME scale the world was built
+        # at — meta may have been recalibrated since, and a mixed-unit world
+        # is worse than a uniformly stale one (rebuild fully to rescale).
+        try:
+            existing_doc = json.loads((world / "world.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            existing_doc = {}
+        if existing_doc.get("units") == "meters":
+            recorded = existing_doc.get("meters_per_unit")
+            mpu = (existing_doc.get("calibrated_from_meters_per_unit")
+                   or (recorded if recorded not in (None, 1.0) else None)
+                   or mpu)
+        elif existing_doc:
+            mpu = None
         # The flag PROMISES the shell record is preserved — so an element
         # patch must never trigger the default shell rebuild (which writes
         # over the live shell.glb and, on failure, would replace a good
@@ -692,6 +725,7 @@ def main() -> int:
         shell = build_shell(job_dir, args, instances, py, script, mpu)
 
     built = [e for e in elements if e.get("built")]
+    scale_fields = world_scale_fields(mpu)
     if args.patch_elements:
         world_json = world / "world.json"
         try:
@@ -713,8 +747,7 @@ def main() -> int:
     doc = {
         "v": 1,
         "job_id": job_dir.name,
-        "units": "meters" if mpu else "scene-units (uncalibrated)",
-        "meters_per_unit": mpu,
+        **scale_fields,
         "up_axis": "Y",
         "counts": {"instances": len(instances), "props_built": len(built),
                    "props_failed": len(elements) - len(built),

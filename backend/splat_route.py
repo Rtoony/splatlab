@@ -7232,14 +7232,40 @@ async def set_splat_scale(job_id: str, payload: dict[str, Any]):
     )
     if not meta:
         raise HTTPException(status_code=404, detail="Splat job not found")
+    restamped = _restamp_world_scale(job_dir, record["meters_per_unit"])
     return {
         "ok": True,
         "job_id": job_id,
         "meters_per_unit": meta.get("meters_per_unit"),
         "scale_calibration": meta.get("scale_calibration"),
         "scale_generation": meta.get("scale_generation"),
+        "world_restamped": restamped,
         "detail": scale_calibration.describe(record),
     }
+
+
+def _restamp_world_scale(job_dir: Path, mpu: float | None) -> list[str]:
+    """Push a new calibration into already-built world documents — but only
+    when their geometry is still in SCENE UNITS, where the factor applies
+    directly. A metre-baked world cannot be retroactively rescaled by
+    stamping (its GLBs are baked); scale_generation flags that staleness and
+    a rebuild is the honest path. Without this, the walker keeps guessing
+    scale from storey height on a capture the operator just calibrated."""
+    restamped: list[str] = []
+    for name in ("world.json", "world_manifest.json"):
+        path = job_dir / WORLD_DIRNAME / name
+        if not path.is_file():
+            continue
+        try:
+            doc = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if doc.get("units") == "meters":
+            continue  # baked geometry: stamping would lie
+        doc["meters_per_unit"] = mpu
+        path.write_text(json.dumps(doc, indent=2))
+        restamped.append(name)
+    return restamped
 
 
 @router.post("/jobs/{job_id}/unpin")
