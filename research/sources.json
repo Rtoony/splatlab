@@ -723,11 +723,11 @@
     "commercial_use": true,
     "verified": true
    },
-   "code_status": "released",
+   "code_status": "available",
    "maturity": "v5.0.0-release",
    "relevance": "high",
-   "decision": "spike",
-   "integration_mode": "opt-in-standalone-blender",
+   "decision": "evaluate",
+   "integration_mode": "isolated-research",
    "priority": "P1",
    "techniques": [
     "native-3dgs-ply-import-into-blender",
@@ -761,11 +761,11 @@
     "commercial_use": true,
     "verified": true
    },
-   "code_status": "released",
+   "code_status": "available",
    "maturity": "v0.6.0-core",
    "relevance": "medium",
    "decision": "watch",
-   "integration_mode": "opt-in-standalone-blender",
+   "integration_mode": "watch-only",
    "priority": "P2",
    "techniques": [
     "geometry-nodes-splat-import",
@@ -797,11 +797,11 @@
     "commercial_use": null,
     "verified": false
    },
-   "code_status": "placeholder-repo",
+   "code_status": "placeholder",
    "maturity": "paper-only",
    "relevance": "high",
-   "decision": "design-doc",
-   "integration_mode": "paper-inspired-independent",
+   "decision": "watch",
+   "integration_mode": "watch-only",
    "priority": "P2",
    "techniques": [
     "training-free-multi-image-conditioning-for-single-image-3d-dits",
@@ -834,11 +834,11 @@
     "commercial_use": false,
     "verified": false
    },
-   "code_status": "released-weights-unverified",
+   "code_status": "available",
    "maturity": "acm-mm-2026",
    "relevance": "low",
-   "decision": "rejected",
-   "integration_mode": "none",
+   "decision": "reject",
+   "integration_mode": "isolated-research",
    "priority": "P3",
    "techniques": [
     "diffusion-normal-branch-with-disparity-init",
@@ -874,8 +874,8 @@
    "code_status": "no-code",
    "maturity": "preprint-1-day-old",
    "relevance": "low",
-   "decision": "rejected",
-   "integration_mode": "none",
+   "decision": "reject",
+   "integration_mode": "watch-only",
    "priority": "P3",
    "techniques": [
     "rd-guided-gaussian-compaction",
