@@ -1,0 +1,6 @@
+[Unit]
+Description=SplatLab log maintenance (audit + op-registry retention prunes)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/rtoony/projects/splatlab/tools/prune-maintenance.py
