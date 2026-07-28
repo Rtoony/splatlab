@@ -2904,3 +2904,36 @@ Two HIGHs, both proven by execution before fixing:
 Also fixed: dual-lock (mesh + edit lanes no longer interleave on splat.ply), staged-file
 try/finally on promote, status=completed admission (a running training's ns-export writes
 splat.ply in place), sha256 hashing off the event loop. Suites: 1108 backend green.
+
+## 2026-07-28 pm — P1: PROPS OBEY PHYSICS (playable-worlds roadmap, phase 1)
+
+Branch `p1-physics`, per the approved macro roadmap
+(`~/projects/nexus-planning/06-splatlab-playable-worlds-roadmap.md` — capture → inhabit →
+play; flagship: playable game first).
+
+**Architecture (aab639f):** the player keeps the proven capsule-vs-BVH controller; Rapier
+(`@dimforge/rapier3d-compat` 0.19.3, WASM, deterministic) owns the PROPS. Each prop is
+re-origined (geometry arrives world-space-baked, identity transforms — exporter contract)
+and gets convex colliders from its CoACD `UCX_*.glb` hulls via the world file route
+(raw-manifest `collision.files`), falling back to a render-mesh hull. Player mirrored as a
+kinematic capsule → walking into a box SHOVES it. Props rest on the collision solid; fixed
+1/60 accumulator; sleeping props cost nothing; dynamic-vs-`collideProps` mutual exclusion.
+Best-effort: WASM/hull failure degrades to display-only with a visible warning.
+
+**Pickup lands (7641a16):** E on an authored `pickup` prop lifts it into a kinematic carry
+(hold-point in front of the camera), E puts down, left-click THROWS. Disturbed prop poses
+persist via the reserved `player` seam: new `POST /world/player` (validated — finite
+floats, ~unit quaternions, bounded count; element-state writes and pose writes never
+clobber each other), page saves every 5 s + on teardown, restores on load. Carrying is
+deliberately ephemeral. Physics tests run the REAL Rapier WASM in node: drop-settle,
+bit-identical determinism, carry/throw, pose round-trip. Suites: frontend 90, backend 1111.
+
+**Live proof (f737475, `tools/prove-physics-live.py`):** real GPU walker on bonsai, teleport
+to the prop cluster, walk in — `plastic-storage-container` shoved with a real tumble
+quaternion and **persisted server-side** at [1.835, -1.648, 1.016]; screenshots show the
+cardboard box knocked over on the floor. First authored pickup record: `cardboard-box-2`.
+
+**⚠️ Noticed (pre-existing, open for P2):** the walker's raw `world_manifest.json` carries
+no `meters_per_unit`, so a CALIBRATED capture still walks on the storey-height GUESS
+(bonsai: guess 1.032 u/m vs calibrated 1.053 — luckily close). The merged /world/manifest
+route has it; the walker deliberately reads the raw file. Fold into P2.
