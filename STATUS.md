@@ -2846,3 +2846,22 @@ per-axis scales differ because KIRI canonicalizes ellipsoid axis order with a co
 rotation — sorted per-splat triples match orig+ln2 exactly for 99.98%. Edited-splat exports
 are mathematically equivalent → ledger gate cleared; graduation into the audited workflow
 is the open decision.
+
+## 2026-07-28 pm — R4-A: floor metric reconciled → BONSAI IS THE FIRST ALL-GREEN WORLD
+
+The two graders disagreed on the same mesh (world_shell 1.0 vs world_gate 0.8968) because
+world_gate demanded every column's LOWEST surface in a ground band — counting standable
+furniture over occluded floor as holes (diagnosed: the failing 10% hugged the room
+perimeter at desk/shelf height, exactly where cameras never saw beneath). New
+`mesh/floor_support.py` is THE measurement, consumed verbatim by BOTH graders: down-rays
+from a head-height probe (0.6×span, unit-free); a hit is standable support, a miss is a
+fall-through. No ceiling blind spot (rays start below it — the case the old design
+existed for, pinned by synthetic tests: intact room 1.0 / hole-under-ceiling caught /
+furniture supported / slab-over-hole = support). Old strict number survives as the
+`ground_band_coverage` diagnostic. world_shell keeps its probe machinery for
+capsule/walkability internals; its ACCEPTED number is now the shared one.
+
+**Bonsai: `VERDICT: PASS — all gates passed`** (floor 0.9779, gap 0.0063; diag band
+0.8968). **Bicycle regression: all measurable gates passed** (floor 1.0, unchanged).
+Suite 1102 green. Per the metric-trust doctrine this is the direction a metric earns
+gating rights: it now agrees with RToony's lived walk.

@@ -58,15 +58,8 @@ FLOOR_MIN_COVERAGE = 0.90
 # A void is only a bug if it is contiguous and big enough to fall into. 3% of the
 # floor plan is larger than any plausible single unobserved furniture shadow.
 FLOOR_MAX_GAP_FRAC = 0.03
-# Grid is sized so the longer horizontal axis gets this many cells. Recorded in
-# the report along with the resulting cell size so the number is reproducible.
-FLOOR_GRID_CELLS = 128
-# Interior footprint is eroded by this many cells to keep the wall ring itself
-# out of the floor test.
-FLOOR_INTERIOR_ERODE = 2
-# Diagnostic only (not gated): a column counts as "ground supported" when its
-# lowest surface sits within this fraction of scene height of the median ground.
-FLOOR_GROUND_BAND_FRAC = 0.15
+# Grid size / erosion / probe height now live in floor_support.py — the ONE
+# measurement both this gate and world_shell consume (reconciled 2026-07-28).
 
 # A prop may legitimately reconstruct in a few pieces (a bicycle's wheels need
 # not weld to its frame), but it must be recognisably one object.
@@ -269,129 +262,53 @@ def gate_shell_connectivity(shell: trimesh.Trimesh) -> dict:
 # --------------------------------------------------------------------------
 
 def gate_floor_continuity(shell: trimesh.Trimesh, up_axis: str, units: str) -> dict:
-    up, hax = _axis_indices(up_axis)
+    """Fall-through test via the SHARED floor-support measurement.
+
+    Until 2026-07-28 this gate demanded every interior column's LOWEST
+    surface to sit in a ground band, which counted standable furniture over
+    occluded floor as missing floor and disagreed with world_shell's own
+    acceptance on the same mesh. Both graders now consume
+    floor_support.measure_floor_support verbatim: down-rays from a
+    head-height probe; a hit is standable support, a miss is a fall-through.
+    The old strict number survives as the ground_band_coverage diagnostic.
+    """
+    import floor_support
+
     welded = _weld(shell)
-    lo, hi = welded.bounds
-    span = hi - lo
-    if span[hax[0]] <= 0 or span[hax[1]] <= 0 or span[up] <= 0:
-        raise GateError("shell has zero extent on an axis; cannot lay out a floor grid")
-
-    cell = max(span[hax[0]], span[hax[1]]) / FLOOR_GRID_CELLS
-    na = max(int(np.ceil(span[hax[0]] / cell)), 2)
-    nb = max(int(np.ceil(span[hax[1]] / cell)), 2)
-    ca = lo[hax[0]] + (np.arange(na) + 0.5) * cell
-    cb = lo[hax[1]] + (np.arange(nb) + 0.5) * cell
-
-    A, B = np.meshgrid(ca, cb, indexing="ij")
-    pa, pb = A.ravel(), B.ravel()
-
-    rs = o3d.t.geometry.RaycastingScene()
-    rs.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(
-        o3d.geometry.TriangleMesh(
-            o3d.utility.Vector3dVector(np.asarray(welded.vertices, dtype=np.float64)),
-            o3d.utility.Vector3iVector(np.asarray(welded.faces, dtype=np.int32)))))
-
-    pad = 0.01 * span[up] + 1e-3
-
-    def _cast(origin_level: float, direction: float) -> np.ndarray:
-        rays = np.zeros((len(pa), 6), dtype=np.float32)
-        rays[:, hax[0]] = pa
-        rays[:, hax[1]] = pb
-        rays[:, up] = origin_level
-        rays[:, 3 + up] = direction
-        return rs.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
-
-    # Up from beneath the model: the first hit is the LOWEST surface in that
-    # column -- the floor, if there is one -- in a single cast. The downward cast
-    # is the independent cross-check: the two must agree on which columns are
-    # empty, since an unsigned raycast cannot care which side it approaches from.
-    t_down = _cast(float(hi[up] + pad), -1.0)
-    t_up = _cast(float(lo[up] - pad), +1.0)
-    hit_down = np.isfinite(t_down)
-    hit_up = np.isfinite(t_up)
-    disagree = int((hit_down != hit_up).sum())
-    hit_grid = (hit_down | hit_up).reshape(na, nb)
-
-    # Interior footprint from the columns that actually contain surface, NOT from
-    # vertex occupancy: a mesh whose vertex spacing is coarser than a grid cell
-    # marks a checkerboard lattice, which erodes to nothing and would abort the
-    # gate on a perfectly sound but coarse shell. Ray coverage is independent of
-    # tessellation density. Holes are then filled back in on purpose -- a missing
-    # patch of floor is an enclosed void, and letting it shrink the footprint
-    # would excuse the very defect this gate exists to find. Erosion drops the
-    # boundary/wall ring. A void that breaches the outline is not enclosed and so
-    # falls outside the footprint: this gate under-reports rather than over.
-    footprint = ndimage.binary_fill_holes(hit_grid)
-    interior = (ndimage.binary_erosion(footprint, iterations=FLOOR_INTERIOR_ERODE)
-                if FLOOR_INTERIOR_ERODE else footprint)
-    n_interior = int(interior.sum())
-    if n_interior < 16:
-        raise GateError(
-            f"interior footprint collapsed to {n_interior} cells; shell is too "
-            "sparse or too thin to test for a floor")
-
-    any_geometry = float(hit_grid[interior].mean())
-
-    # "Is there anything in this column" is NOT the floor test. In a room with a
-    # ceiling, a ray fired down through a hole in the floor still hits the
-    # ceiling and reports a hit -- a false pass on precisely the defect this gate
-    # exists to catch (demonstrated on a synthetic ceilinged room with a disc of
-    # floor removed). What matters is the LOWEST surface in the column: fire up
-    # from beneath the model and the first thing hit is the floor, if there is
-    # one. Over a hole, the first hit is the ceiling, far above the ground plane.
-    lowest_all = np.where(hit_up, (lo[up] - pad) + t_up, np.nan).reshape(na, nb)
-    lowest = lowest_all[interior]
-    ground_level = float(np.nanmedian(lowest)) if np.isfinite(lowest).any() else None
-    if ground_level is None:
-        raise GateError("no interior column contains any surface; shell is empty")
-
-    band = FLOOR_GROUND_BAND_FRAC * float(span[up])
-    supported_grid = (np.nan_to_num(lowest_all, nan=np.inf) <= ground_level + band)
-    supported_grid &= hit_up.reshape(na, nb)
-    coverage = float(supported_grid[interior].mean())
-
-    # Largest contiguous void, 4-connected (diagonal touching does not merge
-    # regions - the conservative choice, it under-reports rather than over).
-    holes = interior & ~supported_grid
-    labels, n_regions = ndimage.label(holes)
-    if n_regions:
-        sizes = np.bincount(labels.ravel())[1:]
-        gap_cells = int(sizes.max())
-    else:
-        gap_cells = 0
-    gap_frac = gap_cells / n_interior
+    try:
+        m = floor_support.measure_floor_support(
+            np.asarray(welded.vertices), np.asarray(welded.faces), up_axis
+        )
+    except ValueError as exc:
+        raise GateError(str(exc)) from exc
 
     return _gate(
         {
             "coverage": _check(
-                round(coverage, 4), FLOOR_MIN_COVERAGE, coverage >= FLOOR_MIN_COVERAGE,
-                ">=", "fraction of interior columns whose lowest surface sits within "
-                      "the ground band, i.e. that have a floor under them"),
+                m["coverage"], FLOOR_MIN_COVERAGE,
+                m["coverage"] >= FLOOR_MIN_COVERAGE,
+                ">=", "fraction of interior columns with standable support "
+                      "below the head-height probe (shared floor_support "
+                      "measurement)"),
             "largest_gap_frac": _check(
-                round(gap_frac, 4), FLOOR_MAX_GAP_FRAC, gap_frac <= FLOOR_MAX_GAP_FRAC,
-                "<=", "largest 4-connected void as a fraction of interior footprint"),
+                m["largest_gap_frac"], FLOOR_MAX_GAP_FRAC,
+                m["largest_gap_frac"] <= FLOOR_MAX_GAP_FRAC,
+                "<=", "largest 4-connected unsupported void as a fraction of "
+                      "interior footprint"),
         },
-        grid={"cells": [na, nb], "cell_size": round(float(cell), 5),
-              "units": units, "footprint_cells": int(footprint.sum()),
-              "interior_cells": n_interior,
-              "interior_frac_of_bbox": round(n_interior / (na * nb), 4)},
-        rays_cast=int(2 * len(pa)),
+        grid={**m["grid"], "units": units},
+        rays_cast=m["rays_cast"],
         up_axis=up_axis,
-        unsupported_cells=int(n_interior - int(supported_grid[interior].sum())),
-        void_regions=int(n_regions),
-        largest_gap_cells=gap_cells,
-        largest_gap_span=round(float(np.sqrt(gap_cells) * cell), 4),
-        ground_level=round(ground_level, 4),
-        ground_band=round(float(band), 4),
-        any_geometry_frac=round(any_geometry, 4),
-        any_geometry_note=("diagnostic only: interior columns containing any surface "
-                           "at all. Always >= coverage, and blind to a floor hole "
-                           "under a ceiling, which is why it is not the gated value."),
-        raycast_consistency={"down_up_disagreements": disagree,
-                             "note": "up- and down-cast must agree on which columns "
-                                     "are empty; a nonzero count means the raycast "
-                                     "itself is unreliable"},
-        method=("shell only - props are not allowed to patch a hole in the floor"),
+        unsupported_cells=m["unsupported_cells"],
+        void_regions=m["void_regions"],
+        largest_gap_cells=m["largest_gap_cells"],
+        largest_gap_span=m["largest_gap_span"],
+        ground_level=m["ground_level"],
+        probe_level=m["probe_level"],
+        ground_band_coverage=m["ground_band_coverage"],
+        ground_band_note=m["ground_band_note"],
+        method=m["method"] + " Shell only - props are not allowed to patch "
+                             "a hole in the floor.",
     )
 
 
@@ -694,7 +611,8 @@ def run(world: Path, strict: bool) -> dict:
             "shell_min_largest_component_frac": SHELL_MIN_LARGEST_COMPONENT_FRAC,
             "floor_min_coverage": FLOOR_MIN_COVERAGE,
             "floor_max_gap_frac": FLOOR_MAX_GAP_FRAC,
-            "floor_grid_cells": FLOOR_GRID_CELLS,
+            "floor_measurement": "floor_support.measure_floor_support "
+                                 "(shared with world_shell)",
             "prop_min_largest_component_frac": PROP_MIN_LARGEST_COMPONENT_FRAC,
             "prop_max_degenerate_frac": PROP_MAX_DEGENERATE_FRAC,
             "texture_min_coverage": TEXTURE_MIN_COVERAGE,
@@ -749,12 +667,13 @@ def _print_summary(rep: dict) -> None:
             w(f"       . grid {gr['cells'][0]}x{gr['cells'][1]} @ {gr['cell_size']} "
               f"{gr['units']}/cell, {gr['interior_cells']} interior cells, "
               f"{g['rays_cast']} rays")
-            w(f"       . {g['unsupported_cells']} columns with no floor under them, "
-              f"in {g['void_regions']} voids")
+            w(f"       . {g['unsupported_cells']} columns with no support under "
+              f"them, in {g['void_regions']} voids")
             w(f"       . largest void {g['largest_gap_cells']} cells "
               f"(~{g['largest_gap_span']} units across)")
-            w(f"       . ground level {g['ground_level']} +/- {g['ground_band']} band; "
-              f"any-geometry {g['any_geometry_frac']} (diagnostic)")
+            w(f"       . ground level {g['ground_level']}, probe at "
+              f"{g['probe_level']}; strict ground-band coverage "
+              f"{g['ground_band_coverage']} (diagnostic)")
         elif name == "prop_integrity":
             for p in g["per_prop"]:
                 if "checks" not in p:

@@ -356,7 +356,27 @@ def evaluate(mesh, probe: Probe, player_radius: float, player_height: float) -> 
     hit = np.isfinite(t_head)
     hit_y = head_y - t_head
     gates["ray_start_y"] = round(head_y, 4)
-    gates["floor_continuity"] = round(float(hit.mean()), 4) if n_rays else 0.0
+    # The ACCEPTED floor number is the shared measurement world_gate also
+    # consumes (floor_support.measure_floor_support), so the two graders can
+    # never disagree on the same mesh again (reconciliation, 2026-07-28).
+    # The probe-grid head-cast stays as a diagnostic and keeps feeding the
+    # capsule/walkability machinery below, which is tied to the source-cloud
+    # probe by design.
+    gates["floor_continuity_probe"] = (
+        round(float(hit.mean()), 4) if n_rays else 0.0
+    )
+    try:
+        import floor_support
+        fs = floor_support.measure_floor_support(verts, faces, "Y")
+        gates["floor_continuity"] = fs["coverage"]
+        gates["floor_support"] = {
+            key: fs[key]
+            for key in ("largest_gap_frac", "largest_gap_span", "ground_level",
+                        "probe_level", "ground_band_coverage")
+        }
+    except ValueError as exc:
+        gates["floor_continuity"] = 0.0
+        gates["floor_support"] = {"error": str(exc)[:200]}
     if hit.any():
         gates["hit_height_pct"] = [
             round(float(v), 3) for v in np.percentile(hit_y[hit], [5, 50, 95])
