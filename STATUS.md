@@ -2732,3 +2732,25 @@ under the post-r2 code (610e93d grades what you STAND on) fails bonsai on
 prop_integrity, identical to the stored 07-26 report. The r2 wave only ever re-graded the
 bicycle job (splat_3aaf8067). Bonsai's collision shell needs a walkability pass some day —
 recorded as an open item, deliberately not chased this wave (not scoped; not appearance work).
+
+## 2026-07-28 — G3: prop_integrity 3/5 → 5/5 (fixed the artifact, not the gate)
+
+Root cause was structural: `place_generated()` shipped SAM-3D props as vertex-coloured
+meshes with NO UV/texture (its `tex` parameter was never consumed), so every
+--prefer-generated world failed `prop_integrity` by construction. New
+`mesh/generated_texture.py` (2667b57) completes the artifact: measured island-drop
+(smallest-first, only until largest/total ≥ 0.8, never any component >20% — bonsai
+cardboard-box's secondaries all sit INSIDE the main bbox: interior generation shells,
+not real parts) → xatlas unwrap → object_texture's k-NN bake fed by the mesh's own
+vertex colours → dilate → textured GLB + fresh sidecar (cures the stale-atlas drift).
+`--patch-elements` added: edits world.json in place; a bare `--only` run REWRITES it
+with just the filtered slugs (the 07-26 drift class). Guarded: requires --only, refuses
+--report, needs an existing world.json.
+
+**Live re-derive (18.6 s, backup at `_world/_work/g3-backup-2026-07-28/`):**
+cardboard-box frac 0.7107→**0.8151** uv/tex TRUE (6,976 faces; 546+460+18-face interior
+fragments dropped, 1,290-face wall KEPT); orange-bike-bottle frac→**0.996** uv/tex TRUE.
+Gate: **prop_integrity PASS 5/5**, texture_coverage PASS. Remaining failures are only the
+pre-existing r2 walkability items (shell_connectivity 27>20, floor_continuity 0.8975<0.9)
+recorded in the entry above. Tests: 6/6 incl. opt-in mesh-env bake e2e (equal-sized
+components are refused by the max-single-drop guard — proven by the test's first draft).
