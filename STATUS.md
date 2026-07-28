@@ -2937,3 +2937,32 @@ cardboard box knocked over on the floor. First authored pickup record: `cardboar
 no `meters_per_unit`, so a CALIBRATED capture still walks on the storey-height GUESS
 (bonsai: guess 1.032 u/m vs calibrated 1.053 — luckily close). The merged /world/manifest
 route has it; the walker deliberately reads the raw file. Fold into P2.
+
+## 2026-07-28 pm — P2: THE LIVING WORLD (branch p2-living-world)
+
+**P2-a scale semantics (bd4bd04):** metre-baked worlds declared their CAPTURE factor as
+mpu while their GLBs were metres — every consumer 5% wrong and the walker guessing from
+storey height whenever the manifest went stale. Baked worlds now declare mpu 1.0 with
+`calibrated_from_meters_per_unit` provenance; patch-mode bakes at the WORLD's factor;
+/scale back-stamps scene-unit worlds only. Bonsai migrated live: HUD locked 1.00 u/m,
+banner gone, exact-metre 1.5m rule + scale_sanity.
+
+**P2-b regrade (bcdf858):** POST /world/regrade — sticky (regrades.json replayed on every
+rebuild), audited, collision regenerated to match. Live: the bicycle regraded to prop
+("a bicycle is movable; the 1.5 m heuristic misgraded it"), 8 CoACD hulls, shovable.
+
+**P2-c affordances (66766ed):** POST /world/affordances/propose — rule-driven, explained,
+through the SAME validation gate as PUT; authored records never clobbered. Applied live on
+bonsai: water bottle + cardboard box → pickup, bicycle/container correctly "too large to
+carry (1.66 m)".
+
+**P2-d auto-generate-under-gates (fb50b0c):** captured props that trip a measured floor
+(build failed / gate-failing frac / <1000 source gaussians) trigger object_generate during
+solidify; used ONLY if its mask/placement gates pass; trigger+outcome recorded either way,
+refusals in the gate's own words. Live on the bicycle scene: only the 240-gaussian
+fragment triggered; SAM masked it but the alignment gate REFUSED at IoU 0.057 — correctly
+declining to hallucinate a bicycle for a junk cluster; captured kept; verdict all-green.
+Found+pinned en route: the UV-seam weld trap (frac 0.06 vs gate's 0.93 pre-fix).
+**Recorded gap:** the big shard-bicycle passes every measured floor (frac 0.93, 25k
+gaussians) while looking wrong — the trigger for THAT needs a render-agreement metric
+(the UMI3D watch item), not a guessed threshold.
