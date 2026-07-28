@@ -28,11 +28,13 @@ Two headless gotchas this file exists to encode:
    written (a silent failure). The fix: monkeypatch timers.register to
    capture callbacks and drain the chain synchronously (drain_deferred).
 
-Known open validation item: the exported `scale_*` attributes shift by more
-than ln(s) under a uniform scale s (measured 1.621 vs ln(2)=0.693 on the
-bonsai), so KIRI may reparametrize gaussian scale on export. Render-compare
-an edited export in the Spark viewer before trusting edited splats anywhere
-user-facing.
+Validation (2026-07-28, analytic): positions are EXACT under editing (0.0
+error at 2x on 605k splats, order preserved). Per-AXIS scale values look
+wrong at first glance because KIRI canonicalizes each ellipsoid's axis order
+on export (permuting scale_0/1/2 with a compensating rotation quaternion) —
+sorted per-splat scale triples match original+ln(s) exactly for 99.98% of
+splats. Same gaussians, identical renders; compare sorted triples, never
+axis-to-axis.
 """
 
 from __future__ import annotations

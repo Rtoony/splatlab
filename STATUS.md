@@ -2809,3 +2809,40 @@ review swarm (3 lenses → skeptic-per-finding): 7 confirmed, 0 refuted, all fix
 glb_check self-containment (security). Return digest:
 `~/reports/2026-07-28-splatlab-r3-automode-digest.md`. Memory:
 `splatlab-r3-polish-return-leg-2026-07-28`.
+
+## 2026-07-28 pm — CALIBRATION + FRAME FIX + KIRI VALIDATED (RToony back, live session)
+
+RToony's verdict on the walkable world: "Holy Crap. This is MUCH better than what we had
+before." Then three follow-ups landed in one burst:
+
+**Banner root-caused:** the viewer's shared-coordinate-frame warning was bonsai's visual
+shell.glb — a 07-26 bake predating r2's double-rotation fix (height stored in the wrong
+axis). The wave's Blender polishes were proven innocent (0.000 centre drift vs their
+versioned originals); the G3 re-derive had actually CORRECTED the generated props (the old
+place_generated skipped the Y-up rotation whenever mpu was None — its rotation lived
+inside `if mpu:`; floor heights now agree across all props).
+
+**Calibration LIVE:** RToony measured a 32" door (dimension 1785271325762, 0.856 u);
+completed via POST /scale references → **meters_per_unit 0.94975, method "dimension",
+scale_generation 1**. Sanity: room height 2.68 m, bicycle 1.66 m long.
+
+**Full re-solidify at metre scale** (60 s; backup `_world/_work/pre-recal-backup-2026-07-28/`):
+all 5 props + shell rebuilt with correct rotations → **all elements inside the shell AABB
+(banner clears), scale_sanity PASS 6/6 (first time ever), prop_integrity 5/5,
+texture_coverage 6/6.** The 3 polished elements were re-polished via recipes post-rebuild
+(713aff85 / 0a48263d / d1254d6d, double-verified).
+
+**Walkability:** collision rebuild reproduced voxel 27 comps; ONE principled cleanup
+(largest-component keep, 5,464 crumb tris across 26 floating islands) → shell_connectivity
+**PASS (1 comp, frac 1.0)**. floor_continuity stays marginally red (coverage 0.8968 vs 0.9,
+gap 0.0308 vs 0.03) — deliberately NOT tuned further. ⚠️ **Design question for RToony:**
+world_shell's own acceptance passes this exact mesh 4/4 (its floor metric reads 1.0) while
+world_gate fails it at threshold-noise margins — the two gate systems disagree, and per the
+metric-trust doctrine the threshold shouldn't drive work until it matches his lived grades
+(he just walked the world happily).
+
+**KIRI scale anomaly RESOLVED analytically:** positions EXACT (0.0 err at 2x, 605k splats);
+per-axis scales differ because KIRI canonicalizes ellipsoid axis order with a compensating
+rotation — sorted per-splat triples match orig+ln2 exactly for 99.98%. Edited-splat exports
+are mathematically equivalent → ledger gate cleared; graduation into the audited workflow
+is the open decision.

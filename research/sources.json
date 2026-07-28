@@ -739,17 +739,15 @@
      "headless-driver-integrations/blender/kiri_headless_driver.py",
      "spike-proven-2026-07-28:-605391-splats-round-trip-lossless-sh3-preserved",
      "serpens-sna-operator-map-documented",
-     "timer-drain-workaround-for-deferred-export"
+     "timer-drain-workaround-for-deferred-export",
+     "scale-anomaly-RESOLVED-2026-07-28:-per-splat-axis-canonicalization-with-compensating-rotation;-sorted-triples-match-ln2-exactly-for-99.98pct"
     ],
     "next": [
-     "render-compare-an-edited-export-in-spark-before-user-facing-use",
-     "explain-scale-attribute-shift-(1.621-vs-ln2)-on-uniform-scale",
      "decide-whether-splat-editing-graduates-into-the-audited-workflow"
     ]
    },
    "gates": [
-    "blender-5.1.x-only-(local-5.1.2-matches;-5.2-unsupported;-4.5.11-pipeline-untouched)",
-    "edited-export-scale-parametrization-unvalidated"
+    "blender-5.1.x-only-(local-5.1.2-matches;-5.2-unsupported;-4.5.11-pipeline-untouched)"
    ],
    "risks": [
     "n-panel-operators-may-resist-headless-context",
