@@ -68,12 +68,18 @@ def _apply_user_labels(class_rel: np.ndarray, class_ids: list[str],
                        lfdir: Path, n_rows: int, live_map: np.ndarray | None):
     """User paint = absolute truth. Painted ground classes become one-hot 1.0;
     painted NON-ground classes zero every ground channel for those rows.
-    Class-label indices are EXPORTED-PLY rows; live_map converts to ckpt rows."""
+    Class-label indices are EXPORTED-PLY rows; live_map converts to ckpt rows.
+
+    Returns (painted_row_count, painted_ground bool[n_rows]). The flag array
+    is set ONLY by ground-class paint — a non-ground veto never sets it, so a
+    structure-painted gaussian can never rescue a ground cell downstream
+    (ground_binning's painted exemptions consume this array)."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import class_labels as cl  # noqa: PLC0415 — worker-side numpy module
 
     pos = {cid: i for i, cid in enumerate(class_ids)}
     painted_rows = 0
+    painted_ground = np.zeros(n_rows, dtype=bool)
     for record in cl.load_manifest(lfdir):
         if record.get("invalid_reason"):
             continue
@@ -92,9 +98,10 @@ def _apply_user_labels(class_rel: np.ndarray, class_ids: list[str],
         class_rel[rows, :] = 0.0
         if channel is not None:  # a ground class -> one-hot certainty
             class_rel[rows, channel] = 1.0
+            painted_ground[rows] = True
         # non-ground paint (vegetation/structure/...) leaves all channels 0 =
         # a hard ground veto for those gaussians.
-    return painted_rows
+    return painted_rows, painted_ground
 
 
 def main() -> int:
@@ -179,16 +186,18 @@ def main() -> int:
         live_for_labels = None
 
     painted = 0
+    painted_ground = np.zeros(len(xyz), dtype=bool)
     if args.class_labels and Path(args.class_labels).is_dir():
         class_rel = class_rel.astype(np.float32)
-        painted = _apply_user_labels(
+        painted, painted_ground = _apply_user_labels(
             class_rel, class_ids, Path(args.class_labels), len(xyz), live_for_labels)
         rel = class_rel.max(axis=1).astype(np.float32)
         class_rel = class_rel.astype(np.float16)
 
     np.savez_compressed(out_path, xyz=xyz, rel=rel, seen=seen,
                         class_rel=class_rel,
-                        class_ids=np.array(class_ids))
+                        class_ids=np.array(class_ids),
+                        painted=painted_ground)
     print(json.dumps({
         "gaussians": int(len(xyz)),
         "seen": int(seen.sum()),

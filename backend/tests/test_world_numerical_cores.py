@@ -503,3 +503,90 @@ def test_the_cli_defaults_match_the_extracted_defaults():
     assert f'default={gb.DEFAULT_CELL_UNITS}' in source
     assert f'default={gb.DEFAULT_MIN_PTS_CELL}' in source
     assert f'default={gb.DEFAULT_SPIKE_TOL_UNITS}' in source
+
+
+# ===========================================================================
+# ground_binning — painted-ground authority (PW-A3)
+# ===========================================================================
+
+def test_a_painted_island_survives_the_component_drop():
+    """A detached island the user painted is ground on human authority."""
+    main = _flat_ground(n_side=6, cell=0.1)
+    island = _flat_ground(n_side=2, cell=0.1) + np.array([5.0, 5.0, 0.0])
+    pts = np.vstack([main, island])
+    painted = np.zeros(len(pts), bool)
+    painted[len(main):] = True
+
+    out = gb.build_ground_cells(pts, cell_units=0.1, painted_mask=painted)
+    assert len(out["cells"]) == 36 + 4
+    assert out["disconnected_dropped"] == 0
+    assert out["painted_rescued_component"] == 4
+    assert out["painted_cells"] == 4
+
+
+def test_an_unpainted_island_still_drops():
+    """The regression guard: without paint, the default behaviour holds."""
+    main = _flat_ground(n_side=6, cell=0.1)
+    island = _flat_ground(n_side=2, cell=0.1) + np.array([5.0, 5.0, 0.0])
+    pts = np.vstack([main, island])
+    out = gb.build_ground_cells(pts, cell_units=0.1)
+    assert len(out["cells"]) == 36
+    assert out["disconnected_dropped"] == 4
+    assert out["painted_rescued_component"] == 0
+
+
+def test_a_single_painted_point_makes_a_cell():
+    """Paint relaxes the evidence-quantity floor to one point — an unpainted
+    single point still has too little evidence for a height."""
+    base = _flat_ground(n_side=3, cell=0.1)
+    extra = np.array([[0.55, 0.05, 0.0],   # lone point, new cell (5, 0)
+                      [0.75, 0.05, 0.0]])  # lone point, new cell (7, 0)
+    pts = np.vstack([base, extra])
+    painted = np.zeros(len(pts), bool)
+    painted[len(base)] = True              # paint only the first extra
+
+    cells, _ = gb.bin_cells(pts, cell_units=0.1, min_pts_cell=3,
+                            painted_mask=painted)
+    assert (5, 0) in cells
+    assert (7, 0) not in cells
+
+
+def test_paint_does_not_save_a_spike():
+    """Spike rejection is a consistency check, not a quantity check — a
+    stroke that clipped a hedge must not put a 3-unit spike into the TIN.
+    The spike is a fresh cell BORDERING the flat grid (>=3 neighbours, so the
+    test has an opinion) — points dumped into an occupied cell would just be
+    absorbed by the 15th-percentile height, which is its own robustness."""
+    pts = _flat_ground(n_side=5, cell=0.1)
+    spike = np.array([[0.55, 0.25, 3.0]] * 5)   # tall new cell at (5, 2)
+    all_pts = np.vstack([pts, spike])
+    painted = np.zeros(len(all_pts), bool)
+    painted[len(pts):] = True
+
+    out = gb.build_ground_cells(all_pts, cell_units=0.1, painted_mask=painted)
+    assert (5, 2) not in out["cells"]
+    assert out["spikes_rejected"] >= 1
+
+
+def test_no_painted_mask_is_identical_to_legacy():
+    pts = _flat_ground(n_side=8, cell=0.1)
+    legacy = gb.build_ground_cells(pts, cell_units=0.1)
+    explicit = gb.build_ground_cells(pts, cell_units=0.1, painted_mask=None)
+    zeros = gb.build_ground_cells(pts, cell_units=0.1,
+                                  painted_mask=np.zeros(len(pts), bool))
+    assert legacy["cells"] == explicit["cells"] == zeros["cells"]
+    assert legacy["binned"] == zeros["binned"]
+    assert zeros["painted_cells"] == 0
+    assert zeros["painted_rescued_sparse"] == 0
+
+
+def test_painted_sparse_rescue_is_counted():
+    base = _flat_ground(n_side=4, cell=0.1)
+    lone = np.array([[0.95, 0.05, 0.0]])       # single-point cell (9, 0)
+    pts = np.vstack([base, lone])
+    painted = np.zeros(len(pts), bool)
+    painted[len(base):] = True
+    out = gb.build_ground_cells(pts, cell_units=0.1, painted_mask=painted)
+    assert out["painted_rescued_sparse"] == 1
+    # It is detached from the 4x4 block too — protection covers both filters.
+    assert (9, 0) in out["cells"]

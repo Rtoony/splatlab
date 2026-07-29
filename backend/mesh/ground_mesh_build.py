@@ -59,12 +59,16 @@ def main() -> int:
     # The algorithm is unchanged; it now lives in ground_binning.py so it can be
     # unit-tested without open3d/scipy.spatial. See that module for why each of
     # the three stages exists.
+    # Painted-ground authority (semantic_ground's `painted` flag — ground-class
+    # paint only; vetoes never set it). Absent on legacy npz -> legacy build.
+    painted_kept = g["painted"].astype(bool)[keep] if "painted" in g.files else None
     binned = ground_binning.build_ground_cells(
         pts,
         cell_units=args.cell_units,
         min_pts_cell=args.min_pts_cell,
         spike_tol_units=args.spike_tol_units,
         class_relevancy=class_rel_kept,
+        painted_mask=painted_kept,
     )
     kept_cells = binned["cells"]
     cell_votes = binned["votes"]
@@ -118,6 +122,11 @@ def main() -> int:
         "gaussians_total": int(len(g["rel"])), "gaussians_ground": int(keep.sum()),
         "cells_with_data": binned["binned"], "cells_spike_rejected": rejected,
         "cells_disconnected_dropped": disconnected_dropped,
+        # The paint-authority ledger: how much of this ground exists because a
+        # human said so (0s on unpainted/legacy builds).
+        "painted_cells": binned["painted_cells"],
+        "painted_rescued_sparse": binned["painted_rescued_sparse"],
+        "painted_rescued_component": binned["painted_rescued_component"],
         "ground_points": int(len(ground)), "triangles": int(len(tri.simplices)),
         "ground_z_range_units": [round(float(ground[:, 2].min()), 4),
                                  round(float(ground[:, 2].max()), 4)],

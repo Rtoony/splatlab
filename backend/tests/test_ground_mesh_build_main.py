@@ -127,3 +127,30 @@ def test_legacy_npz_without_classes_builds_classless(monkeypatch, tmp_path) -> N
     report = json.loads((out / "ground_mesh_build.json").read_text())
     assert report["class_cells"] is None
     assert not (out / "ground_class_cells.npz").exists()
+
+
+def test_painted_field_flows_to_the_report(monkeypatch, tmp_path) -> None:
+    """A painted detached island survives the whole pipeline and the report
+    carries the authority ledger (PW-A3)."""
+    main_pts = _flat_ground()                                  # 12x12 block
+    island_pts = _flat_ground(n_side=2) + np.array([9.0, 9.0, 0.0])
+    pts = np.vstack([main_pts, island_pts])
+    n = len(pts)
+    painted = np.zeros(n, bool)
+    painted[len(main_pts):] = True
+    path = tmp_path / "ground_gaussians.npz"
+    np.savez_compressed(path, xyz=pts.astype(np.float32),
+                        rel=np.full(n, 0.9, np.float32),
+                        seen=np.ones(n, bool), painted=painted)
+
+    rc, out = _run(monkeypatch, tmp_path, path)
+    assert rc == 0
+    report = json.loads((out / "ground_mesh_build.json").read_text())
+    assert report["ground_points"] == 144 + 4
+    assert report["cells_disconnected_dropped"] == 0
+    assert report["painted_cells"] == 4
+    assert report["painted_rescued_component"] == 4
+    # Ledger still coherent with the rescues in play.
+    assert (report["cells_with_data"]
+            - report["cells_spike_rejected"]
+            - report["cells_disconnected_dropped"]) == report["ground_points"]

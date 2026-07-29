@@ -37,12 +37,17 @@ MIN_NEIGHBOURS_FOR_SPIKE_TEST = 3
 
 def bin_cells(points: np.ndarray, cell_units: float = DEFAULT_CELL_UNITS,
               min_pts_cell: int = DEFAULT_MIN_PTS_CELL,
-              class_relevancy: np.ndarray | None = None):
+              class_relevancy: np.ndarray | None = None,
+              painted_mask: np.ndarray | None = None):
     """Bin XY into square cells; a cell's height is its 15th-percentile z.
 
     Returns (cells, votes): `cells` maps (i, j) -> height, `votes` maps
     (i, j) -> summed per-class evidence (empty when class_relevancy is None).
-    Cells holding fewer than `min_pts_cell` points are dropped entirely.
+    Cells holding fewer than `min_pts_cell` points are dropped entirely —
+    UNLESS the cell contains a painted-ground point (painted_mask): paint is
+    explicit human evidence that this is floor, so the evidence-quantity
+    floor relaxes to a single point there. The height percentile and every
+    consistency check stay identical for painted cells.
     """
     points = np.asarray(points, dtype=np.float64)
     if len(points) == 0:
@@ -53,11 +58,14 @@ def bin_cells(points: np.ndarray, cell_units: float = DEFAULT_CELL_UNITS,
     ij_sorted, z_sorted = ij[order], points[order, 2]
     keys, starts = np.unique(ij_sorted, axis=0, return_index=True)
     rel_sorted = class_relevancy[order] if class_relevancy is not None else None
+    painted_sorted = (np.asarray(painted_mask, dtype=bool)[order]
+                      if painted_mask is not None else None)
 
     cells: dict[tuple[int, int], float] = {}
     votes: dict[tuple[int, int], np.ndarray] = {}
     for k, (s, e) in enumerate(zip(starts, list(starts[1:]) + [len(z_sorted)])):
-        if e - s >= min_pts_cell:
+        has_paint = bool(painted_sorted[s:e].any()) if painted_sorted is not None else False
+        if e - s >= min_pts_cell or has_paint:
             key = tuple(keys[k])
             cells[key] = float(np.percentile(z_sorted[s:e], GROUND_PERCENTILE))
             if rel_sorted is not None:
@@ -87,8 +95,11 @@ def reject_spikes(cells: dict, spike_tol_units: float = DEFAULT_SPIKE_TOL_UNITS)
     return kept, rejected
 
 
-def largest_component(cells: dict):
-    """Keep only the largest 8-connected group of cells."""
+def largest_component(cells: dict, protected: frozenset = frozenset()):
+    """Keep only the largest 8-connected group of cells — plus any PROTECTED
+    (painted) cells outside it. A detached island the user explicitly painted
+    is ground on human authority, not a stray; an unpainted island still
+    drops. `dropped` counts every cell that did not survive."""
     if not cells:
         return {}, 0
     unvisited = set(cells)
@@ -108,7 +119,19 @@ def largest_component(cells: dict):
                         frontier.append(neighbour)
         if len(component) > len(best):
             best = component
-    return {k: cells[k] for k in best}, len(cells) - len(best)
+    keep = best | (protected & set(cells))
+    return {k: cells[k] for k in keep}, len(cells) - len(keep)
+
+
+def painted_cell_keys(points: np.ndarray, painted_mask: np.ndarray,
+                      cell_units: float) -> set[tuple[int, int]]:
+    """The (i, j) cell keys that contain at least one painted point."""
+    points = np.asarray(points, dtype=np.float64)
+    mask = np.asarray(painted_mask, dtype=bool)
+    if not mask.any():
+        return set()
+    ij = np.floor(points[mask, :2] / cell_units).astype(np.int64)
+    return {tuple(row) for row in np.unique(ij, axis=0)}
 
 
 def cell_centres(cells: dict, cell_keys: list, cell_units: float) -> np.ndarray:
@@ -120,16 +143,48 @@ def cell_centres(cells: dict, cell_keys: list, cell_units: float) -> np.ndarray:
 def build_ground_cells(points: np.ndarray, *, cell_units: float = DEFAULT_CELL_UNITS,
                        min_pts_cell: int = DEFAULT_MIN_PTS_CELL,
                        spike_tol_units: float = DEFAULT_SPIKE_TOL_UNITS,
-                       class_relevancy: np.ndarray | None = None) -> dict:
-    """All three stages in order, with the counts each one dropped."""
-    cells, votes = bin_cells(points, cell_units, min_pts_cell, class_relevancy)
+                       class_relevancy: np.ndarray | None = None,
+                       painted_mask: np.ndarray | None = None) -> dict:
+    """All three stages in order, with the counts each one dropped.
+
+    Paint authority comes with a ledger: painted cells relax the sparse-cell
+    floor and survive the component drop, and every such rescue is COUNTED
+    (`painted_rescued_sparse` / `painted_rescued_component`) so a receipt
+    reader can see exactly how much ground exists on human authority. Spike
+    rejection is deliberately NOT exempted — it is a consistency check, and a
+    stroke that clipped a hedge must not put a 3-unit spike into the TIN; a
+    rejected painted cell shows up in `spikes_rejected` where the
+    disagreement is visible."""
+    has_paint = painted_mask is not None and np.asarray(painted_mask, bool).any()
+    cells, votes = bin_cells(points, cell_units, min_pts_cell, class_relevancy,
+                             painted_mask if has_paint else None)
     binned = len(cells)
+
+    painted_keys: frozenset = frozenset()
+    rescued_sparse = 0
+    if has_paint:
+        painted_keys = frozenset(painted_cell_keys(points, painted_mask, cell_units))
+        # Exact rescue count: cells that exist now but would not without paint.
+        strict, _ = bin_cells(points, cell_units, min_pts_cell, None)
+        rescued_sparse = sum(1 for k in cells if k in painted_keys and k not in strict)
+
     cells, rejected = reject_spikes(cells, spike_tol_units)
-    cells, disconnected = largest_component(cells)
+
+    rescued_component = 0
+    if has_paint:
+        strict_kept, _ = largest_component(dict(cells))
+        cells, disconnected = largest_component(cells, protected=painted_keys)
+        rescued_component = len(set(cells) - set(strict_kept))
+    else:
+        cells, disconnected = largest_component(cells)
+
     return {
         "cells": cells,
         "votes": votes,
         "binned": binned,
         "spikes_rejected": rejected,
         "disconnected_dropped": disconnected,
+        "painted_cells": len(painted_keys & set(cells)),
+        "painted_rescued_sparse": rescued_sparse,
+        "painted_rescued_component": rescued_component,
     }
