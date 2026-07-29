@@ -3080,3 +3080,48 @@ object truth: 0 restyle-shader meshes of 6; the bicycle's tint lives in its atla
 charts bake correctly. Also proven: a fantasy class (cobblestone) end-to-end.
 
 **Suites:** backend 1156 green (+16), frontend 136 green (+2), tsc clean.
+
+---
+
+## 2026-07-28 — W3 Lane B: fantasy set-dressing (authored assets enter the world)
+
+**The registry (0882a73).** Nothing could ADD an object to a world — four refusal
+points, and every rebuild erased anything not capture-derived. `world_placed.py` is the
+sticky-regrades pattern for placed assets: `_world/placed.json`, written only by the
+audited door, re-applied by `world_collision` every run (captured slugs win loudly via
+`authored_conflicts`; missing GLBs mark unbuilt; authored props get real CoACD hulls on
+the next run). The non-atomic `world_manifest.json` write is fixed (staged + os.replace).
+
+**The frame gate (c85a009).** `glb_check.position_bounds`: POSITION min/max union +
+node-transform identity (own or inherited), stdlib-only — the shared-frame contract,
+checkable at the door.
+
+**The door (2fdc32e).** `POST /world/elements` is polish's mirror image: it INVENTS and
+refuses to replace (slug existing anywhere → 409). Same discipline: .building-* stage,
+glb_check + position_bounds before anything live, mesh lock, `supersedes: null` receipt,
+audit. Node-TRS props are 422ed; statics warn. DELETE tombstones to `_world/versions/`,
+authored-only. One append point buys walker / world_slugs / affordances / restyle /
+interactions / HUD.
+
+**The library (808b109).** 3 committed self-validating starters (torch-sconce 0.44 m,
+treasure-chest 0.48 m, wooden-signpost 1.10 m) from a deterministic Blender script:
+metre-scale, origin bottom-centre, ONE joined mesh, identity nodes, <20 KB each.
+
+**The authoring loop (a0f2cc8).** Blender MCP 12 → 14 tools: `list_asset_library`
+(broken files reported, never hidden), `import_asset` (containment-checked against
+assets/library; ONE-mesh contract; reports dimensions in metres), and
+`export_blend_glb(bake_world_transform=True)` — matrix_world into the vertices, node
+identitied, parented objects refused, in-memory only. **(fca6b60)** PlacedPanel in the
+walker: rows + armed Remove + place-new via the house upload zone.
+
+**Live proof (`tools/prove-dressing-live.py`, splat_aea04ab3, 5090):** all 8 receipts —
+authored torch exported at the commanded floor point (x=0.30 z=-1.20 y=floor, identity);
+landed 200/authored; same-slug re-POST **409 live**; visible (3 mesh primitives + DOM);
+authored toggle tints it #ffd27f in the walker; state survives reload; a REAL
+`world_collision` re-run preserves the entry (counts.authored=1); round-trips back into
+Blender (276 faces); removed with tombstone, pixel delta 6.8. Found live and fixed: the
+centered "Click to walk" card can cover a small asset — pixel receipts now measure an
+overlay-free band.
+
+**Suites:** backend 1195 green (+39 this lane), frontend 136 green, tsc clean.
+`prove-game-live` (Stump) and `prove-restyle-live` re-run green — nothing regressed.
