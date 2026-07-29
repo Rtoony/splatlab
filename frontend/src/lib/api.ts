@@ -1,3 +1,4 @@
+import type { RestyleDoc, RestyleEntry, RestyleMaterial } from "./world-restyle";
 import type {
   LangfieldInventoryResult,
   LangfieldQueryResult,
@@ -472,5 +473,48 @@ export function solidifyWorld(
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     },
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Restyle (W2-C2): the look applied over a captured world.            *
+ * ------------------------------------------------------------------ */
+
+export interface WorldRestylePayload {
+  job_id: string;
+  restyle: RestyleDoc;
+  known_slugs: string[];
+  materials: RestyleMaterial[];
+  presets: string[];
+}
+
+export function fetchWorldRestyle(
+  jobId: string,
+  signal?: AbortSignal,
+): Promise<WorldRestylePayload> {
+  return apiRequest<WorldRestylePayload>(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/world/restyle`,
+    { signal },
+  );
+}
+
+export function setWorldRestyle(
+  jobId: string,
+  doc: { elements: Record<string, RestyleEntry>; lighting: RestyleDoc["lighting"] },
+): Promise<WorldRestylePayload> {
+  return apiRequest<WorldRestylePayload>(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/world/restyle`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(doc),
+    },
+  );
+}
+
+export function resetWorldRestyle(jobId: string): Promise<WorldRestylePayload> {
+  return apiRequest<WorldRestylePayload>(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/world/restyle`,
+    { method: "DELETE" },
   );
 }

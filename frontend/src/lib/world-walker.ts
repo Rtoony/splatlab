@@ -39,6 +39,13 @@ import {
 } from "./world-physics";
 import { SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
 import {
+  classTile,
+  presetFor,
+  triplanarMaterial,
+  type RestyleDoc,
+  type RestyleMaterial,
+} from "./world-restyle";
+import {
   INTERACT_KEY,
   type InteractionRecord,
   type TargetInfo,
@@ -381,6 +388,11 @@ export class WorldWalker {
   private readonly clock = new THREE.Clock();
   private readonly worldGroup = new THREE.Group();
   private readonly lights = new THREE.Group();
+  /** The applied look, or null for "as captured". */
+  private restyle: RestyleDoc | null = null;
+  /** True while an active restyle is showing mesh in place of the splat. */
+  private restyleShowsMesh = false;
+  private readonly classTiles = new Map<string, THREE.DataTexture>();
 
   /** Geometry of the dedicated collision solid, when the manifest ships one. */
   private collisionShellGeom: THREE.BufferGeometry | null = null;
@@ -1155,6 +1167,12 @@ export class WorldWalker {
     splat.renderOrder = -1;
     this.scene.add(splat);
     this.backdrop = splat;
+    // An active restyle keeps the mesh world on top of the photograph.
+    if (this.restyleShowsMesh) {
+      splat.visible = false;
+      this.setElementVisible("shell", true);
+      return;
+    }
 
     // Hide the shell while the splat is showing. This is the whole point of the
     // split: the shell is a 24k-tri blocky solid whose entire job is to be
@@ -1185,6 +1203,109 @@ export class WorldWalker {
     if (!el) return;
     el.visible = visible;
     el.object.visible = visible;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Restyle (W2-C2) — a look applied OVER the capture, never into it  *
+   * ---------------------------------------------------------------- */
+
+  /**
+   * Apply a restyle document: per-element tint / class material, plus one
+   * lighting preset. Idempotent and fully reversible — every restyled mesh
+   * keeps its baked materials in userData, so an empty document restores
+   * the capture exactly (that is what `Reset` and DELETE do).
+   */
+  applyRestyle(doc: RestyleDoc | null, materials: RestyleMaterial[]): void {
+    this.restyle = doc;
+    const byId = new Map(materials.map((m) => [m.id, m]));
+    const entries = doc?.elements ?? {};
+
+    // A restyle you cannot see is not a restyle. The splat backdrop is the
+    // photograph — it cannot be re-surfaced or relit (its light is baked into
+    // the gaussians), and it HIDES the shell it stands in for. So any active
+    // restyle shows the reconstructed geometry instead. Measured: without
+    // this, re-surfacing the shell changed the frame by 0.0 mean RGB.
+    const relighting = (doc?.lighting?.preset ?? "as-captured") !== "as-captured";
+    const restyled = Object.keys(entries);
+    this.restyleShowsMesh = relighting || restyled.length > 0;
+    if (this.backdrop) this.backdrop.visible = !this.restyleShowsMesh;
+    for (const slug of restyled) this.setElementVisible(slug, true);
+    if (this.restyleShowsMesh) this.setElementVisible("shell", true);
+    else if (this.backdrop) this.setElementVisible("shell", false);
+
+    for (const el of this.elements) {
+      const entry = entries[el.slug];
+      const cls = entry?.material ? byId.get(entry.material) : undefined;
+      const tint = entry?.tint ? new THREE.Color(entry.tint) : null;
+
+      el.object.traverse((o) => {
+        const mesh = o as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        const lit = mesh.userData.litMaterial as THREE.MeshStandardMaterial | undefined;
+        const unlit = mesh.userData.unlitMaterial as THREE.MeshBasicMaterial | undefined;
+
+        // Restyled materials are OURS to dispose; baked ones never are.
+        const previous = mesh.userData.restyleMaterial as THREE.Material | undefined;
+        if (previous) {
+          previous.dispose();
+          mesh.userData.restyleMaterial = undefined;
+        }
+
+        if (cls) {
+          const metresPerTile = entry?.material_scale ?? 1;
+          const tile = this.classTile(cls);
+          const mat = triplanarMaterial(
+            tile, metresPerTile * this.params.unitsPerMetre, cls, tint);
+          mesh.userData.restyleMaterial = mat;
+          mesh.material = mat;
+          return;
+        }
+
+        // No class swap: restore the baked material and re-apply any tint by
+        // multiplying it into the material colour (never into the texture).
+        for (const mat of [lit, unlit]) {
+          if (!mat) continue;
+          const baked = (mesh.userData[mat === lit ? "bakedLitColor" : "bakedUnlitColor"]
+            ??= mat.color.clone()) as THREE.Color;
+          mat.color.copy(tint ?? baked);
+        }
+        const base = this.params.unlit ? unlit : lit;
+        if (base) mesh.material = base;
+      });
+    }
+
+    this.applyLighting();
+  }
+
+  /** Cached per class id — one tile serves every element using that class. */
+  private classTile(cls: RestyleMaterial): THREE.DataTexture {
+    const cached = this.classTiles.get(cls.id);
+    if (cached) return cached;
+    const tile = classTile(cls);
+    this.classTiles.set(cls.id, tile);
+    return tile;
+  }
+
+  /** Drive the light rig (and the sky behind an open shell) from the preset. */
+  private applyLighting(): void {
+    const name = this.restyle?.lighting?.preset ?? "as-captured";
+    const preset = presetFor(name, this.restyle?.lighting?.intensity ?? 1);
+    const [hemi, key, fill, ambient] = this.lights.children as [
+      THREE.HemisphereLight, THREE.DirectionalLight,
+      THREE.DirectionalLight, THREE.AmbientLight];
+    hemi.color.setHex(preset.sky);
+    hemi.groundColor.setHex(preset.ground);
+    hemi.intensity = preset.hemiIntensity;
+    key.color.setHex(preset.key);
+    key.intensity = preset.keyIntensity;
+    fill.intensity = preset.keyIntensity * 0.4;
+    ambient.intensity = preset.ambient;
+    this.renderer.setClearColor(preset.background, 1);
+    // A relight is only visible on LIT materials: choosing any preset other
+    // than as-captured means "stop showing me the baked-in daylight".
+    const wantLit = !preset.asCaptured;
+    if (wantLit && this.params.unlit) this.setParams({ unlit: false });
+    this.lights.visible = !this.params.unlit;
   }
 
   /* ---------------------------------------------------------------- *
@@ -1363,6 +1484,10 @@ export class WorldWalker {
     this.worldGroup.traverse((o) => {
       const mesh = o as THREE.Mesh;
       if (!mesh.isMesh) return;
+      // A restyled surface outranks the lit/unlit toggle: the class material
+      // IS the surface now, and swapping it back would silently undo a
+      // restyle every time the checkbox moved.
+      if (mesh.userData.restyleMaterial) return;
       const next = unlit ? mesh.userData.unlitMaterial : mesh.userData.litMaterial;
       if (next) mesh.material = next as THREE.Material;
     });
@@ -1643,6 +1768,8 @@ export class WorldWalker {
     // hundreds of MB of GPU buffers for a 1.2M-gaussian scene (review
     // finding, which the debug global made retainable).
     this.clearBackdrop();
+    for (const tile of this.classTiles.values()) tile.dispose();
+    this.classTiles.clear();
     this.renderer.dispose();
   }
 }

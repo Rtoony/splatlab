@@ -16,7 +16,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { TargetInfo } from "@/lib/world-interactions";
 import { Link, useRoute } from "wouter";
-import { uploadPolishedWorldElement , fetchWorldInteractions, fetchWorldNavmesh, fetchWorldScenario, setWorldElementState, setWorldPlayerPoses, solidifyWorld} from "@/lib/api";
+import { uploadPolishedWorldElement , fetchWorldInteractions, fetchWorldNavmesh, fetchWorldRestyle, fetchWorldScenario, resetWorldRestyle, setWorldElementState, setWorldPlayerPoses, setWorldRestyle, solidifyWorld} from "@/lib/api";
+import { LIGHT_PRESETS, emptyRestyle, type RestyleDoc, type RestyleEntry, type RestyleMaterial } from "@/lib/world-restyle";
 import { WorldGame, type GameHudState, type Scenario } from "@/lib/world-game";
 import type { parseNavmesh } from "@/lib/world-navmesh";
 import { PolishUploadZone } from "@/components/workspace/polish-upload";
@@ -45,6 +46,7 @@ import {
   MapPin,
   Ruler,
   Settings2,
+  Palette,
   Shapes,
   UploadCloud,
 } from "lucide-react";
@@ -130,6 +132,9 @@ export default function WorldViewPage() {
   } | null>(null);
   const [gameHud, setGameHud] = useState<GameHudState | null>(null);
   const [gameReady, setGameReady] = useState(false);
+  const [restyle, setRestyle] = useState<RestyleDoc | null>(null);
+  const [restyleMaterials, setRestyleMaterials] = useState<RestyleMaterial[]>([]);
+  const [restyleBusy, setRestyleBusy] = useState(false);
   const [damageFlash, setDamageFlash] = useState(0);
   const [hitMarker, setHitMarker] = useState(0);
   const [sceneInfo, setSceneInfo] = useState<SceneInfo | null>(null);
@@ -299,6 +304,15 @@ export default function WorldViewPage() {
               setGameReady(true);
             }
           }).catch(() => { /* no scenario/navmesh: the world simply is not playable yet */ });
+
+          // The stored look. A world with no restyle.json simply reads as
+          // "as captured" — never a reason to fail the load.
+          void fetchWorldRestyle(jobId, controller.signal).then((payload) => {
+            if (cancelled) return;
+            setRestyle(payload.restyle);
+            setRestyleMaterials(payload.materials);
+            walker.applyRestyle(payload.restyle, payload.materials);
+          }).catch(() => { /* no world yet, or restyle unavailable */ });
         }
 
         // The splat backdrop. The mesh is what you collide with and act on;
@@ -339,6 +353,47 @@ export default function WorldViewPage() {
       if (w.__worldWalker === walker) delete w.__worldWalker;
     };
   }, [source, reloadNonce]);
+
+  /** Apply a restyle locally at once, then persist it. The walker is the
+   *  preview; the document is the truth — a failed save says so and rolls
+   *  the panel back to what the server still holds. */
+  const commitRestyle = useCallback((next: RestyleDoc) => {
+    const walker = walkerRef.current;
+    setRestyle(next);
+    walker?.applyRestyle(next, restyleMaterials);
+    if (source.kind !== "api") return;
+    setRestyleBusy(true);
+    void setWorldRestyle(jobId, { elements: next.elements, lighting: next.lighting })
+      .then((payload) => {
+        setRestyle(payload.restyle);
+        walker?.applyRestyle(payload.restyle, payload.materials);
+      })
+      .catch((e: unknown) => {
+        setWarnings((w) => [...w,
+          `Restyle not saved: ${e instanceof Error ? e.message : String(e)}`]);
+        void fetchWorldRestyle(jobId).then((payload) => {
+          setRestyle(payload.restyle);
+          walker?.applyRestyle(payload.restyle, payload.materials);
+        }).catch(() => undefined);
+      })
+      .finally(() => setRestyleBusy(false));
+  }, [jobId, restyleMaterials, source.kind]);
+
+  const clearRestyle = useCallback(() => {
+    const walker = walkerRef.current;
+    const empty = emptyRestyle(jobId);
+    setRestyle(empty);
+    walker?.applyRestyle(empty, restyleMaterials);
+    if (source.kind !== "api") return;
+    setRestyleBusy(true);
+    void resetWorldRestyle(jobId)
+      .then((payload) => {
+        setRestyle(payload.restyle);
+        walker?.applyRestyle(payload.restyle, payload.materials);
+      })
+      .catch(() => setWarnings((w) => [...w, "Could not clear the restyle."]))
+      .finally(() => setRestyleBusy(false));
+  }, [jobId, restyleMaterials, source.kind]);
 
   const startGame = useCallback(() => {
     const walker = walkerRef.current;
@@ -600,6 +655,16 @@ export default function WorldViewPage() {
                 onCalibrateByHeight={calibrateByHeight}
               />
               <MovementPanel params={walkParams} onChange={updateParams} />
+              {restyle && (
+                <RestylePanel
+                  restyle={restyle}
+                  materials={restyleMaterials}
+                  rows={rows}
+                  busy={restyleBusy}
+                  onChange={commitRestyle}
+                  onClear={clearRestyle}
+                />
+              )}
               <Panel icon={<Layers className="h-3.5 w-3.5" />} title="Backdrop">
                 <label className="flex items-start gap-2 text-[11px] text-zinc-300">
                   <input
@@ -1295,6 +1360,150 @@ function ElementsPanel({
  * Small presentational primitives (kept local — @/components/ui is    *
  * being restructured by another agent right now).                     *
  * ------------------------------------------------------------------ */
+
+function RestylePanel({
+  restyle,
+  materials,
+  rows,
+  busy,
+  onChange,
+  onClear,
+}: {
+  restyle: RestyleDoc;
+  materials: RestyleMaterial[];
+  rows: ElementRow[];
+  busy: boolean;
+  onChange: (next: RestyleDoc) => void;
+  onClear: () => void;
+}) {
+  const [slug, setSlug] = useState<string>(rows[0]?.slug ?? "");
+  const target = rows.find((r) => r.slug === slug) ?? rows[0];
+  const entry: RestyleEntry = (target && restyle.elements[target.slug]) || {};
+  const styled = Object.keys(restyle.elements).length;
+
+  const patch = (next: RestyleEntry | null) => {
+    if (!target) return;
+    const elements = { ...restyle.elements };
+    if (!next || (!next.tint && !next.material)) delete elements[target.slug];
+    else elements[target.slug] = next;
+    onChange({ ...restyle, elements });
+  };
+
+  return (
+    <Panel icon={<Palette className="h-3.5 w-3.5" />} title="Restyle">
+      <p className="mb-2 text-[11px] leading-relaxed text-zinc-400">
+        A look applied over the capture — nothing on disk is rewritten, so
+        Reset always returns the world exactly as it was photographed.
+      </p>
+
+      <label className="mb-1 block text-[10px] uppercase tracking-wider text-zinc-500">
+        Lighting
+      </label>
+      <select
+        className="mb-2 w-full rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[11px] text-zinc-200"
+        value={restyle.lighting.preset}
+        onChange={(e) => onChange({
+          ...restyle,
+          lighting: { ...restyle.lighting, preset: e.target.value },
+        })}
+      >
+        {Object.keys(LIGHT_PRESETS).map((name) => (
+          <option key={name} value={name}>{name}</option>
+        ))}
+      </select>
+      <Slider
+        label="Light level"
+        unit="×"
+        min={0}
+        max={3}
+        step={0.05}
+        value={restyle.lighting.intensity}
+        onChange={(v) => onChange({
+          ...restyle, lighting: { ...restyle.lighting, intensity: v },
+        })}
+      />
+
+      {target && (
+        <>
+          <label className="mb-1 mt-3 block text-[10px] uppercase tracking-wider text-zinc-500">
+            Element
+          </label>
+          <select
+            className="mb-2 w-full rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[11px] text-zinc-200"
+            value={target.slug}
+            onChange={(e) => setSlug(e.target.value)}
+          >
+            {rows.map((r) => (
+              <option key={r.slug} value={r.slug}>
+                {r.label || r.slug}{restyle.elements[r.slug] ? " ●" : ""}
+              </option>
+            ))}
+          </select>
+
+          <div className="mb-2 flex items-center gap-2">
+            <input
+              type="color"
+              aria-label="tint"
+              className="h-7 w-10 cursor-pointer rounded border border-white/10 bg-black/60"
+              value={entry.tint ?? "#ffffff"}
+              onChange={(e) => patch({ ...entry, tint: e.target.value })}
+            />
+            <span className="text-[11px] text-zinc-400">Tint</span>
+            {entry.tint && (
+              <button
+                type="button"
+                className="ml-auto text-[10px] text-zinc-500 underline"
+                onClick={() => patch({ ...entry, tint: undefined })}
+              >
+                clear
+              </button>
+            )}
+          </div>
+
+          <label className="mb-1 block text-[10px] uppercase tracking-wider text-zinc-500">
+            Surface
+          </label>
+          <select
+            className="w-full rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[11px] text-zinc-200"
+            value={entry.material ?? ""}
+            onChange={(e) => patch({
+              ...entry, material: e.target.value || undefined,
+            })}
+          >
+            <option value="">as captured</option>
+            {materials.map((m) => (
+              <option key={m.id} value={m.id}>{m.display}</option>
+            ))}
+          </select>
+          {entry.material && (
+            <Slider
+              label="Tile size"
+              unit="m"
+              min={0.1}
+              max={5}
+              step={0.1}
+              value={entry.material_scale ?? 1}
+              onChange={(v) => patch({ ...entry, material_scale: v })}
+            />
+          )}
+        </>
+      )}
+
+      <div className="mt-3 flex items-center justify-between">
+        <span className="text-[10px] text-zinc-500">
+          {busy ? "saving…" : `${styled} element${styled === 1 ? "" : "s"} restyled`}
+        </span>
+        <button
+          type="button"
+          className="rounded-md border border-white/10 px-2 py-1 text-[10px] text-zinc-300 hover:bg-white/5"
+          onClick={onClear}
+        >
+          Reset to capture
+        </button>
+      </div>
+    </Panel>
+  );
+}
 
 function Panel({
   icon,

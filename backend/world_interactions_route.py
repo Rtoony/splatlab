@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 import artifact_manifest as manifests
 import splat_route
 import world_interactions as wi
+import world_restyle as wr
 
 router = APIRouter()
 
@@ -283,3 +284,95 @@ async def reset_world_state(job_id: str) -> dict[str, Any]:
     _job_dir, world_dir, world_manifest = _require_world(job_id)
     wi.state_path(world_dir).unlink(missing_ok=True)
     return _payload(job_id, world_dir, world_manifest)
+
+
+# ---------------------------------------------------------------------------
+# Restyle (W2-C2): recolour / resurface / relight, as a non-destructive diff
+# ---------------------------------------------------------------------------
+
+def _taxonomy_classes() -> list[dict[str, Any]]:
+    """The surface-class catalogue the walker can offer, or [] if unreadable.
+
+    Same file the ground and object bakes read, so a class swap in the walker
+    and a later permanent re-bake mean the same thing by construction.
+    """
+    path = Path(__file__).resolve().parent / "class_taxonomy.json"
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    classes = raw.get("classes") if isinstance(raw, dict) else raw
+    if not isinstance(classes, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in classes:
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        gen = entry.get("generative") or {}
+        out.append({
+            "id": str(entry["id"]),
+            "display": str(entry.get("display") or entry["id"]),
+            "category": str(entry.get("category") or ""),
+            "color": str(entry.get("color") or "#888888"),
+            # The walker builds its procedural tile from these — the SAME
+            # numbers class_textures.tile_for uses, so the preview and the
+            # eventual bake agree.
+            "base_rgb": gen.get("base_rgb") or [0.5, 0.5, 0.5],
+            "roughness": gen.get("roughness", 0.85),
+            "metallic": gen.get("metallic", 0.0),
+            "noise": gen.get("noise") or {},
+        })
+    return out
+
+
+def _restyle_payload(job_id: str, world_dir: Path,
+                     world_manifest: dict[str, Any] | None) -> dict[str, Any]:
+    return {
+        "job_id": job_id,
+        "restyle": wr.read_restyle(world_dir, job_id),
+        "known_slugs": sorted(wi.world_slugs(world_manifest)),
+        "materials": _taxonomy_classes(),
+        "presets": list(wr.LIGHTING_PRESETS),
+    }
+
+
+class RestyleBody(BaseModel):
+    """The whole restyle. PUT replaces — a restyle is one coherent look."""
+    elements: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    lighting: dict[str, Any] | None = None
+
+
+@router.get("/jobs/{job_id}/world/restyle")
+async def get_world_restyle(job_id: str) -> dict[str, Any]:
+    """The stored restyle plus the catalogue needed to author a new one."""
+    _job_dir, world_dir, world_manifest = _require_world(job_id)
+    return _restyle_payload(job_id, world_dir, world_manifest)
+
+
+@router.put("/jobs/{job_id}/world/restyle")
+async def put_world_restyle(job_id: str, body: RestyleBody) -> dict[str, Any]:
+    """Author the look: tints, class materials, one lighting preset.
+
+    Cosmetic and reversible by construction — nothing under `_world/` is
+    rewritten, so DELETE (or an empty PUT) restores the capture exactly.
+    """
+    _job_dir, world_dir, world_manifest = _require_world(job_id)
+    known = wi.world_slugs(world_manifest) if world_manifest else None
+    classes = {c["id"] for c in _taxonomy_classes()} or None
+    document = wr.new_restyle(job_id)
+    document["elements"] = body.elements
+    if body.lighting is not None:
+        document["lighting"] = body.lighting
+    try:
+        wr.write_restyle(world_dir, document, known, classes)
+    except wr.RestyleError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _restyle_payload(job_id, world_dir, world_manifest)
+
+
+@router.delete("/jobs/{job_id}/world/restyle")
+async def reset_world_restyle(job_id: str) -> dict[str, Any]:
+    """Drop the restyle; the world returns to how it was captured."""
+    _job_dir, world_dir, world_manifest = _require_world(job_id)
+    (world_dir / wr.RESTYLE_FILENAME).unlink(missing_ok=True)
+    return _restyle_payload(job_id, world_dir, world_manifest)
