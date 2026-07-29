@@ -3022,3 +3022,18 @@ real probe can never produce, and `walker.groundAt` (the wave's actual fix) had 
 test; it now has 7 against a real MeshBVH. ⚠️ A review subagent edited the working tree
 mid-run and reverted a committed P3 endgame fix; caught by `git status`, restored from
 HEAD. Review agents must be read-only.
+
+**W2-C2 — restyle (7a1025b).** The decorating / dungeon-ifying starter: a validated
+`_world/restyle.json` applied OVER the capture — per-element tint, per-element taxonomy
+class material (procedural tile from the SAME `class_taxonomy.json` the bakes read,
+projected triplanarly in world space because each element's UVs are its own atlas chart
+packing), and one scene lighting preset (as-captured / noon / golden-hour / overcast /
+dusk / night / dungeon × intensity). Reversibility is measured, not asserted:
+`tools/prove-restyle-live.py` compares the frame before / restyled / reset — the restyle
+moved it 53.5 mean RGB and reset returned it to **0.0**. Found live and fixed: a restyle
+you cannot see is not a restyle — the splat backdrop is the photograph (it cannot be
+re-surfaced or relit, and it hides the shell it stands in for), so an active restyle now
+shows the reconstructed geometry instead. 7 backend + 11 frontend tests.
+
+**Wave totals:** backend 1140 green, frontend 134 green. Branch `w2-world-tools` pushed;
+merge is RToony's call.
