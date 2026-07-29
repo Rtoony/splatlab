@@ -419,6 +419,18 @@ def evaluate(mesh, probe: Probe, player_radius: float, player_height: float) -> 
     gates["capsule_clear_frac"] = round(float(clear.mean()), 4)
     # ground to stand on AND room to stand in
     gates["walkable_frac"] = round(float((hit & clear).mean()), 4)
+    # The per-cell mask, kept for the navmesh export (P3): actors path over
+    # exactly the cells the acceptance gates graded as standable. Underscore
+    # prefix = side-channel, stripped before any JSON serialization.
+    walk_grid = np.zeros(probe.shape, bool)
+    walk_grid[sel] = hit & clear
+    gates["_walkable"] = {
+        "cell": float(probe.cell),
+        "origin": [float(probe.origin[0]), float(probe.origin[1])],
+        "shape": [int(probe.shape[0]), int(probe.shape[1])],
+        "floor_y": float(probe.floor_level),
+        "rows": ["".join("1" if v else "0" for v in row) for row in walk_grid],
+    }
     src_free = float(probe.capsule_free[sel].mean())
     gates["source_capsule_free_frac"] = round(src_free, 4)
     gates["walkable_vs_source"] = (
@@ -860,6 +872,29 @@ def main() -> int:
 
         _log(f"[5/5] winner {winner['route']}")
         mesh = winner.pop("_mesh")
+        # Floating collision crumbs (voxelization islands under 1% of faces)
+        # snag capsules and fail shell_connectivity on every rebuild — drop
+        # them here, durably, instead of as a one-off data fix (2026-07-28:
+        # 26 crumbs, 5,464 tris on the bonsai). The largest island is always
+        # kept, so a degenerate threshold can never empty the solid.
+        import trimesh.graph as _tg
+
+        comps = _tg.connected_components(mesh.face_adjacency,
+                                         nodes=np.arange(len(mesh.faces)))
+        if len(comps) > 1:
+            sizes = [(len(c), i) for i, c in enumerate(comps)]
+            largest = max(sizes)[1]
+            keep = np.zeros(len(mesh.faces), bool)
+            dropped = 0
+            for size, index in sizes:
+                if index == largest or size >= 0.01 * len(mesh.faces):
+                    keep[comps[index]] = True
+                else:
+                    dropped += 1
+            if dropped:
+                mesh.update_faces(keep)
+                mesh.remove_unreferenced_vertices()
+                _log(f"      dropped {dropped} collision crumb component(s)")
         mesh.export(str(out_glb))
         # MANDATORY readback: the export is only real if it reloads identically.
         import trimesh
@@ -874,6 +909,21 @@ def main() -> int:
             "bounds": [[round(float(v), 4) for v in b] for b in back.bounds],
         }
         readback["match"] = readback["triangles_written"] == readback["triangles_read_back"]
+        # The navmesh: the winner's own walkable cells, written beside the
+        # collision solid. Actors will path over exactly what the gates
+        # graded as standable — no second opinion about where feet may go.
+        nav = None
+        for cand in scored:
+            popped = (cand.get("gates") or {}).pop("_walkable", None)
+            if cand is winner:
+                nav = popped
+        if nav:
+            nav_path = out_glb.parent / "navmesh.json"
+            nav_path.write_text(json.dumps({"v": 1, "frame": "y-up", **nav}))
+            report["navmesh"] = {"path": nav_path.name, "shape": nav["shape"],
+                                 "cell": nav["cell"],
+                                 "walkable_cells": sum(r.count("1") for r in nav["rows"])}
+
         g = winner["gates"]
         report.update(
             {
