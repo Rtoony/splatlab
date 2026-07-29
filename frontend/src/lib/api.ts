@@ -339,6 +339,46 @@ export function uploadPolishedWorldElement(
   );
 }
 
+// Set-dressing lane: land an authored fantasy asset as a NEW world element
+// (the create door refuses existing slugs — polish replaces, placement
+// invents), or remove a placed one (its GLB is tombstoned to
+// _world/versions/ server-side; captured elements are refused).
+export interface PlacedElementResponse {
+  ok: boolean;
+  slug: string;
+  url: string;
+  element: { slug: string; label?: string; role?: string; provenance?: string };
+  receipt: Record<string, unknown>;
+  warnings: string[];
+}
+
+export function uploadPlacedWorldElement(
+  jobId: string,
+  slug: string,
+  role: string,
+  label: string,
+  file: File,
+  onProgress?: (pct: number) => void,
+): Promise<PlacedElementResponse> {
+  const params = new URLSearchParams({ slug, role });
+  if (label) params.set("label", label);
+  return uploadGlbTo(
+    `/api/splat/jobs/${jobId}/world/elements?${params.toString()}`,
+    file,
+    onProgress,
+  );
+}
+
+export function removePlacedWorldElement(
+  jobId: string,
+  slug: string,
+): Promise<{ ok: boolean; slug: string; tombstone: string | null }> {
+  return apiRequest(
+    `/api/splat/jobs/${jobId}/world/elements/${encodeURIComponent(slug)}`,
+    { method: "DELETE" },
+  );
+}
+
 // List the job's edit restore points (newest-first ordering is the caller's job).
 export function fetchEditVersions(jobId: string): Promise<SplatEditVersionsResponse> {
   return apiRequest<SplatEditVersionsResponse>(`/api/splat/jobs/${jobId}/edit/versions`);

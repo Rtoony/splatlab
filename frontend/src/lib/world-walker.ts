@@ -94,6 +94,9 @@ export interface WorldEntry {
   extent?: [number, number, number];
   collision?: WorldCollisionBlock;
   classification?: string[];
+  /** "authored" for placed set-dressing (world_placed registry); absent for
+   *  capture-derived elements. */
+  provenance?: string | null;
 }
 
 export interface WorldManifest {

@@ -16,7 +16,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { TargetInfo } from "@/lib/world-interactions";
 import { Link, useRoute } from "wouter";
-import { uploadPolishedWorldElement , bakeWorldRestyle, fetchWorldInteractions, fetchWorldNavmesh, fetchWorldRestyle, fetchWorldScenario, resetWorldRestyle, revertWorldRestyleBake, setWorldElementState, setWorldPlayerPoses, setWorldRestyle, solidifyWorld} from "@/lib/api";
+import { uploadPolishedWorldElement , bakeWorldRestyle, fetchWorldInteractions, fetchWorldNavmesh, fetchWorldRestyle, fetchWorldScenario, removePlacedWorldElement, resetWorldRestyle, revertWorldRestyleBake, setWorldElementState, setWorldPlayerPoses, setWorldRestyle, solidifyWorld, uploadPlacedWorldElement} from "@/lib/api";
 import { LIGHT_PRESETS, emptyRestyle, type RestyleDoc, type RestyleEntry, type RestyleMaterial } from "@/lib/world-restyle";
 import { WorldGame, type GameHudState, type Scenario } from "@/lib/world-game";
 import type { parseNavmesh } from "@/lib/world-navmesh";
@@ -49,6 +49,7 @@ import {
   Palette,
   Shapes,
   UploadCloud,
+  Wand2,
 } from "lucide-react";
 
 const DEV_SOURCE_KEY = "splatlab.world-view.devSource";
@@ -425,6 +426,29 @@ export default function WorldViewPage() {
       .finally(() => setRestyleBusy(false));
   }, [jobId, source.kind]);
 
+  /** Land an authored asset through the create door, surface its warnings,
+   *  and reload so the walker fetches the new element. Rejection messages
+   *  come back verbatim for the upload zone to display. */
+  const placeAsset = useCallback(async (
+    slug: string, role: string, label: string, file: File,
+    onProgress: (pct: number) => void,
+  ) => {
+    const result = await uploadPlacedWorldElement(
+      jobId, slug, role, label, file, onProgress);
+    if (result.warnings?.length) {
+      setWarnings((w) => [...w,
+        ...result.warnings.map((x) => `Placed '${slug}': ${x}`)]);
+    }
+    setReloadNonce((n) => n + 1);
+  }, [jobId]);
+
+  const removePlaced = useCallback((slug: string) => {
+    void removePlacedWorldElement(jobId, slug)
+      .then(() => setReloadNonce((n) => n + 1))
+      .catch((e: unknown) => setWarnings((w) => [...w,
+        `Remove failed: ${e instanceof Error ? e.message : String(e)}`]));
+  }, [jobId]);
+
   const startGame = useCallback(() => {
     const walker = walkerRef.current;
     const data = gameDataRef.current;
@@ -697,6 +721,13 @@ export default function WorldViewPage() {
                   onClear={clearRestyle}
                   onBake={bakeRestyle}
                   onRevert={revertBake}
+                />
+              )}
+              {source.kind === "api" && manifest && (
+                <PlacedPanel
+                  manifest={manifest}
+                  onPlace={placeAsset}
+                  onRemove={removePlaced}
                 />
               )}
               <Panel icon={<Layers className="h-3.5 w-3.5" />} title="Backdrop">
@@ -1611,6 +1642,128 @@ function RestylePanel({
           )}
         </div>
       )}
+    </Panel>
+  );
+}
+
+function PlacedPanel({
+  manifest,
+  onPlace,
+  onRemove,
+}: {
+  manifest: WorldManifest;
+  onPlace: (slug: string, role: string, label: string, file: File,
+            onProgress: (pct: number) => void) => Promise<void>;
+  onRemove: (slug: string) => void;
+}) {
+  const placed = (manifest.elements ?? []).filter(
+    (e) => e.provenance === "authored");
+  const [slug, setSlug] = useState("");
+  const [role, setRole] = useState<"static" | "prop">("static");
+  // Armed like every other destructive control: first click arms, second
+  // fires, 4 s to change your mind.
+  const [armedRemove, setArmedRemove] = useState<string | null>(null);
+  useEffect(() => {
+    if (armedRemove === null) return;
+    const t = window.setTimeout(() => setArmedRemove(null), 4000);
+    return () => window.clearTimeout(t);
+  }, [armedRemove]);
+  // Mirror of the server's placement slug grammar (world_placed.SLUG_RE);
+  // the door is the real gate — this only saves a round trip.
+  const slugOk = /^[a-z0-9][a-z0-9-]{0,39}$/.test(slug) && slug !== "shell";
+  const uncalibrated = manifest.meters_per_unit == null;
+
+  return (
+    <Panel icon={<Wand2 className="h-3.5 w-3.5" />} title="Placed assets">
+      <p className="mb-2 text-[11px] leading-relaxed text-zinc-400">
+        Fantasy set-dressing authored in Blender, landed as first-class world
+        elements. They survive rebuilds; Remove tombstones the file.
+      </p>
+
+      {placed.length > 0 ? (
+        <div className="mb-2 space-y-1">
+          {placed.map((entry) => (
+            <div
+              key={entry.slug}
+              className="flex items-center gap-2 rounded-md border border-white/5 bg-black/40 px-2 py-1"
+            >
+              <span className="min-w-0 flex-1 truncate text-[11px] text-zinc-200">
+                {entry.label || entry.slug}
+                <span className="ml-1 text-[9px] uppercase tracking-wider text-zinc-500">
+                  {entry.role}
+                </span>
+                {entry.extent && (
+                  <span className="ml-1 text-[10px] text-zinc-500">
+                    {entry.extent.map((v) => v.toFixed(2)).join("×")}
+                    {uncalibrated ? " u" : " m"}
+                  </span>
+                )}
+              </span>
+              <button
+                type="button"
+                className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] ${
+                  armedRemove === entry.slug
+                    ? "border-amber-400/60 bg-amber-500/15 text-amber-300"
+                    : "border-white/10 text-zinc-400 hover:bg-white/5"
+                }`}
+                onClick={() => {
+                  if (armedRemove === entry.slug) {
+                    setArmedRemove(null);
+                    onRemove(entry.slug);
+                  } else {
+                    setArmedRemove(entry.slug);
+                  }
+                }}
+              >
+                {armedRemove === entry.slug ? "Sure? Tombstone it" : "Remove"}
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="mb-2 text-[10px] text-zinc-500">
+          Nothing placed yet — the world is exactly as captured.
+        </p>
+      )}
+
+      <label className="mb-1 block text-[10px] uppercase tracking-wider text-zinc-500">
+        Place new asset
+      </label>
+      <div className="mb-1 flex items-center gap-2">
+        <input
+          type="text"
+          value={slug}
+          onChange={(e) => setSlug(e.target.value.trim())}
+          placeholder="new-slug (kebab-case)"
+          className="min-w-0 flex-1 rounded-md border border-white/10 bg-black/60 px-2 py-1 font-mono text-[11px] text-zinc-200 placeholder:text-zinc-600"
+        />
+        <select
+          value={role}
+          onChange={(e) => setRole(e.target.value as "static" | "prop")}
+          className="rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[11px] text-zinc-200"
+        >
+          <option value="static">static</option>
+          <option value="prop">prop</option>
+        </select>
+      </div>
+      {slug && !slugOk && (
+        <p className="mb-1 text-[10px] text-amber-300/90">
+          Slug must be lowercase kebab-case (max 40 chars), not “shell”.
+        </p>
+      )}
+      {uncalibrated && (
+        <p className="mb-1 text-[10px] leading-snug text-amber-300/80">
+          World scale is a guess — a metre-modelled asset lands at a guessed
+          size. Calibrate via the Measure tab for honest sizing.
+        </p>
+      )}
+      <PolishUploadZone
+        title="Drop a world-frame GLB to place"
+        hint={"Author in Blender: import_asset → transform_object → export with bake_world_transform=true. The slug must be NEW — placement invents, polish replaces."}
+        confirmLabel={slugOk ? `Place as '${slug}' (${role})` : "Enter a slug first"}
+        disabled={!slugOk}
+        onUpload={(file, onProgress) => onPlace(slug, role, slug, file, onProgress)}
+      />
     </Panel>
   );
 }
