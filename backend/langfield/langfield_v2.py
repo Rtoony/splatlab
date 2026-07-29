@@ -46,7 +46,6 @@ scales = torch.exp(m.scales.detach())
 opac = torch.sigmoid(m.opacities.detach()).squeeze(-1)
 N = means.shape[0]
 cams = pipeline.datamanager.train_dataset.cameras.to(DEV)
-fullW, fullH = int(cams.width[0]), int(cams.height[0])
 
 meta = json.load(open(FEAT / "frames_meta.json"))
 n_frames, LIFT_W, LIFT_H = meta["n"], meta["W"], meta["H"]
@@ -56,8 +55,14 @@ def viewmat_for(i):
     return get_viewmat(cams.camera_to_worlds[i:i+1])
 
 def K_for(i, w, h):
+    # PER-CAMERA native dims, not camera 0's: intrinsics belong to each
+    # camera's own resolution, and mixed-res datasets (ETH3D Courtyard) have
+    # cameras whose native W/H differ by a pixel or two. export_frames resizes
+    # every frame to the canonical (w, h), so scaling K by w/width_i is exact
+    # for uniform datasets and correct for mixed ones.
     K = cams.get_intrinsics_matrices()[i:i+1].clone().to(DEV)
-    K[:, 0, :] *= (w / fullW); K[:, 1, :] *= (h / fullH)
+    K[:, 0, :] *= (w / float(cams.width[i]))
+    K[:, 1, :] *= (h / float(cams.height[i]))
     return K
 
 # ── SigLIP 2 region encoder ──────────────────────────────────────────────────────

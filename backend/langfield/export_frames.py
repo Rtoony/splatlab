@@ -26,10 +26,26 @@ frames_dir.mkdir(parents=True, exist_ok=True)
 config, pipeline, _, _ = eval_setup(CONFIG, test_mode="test")
 ds = pipeline.datamanager.train_dataset
 n = len(ds)
+# ONE canonical resolution for the whole lift, taken from frame 0. Mixed
+# per-frame dims are real (ETH3D Courtyard: 1551x1033 next to 1549x1032 —
+# dataparser downscale rounding varies per source image), and the lift
+# rasterizes, masks, and indexes every view at a single (W, H): the old code
+# recorded only the LAST frame's dims, so the first mixed-res dataset died in
+# PASS B's resolution assert. Sub-0.2% resamples are semantically nil for SAM
+# masks and SigLIP features; the per-camera intrinsics scaling in
+# langfield_v2.K_for absorbs the geometry side.
 W = H = None
+resized = 0
 for i in range(n):
     img = (ds[i]["image"][..., :3].cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)  # HWC RGB
-    H, W = img.shape[:2]
-    Image.fromarray(img).save(frames_dir / f"frame_{i:03d}.png")
-json.dump({"n": n, "W": int(W), "H": int(H)}, open(OUTD / "frames_meta.json", "w"))
-print(f"EXPORTED {n} frames @ {W}x{H} -> {frames_dir}")
+    frame = Image.fromarray(img)
+    if W is None:
+        H, W = img.shape[:2]
+    elif img.shape[:2] != (H, W):
+        frame = frame.resize((W, H), Image.LANCZOS)
+        resized += 1
+    frame.save(frames_dir / f"frame_{i:03d}.png")
+json.dump({"n": n, "W": int(W), "H": int(H), "resized_to_canonical": resized},
+          open(OUTD / "frames_meta.json", "w"))
+note = f" ({resized} frames resized to canonical)" if resized else ""
+print(f"EXPORTED {n} frames @ {W}x{H}{note} -> {frames_dir}")
