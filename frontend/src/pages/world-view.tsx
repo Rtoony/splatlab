@@ -350,6 +350,7 @@ export default function WorldViewPage() {
       navmeshDoc: data.navmeshDoc,
       scenario: data.scenario,
       unitsPerMetre: walker.params.unitsPerMetre,
+      groundAt: (x, z) => walker.groundAt(x, z),
     });
     game.onHud = (h) => {
       setGameHud(h);

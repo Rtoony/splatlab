@@ -202,3 +202,54 @@ describe("combat polish (W2-B, capped)", () => {
     }
   });
 });
+
+describe("outdoor terrain (measured live on the Stump)", () => {
+  it("zombies stand on the probed ground, not the navmesh's flat floor_y", () => {
+    // The navmesh says floor_y=0, but the real terrain slopes to ~2 units up.
+    const terrain = (x: number, _z: number) => 2 + 0.1 * x;
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, 1);
+    camera.position.set(5, 1.7 + terrain(5, 5), 5);
+    camera.updateMatrixWorld(true);
+    const game = new WorldGame({
+      scene, camera, navmeshDoc: OPEN_ROOM, scenario: scenario(),
+      unitsPerMetre: 1, seed: 7, groundAt: terrain,
+    });
+    game.start();
+    const dt = 1 / 60;
+    for (let t = 0; t < 4; t += dt) game.update(dt);
+    const zombies = zombieGroups(scene);
+    expect(zombies.length).toBeGreaterThan(0);
+    for (const z of zombies) {
+      const want = terrain(z.position.x, z.position.z);
+      expect(Math.abs(z.position.y - want)).toBeLessThan(0.35);
+      expect(z.position.y).toBeGreaterThan(1); // nowhere near flat floor_y=0
+    }
+    game.dispose();
+  });
+
+  it("carries its own actor light in unlit worlds, defers to scene lights", () => {
+    const { scene, game, step } = rig();
+    // The renderer honors hierarchical visibility, so measure the effective
+    // flag (self AND every ancestor), not the light's own bit.
+    const lit = (o: THREE.Object3D): boolean => {
+      for (let p: THREE.Object3D | null = o; p; p = p.parent) if (!p.visible) return false;
+      return true;
+    };
+    const lights = () => {
+      const out: THREE.Light[] = [];
+      scene.traverse((o) => { if ((o as THREE.Light).isLight) out.push(o as THREE.Light); });
+      return out;
+    };
+    game.start();
+    step(0.3);
+    expect(lights().some(lit)).toBe(true); // dark world: ours is on
+    const house = new THREE.DirectionalLight(0xffffff, 1);
+    scene.add(house);
+    step(0.3);
+    const gameLights = lights().filter((l) => l !== house);
+    expect(gameLights.every((l) => !lit(l))).toBe(true); // theirs wins
+    game.stop();
+    expect(gameLights.every((l) => !lit(l))).toBe(true);
+  });
+});

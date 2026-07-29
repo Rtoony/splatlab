@@ -1000,6 +1000,21 @@ export class WorldWalker {
   }
 
   /**
+   * The true standing height at (x, z): one down-cast onto the collider.
+   * Null when nothing is below — the caller picks its own fallback. The
+   * navmesh only records a single flat floor_y, so anything that stands on
+   * outdoor terrain (zombies, props) asks here instead of trusting it.
+   */
+  groundAt(x: number, z: number): number | null {
+    if (!this.bvh) return null;
+    const top = this.sceneBox.max.y + Math.max(1, this.sceneBox.getSize(new THREE.Vector3()).y);
+    _ray.origin.set(x, top, z);
+    _ray.direction.set(0, -1, 0);
+    const hit = this.bvh.raycastFirst(_ray, THREE.DoubleSide);
+    return hit?.point ? hit.point.y : null;
+  }
+
+  /**
    * Ray-cast straight down onto the collider to find a floor, then place the
    * eye one eye-height above it. Falls back to a ring of nearby probes, then
    * to a mid-air drop, so an odd scene never leaves the player nowhere.

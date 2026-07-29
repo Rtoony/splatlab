@@ -70,6 +70,10 @@ interface ZombieActor {
   stagger: number;
   /** Seconds into the spawn rise; >= RISE_SECONDS means fully surfaced. */
   rising: number;
+  /** Smoothed terrain height under the actor (falls back to nav floor_y). */
+  groundY: number;
+  /** Latest ground sample; groundY eases toward it so slopes read as walking. */
+  groundGoalY: number;
   /** Per-actor variety: scales size and speed (±12%), no new systems. */
   jitter: number;
 }
@@ -131,7 +135,9 @@ export class WorldGame {
   private readonly scenario: Scenario;
   private readonly unitsPerMetre: number;
   private readonly rng: () => number;
+  private readonly groundProbe: ((x: number, z: number) => number | null) | null;
   private readonly root = new THREE.Group();
+  private readonly gameLight = new THREE.Group();
   private readonly zombies: ZombieActor[] = [];
   private readonly _ray = new THREE.Raycaster();
   private readonly _fwd = new THREE.Vector3();
@@ -154,6 +160,9 @@ export class WorldGame {
     scenario: Scenario;
     unitsPerMetre: number;
     seed?: number;
+    /** True terrain height at (x, z) — the navmesh's single flat floor_y
+     *  floats actors over outdoor ground (measured live on the Stump). */
+    groundAt?: (x: number, z: number) => number | null;
   }) {
     this.scene = options.scene;
     this.camera = options.camera;
@@ -161,8 +170,40 @@ export class WorldGame {
     this.scenario = options.scenario;
     this.unitsPerMetre = Math.max(1e-6, options.unitsPerMetre);
     this.rng = makeRng(options.seed ?? 1337);
+    this.groundProbe = options.groundAt ?? null;
     this.health = options.scenario.player.health;
+    // Unlit worlds (the faithful default — atlases bake their own light)
+    // render standard-material actors pitch black. Carry our own light; it
+    // only switches on when nothing else in the scene is lighting them.
+    const hemi = new THREE.HemisphereLight(0xfff2df, 0x33402e, 2.2);
+    const key = new THREE.DirectionalLight(0xffffff, 1.1);
+    key.position.set(2, 5, 3);
+    this.gameLight.add(hemi, key);
+    this.gameLight.visible = false;
+    this.root.add(this.gameLight);
     this.scene.add(this.root);
+  }
+
+  /** True when some OTHER visible light already reaches the actors. */
+  private sceneHasLight(): boolean {
+    let found = false;
+    this.scene.traverse((o) => {
+      if (found || !o.visible) return;
+      if ((o as THREE.Light).isLight && !this.gameLight.children.includes(o as THREE.Light)) {
+        let p = o.parent;
+        let shaded = true;
+        while (p) {
+          if (!p.visible) { shaded = false; break; }
+          p = p.parent;
+        }
+        if (shaded) found = true;
+      }
+    });
+    return found;
+  }
+
+  private groundYAt(x: number, z: number): number {
+    return this.groundProbe?.(x, z) ?? this.nav.floorY;
   }
 
   get active(): boolean {
@@ -175,12 +216,14 @@ export class WorldGame {
     this.health = this.scenario.player.health;
     this.kills = 0;
     this.waveIndex = -1;
+    this.gameLight.visible = !this.sceneHasLight();
     this.beginRest(1.5);
     this.emitHud(true);
   }
 
   stop(): void {
     this.phase = "idle";
+    this.gameLight.visible = false;
     this.clearActors();
     this.emitHud(true);
   }
@@ -272,7 +315,7 @@ export class WorldGame {
         zombie.rising += dt;
         const t = Math.min(1, zombie.rising / RISE_SECONDS);
         const height = ZOMBIE_HEIGHT_M * this.unitsPerMetre * zombie.jitter;
-        zombie.group.position.y = this.nav.floorY - height * (1 - t * t);
+        zombie.group.position.y = zombie.groundY - height * (1 - t * t);
         continue;
       }
 
@@ -284,16 +327,21 @@ export class WorldGame {
       }
       zombie.group.rotation.x = 0;
 
-      // Chase: repath toward the player's cell on a slow clock.
+      // Chase: repath toward the player's cell on a slow clock. The same
+      // clock re-samples the terrain height so slopes are followed without
+      // per-frame raycasts.
       zombie.repathClock -= dt;
-      if (zombie.repathClock <= 0 && playerCell) {
+      if (zombie.repathClock <= 0) {
         zombie.repathClock = REPATH_SECONDS + this.rng() * 0.3;
-        const from = nearestWalkable(this.nav, zombie.group.position.x, zombie.group.position.z);
-        if (from) {
-          const path = findPath(this.nav, from, playerCell, 8000);
-          if (path && path.length > 1) {
-            zombie.path = path;
-            zombie.pathAt = 1;
+        zombie.groundGoalY = this.groundYAt(zombie.group.position.x, zombie.group.position.z);
+        if (playerCell) {
+          const from = nearestWalkable(this.nav, zombie.group.position.x, zombie.group.position.z);
+          if (from) {
+            const path = findPath(this.nav, from, playerCell, 8000);
+            if (path && path.length > 1) {
+              zombie.path = path;
+              zombie.pathAt = 1;
+            }
           }
         }
       }
@@ -317,7 +365,8 @@ export class WorldGame {
       // Shamble animation + hit flash.
       zombie.seed += dt;
       const sway = Math.sin(zombie.seed * 6) * 0.06;
-      zombie.group.position.y = this.nav.floorY + Math.abs(Math.sin(zombie.seed * 6)) * 0.03;
+      zombie.groundY += (zombie.groundGoalY - zombie.groundY) * Math.min(1, dt * 6);
+      zombie.group.position.y = zombie.groundY + Math.abs(Math.sin(zombie.seed * 6)) * 0.03;
       zombie.group.rotation.z = sway * 0.4;
       zombie.parts.armL.rotation.x = -0.2 + sway;
       zombie.parts.armR.rotation.x = -0.2 - sway;
@@ -367,7 +416,10 @@ export class WorldGame {
     }
 
     this.hudClock += dt;
-    if (this.hudClock >= 0.25) this.emitHud(false);
+    if (this.hudClock >= 0.25) {
+      this.gameLight.visible = !this.sceneHasLight();
+      this.emitHud(false);
+    }
   }
 
   dispose(): void {
@@ -421,9 +473,10 @@ export class WorldGame {
     const scale = (ZOMBIE_HEIGHT_M * this.unitsPerMetre / 1.6) * jitter;
     const built = buildZombie(scale);
     const [x, z] = worldAt(this.nav, cell);
+    const groundY = this.groundYAt(x, z);
     // Born underground; the rise animation surfaces it.
     built.group.position.set(
-      x, this.nav.floorY - ZOMBIE_HEIGHT_M * this.unitsPerMetre * jitter, z);
+      x, groundY - ZOMBIE_HEIGHT_M * this.unitsPerMetre * jitter, z);
     built.group.userData.zombieIndex = this.zombies.length;
     this.root.add(built.group);
     this.zombies.push({
@@ -438,6 +491,8 @@ export class WorldGame {
       hitFlash: 0,
       dying: -1,
       seed: this.rng() * 10,
+      groundY,
+      groundGoalY: groundY,
       stagger: 0,
       rising: 0,
       jitter,
