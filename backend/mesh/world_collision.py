@@ -37,12 +37,16 @@ Usage: world_collision.py <job_dir> [--prop-max-frac 0.16] [--prop-max-metres 1.
 """
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import trimesh
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import world_placed  # noqa: E402  (authored set-dressing registry — stdlib-only)
 
 # CoACD is chatty on stdout; keep the stage's own reporting readable.
 try:
@@ -274,6 +278,41 @@ def main() -> int:
             _log(f"  {slug}: static -> complex-as-simple")
         out.append(rec)
 
+    # Authored set-dressing survives rebuilds the same way regrades do: the
+    # placed.json registry (written only by the audited place/remove door) is
+    # re-applied over the derived list every run. A corrupt registry degrades
+    # loudly to "none" here — a rebuild must not brick on registry damage.
+    try:
+        placed = world_placed.read_placed(job_dir / "_world",
+                                          world.get("job_id") or "")
+    except world_placed.PlacedError as exc:
+        _log(f"  WARNING: {exc} — no authored assets applied this run")
+        placed = world_placed.new_placed(world.get("job_id") or "")
+    captured_slugs = {e["slug"] for e in out}
+    authored_conflicts = []
+    for entry in placed.get("elements", []):
+        slug = entry["slug"]
+        if slug in captured_slugs:
+            authored_conflicts.append(slug)
+            _log(f"  {slug}: authored slug collides with a captured element "
+                 "— captured wins")
+            continue
+        rec = world_placed.manifest_element(entry)
+        glb = job_dir / "_world" / "elements" / entry["glb"]
+        if not glb.is_file():
+            rec.update({"role": "unbuilt", "reason": "placed GLB missing",
+                        "collision": None})
+            _log(f"  {slug}: authored GLB missing -> unbuilt")
+        elif rec["role"] == "prop":
+            rec["collision"] = convex_hulls(glb, hull_dir, slug,
+                                            args.max_hulls,
+                                            args.coacd_threshold)
+            _log(f"  {slug}: authored prop -> "
+                 f"{rec['collision'].get('hulls', 0)} hulls")
+        else:
+            _log(f"  {slug}: authored static -> complex-as-simple")
+        out.append(rec)
+
     shell_rec = None
     if shell.get("built"):
         shell_rec = {"slug": "shell", "role": "static", "glb": shell.get("glb"),
@@ -294,16 +333,23 @@ def main() -> int:
         "coacd_available": HAVE_COACD,
         "shell": shell_rec,
         "elements": out,
+        "authored_conflicts": authored_conflicts,
         "counts": {
             "props": sum(1 for e in out if e.get("role") == "prop"),
             "static": sum(1 for e in out if e.get("role") == "static"),
             "unbuilt": sum(1 for e in out if e.get("role") == "unbuilt"),
+            "authored": sum(1 for e in out if e.get("provenance") == "authored"),
             "hulls_total": sum((e.get("collision") or {}).get("hulls", 0) or 0 for e in out),
         },
         "seconds": round(time.time() - t0, 1),
     }
     dest = Path(args.report) if args.report else job_dir / "_world" / "world_manifest.json"
-    dest.write_text(json.dumps(doc, indent=2))
+    # Staged + atomic: the walker fetches this file RAW, so a torn read must
+    # be impossible. (splat_route's regrades.json write shares this hazard —
+    # flagged, out of scope here.)
+    staged = dest.with_name(".building-" + dest.name)
+    staged.write_text(json.dumps(doc, indent=2))
+    os.replace(staged, dest)
     print(json.dumps(doc, indent=2))
     return 0
 
