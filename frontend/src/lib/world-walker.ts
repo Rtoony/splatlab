@@ -1000,18 +1000,23 @@ export class WorldWalker {
   }
 
   /**
-   * The true standing height at (x, z): one down-cast onto the collider.
-   * Null when nothing is below — the caller picks its own fallback. The
-   * navmesh only records a single flat floor_y, so anything that stands on
-   * outdoor terrain (zombies, props) asks here instead of trusting it.
+   * The true standing height at (x, z): the HIGHEST collider face at or
+   * below `belowY`. Both naive casts fail on a real outdoor world (measured
+   * live on the Stump): first-hit-from-the-sky lands on the tree canopy /
+   * shell roof, lowest-hit lands on the terrain slab's UNDERSIDE. Callers
+   * pass a `belowY` just above the walkable band (e.g. navmesh floor_y +
+   * headroom) so the pick is the turf top under any canopy. Null when the
+   * column has no face at or below the cap.
    */
-  groundAt(x: number, z: number): number | null {
+  groundAt(x: number, z: number, belowY = Infinity): number | null {
     if (!this.bvh) return null;
     const top = this.sceneBox.max.y + Math.max(1, this.sceneBox.getSize(new THREE.Vector3()).y);
     _ray.origin.set(x, top, z);
     _ray.direction.set(0, -1, 0);
-    const hit = this.bvh.raycastFirst(_ray, THREE.DoubleSide);
-    return hit?.point ? hit.point.y : null;
+    const hits = this.bvh.raycast(_ray, THREE.DoubleSide);
+    let best = -Infinity;
+    for (const h of hits) if (h.point.y <= belowY && h.point.y > best) best = h.point.y;
+    return Number.isFinite(best) ? best : null;
   }
 
   /**
@@ -1020,7 +1025,6 @@ export class WorldWalker {
    * to a mid-air drop, so an odd scene never leaves the player nowhere.
    */
   private findStandingPoint(nearXZ: THREE.Vector3): THREE.Vector3 {
-    const top = this.sceneBox.max.y + Math.max(1, this.sceneBox.getSize(new THREE.Vector3()).y);
     const radiusStep = this.sceneBox.getSize(new THREE.Vector3()).length() * 0.06;
     const probes: THREE.Vector3[] = [nearXZ.clone()];
     for (let ring = 1; ring <= 3; ring++) {
@@ -1037,11 +1041,12 @@ export class WorldWalker {
     }
 
     if (this.bvh) {
+      // Cap the probe below the upper third of the world so it lands on the
+      // floor/turf, never the canopy or roof (the old shell-roof spawn bug).
+      const cap = this.sceneBox.min.y + this.sceneBox.getSize(new THREE.Vector3()).y * 0.7;
       for (const p of probes) {
-        _ray.origin.set(p.x, top, p.z);
-        _ray.direction.set(0, -1, 0);
-        const hit = this.bvh.raycastFirst(_ray, THREE.DoubleSide);
-        if (hit?.point) return new THREE.Vector3(p.x, hit.point.y + this.eyeHeight, p.z);
+        const y = this.groundAt(p.x, p.z, cap);
+        if (y !== null) return new THREE.Vector3(p.x, y + this.eyeHeight, p.z);
       }
     }
     // No floor found: hover at mid-height and let gravity sort it out.

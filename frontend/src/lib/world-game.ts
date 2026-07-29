@@ -116,8 +116,15 @@ function buildZombie(scale: number): ZombieActor["parts"] & { group: THREE.Group
   const armR = new THREE.Mesh(armGeom, skin);
   armL.position.set(-0.3 * scale, 1.05 * scale, 0.25 * scale);
   armR.position.set(0.3 * scale, 1.05 * scale, 0.25 * scale);
+  // Legs reach the group origin: without them the torso capsule ends 0.35
+  // units up and every zombie looks like it hovers (measured on the Stump).
+  const legGeom = new THREE.BoxGeometry(0.11 * scale, 0.42 * scale, 0.13 * scale);
+  const legL = new THREE.Mesh(legGeom, cloth);
+  const legR = new THREE.Mesh(legGeom, cloth);
+  legL.position.set(-0.11 * scale, 0.21 * scale, 0);
+  legR.position.set(0.11 * scale, 0.21 * scale, 0);
   const group = new THREE.Group();
-  group.add(torso, head, armL, armR);
+  group.add(torso, head, armL, armR, legL, legR);
   return { group, torso, head, armL, armR };
 }
 
@@ -135,7 +142,7 @@ export class WorldGame {
   private readonly scenario: Scenario;
   private readonly unitsPerMetre: number;
   private readonly rng: () => number;
-  private readonly groundProbe: ((x: number, z: number) => number | null) | null;
+  private readonly groundProbe: ((x: number, z: number, belowY: number) => number | null) | null;
   private readonly root = new THREE.Group();
   private readonly gameLight = new THREE.Group();
   private readonly zombies: ZombieActor[] = [];
@@ -161,8 +168,9 @@ export class WorldGame {
     unitsPerMetre: number;
     seed?: number;
     /** True terrain height at (x, z) — the navmesh's single flat floor_y
-     *  floats actors over outdoor ground (measured live on the Stump). */
-    groundAt?: (x: number, z: number) => number | null;
+     *  floats actors over outdoor ground (measured live on the Stump).
+     *  `belowY` caps the probe so tree canopies are never picked. */
+    groundAt?: (x: number, z: number, belowY: number) => number | null;
   }) {
     this.scene = options.scene;
     this.camera = options.camera;
@@ -203,7 +211,10 @@ export class WorldGame {
   }
 
   private groundYAt(x: number, z: number): number {
-    return this.groundProbe?.(x, z) ?? this.nav.floorY;
+    // Cap the probe one head above the graded floor: below any canopy,
+    // above the local terrain undulation the navmesh tolerates.
+    const cap = this.nav.floorY + 1.0 * this.unitsPerMetre;
+    return this.groundProbe?.(x, z, cap) ?? this.nav.floorY;
   }
 
   get active(): boolean {

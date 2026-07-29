@@ -206,7 +206,11 @@ describe("combat polish (W2-B, capped)", () => {
 describe("outdoor terrain (measured live on the Stump)", () => {
   it("zombies stand on the probed ground, not the navmesh's flat floor_y", () => {
     // The navmesh says floor_y=0, but the real terrain slopes to ~2 units up.
-    const terrain = (x: number, _z: number) => 2 + 0.1 * x;
+    const caps: number[] = [];
+    const terrain = (x: number, _z: number, belowY?: number) => {
+      if (belowY !== undefined) caps.push(belowY);
+      return 2 + 0.1 * x;
+    };
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(75, 1);
     camera.position.set(5, 1.7 + terrain(5, 5), 5);
@@ -225,6 +229,10 @@ describe("outdoor terrain (measured live on the Stump)", () => {
       expect(Math.abs(z.position.y - want)).toBeLessThan(0.35);
       expect(z.position.y).toBeGreaterThan(1); // nowhere near flat floor_y=0
     }
+    // The probe must be capped just above the walkable band so a canopy
+    // face can never be picked: floor_y (0) + 1 m at 1 unit/m.
+    expect(caps.length).toBeGreaterThan(0);
+    for (const c of caps) expect(c).toBeCloseTo(1.0, 5);
     game.dispose();
   });
 

@@ -157,6 +157,8 @@ export default function WorldViewPage() {
     const controller = new AbortController();
     const walker = new WorldWalker(canvas);
     walkerRef.current = walker;
+    // Live-proof hook: tools/prove-*.py probe ground truth through this.
+    (window as unknown as { __worldWalker?: WorldWalker }).__worldWalker = walker;
     walker.onStats = (s) => {
       if (!cancelled) setStats(s);
     };
@@ -350,7 +352,7 @@ export default function WorldViewPage() {
       navmeshDoc: data.navmeshDoc,
       scenario: data.scenario,
       unitsPerMetre: walker.params.unitsPerMetre,
-      groundAt: (x, z) => walker.groundAt(x, z),
+      groundAt: (x, z, belowY) => walker.groundAt(x, z, belowY),
     });
     game.onHud = (h) => {
       setGameHud(h);
