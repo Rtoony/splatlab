@@ -83,6 +83,8 @@ const DEATH_SECONDS = 0.9;
 const ZOMBIE_HEIGHT_M = 1.6;
 const STAGGER_SECONDS = 0.35;
 const RISE_SECONDS = 0.8;
+/** How far from the navmesh's graded floor an actor's real ground may sit. */
+const GROUND_BAND_M = 1.6;
 
 /** Deterministic tiny rng (mulberry32) so replays and tests agree. */
 export function makeRng(seed: number): () => number {
@@ -142,7 +144,8 @@ export class WorldGame {
   private readonly scenario: Scenario;
   private readonly unitsPerMetre: number;
   private readonly rng: () => number;
-  private readonly groundProbe: ((x: number, z: number, belowY: number) => number | null) | null;
+  private readonly groundProbe:
+    ((x: number, z: number, referenceY: number, band: number) => number | null) | null;
   private readonly root = new THREE.Group();
   private readonly gameLight = new THREE.Group();
   private readonly zombies: ZombieActor[] = [];
@@ -167,10 +170,11 @@ export class WorldGame {
     scenario: Scenario;
     unitsPerMetre: number;
     seed?: number;
-    /** True terrain height at (x, z) — the navmesh's single flat floor_y
-     *  floats actors over outdoor ground (measured live on the Stump).
-     *  `belowY` caps the probe so tree canopies are never picked. */
-    groundAt?: (x: number, z: number, belowY: number) => number | null;
+    /** The collider surface at (x, z) nearest `referenceY` within `band`,
+     *  or null. The navmesh's single flat floor_y floats actors over real
+     *  outdoor ground (measured live on the Stump); this refines it.
+     *  Contract per walker.surfaceNear — nearest wins, canopy excluded. */
+    groundAt?: (x: number, z: number, referenceY: number, band: number) => number | null;
   }) {
     this.scene = options.scene;
     this.camera = options.camera;
@@ -211,10 +215,11 @@ export class WorldGame {
   }
 
   private groundYAt(x: number, z: number): number {
-    // Cap the probe one head above the graded floor: below any canopy,
-    // above the local terrain undulation the navmesh tolerates.
-    const cap = this.nav.floorY + 1.0 * this.unitsPerMetre;
-    return this.groundProbe?.(x, z, cap) ?? this.nav.floorY;
+    // Search a body-height band around the graded floor: wide enough for
+    // real terrain undulation, narrow enough that overhead geometry is not
+    // a candidate. No face in the band = keep the navmesh's floor.
+    const band = GROUND_BAND_M * this.unitsPerMetre;
+    return this.groundProbe?.(x, z, this.nav.floorY, band) ?? this.nav.floorY;
   }
 
   get active(): boolean {
@@ -284,7 +289,7 @@ export class WorldGame {
     if (this.tracer && (this.tracerTtl -= dt) <= 0) this.killTracer();
     if (this.phase === "won" || this.phase === "lost") {
       for (const zombie of this.zombies) {
-        if (zombie.dying >= 0) zombie.dying += dt;
+        if (zombie.dying >= 0) this.advanceDeath(zombie, dt);
       }
       for (let k = this.zombies.length - 1; k >= 0; k--) {
         if (this.zombies[k].dying >= DEATH_SECONDS) this.removeZombie(k);
@@ -305,17 +310,7 @@ export class WorldGame {
     let alive = 0;
     for (const zombie of this.zombies) {
       if (zombie.dying >= 0) {
-        zombie.dying += dt;
-        zombie.group.rotation.x = -Math.min(1, zombie.dying / DEATH_SECONDS) * (Math.PI / 2);
-        zombie.group.traverse((o) => {
-          const mesh = o as THREE.Mesh;
-          const mat = mesh.material as THREE.Material | undefined;
-          if (mat && "opacity" in mat) {
-            mat.transparent = true;
-            (mat as THREE.MeshStandardMaterial).opacity =
-              Math.max(0, 1 - zombie.dying / DEATH_SECONDS);
-          }
-        });
+        this.advanceDeath(zombie, dt);
         continue;
       }
       alive++;
@@ -331,9 +326,13 @@ export class WorldGame {
       }
 
       // Hit stagger: a landed shot interrupts — flinch, no steps, no bites.
+      // The hit flash burns down HERE too: it used to be applied only in the
+      // shamble section below, which stagger skips, so the red flash fired
+      // 0.35 s AFTER the shot that caused it (review finding).
       if (zombie.stagger > 0) {
         zombie.stagger -= dt;
         zombie.group.rotation.x = -0.25 * (zombie.stagger / STAGGER_SECONDS);
+        this.applyHitFlash(zombie, dt);
         continue;
       }
       zombie.group.rotation.x = 0;
@@ -381,13 +380,7 @@ export class WorldGame {
       zombie.group.rotation.z = sway * 0.4;
       zombie.parts.armL.rotation.x = -0.2 + sway;
       zombie.parts.armR.rotation.x = -0.2 - sway;
-      const torsoMat = zombie.parts.torso.material as THREE.MeshStandardMaterial;
-      if (zombie.hitFlash > 0) {
-        zombie.hitFlash -= dt;
-        torsoMat.emissive.setHex(0xff3333);
-      } else {
-        torsoMat.emissive.setHex(0x000000);
-      }
+      this.applyHitFlash(zombie, dt);
 
       // Melee when in reach — in 3D: a zombie must not chew a player on a
       // balcony above it (review finding). The bite point is chest height.
@@ -440,6 +433,34 @@ export class WorldGame {
 
   /* ---------------- internals ---------------- */
 
+  /** Burn down the hit flash. Called from both the stagger and shamble
+   *  paths so the flash lands on the frame the shot did. */
+  private applyHitFlash(zombie: ZombieActor, dt: number): void {
+    const torsoMat = zombie.parts.torso.material as THREE.MeshStandardMaterial;
+    if (zombie.hitFlash > 0) {
+      zombie.hitFlash -= dt;
+      torsoMat.emissive.setHex(0xff3333);
+    } else {
+      torsoMat.emissive.setHex(0x000000);
+    }
+  }
+
+  /** One frame of dying: fall + fade. Shared so a corpse caught by the
+   *  endgame finishes its animation instead of freezing and popping out
+   *  (review finding — the endgame path advanced the clock only). */
+  private advanceDeath(zombie: ZombieActor, dt: number): void {
+    zombie.dying += dt;
+    const t = Math.min(1, zombie.dying / DEATH_SECONDS);
+    zombie.group.rotation.x = -t * (Math.PI / 2);
+    zombie.group.traverse((o) => {
+      const mat = (o as THREE.Mesh).material as THREE.Material | undefined;
+      if (mat && "opacity" in mat) {
+        mat.transparent = true;
+        (mat as THREE.MeshStandardMaterial).opacity = Math.max(0, 1 - t);
+      }
+    });
+  }
+
   private beginRest(seconds: number): void {
     this.phase = "rest";
     this.restClock = seconds;
@@ -468,8 +489,11 @@ export class WorldGame {
     }
     if (!this.zombies.length) {
       // An empty wave must never quietly count as a survived one (review
-      // finding: a cramped or islanded room fake-won in silence).
+      // finding: a cramped or islanded room fake-won in silence). Going idle
+      // must also put the actor light out — update() early-returns on idle,
+      // so nothing would ever reconcile it again (second review finding).
       this.phase = "idle";
+      this.gameLight.visible = false;
       this.onNotice?.(
         "The scenario could not spawn any actors — no reachable spawn "
         + "ground from where you stand.");

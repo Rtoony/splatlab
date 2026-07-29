@@ -335,6 +335,8 @@ export default function WorldViewPage() {
       setGameReady(false);
       walker.dispose();
       if (walkerRef.current === walker) walkerRef.current = null;
+      const w = window as unknown as { __worldWalker?: WorldWalker };
+      if (w.__worldWalker === walker) delete w.__worldWalker;
     };
   }, [source, reloadNonce]);
 
@@ -352,7 +354,7 @@ export default function WorldViewPage() {
       navmeshDoc: data.navmeshDoc,
       scenario: data.scenario,
       unitsPerMetre: walker.params.unitsPerMetre,
-      groundAt: (x, z, belowY) => walker.groundAt(x, z, belowY),
+      groundAt: (x, z, ref, band) => walker.surfaceNear(x, z, ref, band),
     });
     game.onHud = (h) => {
       setGameHud(h);

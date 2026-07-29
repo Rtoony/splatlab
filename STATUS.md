@@ -2978,3 +2978,33 @@ Left-click arbitrated: combat outranks carry-throw. The whole loop runs REAL and
 deterministic under vitest (spawn/chase/melee/aimed-kills/waves/win — 4 tests) and the
 live browser proof spawned 3 undead who chased and OVERRAN a blind playwright player at
 61 fps. FE 102 / BE 1122 green.
+
+## 2026-07-28 late — W2: SECOND WORLD + WORLD-BUILDING TOOLS (branch w2-world-tools)
+
+**W2-A — the Stump is world #2 (virgin outdoor E2E).** Mip-NeRF360 Stump
+(splat_56831407, zero edits): inventory found 5 instances, isolate 1.87M gaussians,
+ground tolerated its known partial failure, solidify + gates + navmesh (21,193 walkable
+cells) + affordances + scenario. Gate verdict honest: FAILED shell_connectivity only
+(2 components, frac 0.9442 vs 0.95 — real disconnected outdoor geometry, not crumbs;
+floor PASS, props 5/5 textured). Live playwright proof: 3 undead rose in the forest,
+chased, died; 60 fps.
+
+**W2-B — combat polish, one capped commit (c153a30).** Hit stagger, crosshair
+hit-marker, spawn-rise telegraph, ±12% size/speed jitter. NO new mechanics, per the cap.
+
+**W2-C1 — one-command world pipeline (8868e65).** POST /jobs/{id}/world/prepare runs
+mesh → inventory → isolate → ground → solidify → collision/navmesh → gates →
+affordances → scenario under ONE opregistry op, skip-if-exists per stage, per-stage
+force, failures resume on re-POST. Surfaces: route + splatlab-make-walkable.sh
+(rewritten onto it) + a Make-walkable button on the scene page. Live-proven on the
+Stump: second run skipped mesh/inventory/isolate/ground, completed the rest.
+
+**Measured on the way (the reason W2-A existed):** three real outdoor-world defects,
+all fixed with tests + live proof: (1) actors floated at the navmesh's single flat
+floor_y — ground probes now ask the collider; (2) BOTH naive probe semantics are wrong
+on a voxel terrain slab (first-hit = canopy/shell roof — the old spawn bug — and
+lowest-hit = slab underside); groundAt(x,z,belowY) returns the highest face at or below
+the walkable band; (3) unlit worlds rendered actors pitch black — the game carries its
+own light, deferring to any visible scene light. Plus: legless zombies read as hovering
+→ legs; uncalibrated captures proposed picking up a tree stump → no size claims without
+calibration (inspect + honest rationale).

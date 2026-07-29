@@ -999,23 +999,48 @@ export class WorldWalker {
     this.lookAt(center);
   }
 
-  /**
-   * The true standing height at (x, z): the HIGHEST collider face at or
-   * below `belowY`. Both naive casts fail on a real outdoor world (measured
-   * live on the Stump): first-hit-from-the-sky lands on the tree canopy /
-   * shell roof, lowest-hit lands on the terrain slab's UNDERSIDE. Callers
-   * pass a `belowY` just above the walkable band (e.g. navmesh floor_y +
-   * headroom) so the pick is the turf top under any canopy. Null when the
-   * column has no face at or below the cap.
-   */
-  groundAt(x: number, z: number, belowY = Infinity): number | null {
-    if (!this.bvh) return null;
+  /** Every collider face in the column at (x, z), by height. Empty with no
+   *  collider or nothing below. The primitive both surface picks share. */
+  columnHits(x: number, z: number): number[] {
+    if (!this.bvh) return [];
     const top = this.sceneBox.max.y + Math.max(1, this.sceneBox.getSize(new THREE.Vector3()).y);
     _ray.origin.set(x, top, z);
     _ray.direction.set(0, -1, 0);
-    const hits = this.bvh.raycast(_ray, THREE.DoubleSide);
+    return this.bvh.raycast(_ray, THREE.DoubleSide)
+      .map((h) => h.point.y)
+      .sort((a, b) => a - b);
+  }
+
+  /**
+   * The standing surface at (x, z) nearest `referenceY`, within `band`.
+   *
+   * Both naive picks are measurably wrong on a real outdoor world: on the
+   * Stump's collider (600 sampled walkable columns, ~2.1 faces each),
+   * highest-hit lands on the tree canopy in the top 5% of columns and
+   * lowest-hit always lands on the terrain slab's UNDERSIDE. Choosing the
+   * face NEAREST the navmesh's graded floor gave |error| p50 0.15 / p95
+   * 0.76 units with no canopy tail at all — so that is the rule.
+   *
+   * The band is a deliberate single-storey contract, matching the navmesh:
+   * this refines height AROUND the graded floor, it does not discover a
+   * mezzanine. Null when no face falls in the band — callers keep using
+   * `referenceY` itself, which is exactly the pre-probe behaviour.
+   */
+  surfaceNear(x: number, z: number, referenceY: number, band: number): number | null {
+    let best: number | null = null;
+    let bestGap = Infinity;
+    for (const y of this.columnHits(x, z)) {
+      const gap = Math.abs(y - referenceY);
+      if (gap <= band && gap < bestGap) { best = y; bestGap = gap; }
+    }
+    return best;
+  }
+
+  /** The highest face at or below `belowY` — spawn placement, where there is
+   *  no graded floor to refine around yet. Null when the column has none. */
+  groundAt(x: number, z: number, belowY = Infinity): number | null {
     let best = -Infinity;
-    for (const h of hits) if (h.point.y <= belowY && h.point.y > best) best = h.point.y;
+    for (const y of this.columnHits(x, z)) if (y <= belowY && y > best) best = y;
     return Number.isFinite(best) ? best : null;
   }
 
@@ -1613,6 +1638,11 @@ export class WorldWalker {
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     this.clearWorld();
+    // The splat backdrop is a separate lane from the world meshes: without
+    // this, a disposed walker still holds the SplatMesh + SparkRenderer —
+    // hundreds of MB of GPU buffers for a 1.2M-gaussian scene (review
+    // finding, which the debug global made retainable).
+    this.clearBackdrop();
     this.renderer.dispose();
   }
 }

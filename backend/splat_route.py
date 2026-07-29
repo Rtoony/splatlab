@@ -528,6 +528,22 @@ def _mesh_export_lock(job_id: str) -> asyncio.Lock:
     return lock
 
 
+# One /world/prepare per job. Without this the second caller (a second tab,
+# or the UI button racing splatlab-make-walkable.sh) mints a duplicate op and
+# then dies on whichever stage lock the first caller holds — a spurious
+# "already running" failure telling the user to retry into the same
+# collision. Review finding; the orchestrator says so up front instead.
+_WORLD_PREPARE_LOCKS: dict[str, asyncio.Lock] = {}
+_WORLD_PREPARE_OPS: dict[str, str] = {}
+
+
+def _world_prepare_lock(job_id: str) -> asyncio.Lock:
+    lock = _WORLD_PREPARE_LOCKS.get(job_id)
+    if lock is None:
+        lock = _WORLD_PREPARE_LOCKS[job_id] = asyncio.Lock()
+    return lock
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -6149,27 +6165,99 @@ async def world_prepare(request: Request, job_id: str, body: WorldPrepareBody):
                    "Language search on; every later stage depends on it")
 
     world_dir = job_dir / WORLD_DIRNAME
-    force = set(body.force)
     stages: list[str] = ["mesh", "inventory", "isolate", "ground",
                          "solidify", "affordances", "scenario"]
-    op_id = opregistry.start("world_prepare", job_id, step="mesh")
+    # A force name that matches no stage used to no-op in silence: the caller
+    # who asked to redo "gound" got a 200 whose only tell was "skipped" buried
+    # in the stages map (review finding). Say it out loud instead.
+    unknown = [s for s in body.force if s not in stages]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown stage(s) in force: {', '.join(sorted(unknown))} "
+                   f"— valid stages: {', '.join(stages)}")
+    force = set(body.force)
+
+    prepare_lock = _world_prepare_lock(job_id)
+    if prepare_lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail=f"A world prepare is already running for this job "
+                   f"(op {_WORLD_PREPARE_OPS.get(job_id, '?')}) — watch it in "
+                   f"Activity rather than starting a second one")
+
+    async with prepare_lock:
+        op_id = opregistry.start("world_prepare", job_id, step="mesh")
+        _WORLD_PREPARE_OPS[job_id] = op_id
+        try:
+            return await _world_prepare_run(
+                request, job_id, body, meta, job_dir, world_dir,
+                stages, force, op_id)
+        finally:
+            _WORLD_PREPARE_OPS.pop(job_id, None)
+
+
+async def _world_prepare_run(
+    request: Request,
+    job_id: str,
+    body: WorldPrepareBody,
+    meta: dict[str, Any],
+    job_dir: Path,
+    world_dir: Path,
+    stages: list[str],
+    force: set[str],
+    op_id: str,
+) -> dict[str, Any]:
+    """The ladder itself, under the caller's lock and op."""
     outcome: dict[str, str] = {}
     warnings: list[str] = []
     gate: dict[str, Any] | None = None
+    op_finished = False
+
+    def _artifact(stage: str) -> Path | None:
+        return {
+            "mesh": job_dir / "_mesh" / "mesh.ply",
+            "inventory": job_dir / SCENE_DIRNAME / "inventory.json",
+            "isolate": (job_dir / SCENE_DIRNAME / "isolated"
+                        / "batch_isolate.json"),
+            "ground": job_dir / SCENE_DIRNAME / "ground" / "ground_mesh_raw.ply",
+            "scenario": world_dir / "scenario.json",
+        }.get(stage)
+
+    def _stamp(stage: str) -> float | None:
+        """mtime of the stage's artifact, or None when it does not exist."""
+        path = _artifact(stage)
+        try:
+            return path.stat().st_mtime if path is not None else None
+        except OSError:
+            return None
 
     def _exists(stage: str) -> bool:
-        return {
-            "mesh": (job_dir / "_mesh" / "mesh.ply").is_file(),
-            "inventory": (job_dir / SCENE_DIRNAME / "inventory.json").is_file(),
-            "isolate": (job_dir / SCENE_DIRNAME / "isolated"
-                        / "batch_isolate.json").is_file(),
-            "ground": (job_dir / SCENE_DIRNAME / "ground"
-                       / "ground_mesh_raw.ply").is_file(),
-            "solidify": (world_dir / "world.json").is_file()
-            and (world_dir / "navmesh.json").is_file(),
-            "affordances": False,  # propose is no-clobber; always cheap-safe
-            "scenario": (world_dir / "scenario.json").is_file(),
-        }[stage]
+        if stage == "solidify":
+            return ((world_dir / "world.json").is_file()
+                    and (world_dir / "navmesh.json").is_file())
+        if stage == "affordances":
+            return False  # propose is no-clobber; always cheap-safe
+        path = _artifact(stage)
+        return bool(path is not None and path.is_file())
+
+    def _finish_failed(stage: str, detail: str) -> None:
+        """Record the failure ONCE, with its diagnostics.
+
+        The outer handler used to finish the op a second time, and
+        opregistry.finish has no terminal-state guard — the second call
+        overwrote result/error with empty strings, erasing exactly the
+        "why did last night's world build fail?" the registry exists to
+        answer (review finding, reproduced against a temp DB).
+        """
+        nonlocal op_finished
+        if op_finished:
+            return
+        op_finished = True
+        with contextlib.suppress(Exception):
+            opregistry.finish(op_id, status=opregistry.FAILED,
+                              result={"stage": stage, "detail": detail},
+                              error=detail[:500])
 
     try:
         for index, stage in enumerate(stages):
@@ -6178,6 +6266,7 @@ async def world_prepare(request: Request, job_id: str, body: WorldPrepareBody):
             if stage not in force and _exists(stage):
                 outcome[stage] = "skipped"
                 continue
+            before = _stamp(stage)
             try:
                 if stage == "mesh":
                     await generate_splat_mesh(request, job_id, None)
@@ -6197,34 +6286,54 @@ async def world_prepare(request: Request, job_id: str, body: WorldPrepareBody):
                         run_gate=True,
                     ))
                     gate = (result or {}).get("gate")
+                    if not (world_dir / "navmesh.json").is_file():
+                        # world.json without navmesh.json means the shell
+                        # build was swallowed (scene_solidify keeps going on
+                        # a failed shell). Say so: the world is not playable,
+                        # and the next re-POST will redo this heavy stage.
+                        outcome[stage] = "partial"
+                        warnings.append(
+                            "solidify produced no navmesh — the shell build "
+                            "did not land, so the world is not walkable yet "
+                            "(re-POST redoes this stage)")
+                        continue
                 elif stage == "affordances":
                     import world_interactions_route
                     await world_interactions_route.propose_world_affordances(
                         job_id,
                         world_interactions_route.AffordanceProposeBody(apply=True),
                     )
-                elif stage == "scenario" and body.install_scenario:
+                elif stage == "scenario":
+                    if not body.install_scenario:
+                        # Nothing was written — never claim it was.
+                        outcome[stage] = "skipped"
+                        continue
                     import world_scenario as ws
                     scenario = ws.validate_scenario(ws.default_scenario(job_id))
                     (world_dir / "scenario.json").write_text(
                         json.dumps(scenario, indent=2))
                 outcome[stage] = "done"
             except HTTPException as exc:
-                if stage == "ground" and _exists("ground"):
+                # "Partial" means THIS run left a usable artifact behind, not
+                # that some older run once did: ground's class-texture step
+                # can 500 after the mesh lands, but an arbiter 503 or a lock
+                # 409 raised BEFORE any work would otherwise be masked as
+                # partial success by a stale ply (review finding).
+                after = _stamp(stage)
+                refreshed = after is not None and (before is None or after > before)
+                if stage == "ground" and refreshed:
                     outcome[stage] = "partial"
                     warnings.append(f"ground finished partially: {exc.detail}")
                     continue
                 outcome[stage] = "failed"
-                opregistry.finish(op_id, status=opregistry.FAILED,
-                                  result={"stage": stage, "detail": str(exc.detail)})
+                _finish_failed(stage, str(exc.detail))
                 raise HTTPException(
                     status_code=exc.status_code,
                     detail=f"stage '{stage}' failed: {exc.detail} — completed "
                            "stages are kept; re-POST to resume from here",
                 ) from exc
-    except Exception:
-        with contextlib.suppress(Exception):
-            opregistry.finish(op_id, status=opregistry.FAILED)
+    except Exception as exc:
+        _finish_failed("?", str(exc)[:500])
         raise
 
     opregistry.finish(op_id, result={"stages": outcome})

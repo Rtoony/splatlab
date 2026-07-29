@@ -150,3 +150,124 @@ def test_prepare_requires_language_field(client, monkeypatch):
     r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={})
     assert r.status_code == 409
     assert "language field" in r.json()["detail"].lower()
+
+
+def test_force_redoes_the_named_stage_and_rejects_typos(client, monkeypatch):
+    """The advertised redo mechanism was entirely unpinned (review finding),
+    and an unknown name used to no-op in silence."""
+    tc, outputs = client
+    job = _mk_job(outputs)
+    calls = _mock_stages(monkeypatch, job)
+    assert tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={}).status_code == 200
+
+    calls.clear()
+    forced = tc.post(f"/api/splat/jobs/{JOB}/world/prepare",
+                     json={"force": ["ground", "solidify"]})
+    assert forced.status_code == 200, forced.text
+    assert calls == ["ground", "solidify", "affordances"]  # only the forced ones re-ran
+    stages = forced.json()["stages"]
+    assert stages["ground"] == "done" and stages["solidify"] == "done"
+    assert stages["mesh"] == "skipped"
+
+    typo = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={"force": ["gound"]})
+    assert typo.status_code == 400
+    assert "gound" in typo.json()["detail"]
+
+
+def test_stale_artifact_never_launders_a_pre_work_failure_into_partial(client, monkeypatch):
+    """A 503/409 raised BEFORE ground does any work must not read as partial
+    success just because an older run left a ply behind (review finding)."""
+    tc, outputs = client
+    job = _mk_job(outputs)
+    _mock_stages(monkeypatch, job)
+    assert tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={}).status_code == 200
+    assert (job / "_scene" / "ground" / "ground_mesh_raw.ply").is_file()
+
+    async def blocked(request, job_id, body):  # raises without touching the ply
+        raise HTTPException(status_code=503, detail="Semantic ground blocked")
+
+    monkeypatch.setattr(splat_route, "scene_ground", blocked)
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={"force": ["ground"]})
+    assert r.status_code == 503, r.text
+    assert "stage 'ground' failed" in r.json()["detail"]
+
+
+def test_failure_diagnostics_survive_in_the_operation_registry(client, monkeypatch):
+    """The op row must still say WHICH stage failed and WHY — a second
+    unconditional finish() used to erase both (review finding)."""
+    tc, outputs = client
+    job = _mk_job(outputs)
+    _mock_stages(monkeypatch, job, fail="inventory")
+    import opregistry
+
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={})
+    assert r.status_code == 503
+    op = opregistry.list_ops(job_id=JOB, kind="world_prepare", limit=5)[0]
+    assert op["status"] == opregistry.FAILED
+    assert op["step"] == "inventory"
+    assert op["result"]["stage"] == "inventory"
+    assert "arbiter says no" in op["result"]["detail"]
+    assert "arbiter says no" in op["error"]
+
+
+def test_solidify_without_a_navmesh_is_partial_not_done(client, monkeypatch):
+    """scene_solidify swallows a failed shell build, so world.json can land
+    with no navmesh — an unwalkable world must not report 'done'."""
+    tc, outputs = client
+    job = _mk_job(outputs)
+    _mock_stages(monkeypatch, job)
+
+    async def shell_less(job_id, body):
+        w = job / "_world"
+        w.mkdir(exist_ok=True)
+        (w / "world.json").write_text("{}")
+        return {"gate": None}
+
+    monkeypatch.setattr(splat_route, "world_solidify", shell_less)
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["stages"]["solidify"] == "partial"
+    assert any("navmesh" in w for w in r.json()["warnings"])
+
+
+def test_install_scenario_false_reports_skipped_and_writes_nothing(client, monkeypatch):
+    tc, outputs = client
+    job = _mk_job(outputs)
+    _mock_stages(monkeypatch, job)
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare",
+                json={"install_scenario": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["stages"]["scenario"] == "skipped"
+    assert not (job / "_world" / "scenario.json").exists()
+
+
+def test_resume_after_a_failure_redoes_only_the_failed_stage(client, monkeypatch):
+    """The headline promise, asserted behaviourally rather than by substring."""
+    tc, outputs = client
+    job = _mk_job(outputs)
+    calls = _mock_stages(monkeypatch, job, fail="inventory")
+    assert tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={}).status_code == 503
+
+    calls = _mock_stages(monkeypatch, job)  # the transient failure clears
+    ok = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={})
+    assert ok.status_code == 200, ok.text
+    assert calls == ["inventory", "isolate", "ground", "solidify", "affordances"]
+    assert ok.json()["stages"]["mesh"] == "skipped"
+
+
+def test_a_second_concurrent_prepare_is_refused_with_the_running_op(client, monkeypatch):
+    tc, outputs = client
+    job = _mk_job(outputs)
+    _mock_stages(monkeypatch, job)
+    lock = splat_route._world_prepare_lock(JOB)
+    splat_route._WORLD_PREPARE_OPS[JOB] = "op-already-running"
+
+    async def hold():
+        async with lock:
+            return tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={})
+
+    import asyncio
+    r = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(hold())
+    splat_route._WORLD_PREPARE_OPS.pop(JOB, None)
+    assert r.status_code == 409
+    assert "op-already-running" in r.json()["detail"]
