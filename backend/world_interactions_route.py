@@ -20,6 +20,7 @@ already.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -148,6 +149,46 @@ async def set_world_element_state(job_id: str, body: StateBody) -> dict[str, Any
     wi.write_state(world_dir, document)
 
     return _payload(job_id, world_dir, world_manifest)
+
+
+class ScenarioBody(BaseModel):
+    """PUT replaces the whole scenario; {} means 'install the default'."""
+    scenario: dict[str, Any] | None = None
+
+
+@router.get("/jobs/{job_id}/world/scenario")
+async def get_world_scenario(job_id: str) -> dict[str, Any]:
+    import world_scenario as ws
+
+    _job_dir, world_dir, _wm = _require_world(job_id)
+    path = world_dir / "scenario.json"
+    if not path.is_file():
+        return {"job_id": job_id, "scenario": None,
+                "default": ws.default_scenario(job_id)}
+    try:
+        scenario = ws.validate_scenario(json.loads(path.read_text()))
+    except (OSError, json.JSONDecodeError, ws.ScenarioError) as exc:
+        raise HTTPException(status_code=500,
+                            detail=f"stored scenario is invalid: {exc}") from exc
+    return {"job_id": job_id, "scenario": scenario, "default": None}
+
+
+@router.put("/jobs/{job_id}/world/scenario")
+async def put_world_scenario(job_id: str, body: ScenarioBody) -> dict[str, Any]:
+    """Author the scenario through the same fail-loud gate every world
+    document gets; omitting `scenario` installs the validated default
+    (three growing zombie waves)."""
+    import world_scenario as ws
+
+    _job_dir, world_dir, _wm = _require_world(job_id)
+    raw = body.scenario if body.scenario is not None else ws.default_scenario(job_id)
+    raw.setdefault("job_id", job_id)
+    try:
+        scenario = ws.validate_scenario(raw)
+    except ws.ScenarioError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    (world_dir / "scenario.json").write_text(json.dumps(scenario, indent=2))
+    return {"job_id": job_id, "scenario": scenario}
 
 
 class AffordanceProposeBody(BaseModel):

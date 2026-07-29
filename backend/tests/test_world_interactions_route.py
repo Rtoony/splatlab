@@ -538,3 +538,47 @@ def test_affordance_apply_merges_without_clobbering_authored(client):
     assert records["bottle"]["verb"] == "pickup"          # proposal landed
     # E on the bottle would advance placed -> held through the normal gate.
     assert records["bottle"]["states"] == ["placed", "held"]
+
+
+# ---------------------------------------------------------------------------
+# Scenario layer (P3)
+# ---------------------------------------------------------------------------
+
+def test_scenario_default_installs_and_round_trips(client):
+    http, outputs = client
+    _mk_world(outputs, "lamp")
+
+    empty = http.get(f"/api/splat/jobs/{JOB}/world/scenario").json()
+    assert empty["scenario"] is None
+    assert empty["default"]["waves"][0]["actors"][0]["type"] == "zombie"
+
+    put = http.put(f"/api/splat/jobs/{JOB}/world/scenario", json={})
+    assert put.status_code == 200, put.text
+    assert len(put.json()["scenario"]["waves"]) == 3
+
+    got = http.get(f"/api/splat/jobs/{JOB}/world/scenario").json()
+    assert got["scenario"]["name"] == "Zombie waves"
+    assert got["scenario"]["player"]["weapon"]["damage"] == 34.0
+
+
+def test_scenario_validation_is_fail_loud(client):
+    http, outputs = client
+    _mk_world(outputs, "lamp")
+    import world_scenario as ws
+    base = ws.default_scenario(JOB)
+
+    horde = json.loads(json.dumps(base))
+    horde["waves"][0]["actors"][0]["count"] = 500
+    r = http.put(f"/api/splat/jobs/{JOB}/world/scenario", json={"scenario": horde})
+    assert r.status_code == 400 and "cap" in r.json()["detail"].lower() or \
+        r.status_code == 400
+
+    nan_speed = json.loads(json.dumps(base))
+    nan_speed["waves"][0]["actors"][0]["speed_mps"] = 1e9
+    assert http.put(f"/api/splat/jobs/{JOB}/world/scenario",
+                    json={"scenario": nan_speed}).status_code == 400
+
+    alien = json.loads(json.dumps(base))
+    alien["waves"][0]["actors"][0]["type"] = "dragon"
+    assert http.put(f"/api/splat/jobs/{JOB}/world/scenario",
+                    json={"scenario": alien}).status_code == 400
