@@ -220,6 +220,8 @@ def test_bake_lands_versions_markers_receipt_and_clears_overlay(
     assert stored["elements"] == {}
     assert stored["lighting"] == {"preset": "dungeon", "intensity": 1.2}
     assert body["restyle"]["restyle"]["elements"] == {}
+    # The walker's bakedLook signal rides the restyle payload.
+    assert body["restyle"]["baked_elements"] == ["shell", "crate"]
 
     # No staging debris.
     assert not list(world.glob(".building-*"))
@@ -288,6 +290,7 @@ def test_revert_restores_bytes_markers_and_doc(client, monkeypatch) -> None:
     # The baked state was itself versioned first — revert is un-revertable
     # only by re-baking, never by data loss.
     assert (world / "versions" / "crate-v0002.glb").read_bytes() == b"baked-crate"
+    assert response.json()["restyle"]["baked_elements"] == []
 
     ops = opregistry.list_ops(job_id=JOB, kind="restyle_bake_revert")
     assert ops and ops[0]["status"] == opregistry.SUCCEEDED

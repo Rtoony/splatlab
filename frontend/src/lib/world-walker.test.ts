@@ -104,3 +104,37 @@ describe("ground probe (real BVH)", () => {
     expect(w.groundAt(0, 0)).toBeNull();
   });
 });
+
+describe("baked look (setBakedLook)", () => {
+  // After a bake the overlay document is EMPTY, so restyleShowsMesh would go
+  // false and the splat backdrop — still the un-restyled photograph — would
+  // hide the baked geometry. The baked flag keeps the mesh on top.
+  function rig(withBackdrop = true) {
+    const walker = Object.create(WorldWalker.prototype) as WorldWalker;
+    const backdrop = { visible: true };
+    Object.assign(walker, {
+      restyle: null,
+      restyleShowsMesh: false,
+      bakedLook: false,
+      elements: [],
+      backdrop: withBackdrop ? backdrop : null,
+    });
+    return { walker, backdrop };
+  }
+
+  it("keeps the mesh in front of the photograph, and revert restores it", () => {
+    const { walker, backdrop } = rig();
+    walker.setBakedLook(true);
+    expect(backdrop.visible).toBe(false);
+    walker.setBakedLook(false); // a revert
+    expect(backdrop.visible).toBe(true);
+  });
+
+  it("is idempotent and safe with no backdrop loaded", () => {
+    const { walker } = rig(false);
+    walker.setBakedLook(true);
+    walker.setBakedLook(true);
+    const internals = walker as unknown as { restyleShowsMesh: boolean };
+    expect(internals.restyleShowsMesh).toBe(true);
+  });
+});

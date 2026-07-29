@@ -390,6 +390,8 @@ export class WorldWalker {
   private readonly lights = new THREE.Group();
   /** The applied look, or null for "as captured". */
   private restyle: RestyleDoc | null = null;
+  /** True when this world's atlases carry a permanently baked restyle. */
+  private bakedLook = false;
   /** True while an active restyle is showing mesh in place of the splat. */
   private restyleShowsMesh = false;
   private readonly classTiles = new Map<string, THREE.DataTexture>();
@@ -1227,7 +1229,7 @@ export class WorldWalker {
     // this, re-surfacing the shell changed the frame by 0.0 mean RGB.
     const relighting = (doc?.lighting?.preset ?? "as-captured") !== "as-captured";
     const restyled = Object.keys(entries);
-    this.restyleShowsMesh = relighting || restyled.length > 0;
+    this.restyleShowsMesh = relighting || restyled.length > 0 || this.bakedLook;
     if (this.backdrop) this.backdrop.visible = !this.restyleShowsMesh;
     for (const slug of restyled) this.setElementVisible(slug, true);
     if (this.restyleShowsMesh) this.setElementVisible("shell", true);
@@ -1275,6 +1277,25 @@ export class WorldWalker {
     }
 
     this.applyLighting();
+  }
+
+  /**
+   * Mark this world as carrying a permanently BAKED restyle. After a bake the
+   * overlay document is empty, but the splat backdrop is still the
+   * un-restyled photograph and it hides the shell it stands in for — so the
+   * baked flag joins the restyleShowsMesh predicate and the reconstructed
+   * geometry stays on top (the 0.0 mean-RGB lesson, permanent edition).
+   */
+  setBakedLook(baked: boolean): void {
+    if (this.bakedLook === baked) return;
+    this.bakedLook = baked;
+    const relighting =
+      (this.restyle?.lighting?.preset ?? "as-captured") !== "as-captured";
+    const restyledCount = Object.keys(this.restyle?.elements ?? {}).length;
+    this.restyleShowsMesh = relighting || restyledCount > 0 || this.bakedLook;
+    if (this.backdrop) this.backdrop.visible = !this.restyleShowsMesh;
+    if (this.restyleShowsMesh) this.setElementVisible("shell", true);
+    else if (this.backdrop) this.setElementVisible("shell", false);
   }
 
   /** Cached per class id — one tile serves every element using that class. */

@@ -16,7 +16,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { TargetInfo } from "@/lib/world-interactions";
 import { Link, useRoute } from "wouter";
-import { uploadPolishedWorldElement , fetchWorldInteractions, fetchWorldNavmesh, fetchWorldRestyle, fetchWorldScenario, resetWorldRestyle, setWorldElementState, setWorldPlayerPoses, setWorldRestyle, solidifyWorld} from "@/lib/api";
+import { uploadPolishedWorldElement , bakeWorldRestyle, fetchWorldInteractions, fetchWorldNavmesh, fetchWorldRestyle, fetchWorldScenario, resetWorldRestyle, revertWorldRestyleBake, setWorldElementState, setWorldPlayerPoses, setWorldRestyle, solidifyWorld} from "@/lib/api";
 import { LIGHT_PRESETS, emptyRestyle, type RestyleDoc, type RestyleEntry, type RestyleMaterial } from "@/lib/world-restyle";
 import { WorldGame, type GameHudState, type Scenario } from "@/lib/world-game";
 import type { parseNavmesh } from "@/lib/world-navmesh";
@@ -139,6 +139,8 @@ export default function WorldViewPage() {
   const [hitMarker, setHitMarker] = useState(0);
   const [sceneInfo, setSceneInfo] = useState<SceneInfo | null>(null);
   const [walkParams, setWalkParams] = useState<WalkParams>(DEFAULT_WALK_PARAMS);
+  /** Slugs whose atlas carries a permanently baked restyle (server markers). */
+  const [bakedElements, setBakedElements] = useState<string[]>([]);
   const [stats, setStats] = useState<WalkerStats>({
     fps: 0,
     position: [0, 0, 0],
@@ -311,6 +313,11 @@ export default function WorldViewPage() {
             if (cancelled) return;
             setRestyle(payload.restyle);
             setRestyleMaterials(payload.materials);
+            const baked = payload.baked_elements ?? [];
+            setBakedElements(baked);
+            // Before the backdrop loads: a baked look must keep the mesh in
+            // front of the un-restyled photograph.
+            walker.setBakedLook(baked.length > 0);
             walker.applyRestyle(payload.restyle, payload.materials);
           }).catch(() => { /* no world yet, or restyle unavailable */ });
         }
@@ -394,6 +401,29 @@ export default function WorldViewPage() {
       .catch(() => setWarnings((w) => [...w, "Could not clear the restyle."]))
       .finally(() => setRestyleBusy(false));
   }, [jobId, restyleMaterials, source.kind]);
+
+  /** Bake is destructive-ish (priors are versioned server-side), so this is
+   *  pessimistic on purpose — nothing applies locally; on success the world
+   *  reloads and the walker fetches the re-baked GLBs from disk. */
+  const bakeRestyle = useCallback(() => {
+    if (source.kind !== "api") return;
+    setRestyleBusy(true);
+    void bakeWorldRestyle(jobId, { units_per_metre: walkParams.unitsPerMetre })
+      .then(() => setReloadNonce((n) => n + 1))
+      .catch((e: unknown) => setWarnings((w) => [...w,
+        `Bake failed: ${e instanceof Error ? e.message : String(e)}`]))
+      .finally(() => setRestyleBusy(false));
+  }, [jobId, source.kind, walkParams.unitsPerMetre]);
+
+  const revertBake = useCallback(() => {
+    if (source.kind !== "api") return;
+    setRestyleBusy(true);
+    void revertWorldRestyleBake(jobId)
+      .then(() => setReloadNonce((n) => n + 1))
+      .catch((e: unknown) => setWarnings((w) => [...w,
+        `Revert failed: ${e instanceof Error ? e.message : String(e)}`]))
+      .finally(() => setRestyleBusy(false));
+  }, [jobId, source.kind]);
 
   const startGame = useCallback(() => {
     const walker = walkerRef.current;
@@ -661,8 +691,12 @@ export default function WorldViewPage() {
                   materials={restyleMaterials}
                   rows={rows}
                   busy={restyleBusy}
+                  api={source.kind === "api"}
+                  baked={bakedElements.length > 0}
                   onChange={commitRestyle}
                   onClear={clearRestyle}
+                  onBake={bakeRestyle}
+                  onRevert={revertBake}
                 />
               )}
               <Panel icon={<Layers className="h-3.5 w-3.5" />} title="Backdrop">
@@ -1366,20 +1400,43 @@ function RestylePanel({
   materials,
   rows,
   busy,
+  api,
+  baked,
   onChange,
   onClear,
+  onBake,
+  onRevert,
 }: {
   restyle: RestyleDoc;
   materials: RestyleMaterial[];
   rows: ElementRow[];
   busy: boolean;
+  api: boolean;
+  baked: boolean;
   onChange: (next: RestyleDoc) => void;
   onClear: () => void;
+  onBake: () => void;
+  onRevert: () => void;
 }) {
   const [slug, setSlug] = useState<string>(rows[0]?.slug ?? "");
   const target = rows.find((r) => r.slug === slug) ?? rows[0];
   const entry: RestyleEntry = (target && restyle.elements[target.slug]) || {};
   const styled = Object.keys(restyle.elements).length;
+  // Armed like every other destructive control (edit-lane idiom): first
+  // click arms, second fires, 4 s to change your mind.
+  const [bakeArmed, setBakeArmed] = useState(false);
+  const [revertArmed, setRevertArmed] = useState(false);
+  useEffect(() => {
+    if (!bakeArmed) return;
+    const t = window.setTimeout(() => setBakeArmed(false), 4000);
+    return () => window.clearTimeout(t);
+  }, [bakeArmed]);
+  useEffect(() => {
+    if (!revertArmed) return;
+    const t = window.setTimeout(() => setRevertArmed(false), 4000);
+    return () => window.clearTimeout(t);
+  }, [revertArmed]);
+  const canBake = api && styled > 0;
 
   const patch = (next: RestyleEntry | null) => {
     if (!target) return;
@@ -1501,6 +1558,59 @@ function RestylePanel({
           Reset to capture
         </button>
       </div>
+
+      {(canBake || (api && baked)) && (
+        <div className="mt-2 flex items-center justify-between gap-2 border-t border-white/5 pt-2">
+          <span className="text-[10px] leading-snug text-zinc-500">
+            {canBake
+              ? "Make it permanent — survives Blender/UE export"
+              : "This world carries a baked look"}
+          </span>
+          {canBake ? (
+            <button
+              type="button"
+              disabled={busy}
+              className={`shrink-0 rounded-md border px-2 py-1 text-[10px] ${
+                bakeArmed
+                  ? "border-amber-400/60 bg-amber-500/15 text-amber-300"
+                  : "border-white/10 text-zinc-300 hover:bg-white/5"
+              } disabled:opacity-50`}
+              onClick={() => {
+                if (bakeArmed) {
+                  setBakeArmed(false);
+                  onBake();
+                } else {
+                  setBakeArmed(true);
+                }
+              }}
+            >
+              {bakeArmed
+                ? `Sure? Rewrites ${styled} GLB${styled === 1 ? "" : "s"} (versioned)`
+                : "Bake this look"}
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled={busy}
+              className={`shrink-0 rounded-md border px-2 py-1 text-[10px] ${
+                revertArmed
+                  ? "border-amber-400/60 bg-amber-500/15 text-amber-300"
+                  : "border-white/10 text-zinc-300 hover:bg-white/5"
+              } disabled:opacity-50`}
+              onClick={() => {
+                if (revertArmed) {
+                  setRevertArmed(false);
+                  onRevert();
+                } else {
+                  setRevertArmed(true);
+                }
+              }}
+            >
+              {revertArmed ? "Sure? Restore the capture" : "Revert bake"}
+            </button>
+          )}
+        </div>
+      )}
     </Panel>
   );
 }

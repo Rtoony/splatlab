@@ -325,6 +325,20 @@ def _taxonomy_classes() -> list[dict[str, Any]]:
     return out
 
 
+def _baked_elements(world_dir: Path) -> list[str]:
+    """Slugs whose atlas carries a permanently BAKED restyle (the marker files
+    the bake route writes). The walker needs this at load time: after a bake
+    the overlay document is empty, but the splat backdrop is still the
+    un-restyled photograph and must not hide the baked geometry."""
+    suffix = ".restyle.json"
+    baked = ["shell"] if (world_dir / f"shell{suffix}").is_file() else []
+    elements = world_dir / "elements"
+    if elements.is_dir():
+        baked += sorted(p.name[:-len(suffix)]
+                        for p in elements.glob(f"*{suffix}"))
+    return baked
+
+
 def _restyle_payload(job_id: str, world_dir: Path,
                      world_manifest: dict[str, Any] | None) -> dict[str, Any]:
     return {
@@ -333,6 +347,7 @@ def _restyle_payload(job_id: str, world_dir: Path,
         "known_slugs": sorted(wi.world_slugs(world_manifest)),
         "materials": _taxonomy_classes(),
         "presets": list(wr.LIGHTING_PRESETS),
+        "baked_elements": _baked_elements(world_dir),
     }
 
 

@@ -486,6 +486,9 @@ export interface WorldRestylePayload {
   known_slugs: string[];
   materials: RestyleMaterial[];
   presets: string[];
+  /** Slugs whose atlas carries a permanently BAKED restyle — the walker must
+   *  keep the reconstructed geometry in front of the splat photograph. */
+  baked_elements?: string[];
 }
 
 export function fetchWorldRestyle(
@@ -516,5 +519,39 @@ export function resetWorldRestyle(jobId: string): Promise<WorldRestylePayload> {
   return apiRequest<WorldRestylePayload>(
     `/api/splat/jobs/${encodeURIComponent(jobId)}/world/restyle`,
     { method: "DELETE" },
+  );
+}
+
+export interface RestyleBakeResult {
+  ok: boolean;
+  job_id: string;
+  op_id: string;
+  uncalibrated?: boolean;
+  lighting_baked?: boolean;
+  elements: { slug: string; verbs?: string[]; versioned_as?: string }[];
+  restyle: WorldRestylePayload;
+}
+
+/** Make the current restyle permanent — the server re-bakes each restyled
+ *  element's atlas and versions the priors. The world must be reloaded after
+ *  (the GLB files on disk changed). */
+export function bakeWorldRestyle(
+  jobId: string,
+  body: { units_per_metre: number },
+): Promise<RestyleBakeResult> {
+  return apiRequest<RestyleBakeResult>(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/world/restyle/bake`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+export function revertWorldRestyleBake(jobId: string): Promise<RestyleBakeResult> {
+  return apiRequest<RestyleBakeResult>(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/world/restyle/bake/revert`,
+    { method: "POST" },
   );
 }
