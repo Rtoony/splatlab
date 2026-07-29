@@ -11,7 +11,7 @@ import type {
   SplatStatusResponse,
 } from "@/lib/contracts";
 import type { ViewerCameraNodeTarget, ViewerCameraPose, ViewerCameraViewTarget, ViewerHighlight, ViewerOverlay } from "@/components/viewer-types";
-import { Button, Card, DropdownItem, DropdownMenu, DropdownSeparator, Input, SectionLabel, Tabs, TabsList, TabsTrigger } from "@/components/ui";
+import { Button, Card, DropdownItem, DropdownMenu, DropdownSeparator, Input, SectionLabel, Tabs, TabsList, TabsTrigger, useToast } from "@/components/ui";
 import { EditProgress } from "@/components/edit-progress";
 import { EditLane } from "@/components/workspace/edit-lane";
 import { ExportLane } from "@/components/workspace/export-lane";
@@ -58,6 +58,11 @@ export default function SplatViewPage() {
   // recover card instead of silently falling back.
   const [viewerError, setViewerError] = useState<string | null>(null);
   const [geoOpen, setGeoOpen] = useState(false);
+  // One-command world pipeline (W2-C1): the POST blocks until the whole
+  // ladder lands, so the button owns a pending state and /activity shows
+  // the per-stage op meanwhile.
+  const [worldPrep, setWorldPrep] = useState(false);
+  const pushToast = useToast();
   const [sectionsOpen, setSectionsOpen] = useState(false);
   const [sceneRegenOpen, setSceneRegenOpen] = useState(false);
   // Workspace mode tab. The viewer never unmounts on tab switch — Edit/Export/
@@ -348,6 +353,35 @@ export default function SplatViewPage() {
                       className="border-cyan-300/40 text-cyan-200"
                     >
                       <Mountain className="h-3.5 w-3.5" /> Walk world
+                    </Button>
+                  )}
+                  {!job.world_available && job.status === "completed" && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={worldPrep}
+                      onClick={() => {
+                        if (worldPrep) return;
+                        setWorldPrep(true);
+                        pushToast("Preparing walkable world — heavy stages can take many minutes. Progress lives in Activity.", "info");
+                        apiRequest(`/api/splat/jobs/${encodeURIComponent(job.job_id)}/world/prepare`, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({}),
+                        }).then(() => {
+                          pushToast("World ready — walking in.", "success");
+                          navigate(`/world/${job.job_id}`);
+                        }).catch((e: unknown) => {
+                          pushToast(`World preparation failed: ${e instanceof Error ? e.message : String(e)}`, "error");
+                        }).finally(() => setWorldPrep(false));
+                      }}
+                      title="Run the whole ladder — mesh, inventory, isolate, ground, world, navmesh, affordances, scenario — in one go. Re-run resumes after a failure."
+                      className="border-cyan-300/40 text-cyan-200"
+                    >
+                      {worldPrep
+                        ? (<><Loader2 className="h-3.5 w-3.5 animate-spin" /> Preparing world…</>)
+                        : (<><Mountain className="h-3.5 w-3.5" /> Make walkable</>)}
                     </Button>
                   )}
                   <Button
