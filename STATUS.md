@@ -3016,7 +3016,8 @@ existed (a 503 before any work read as 200 ok), and a second `opregistry.finish`
 failure path erased the stage+detail the registry exists to hold. The probe rule itself
 was re-derived from measurement, not argument: sampling 600 walkable columns of the
 Stump collider, "nearest face to the graded floor" beat "highest below a cap" (|error|
-p50 0.15 vs 0.76 units) and removed the canopy tail entirely. Test-honesty findings were
+p50 0.15 / p95 0.76 vs naive-highest's p95 2.87) and removed the canopy tail entirely
+(reproduce with `tools/measure-ground-probe.py <job> 600 <u/m>`). Test-honesty findings were
 taken as seriously as the bugs — the terrain test's mock had been asserting behaviour the
 real probe can never produce, and `walker.groundAt` (the wave's actual fix) had no direct
 test; it now has 7 against a real MeshBVH. ⚠️ A review subagent edited the working tree
