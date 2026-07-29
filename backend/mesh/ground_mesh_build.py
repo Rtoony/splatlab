@@ -116,7 +116,7 @@ def main() -> int:
         "v": 1, "provenance": "ground-derived",
         "semantic_thresh": args.semantic_thresh, "cell_units": args.cell_units,
         "gaussians_total": int(len(g["rel"])), "gaussians_ground": int(keep.sum()),
-        "cells_with_data": len(cells), "cells_spike_rejected": rejected,
+        "cells_with_data": binned["binned"], "cells_spike_rejected": rejected,
         "cells_disconnected_dropped": disconnected_dropped,
         "ground_points": int(len(ground)), "triangles": int(len(tri.simplices)),
         "ground_z_range_units": [round(float(ground[:, 2].min()), 4),
