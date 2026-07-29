@@ -142,7 +142,7 @@ describe("review-finding regressions", () => {
                            damage: 100, reach_m: 0.9, attack_cooldown_s: 5 }] }],
     }));
     game.start();
-    step(2);
+    step(3.5); // rest + spawn-rise complete: the zombie is surfaced and shootable
     const target = zombieGroups(scene)[0];
     camera.lookAt(target.position.clone().setY(0.8));
     camera.updateMatrixWorld(true);
@@ -150,5 +150,55 @@ describe("review-finding regressions", () => {
     step(3);
     expect(hud().phase).toBe("won");
     expect(zombieGroups(scene).length).toBe(0); // corpse finished dying post-win
+  });
+});
+
+describe("combat polish (W2-B, capped)", () => {
+  it("a landed shot staggers the zombie — no steps, no bites, briefly", () => {
+    const { scene, camera, game, step } = rig(scenario({
+      player: { health: 100, weapon: { damage: 10, range_m: 30, cooldown_s: 0.05 } },
+      waves: [{ actors: [{ type: "zombie", count: 1, health: 1000, speed_mps: 0.8,
+                           damage: 10, reach_m: 0.9, attack_cooldown_s: 0.5 }] }],
+      spawn: { policy: "far-walkable", min_distance_m: 4 },
+    }));
+    game.start();
+    step(2.6); // rest + rise complete, chase underway but far from arrival
+    const zombie = zombieGroups(scene)[0];
+    camera.lookAt(zombie.position.clone().setY(0.8));
+    camera.updateMatrixWorld(true);
+    expect(game.shoot()).toBe(true);
+    const frozen = zombie.position.clone();
+    step(0.2); // inside the stagger window
+    expect(zombie.position.distanceTo(frozen)).toBeLessThan(1e-6);
+    step(1.0); // stagger over: it moves again
+    expect(zombie.position.distanceTo(frozen)).toBeGreaterThan(0.05);
+  });
+
+  it("zombies rise from the ground and neither walk nor bite until surfaced", () => {
+    const { scene, game, step, hud } = rig(scenario({
+      player: { health: 100, weapon: { damage: 10, range_m: 30, cooldown_s: 0.05 } },
+    }));
+    game.start();
+    step(1.6); // just past rest: spawn happened, rise in progress
+    const zombie = zombieGroups(scene)[0];
+    expect(zombie.position.y).toBeLessThan(0); // still surfacing
+    expect(hud().health).toBe(100);
+    step(1.5);
+    expect(zombie.position.y).toBeGreaterThanOrEqual(0); // surfaced
+  });
+
+  it("per-zombie jitter varies size within the ±12% bound", () => {
+    const { scene, game, step } = rig();
+    game.start();
+    step(2.5);
+    const heights = zombieGroups(scene).map((z) => {
+      const box = new THREE.Box3().setFromObject(z);
+      return box.max.y - box.min.y;
+    });
+    expect(new Set(heights.map((h) => h.toFixed(3))).size).toBeGreaterThan(1);
+    for (const h of heights) {
+      expect(h).toBeGreaterThan(1.6 * 0.8);
+      expect(h).toBeLessThan(1.6 * 1.25);
+    }
   });
 });

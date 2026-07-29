@@ -66,11 +66,19 @@ interface ZombieActor {
   hitFlash: number;
   dying: number; // seconds into the death fall; -1 = alive
   seed: number;
+  /** Seconds left of hit-stagger: no movement or attacks, a flinch instead. */
+  stagger: number;
+  /** Seconds into the spawn rise; >= RISE_SECONDS means fully surfaced. */
+  rising: number;
+  /** Per-actor variety: scales size and speed (±12%), no new systems. */
+  jitter: number;
 }
 
 const REPATH_SECONDS = 0.5;
 const DEATH_SECONDS = 0.9;
 const ZOMBIE_HEIGHT_M = 1.6;
+const STAGGER_SECONDS = 0.35;
+const RISE_SECONDS = 0.8;
 
 /** Deterministic tiny rng (mulberry32) so replays and tests agree. */
 export function makeRng(seed: number): () => number {
@@ -112,6 +120,8 @@ function buildZombie(scale: number): ZombieActor["parts"] & { group: THREE.Group
 export class WorldGame {
   onHud: ((state: GameHudState) => void) | null = null;
   onPlayerHit: (() => void) | null = null;
+  /** Fired when a shot connects — the HUD flashes a hit-marker. */
+  onHitMarker: (() => void) | null = null;
   /** Fired for player-facing problems (e.g. no spawnable ground). */
   onNotice: ((message: string) => void) | null = null;
 
@@ -203,6 +213,8 @@ export class WorldGame {
 
     zombie.health -= this.scenario.player.weapon.damage;
     zombie.hitFlash = 0.15;
+    zombie.stagger = STAGGER_SECONDS;
+    this.onHitMarker?.();
     if (zombie.health <= 0) {
       zombie.dying = 0;
       this.kills++;
@@ -254,6 +266,24 @@ export class WorldGame {
       }
       alive++;
 
+      // Spawn rise: surface from the ground before doing anything else — a
+      // readable telegraph instead of zombies popping into existence.
+      if (zombie.rising < RISE_SECONDS) {
+        zombie.rising += dt;
+        const t = Math.min(1, zombie.rising / RISE_SECONDS);
+        const height = ZOMBIE_HEIGHT_M * this.unitsPerMetre * zombie.jitter;
+        zombie.group.position.y = this.nav.floorY - height * (1 - t * t);
+        continue;
+      }
+
+      // Hit stagger: a landed shot interrupts — flinch, no steps, no bites.
+      if (zombie.stagger > 0) {
+        zombie.stagger -= dt;
+        zombie.group.rotation.x = -0.25 * (zombie.stagger / STAGGER_SECONDS);
+        continue;
+      }
+      zombie.group.rotation.x = 0;
+
       // Chase: repath toward the player's cell on a slow clock.
       zombie.repathClock -= dt;
       if (zombie.repathClock <= 0 && playerCell) {
@@ -269,7 +299,7 @@ export class WorldGame {
       }
 
       // Follow the path; face the walking direction.
-      const speed = zombie.stats.speed_mps * upm;
+      const speed = zombie.stats.speed_mps * upm * zombie.jitter;
       if (zombie.pathAt < zombie.path.length) {
         const [tx, tz] = worldAt(this.nav, zombie.path[zombie.pathAt]);
         const dx = tx - zombie.group.position.x;
@@ -387,10 +417,13 @@ export class WorldGame {
   }
 
   private spawnZombie(stats: ScenarioActor, cell: Cell): void {
-    const scale = ZOMBIE_HEIGHT_M * this.unitsPerMetre / 1.6;
+    const jitter = 0.88 + this.rng() * 0.24; // ±12% size + speed variety
+    const scale = (ZOMBIE_HEIGHT_M * this.unitsPerMetre / 1.6) * jitter;
     const built = buildZombie(scale);
     const [x, z] = worldAt(this.nav, cell);
-    built.group.position.set(x, this.nav.floorY, z);
+    // Born underground; the rise animation surfaces it.
+    built.group.position.set(
+      x, this.nav.floorY - ZOMBIE_HEIGHT_M * this.unitsPerMetre * jitter, z);
     built.group.userData.zombieIndex = this.zombies.length;
     this.root.add(built.group);
     this.zombies.push({
@@ -405,6 +438,9 @@ export class WorldGame {
       hitFlash: 0,
       dying: -1,
       seed: this.rng() * 10,
+      stagger: 0,
+      rising: 0,
+      jitter,
     });
   }
 

@@ -131,6 +131,7 @@ export default function WorldViewPage() {
   const [gameHud, setGameHud] = useState<GameHudState | null>(null);
   const [gameReady, setGameReady] = useState(false);
   const [damageFlash, setDamageFlash] = useState(0);
+  const [hitMarker, setHitMarker] = useState(0);
   const [sceneInfo, setSceneInfo] = useState<SceneInfo | null>(null);
   const [walkParams, setWalkParams] = useState<WalkParams>(DEFAULT_WALK_PARAMS);
   const [stats, setStats] = useState<WalkerStats>({
@@ -361,6 +362,10 @@ export default function WorldViewPage() {
       setDamageFlash(1);
       window.setTimeout(() => setDamageFlash(0), 220);
     };
+    game.onHitMarker = () => {
+      setHitMarker((n) => n + 1);
+      window.setTimeout(() => setHitMarker(0), 130);
+    };
     game.onNotice = (message) => setWarnings((w) => [...w, message]);
     walker.onFrame = (dt) => game.update(dt);
     walker.combatClick = () => game.shoot();
@@ -428,6 +433,14 @@ export default function WorldViewPage() {
         <div className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">
           <div className="h-4 w-px bg-white/60" />
           <div className="absolute left-1/2 top-1/2 h-px w-4 -translate-x-1/2 -translate-y-1/2 bg-white/60" />
+          {hitMarker > 0 && (
+            <div className="absolute left-1/2 top-1/2 h-5 w-5 -translate-x-1/2 -translate-y-1/2 rotate-45">
+              <div className="absolute left-0 top-0 h-1.5 w-1.5 border-l-2 border-t-2 border-red-400" />
+              <div className="absolute right-0 top-0 h-1.5 w-1.5 border-r-2 border-t-2 border-red-400" />
+              <div className="absolute bottom-0 left-0 h-1.5 w-1.5 border-b-2 border-l-2 border-red-400" />
+              <div className="absolute bottom-0 right-0 h-1.5 w-1.5 border-b-2 border-r-2 border-red-400" />
+            </div>
+          )}
         </div>
       )}
 
