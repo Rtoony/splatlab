@@ -2966,3 +2966,15 @@ Found+pinned en route: the UV-seam weld trap (frac 0.06 vs gate's 0.93 pre-fix).
 **Recorded gap:** the big shard-bicycle passes every measured floor (frac 0.93, 25k
 gaussians) while looking wrong — the trigger for THAT needs a render-agreement metric
 (the UMI3D watch item), not a guessed threshold.
+
+## 2026-07-28 pm — P3: THE WORLD IS PLAYABLE (branch p3-game-mode)
+
+Zombie waves in the captured bonsai room, end to end: navmesh from the gate-graded
+walkable cells (79038f2, + durable collision-crumb policy), the scenario as validated
+data (2e3199b — closed vocabulary, bounded stats; PUT {} installs three growing waves),
+and the game itself (09267f0): primitive-built shamblers with grid-A* chase, hitscan +
+tracer + hit flash, melee + damage vignette, health, rest timers, win/lose + retry.
+Left-click arbitrated: combat outranks carry-throw. The whole loop runs REAL and
+deterministic under vitest (spawn/chase/melee/aimed-kills/waves/win — 4 tests) and the
+live browser proof spawned 3 undead who chased and OVERRAN a blind playwright player at
+61 fps. FE 102 / BE 1122 green.
