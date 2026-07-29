@@ -365,19 +365,48 @@ def test_stale_and_invalid_player_poses_are_dropped_on_read(client):
     assert reasons and "invalid" in reasons[0]["reason"]
 
 
-def test_restamp_world_scale_respects_baked_geometry(tmp_path):
-    """/scale back-stamps scene-unit worlds; metre-baked worlds are immutable
-    (their GLBs are baked — scale_generation flags the staleness instead)."""
+def test_restamp_world_scale_touches_only_the_walker_manifest(tmp_path):
+    """/scale back-stamps the WALKER-facing manifest of scene-unit worlds
+    only. world.json is the bake-state record scale_sanity trusts ("mpu
+    present == extents are metres") and metre-baked manifests are immutable
+    (scale_generation flags the staleness instead)."""
     world = tmp_path / "_world"
     world.mkdir()
     (world / "world.json").write_text(json.dumps(
         {"units": "scene-units (uncalibrated)", "meters_per_unit": None}))
     (world / "world_manifest.json").write_text(json.dumps(
-        {"units": "meters", "meters_per_unit": 1.0}))
+        {"units": "scene-units (uncalibrated)", "meters_per_unit": None}))
     restamped = splat_route._restamp_world_scale(tmp_path, 0.5)
-    assert restamped == ["world.json"]
-    assert json.loads((world / "world.json").read_text())["meters_per_unit"] == 0.5
-    assert json.loads((world / "world_manifest.json").read_text())["meters_per_unit"] == 1.0
+    assert restamped == ["world_manifest.json"]
+    assert json.loads((world / "world.json").read_text())["meters_per_unit"] is None
+    assert json.loads((world / "world_manifest.json").read_text())["meters_per_unit"] == 0.5
+
+    # Clearing the calibration restamps too — a revoked factor never lingers.
+    assert splat_route._restamp_world_scale(tmp_path, None) == ["world_manifest.json"]
+    assert json.loads((world / "world_manifest.json").read_text())["meters_per_unit"] is None
+
+    # Metre-baked manifests are never touched.
+    (world / "world_manifest.json").write_text(json.dumps(
+        {"units": "meters", "meters_per_unit": 1.0}))
+    assert splat_route._restamp_world_scale(tmp_path, 0.5) == []
+
+
+def test_affordance_extents_are_not_double_calibrated(client):
+    """Old-format metre manifests carry the CAPTURE factor as mpu beside
+    metre-baked extents — the proposer must not apply it twice."""
+    http, outputs = client
+    world = _mk_world(outputs, "thermos")
+    (world / "world_manifest.json").write_text(json.dumps({
+        "v": 1, "job_id": JOB, "units": "meters", "meters_per_unit": 2.3537,
+        "elements": [{"slug": "thermos", "label": "thermos", "role": "prop",
+                      "extent": [0.4, 0.15, 0.15]}],
+        "shell": {"slug": "shell", "role": "static"},
+    }))
+    r = http.post(f"/api/splat/jobs/{JOB}/world/affordances/propose", json={})
+    assert r.status_code == 200, r.text
+    proposal = r.json()["proposals"][0]
+    assert proposal["record"]["verb"] == "pickup"  # 0.4 m, not 0.94 m
+    assert "0.40 m" in proposal["rationale"]
 
 
 # ---------------------------------------------------------------------------

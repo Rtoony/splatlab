@@ -228,11 +228,16 @@ def main() -> int:
             regrades = {k: v for k, v in raw.items() if isinstance(v, dict)}
         except (OSError, json.JSONDecodeError):
             _log("  WARNING: regrades.json unreadable — ignoring it")
+    # A recorded regrade is an AUDITED decision and outranks ad-hoc CLI
+    # flags: it removes the slug from the opposite CLI set, so precedence is
+    # by source, not by branch order (review finding).
     for slug, r in regrades.items():
         if r.get("role") == "prop":
             force_prop.add(slug)
+            force_static.discard(slug)
         elif r.get("role") == "static":
             force_static.add(slug)
+            force_prop.discard(slug)
 
     hull_dir = job_dir / "_world" / "collision"
     out = []

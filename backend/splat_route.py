@@ -6169,7 +6169,9 @@ async def regrade_world_element(request: Request, job_id: str, body: WorldRegrad
         if rc != 0:
             raise HTTPException(
                 status_code=502,
-                detail="collision regrade run failed: " + "\n".join(
+                detail="the regrade IS recorded (sticky — it applies on the "
+                       "next rebuild) but the collision rerun failed: "
+                       + "\n".join(
                     stderr.decode("utf-8", errors="replace").splitlines()[-4:]))
         manifest_path = world_dir / "world_manifest.json"
         try:
@@ -6208,10 +6210,12 @@ class WorldSolidifyBody(BaseModel):
     skip_shell: bool = False
     shell_only: bool = False
     prefer_generated: bool = False
-    # Auto-heal by default on the product path: a captured prop that trips a
-    # measured quality floor is regenerated under object_generate's own gates,
-    # with the trigger and outcome recorded in world.json either way.
-    auto_generate: bool = True
+    # Opt-in: a captured prop that trips a measured quality floor is
+    # regenerated under object_generate's own gates, trigger + outcome
+    # recorded either way. NOT default-on — a full SAM-3D CUDA run (13 GB of
+    # checkpoints) must never be a surprise side effect of a rebuild
+    # (review finding: existing callers sent no key and would have paid it).
+    auto_generate: bool = False
     run_collision: bool = True
     run_gate: bool = True
 
@@ -6459,7 +6463,12 @@ def _world_calibration(world: dict[str, Any], meta: dict[str, Any]) -> dict[str,
     POST /jobs/{id}/scale updates the JOB but nothing re-stamps artifacts already
     on disk. So the viewer must be told BOTH numbers: what the GLBs were built
     with, and what the job believes now."""
-    raw_world = world.get("meters_per_unit")
+    # New-format metre-baked worlds declare mpu 1.0 (their GLBs ARE metres)
+    # and carry the CAPTURE factor as provenance — staleness must compare
+    # that provenance against the job, or a freshly built calibrated world
+    # reads as permanently stale (review finding).
+    raw_world = world.get("calibrated_from_meters_per_unit") \
+        or world.get("meters_per_unit")
     raw_job = meta.get("meters_per_unit")
     world_mpu = float(raw_world) if raw_world else None
     job_mpu = float(raw_job) if raw_job else None
@@ -7300,8 +7309,12 @@ async def set_splat_scale(job_id: str, payload: dict[str, Any]):
             scale_generation=int(existing.get("scale_generation") or 0) + 1)
         if not patched:
             raise HTTPException(status_code=404, detail="Splat job not found")
+        # A revoked calibration must not linger in the walker's manifest
+        # (review finding: the clear path skipped the restamp).
+        restamped = _restamp_world_scale(job_dir, None)
         return {"ok": True, "job_id": job_id, "meters_per_unit": None,
                 "scale_calibration": None,
+                "world_restamped": restamped,
                 "scale_generation": patched.get("scale_generation")}
     else:
         method = (scale_calibration.METHOD_MAP if source == "map"
@@ -7342,26 +7355,28 @@ async def set_splat_scale(job_id: str, payload: dict[str, Any]):
 
 
 def _restamp_world_scale(job_dir: Path, mpu: float | None) -> list[str]:
-    """Push a new calibration into already-built world documents — but only
-    when their geometry is still in SCENE UNITS, where the factor applies
+    """Push a new calibration into the WALKER-facing manifest — but only
+    when its geometry is still in SCENE UNITS, where the factor applies
     directly. A metre-baked world cannot be retroactively rescaled by
     stamping (its GLBs are baked); scale_generation flags that staleness and
-    a rebuild is the honest path. Without this, the walker keeps guessing
-    scale from storey height on a capture the operator just calibrated."""
+    a rebuild is the honest path.
+
+    Deliberately world_manifest.json ONLY: world.json is the bake-state
+    record and scale_sanity treats its mpu as "extents are metres" — a
+    numeric stamp there against scene-unit extents would make the gate
+    judge scene units on metre thresholds (review finding). Clearing a
+    calibration (mpu None) restamps too, so a revoked factor never lingers."""
     restamped: list[str] = []
-    for name in ("world.json", "world_manifest.json"):
-        path = job_dir / WORLD_DIRNAME / name
-        if not path.is_file():
-            continue
+    path = job_dir / WORLD_DIRNAME / "world_manifest.json"
+    if path.is_file():
         try:
             doc = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
-            continue
-        if doc.get("units") == "meters":
-            continue  # baked geometry: stamping would lie
-        doc["meters_per_unit"] = mpu
-        path.write_text(json.dumps(doc, indent=2))
-        restamped.append(name)
+            return restamped
+        if doc.get("units") != "meters":
+            doc["meters_per_unit"] = mpu
+            path.write_text(json.dumps(doc, indent=2))
+            restamped.append("world_manifest.json")
     return restamped
 
 

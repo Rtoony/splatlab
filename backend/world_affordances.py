@@ -38,12 +38,17 @@ def _prompt_for(label: str, slug: str) -> str:
         else text[:PROMPT_MAX]
 
 
-def _extent_metres(element: dict[str, Any], mpu: float | None) -> list[float] | None:
+def _extent_metres(element: dict[str, Any], mpu: float | None,
+                   units: str | None) -> list[float] | None:
     extent = element.get("extent")
     if (not isinstance(extent, list) or len(extent) != 3
             or not all(isinstance(v, (int, float)) for v in extent)):
         return None
-    factor = float(mpu) if mpu else 1.0
+    # units == "meters" means the extents are ALREADY metres (old-format docs
+    # recorded the capture factor as mpu beside metre-baked extents — applying
+    # it would double the calibration; review finding). The factor applies
+    # only to scene-unit documents that carry a restamped calibration.
+    factor = float(mpu) if (mpu and units != "meters") else 1.0
     return [float(v) * factor for v in extent]
 
 
@@ -59,6 +64,7 @@ def propose_affordances(
     """
     existing = existing_slugs or set()
     mpu = world_manifest.get("meters_per_unit")
+    units = world_manifest.get("units")
     proposals: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
 
@@ -76,7 +82,7 @@ def propose_affordances(
 
         label = str(element.get("label") or "")
         prompt = _prompt_for(label, slug)
-        extent_m = _extent_metres(element, mpu)
+        extent_m = _extent_metres(element, mpu, units)
         name = f"{label} {slug}"
 
         if element.get("role") == "static":

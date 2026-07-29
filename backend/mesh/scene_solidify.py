@@ -34,6 +34,8 @@ Usage: scene_solidify.py <job_dir>
 """
 import argparse
 import json
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -340,6 +342,31 @@ def mesh_component_frac(glb_path: Path):
         return None
 
 
+def _read_world_doc(world_dir: Path) -> dict:
+    try:
+        return json.loads((world_dir / "world.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def world_bake_factor(existing_doc: dict, meta_mpu):
+    """The factor a PARTIAL rebuild must bake at: the existing world's, never
+    meta's current one — recalibration between builds must not mix units.
+
+    New-format metre docs carry the capture factor as provenance; old-format
+    docs recorded it AS meters_per_unit (distinguished by the provenance
+    key's presence, not the value — a world legitimately baked at exactly
+    1.0 must not be mistaken for new-format; review finding). An existing
+    scene-unit world stays unbaked regardless of meta."""
+    if not existing_doc:
+        return meta_mpu
+    if existing_doc.get("units") == "meters":
+        if "calibrated_from_meters_per_unit" in existing_doc:
+            return existing_doc.get("calibrated_from_meters_per_unit") or meta_mpu
+        return existing_doc.get("meters_per_unit") or meta_mpu
+    return None
+
+
 def world_scale_fields(mpu) -> dict:
     """The scale record for a world document, describing the GEOMETRY.
 
@@ -393,20 +420,44 @@ def patch_world_doc(doc: dict, new_elements: list[dict], shell: dict | None) -> 
     return doc
 
 
-def _generate_refusal(job_dir: Path, slug: str, proc) -> str:
+def _run_grouped(cmd: list[str], timeout: int) -> tuple[int, str]:
+    """Run a subprocess in its OWN process group and kill the whole group on
+    timeout — object_generate spawns a SAM-3D worker grandchild with its own
+    longer timeout, and killing only the direct child orphans a CUDA process
+    holding checkpoints on the GPU (review finding)."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    try:
+        _out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            _out, err = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            _out, err = proc.communicate()
+        raise
+    return proc.returncode, err or ""
+
+
+def _generate_refusal(job_dir: Path, slug: str, returncode: int,
+                      stderr_text: str, started: float) -> str:
     """A gate refusal is a decision, not a crash — record it in the gate's
     own words (e.g. 'mask/captured-object IoU 0.057 < 0.35') rather than a
     stderr tail of truncated JSON."""
     report_path = job_dir / "_regen" / "objects" / slug / "generate_report.json"
     try:
-        report = json.loads(report_path.read_text())
-        problems = (report.get("mask_alignment_gate") or {}).get("problems") or []
-        if problems:
-            return "refused by the generation gates: " + "; ".join(problems)[:220]
+        # Only trust a report THIS run wrote — a crash before writing one
+        # must not quote a stale earlier attempt (review finding).
+        if report_path.stat().st_mtime >= started:
+            report = json.loads(report_path.read_text())
+            problems = (report.get("mask_alignment_gate") or {}).get("problems") or []
+            if problems:
+                return "refused by the generation gates: " + "; ".join(problems)[:220]
     except (OSError, json.JSONDecodeError):
         pass
-    tail = "\n".join((proc.stderr or "").splitlines()[-3:])
-    return f"generation failed (exit {proc.returncode}): {tail[:200]}"
+    tail = "\n".join(stderr_text.splitlines()[-3:])
+    return f"generation failed (exit {returncode}): {tail[:200]}"
 
 
 def _write_generated_sidecar(out: Path, gen: dict, res: dict) -> None:
@@ -667,6 +718,10 @@ def main() -> int:
             print("FATAL: tsdf shell needs _scene/inventory.json for the "
                   "instance cut boxes", file=sys.stderr)
             return 1
+        # Same bake-factor lock as --patch-elements: a shell rebaked at
+        # meta's CURRENT calibration beside elements baked at the old one is
+        # a mixed-unit world (review finding — this branch lacked the lock).
+        mpu = world_bake_factor(doc, mpu)
         shell = build_shell(job_dir, args, instances, py, script, mpu)
         doc["shell"] = shell
         doc.setdefault("counts", {})["shell_built"] = bool(shell.get("built"))
@@ -695,17 +750,7 @@ def main() -> int:
         # Patched elements must bake at the SAME scale the world was built
         # at — meta may have been recalibrated since, and a mixed-unit world
         # is worse than a uniformly stale one (rebuild fully to rescale).
-        try:
-            existing_doc = json.loads((world / "world.json").read_text())
-        except (OSError, json.JSONDecodeError):
-            existing_doc = {}
-        if existing_doc.get("units") == "meters":
-            recorded = existing_doc.get("meters_per_unit")
-            mpu = (existing_doc.get("calibrated_from_meters_per_unit")
-                   or (recorded if recorded not in (None, 1.0) else None)
-                   or mpu)
-        elif existing_doc:
-            mpu = None
+        mpu = world_bake_factor(_read_world_doc(world), mpu)
         # The flag PROMISES the shell record is preserved — so an element
         # patch must never trigger the default shell rebuild (which writes
         # over the live shell.glb and, on failure, would replace a good
@@ -811,12 +856,12 @@ def main() -> int:
                 gen_cmd = [str(py),
                            str(Path(__file__).with_name("object_generate.py")),
                            str(job_dir), "--object", slug]
+                started = time.time()
                 try:
-                    proc = subprocess.run(gen_cmd, capture_output=True,
-                                          text=True, timeout=1800)
-                    if proc.returncode != 0:
+                    rc, err = _run_grouped(gen_cmd, timeout=1800)
+                    if rc != 0:
                         entry["auto_generate"]["outcome"] = \
-                            _generate_refusal(job_dir, slug, proc)
+                            _generate_refusal(job_dir, slug, rc, err, started)
                 except subprocess.TimeoutExpired:
                     entry["auto_generate"]["outcome"] = "generation timed out"
                 gen = (_generated_candidate(job_dir, slug)
@@ -827,10 +872,21 @@ def main() -> int:
                                    "gates refused; keeping the captured mesh")
                     _log(f"  prop {slug}: {entry['auto_generate']['outcome']}")
                 else:
-                    res2 = place_generated(gen, out, mpu=mpu,
+                    # STAGED replacement: place_generated writes (and on a
+                    # readback mismatch unlinks) its target — pointing it at
+                    # the live GLB could destroy the captured mesh while the
+                    # entry still described it (review finding). The captured
+                    # file is only replaced by a validated success.
+                    staged = out.with_name(f".building-autogen-{out.name}")
+                    res2 = place_generated(gen, staged, mpu=mpu,
                                            faces=args.prop_faces,
                                            tex=args.texture_size)
                     if res2["ok"]:
+                        os.replace(staged, out)
+                        staged_atlas = staged.with_name(staged.stem + "_atlas.png")
+                        if staged_atlas.is_file():
+                            os.replace(staged_atlas,
+                                       out.with_name(out.stem + "_atlas.png"))
                         entry.pop("reason", None)
                         entry.update(
                             geometry_source="generated", generated=gen["report"],
@@ -846,6 +902,8 @@ def main() -> int:
                         _log(f"  prop {slug}: AUTO-GENERATED replacement placed "
                              f"(iou {gen['iou']:.3f})")
                     else:
+                        staged.unlink(missing_ok=True)
+                        staged.with_name(staged.stem + "_atlas.png").unlink(missing_ok=True)
                         entry["auto_generate"]["outcome"] = \
                             f"placement failed: {res2.get('error')}"
                         _log(f"  prop {slug}: {entry['auto_generate']['outcome']}")
