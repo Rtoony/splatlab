@@ -953,6 +953,23 @@ export class WorldWalker {
     return Math.min(this.params.radiusM * this.params.unitsPerMetre, this.eyeHeight * 0.35);
   }
 
+  private get capsuleHeight(): number {
+    // The physics capsule's height in units: the eye height, clamped so the
+    // whole capsule FITS the headroom world_shell proved at the spawn seed —
+    // capsule extent is height + radius, hence the radius-and-margin cap. On
+    // an uncalibrated capture the scale guess can make the player taller
+    // than the interior, and a capsule that cannot fit has no penetration-
+    // free pose: its feet ended ~2 units inside the floor solid and one
+    // depenetration pass threw the player clean out of the world into an
+    // eject/fall/respawn loop (Truck, A9). A wrong scale must cost a short-
+    // feeling player, never a fall out of the world. Worlds without a probe,
+    // and worlds whose headroom really fits the player, are untouched.
+    const headroom = this.spawnTopY - this.spawnFloorY;
+    if (!(headroom > 1e-4)) return this.eyeHeight;
+    const fit = Math.max(this.capsuleRadius * 1.05, (headroom - this.capsuleRadius) * 0.95);
+    return Math.min(this.eyeHeight, fit);
+  }
+
   /* -------------------------------------------------------------- *
    * Spawning / teleporting                                          *
    * -------------------------------------------------------------- */
@@ -972,13 +989,16 @@ export class WorldWalker {
       // 4.8 units, and the whole solid is 5.9 units tall, so the spawn landed
       // outside and fell straight out (ground=air).
       //
-      // So stand on the PROVEN floor at eye height, clamped into the headroom
-      // world_shell measured. A wrong scale then costs a bad-feeling eye level,
-      // never a fall out of the world.
-      const headroom = Math.max(1e-4, this.spawnTopY - this.spawnFloorY);
-      const eye = Math.min(this.eyeHeight, headroom * 0.6);
+      // So stand feet-on-the-PROVEN-floor with the capsule capsuleHeight has
+      // already clamped into the measured headroom (its ceiling margin keeps
+      // the head clear too). A wrong scale then costs a short-feeling player,
+      // never a fall out of the world. Anything less than the full capsule
+      // height here puts the feet INSIDE the floor solid — an earlier eye
+      // clamped to 0.6 × headroom while the capsule kept its full height left
+      // the feet ~2 units deep in the slab, and one depenetration pass hurled
+      // the spawn out of the world (the Truck A9 eject/fall/respawn loop).
       const seeded = this.spawnSeed.clone();
-      seeded.y = this.spawnFloorY + eye;
+      seeded.y = this.spawnFloorY + this.capsuleHeight;
       this.spawn.copy(seeded);
       this.camera.position.copy(seeded);
       this.velocity.set(0, 0, 0);
@@ -1699,8 +1719,9 @@ export class WorldWalker {
 
     const radius = this.capsuleRadius;
     // Capsule in local space: player origin (camera) is the TOP sphere centre,
-    // so the head clears by `radius` and the feet sit at eye - eyeHeight.
-    const segLength = Math.max(1e-5, this.eyeHeight - radius);
+    // so the head clears by `radius` and the feet sit at eye - capsuleHeight
+    // (the eye height clamped into the proven headroom — see capsuleHeight).
+    const segLength = Math.max(1e-5, this.capsuleHeight - radius);
 
     _seg.start.copy(this.camera.position);
     _seg.end.copy(this.camera.position).addScaledVector(_up, -segLength);

@@ -105,6 +105,103 @@ describe("ground probe (real BVH)", () => {
   });
 });
 
+describe("seeded respawn vs low headroom (real BVH + collisions)", () => {
+  // The Truck (A9) numbers: an uncalibrated capture guessed at 1.9245 u/m
+  // makes the 1.7 m player 3.27 units tall inside a proven headroom of only
+  // 2.27 units. The seeded respawn clamped the EYE into the headroom but the
+  // physics capsule kept its full height, so its feet sat ~1.9 units inside
+  // the floor slab and the depenetration pass hurled the spawn out of the
+  // world — an eject/fall/respawn loop the game read as "no reachable spawn
+  // ground". The capsule must be clamped to fit the headroom too.
+  const FLOOR = -0.3241;
+  const TOP = 1.9502;
+  const SEED = new THREE.Vector3(0.4176, -0.0241, -0.4565);
+
+  function room(): THREE.BufferGeometry[] {
+    const geoms: THREE.BufferGeometry[] = [slab(FLOOR, 1)]; // thick floor slab
+    const ceiling = new THREE.PlaneGeometry(20, 20);
+    ceiling.rotateX(Math.PI / 2); // faces down
+    ceiling.translate(0, TOP, 0);
+    geoms.push(ceiling);
+    for (const [dx, dz, ry] of [[10, 0, Math.PI / 2], [-10, 0, -Math.PI / 2], [0, 10, Math.PI], [0, -10, 0]]) {
+      const wall = new THREE.PlaneGeometry(20, 8);
+      wall.rotateY(ry);
+      wall.translate(dx, TOP - 4, dz);
+      geoms.push(wall);
+    }
+    return geoms;
+  }
+
+  function spawnRig() {
+    const walker = probeRig(room());
+    const merged = (walker as unknown as { bvh: MeshBVH }).bvh.geometry;
+    const collider = new THREE.Mesh(merged);
+    collider.updateMatrixWorld(true);
+    Object.assign(walker, {
+      collider,
+      camera: new THREE.PerspectiveCamera(),
+      velocity: new THREE.Vector3(),
+      spawn: new THREE.Vector3(),
+      grounded: false,
+      spawnSeed: SEED.clone(),
+      spawnFloorY: FLOOR,
+      spawnTopY: TOP,
+      params: { eyeHeightM: 1.7, radiusM: 0.32, unitsPerMetre: 1.9245 },
+    });
+    return walker as WorldWalker & { camera: THREE.PerspectiveCamera };
+  }
+
+  it("the spawned capsule FITS the proven headroom: feet never below the floor", () => {
+    // The actual failure contract. Unfixed, the capsule kept the full 3.27u
+    // eye height, so at the clamped spawn eye its feet reached 1.9u below
+    // the proven floor — inside the collision solid — and the depenetration
+    // pass ejected the player. (The eject itself needs the voxel shell's
+    // thousands of jittered faces and is not reproducible with clean box
+    // geometry, so the test pins the geometric contract instead.)
+    const w = spawnRig();
+    w.respawn();
+    const internals = w as unknown as {
+      capsuleHeight: number; capsuleRadius: number; spawn: THREE.Vector3;
+    };
+    const feet = internals.spawn.y - internals.capsuleHeight;
+    expect(feet).toBeGreaterThanOrEqual(FLOOR - 0.02);
+    // The head may graze the ceiling by at most a whisker of the radius.
+    const head = internals.spawn.y + internals.capsuleRadius;
+    expect(head).toBeLessThanOrEqual(TOP + internals.capsuleRadius * 0.1);
+  });
+
+  it("spawns SETTLED: extra collision passes barely move the camera", () => {
+    const w = spawnRig();
+    w.respawn();
+    // The bug's signature was a spawn the collider still disagreed with:
+    // every subsequent pass kept displacing the capsule (in the wild, out of
+    // the world). Settled means another pass finds ~no penetration to fix.
+    const resolve = w as unknown as { resolveCollisions(dt: number): void };
+    const before = w.camera.position.clone();
+    let travelled = 0;
+    for (let i = 0; i < 5; i++) {
+      const prev = w.camera.position.clone();
+      resolve.resolveCollisions(1 / 60);
+      travelled += w.camera.position.distanceTo(prev);
+    }
+    expect(travelled).toBeLessThan(0.1);
+    // And it is standing inside the room, near the seed, not ejected.
+    const p = w.camera.position;
+    expect(Math.abs(p.x - SEED.x)).toBeLessThan(1.5);
+    expect(Math.abs(p.z - SEED.z)).toBeLessThan(1.5);
+    expect(p.y).toBeGreaterThan(FLOOR);
+    expect(p.y).toBeLessThan(TOP);
+    expect(p.distanceTo(before)).toBeLessThan(0.1);
+  });
+
+  it("a world with real headroom keeps the full eye height", () => {
+    const w = spawnRig();
+    Object.assign(w, { spawnTopY: FLOOR + 6, params: { eyeHeightM: 1.7, radiusM: 0.32, unitsPerMetre: 1.0 } });
+    const internals = w as unknown as { capsuleHeight: number; eyeHeight: number };
+    expect(internals.capsuleHeight).toBeCloseTo(internals.eyeHeight, 6);
+  });
+});
+
 describe("baked look (setBakedLook)", () => {
   // After a bake the overlay document is EMPTY, so restyleShowsMesh would go
   // false and the splat backdrop — still the un-restyled photograph — would
