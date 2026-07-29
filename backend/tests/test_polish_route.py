@@ -366,3 +366,81 @@ def test_validate_glb_rejects_external_uris(tmp_path: Path) -> None:
         "images": [{"uri": "data:image/png;base64,AAAA"}],
     }))
     assert glb_check.validate_glb(good)["meshes"] == 1
+
+
+# ── position_bounds (the placement lane's frame gate) ───────────────────────────
+
+
+def _positioned_doc(*, nodes=None, meshes=None, accessors=None) -> dict:
+    return {
+        "asset": {"version": "2.0"},
+        "meshes": meshes if meshes is not None else [
+            {"primitives": [{"attributes": {"POSITION": 0}}]}],
+        "accessors": accessors if accessors is not None else [
+            {"type": "VEC3", "componentType": 5126, "count": 3,
+             "min": [-1.0, 0.0, -2.0], "max": [1.0, 0.5, 2.0]}],
+        "nodes": nodes if nodes is not None else [{"mesh": 0}],
+    }
+
+
+def test_position_bounds_unions_accessors_and_reports_identity(tmp_path: Path) -> None:
+    doc = _positioned_doc(
+        meshes=[{"primitives": [{"attributes": {"POSITION": 0}},
+                                {"attributes": {"POSITION": 1}}]}],
+        accessors=[
+            {"type": "VEC3", "componentType": 5126, "count": 3,
+             "min": [-1.0, 0.0, -2.0], "max": [1.0, 0.5, 2.0]},
+            {"type": "VEC3", "componentType": 5126, "count": 3,
+             "min": [0.5, -0.25, 1.0], "max": [3.0, 0.25, 1.5]},
+        ])
+    path = tmp_path / "ok.glb"
+    path.write_bytes(_glb_from_doc(doc))
+    bounds = glb_check.position_bounds(path)
+    assert bounds["aabb"] == {"min": [-1.0, -0.25, -2.0], "max": [3.0, 0.5, 2.0]}
+    assert bounds["extent"] == [4.0, 0.75, 4.0]
+    assert bounds["identity_transforms"] is True
+    assert bounds["transformed_nodes"] == []
+
+
+def test_position_bounds_flags_node_trs_including_inherited(tmp_path: Path) -> None:
+    # Own transform on the mesh node.
+    own = tmp_path / "own.glb"
+    own.write_bytes(_glb_from_doc(_positioned_doc(
+        nodes=[{"mesh": 0, "translation": [1.0, 0.0, 0.0]}])))
+    got = glb_check.position_bounds(own)
+    assert got["identity_transforms"] is False and got["transformed_nodes"] == [0]
+
+    # A parent's transform taints the child's mesh even with identity child.
+    inherited = tmp_path / "inherited.glb"
+    inherited.write_bytes(_glb_from_doc(_positioned_doc(
+        nodes=[{"children": [1], "scale": [2.0, 2.0, 2.0]}, {"mesh": 0}])))
+    got = glb_check.position_bounds(inherited)
+    assert got["identity_transforms"] is False and got["transformed_nodes"] == [1]
+
+    # Explicit identity values do NOT count as a transform.
+    identity = tmp_path / "identity.glb"
+    identity.write_bytes(_glb_from_doc(_positioned_doc(
+        nodes=[{"mesh": 0, "translation": [0.0, 0.0, 0.0],
+                "rotation": [0.0, 0.0, 0.0, 1.0], "scale": [1.0, 1.0, 1.0]}])))
+    assert glb_check.position_bounds(identity)["identity_transforms"] is True
+
+    # A non-identity matrix counts.
+    matrixed = tmp_path / "matrix.glb"
+    matrix = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 5, 0, 0, 1]
+    matrixed.write_bytes(_glb_from_doc(_positioned_doc(
+        nodes=[{"mesh": 0, "matrix": matrix}])))
+    assert glb_check.position_bounds(matrixed)["identity_transforms"] is False
+
+
+def test_position_bounds_fails_loud_without_minmax_or_positions(tmp_path: Path) -> None:
+    no_minmax = tmp_path / "nominmax.glb"
+    no_minmax.write_bytes(_glb_from_doc(_positioned_doc(
+        accessors=[{"type": "VEC3", "componentType": 5126, "count": 3}])))
+    with pytest.raises(ValueError, match="min/max"):
+        glb_check.position_bounds(no_minmax)
+
+    no_positions = tmp_path / "nopos.glb"
+    no_positions.write_bytes(_glb_from_doc(_positioned_doc(
+        meshes=[{"primitives": [{"attributes": {}}]}])))
+    with pytest.raises(ValueError, match="no POSITION"):
+        glb_check.position_bounds(no_positions)
