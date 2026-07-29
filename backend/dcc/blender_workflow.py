@@ -32,16 +32,27 @@ MUTATING_ACTIONS = {
     "toggle_collection",
     "transform_object",
     "import_world_element",
+    "import_asset",
     "cleanup_mesh",
 }
 READ_ACTIONS = {"inspect"}
 # World-element slugs come from splat_route._object_slug output: lowercase
 # kebab, max 40 chars. Re-validated here so the dcc layer never trusts input.
 ELEMENT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+# Library asset names share the slug grammar — a name IS a filename stem.
+ASSET_NAME_RE = ELEMENT_SLUG_RE
 MAX_NAME_LENGTH = 256
 BLENDER_TIMEOUT_S = 10 * 60
 OUTPUT_ROOT = Path(
     os.environ.get("SPLATLAB_OUTPUT_ROOT", "/home/rtoony/projects/splatcli/outputs/3d")
+).resolve()
+# The curated set-dressing library (assets/library in the repo). import_asset
+# resolves ONLY inside this root — never a free-form path.
+ASSET_LIBRARY_ROOT = Path(
+    os.environ.get(
+        "SPLATLAB_ASSET_LIBRARY",
+        str(Path(__file__).resolve().parents[2] / "assets" / "library"),
+    )
 ).resolve()
 JOB_ID_RE = re.compile(r"^splat_[A-Za-z0-9_-]{3,80}$")
 
@@ -120,6 +131,56 @@ def _contained_scene_file(
     except (OSError, ValueError) as exc:
         raise BlenderWorkflowError("Blender scene is outside the approved job") from exc
     return path
+
+
+def _contained_library_file(path: Path) -> Path:
+    """The _contained_scene_file shape, rooted at the asset library."""
+    try:
+        relative = path.relative_to(ASSET_LIBRARY_ROOT)
+    except ValueError as exc:
+        raise BlenderWorkflowError("asset is outside the library root") from exc
+    cursor = ASSET_LIBRARY_ROOT
+    for part in relative.parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise BlenderWorkflowError("symlinked library assets are not allowed")
+    if not path.is_file():
+        names = sorted(p.stem for p in ASSET_LIBRARY_ROOT.glob("*.glb"))
+        raise BlenderWorkflowError(
+            f"no library asset '{path.stem}' — available: "
+            f"{', '.join(names) or '(library is empty)'}"
+        )
+    try:
+        path.resolve(strict=True).relative_to(ASSET_LIBRARY_ROOT)
+    except (OSError, ValueError) as exc:
+        raise BlenderWorkflowError("asset is outside the library root") from exc
+    return path
+
+
+def list_asset_library() -> list[dict[str, Any]]:
+    """The curated GLBs import_asset may pull in — name, size, extent in
+    metres, validation state. Broken files are REPORTED with their error,
+    never hidden: an operator must see why an asset is unavailable."""
+    if not ASSET_LIBRARY_ROOT.is_dir():
+        return []
+    out: list[dict[str, Any]] = []
+    for path in sorted(ASSET_LIBRARY_ROOT.glob("*.glb")):
+        if path.is_symlink():
+            continue  # the library is plain files by contract
+        entry: dict[str, Any] = {"name": path.stem,
+                                 "bytes": path.stat().st_size}
+        if not ASSET_NAME_RE.fullmatch(path.stem):
+            entry["error"] = "name violates the library naming contract"
+        else:
+            try:
+                entry["gltf"] = glb_check.validate_glb(path)
+                bounds = glb_check.position_bounds(path)
+                entry["extent"] = bounds["extent"]
+                entry["identity_transforms"] = bounds["identity_transforms"]
+            except ValueError as exc:
+                entry["error"] = str(exc)
+        out.append(entry)
+    return out
 
 
 def list_versions(job_id: str) -> list[dict[str, Any]]:
@@ -242,6 +303,16 @@ def _sanitize_params(action: str, params: dict[str, Any]) -> dict[str, Any]:
         return {}
     if action == "import_world_element":
         return {"slug": _element_slug(params.get("slug"))}
+    if action == "import_asset":
+        name = str(params.get("name") or "").strip()
+        if not ASSET_NAME_RE.fullmatch(name):
+            raise BlenderWorkflowError(
+                "asset name must be a lowercase kebab-case library name"
+            )
+        slug = _element_slug(params.get("slug"))
+        if slug == "shell":
+            raise BlenderWorkflowError('"shell" is not a placement slug')
+        return {"name": name, "slug": slug}
     if action == "cleanup_mesh":
         result = {"object": _safe_name(str(params.get("object", "")), "object")}
         if params.get("merge_distance") is not None:
@@ -424,6 +495,15 @@ def run_action(
             raise BlenderWorkflowError(
                 f"world element '{slug}' failed GLB validation: {exc}"
             ) from exc
+    elif action == "import_asset":
+        name = safe_params["name"]
+        import_glb = _contained_library_file(ASSET_LIBRARY_ROOT / f"{name}.glb")
+        try:
+            glb_check.validate_glb(import_glb)
+        except ValueError as exc:
+            raise BlenderWorkflowError(
+                f"library asset '{name}' failed GLB validation: {exc}"
+            ) from exc
 
     with _job_lock(job_dir):
         source, resolved_base = _source_blend(job_dir, base_version)
@@ -523,6 +603,7 @@ def export_glb(
     *,
     base_version: int | None = None,
     object_name: str | None = None,
+    bake_world_transform: bool = False,
     note: str = "",
 ) -> dict[str, Any]:
     """Export a blend version (or the assembled scene) as a GLB artifact.
@@ -534,11 +615,21 @@ def export_glb(
     version replaces the derived artifact and its receipt — versions are
     immutable, exports are derived. With object_name set, only that object is
     exported and the stem gains a slug suffix so the whole-scene export is
-    never clobbered. The exported file feeds the polish-upload route;
-    ingestion stays a separate, audited step.
+    never clobbered. The exported file feeds the polish-upload route (or, for
+    placed assets, the placement route); ingestion stays a separate,
+    audited step.
+
+    bake_world_transform (object exports only) applies the object's
+    matrix_world to the exported vertices and identities the node — the
+    shared-frame contract the walker and the placement door require. The
+    .blend itself is never saved by an export, so the bake is in-memory only.
     """
     if not BLENDER_BIN.is_file() or not ACTION_SCRIPT.is_file():
         raise BlenderWorkflowError("Blender 4.5 LTS workflow toolchain is unavailable")
+    if bake_world_transform and object_name is None:
+        raise BlenderWorkflowError(
+            "bake_world_transform exports exactly one object — set object_name"
+        )
     export_params: dict[str, Any] = {}
     stem_suffix = ""
     if object_name is not None:
@@ -551,6 +642,8 @@ def export_glb(
                 "object_name has no filename-safe characters"
             )
         stem_suffix = f"-{object_slug}"
+        if bake_world_transform:
+            export_params["bake_world_transform"] = True
     job_dir = _job_dir(job_id)
     with _job_lock(job_dir):
         source, resolved_base = _source_blend(job_dir, base_version)

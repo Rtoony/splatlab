@@ -18,6 +18,7 @@ ALLOWED_ACTIONS = {
     "toggle_collection",
     "transform_object",
     "import_world_element",
+    "import_asset",
     "cleanup_mesh",
     "export_glb",
 }
@@ -179,6 +180,48 @@ def _execute(request: dict) -> dict:
             "materials": len(primary.data.materials),
             "superseded": superseded,
         }
+    elif action == "import_asset":
+        # Same host-resolved-path contract as import_world_element, but the
+        # source is the curated library and the library contract is ONE mesh.
+        import_path = request.get("import_glb")
+        if not isinstance(import_path, str) or not import_path.endswith(".glb"):
+            raise ValueError("import_asset requires a host-resolved GLB")
+        before = set(bpy.data.objects)
+        bpy.ops.import_scene.gltf(filepath=import_path)
+        imported = [obj for obj in bpy.data.objects if obj not in before]
+        meshes = [obj for obj in imported if obj.type == "MESH"]
+        if len(meshes) != 1:
+            raise ValueError(
+                f"library asset must be ONE joined mesh, got {len(meshes)} — "
+                "regenerate it with assets/library/generate_starter_assets.py"
+            )
+        primary = meshes[0]
+        canonical = f"asset_{params['slug']}"
+        superseded = None
+        existing = bpy.data.objects.get(canonical)
+        if existing is not None and existing not in imported:
+            # Same collision dance as import_world_element: the fresh import
+            # must own the contract name, never a .001 alias.
+            existing.name = f"{canonical}.superseded"
+            superseded = existing.name
+        primary.name = canonical
+        placed_collection = bpy.data.collections.get("Placed")
+        if placed_collection is None:
+            placed_collection = bpy.data.collections.new("Placed")
+            bpy.context.scene.collection.children.link(placed_collection)
+        for obj in imported:
+            for collection in list(obj.users_collection):
+                collection.objects.unlink(obj)
+            placed_collection.objects.link(obj)
+        result = {
+            "object": primary.name,
+            "faces": len(primary.data.polygons),
+            "materials": len(primary.data.materials),
+            # Blender units (metres) — what the operator scales honestly
+            # against inspect_job's coordinate record before placing.
+            "dimensions": [round(value, 4) for value in primary.dimensions],
+            "superseded": superseded,
+        }
     elif action == "cleanup_mesh":
         obj = bpy.data.objects.get(params["object"])
         if obj is None or obj.type != "MESH":
@@ -245,6 +288,18 @@ def _execute(request: dict) -> dict:
             target = bpy.data.objects.get(selected_name)
             if target is None:
                 raise ValueError(f"object not found: {selected_name!r}")
+            if params.get("bake_world_transform"):
+                # The shared-frame contract: world-baked vertices under an
+                # identity node. In-memory only — the export path never saves
+                # the .blend, so the authored version keeps its transform.
+                if target.parent is not None:
+                    raise ValueError(
+                        "bake_world_transform refuses parented objects — the "
+                        "parent's transform would be silently half-baked"
+                    )
+                matrix = target.matrix_world.copy()
+                target.data.transform(matrix)
+                target.matrix_world.identity()
             for obj in bpy.context.view_layer.objects:
                 obj.select_set(False)
             target.select_set(True)
@@ -254,6 +309,7 @@ def _execute(request: dict) -> dict:
             "exported": True,
             "objects": 1 if selected_name else len(bpy.data.objects),
             "meshes": len(bpy.data.meshes),
+            "world_transform_baked": bool(params.get("bake_world_transform")),
             "bytes": output_path.stat().st_size,
         }
     else:

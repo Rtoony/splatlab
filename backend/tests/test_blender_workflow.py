@@ -435,3 +435,80 @@ def test_export_glb_failed_process_leaves_nothing(
         blender_workflow.export_glb("splat_b1e001")
     exports = job_dir / "_blender" / "exports"
     assert not exports.is_dir() or not list(exports.iterdir())
+
+
+# ── import_asset + the asset library (the set-dressing lane) ────────────────────
+
+
+def _mini_positioned_glb() -> bytes:
+    import struct
+
+    doc = {
+        "asset": {"version": "2.0"},
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+        "accessors": [{"type": "VEC3", "componentType": 5126, "count": 3,
+                       "min": [-0.1, 0.0, -0.1], "max": [0.1, 0.44, 0.1]}],
+        "nodes": [{"mesh": 0}],
+    }
+    payload = json.dumps(doc).encode()
+    payload += b" " * ((4 - len(payload) % 4) % 4)
+    body = struct.pack("<I4s", len(payload), b"JSON") + payload
+    return struct.pack("<4sII", b"glTF", 2, 12 + len(body)) + body
+
+
+def test_import_asset_params_are_validated() -> None:
+    sanitize = blender_workflow._sanitize_params
+    assert sanitize("import_asset", {"name": "torch-sconce",
+                                     "slug": "my-torch"}) == {
+        "name": "torch-sconce", "slug": "my-torch"}
+    for bad_name in ("Bad Name", "../evil", "UPPER", ""):
+        with pytest.raises(blender_workflow.BlenderWorkflowError,
+                           match="library name"):
+            sanitize("import_asset", {"name": bad_name, "slug": "x1"})
+    with pytest.raises(blender_workflow.BlenderWorkflowError,
+                       match="not a placement slug"):
+        sanitize("import_asset", {"name": "torch-sconce", "slug": "shell"})
+    with pytest.raises(blender_workflow.BlenderWorkflowError, match="slug"):
+        sanitize("import_asset", {"name": "torch-sconce", "slug": "UPPER"})
+
+
+def test_library_containment_and_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    monkeypatch.setattr(blender_workflow, "ASSET_LIBRARY_ROOT",
+                        library.resolve())
+    good = library / "torch-sconce.glb"
+    good.write_bytes(_mini_positioned_glb())
+    (library / "broken.glb").write_bytes(b"garbage-not-a-glb")
+    (library / "sneaky.glb").symlink_to(good)
+
+    # Resolution: unknown names fail loud LISTING what exists; symlinks are
+    # refused; the good asset resolves.
+    resolved = blender_workflow._contained_library_file(
+        library / "torch-sconce.glb")
+    assert resolved == good
+    with pytest.raises(blender_workflow.BlenderWorkflowError,
+                       match="available"):
+        blender_workflow._contained_library_file(library / "ghost.glb")
+    with pytest.raises(blender_workflow.BlenderWorkflowError,
+                       match="symlink"):
+        blender_workflow._contained_library_file(library / "sneaky.glb")
+    with pytest.raises(blender_workflow.BlenderWorkflowError,
+                       match="outside the library"):
+        blender_workflow._contained_library_file(tmp_path / "outside.glb")
+
+    listing = {entry["name"]: entry
+               for entry in blender_workflow.list_asset_library()}
+    assert "sneaky" not in listing  # symlinks are not library members
+    assert listing["torch-sconce"]["extent"] == [0.2, 0.44, 0.2]
+    assert listing["torch-sconce"]["identity_transforms"] is True
+    assert "error" in listing["broken"]  # reported, never hidden
+
+
+def test_export_glb_bake_requires_object_name(workflow: Path) -> None:
+    _make_job(workflow)
+    with pytest.raises(blender_workflow.BlenderWorkflowError,
+                       match="object_name"):
+        blender_workflow.export_glb("splat_b1e001", bake_world_transform=True)

@@ -115,6 +115,39 @@ def import_world_element(
     )
 
 
+@mcp.tool(title="List asset library", annotations=READ_ONLY)
+def list_asset_library() -> list[dict[str, Any]]:
+    """The curated fantasy set-dressing GLBs import_asset may pull in — name,
+    size, extent in metres, validation state. Broken files are reported with
+    their error, never hidden."""
+    return workflow.list_asset_library()
+
+
+@mcp.tool(title="Import library asset for placement", annotations=ADDITIVE)
+def import_asset(
+    job_id: str, name: str, slug: str,
+    base_version: int | None = None, note: str = ""
+) -> dict[str, Any]:
+    """Import a curated library GLB (see list_asset_library) into the workflow
+    scene as asset_<slug> inside a Placed collection, saving a new version.
+
+    The path is host-resolved and containment-checked against the library
+    root — never free-form. Authoring loop: place it with transform_object,
+    export it alone with export_blend_glb(object_name="asset_<slug>",
+    bake_world_transform=True), then land it in the world through the audited
+    placement route (POST /world/elements) — ingestion stays a separate,
+    audited step, exactly like polish. The result reports the asset's
+    dimensions in metres so it can be scaled honestly against the world's
+    scale record (inspect_job)."""
+    return workflow.run_action(
+        job_id,
+        "import_asset",
+        {"name": name, "slug": slug},
+        base_version=base_version,
+        note=note,
+    )
+
+
 @mcp.tool(title="Clean up mesh object", annotations=ADDITIVE)
 def cleanup_mesh(
     job_id: str,
@@ -153,6 +186,7 @@ def export_blend_glb(
     job_id: str,
     version: int | None = None,
     object_name: str | None = None,
+    bake_world_transform: bool = False,
     note: str = "",
 ) -> dict[str, Any]:
     """Export a blend version as a validated GLB under _blender/exports/.
@@ -160,10 +194,14 @@ def export_blend_glb(
     Versions are untouched; the artifact is readback-validated (glb_check)
     before it lands. With object_name set, only that object is exported and
     the filename gains a slug suffix so whole-scene exports are preserved.
+    bake_world_transform (object exports only) applies matrix_world to the
+    exported vertices and identities the node — the shared-frame contract
+    placed assets need; the .blend itself is never saved by an export.
     Feeding it back into the app stays a separate, audited step via the
-    polish-upload route."""
+    polish-upload route (or the placement route for authored assets)."""
     return workflow.export_glb(
-        job_id, base_version=version, object_name=object_name, note=note
+        job_id, base_version=version, object_name=object_name,
+        bake_world_transform=bake_world_transform, note=note
     )
 
 
