@@ -183,6 +183,10 @@ export class WorldGame {
     this._ray.far = range;
     this._ray.setFromCamera(new THREE.Vector2(0, 0), this.camera);
     const targets = this.zombies.filter((z) => z.dying < 0).map((z) => z.group);
+    // The raycast must see where actors ARE, not where the last render left
+    // their matrices — a shot fired before the next frame (or in a headless
+    // test) would otherwise test against stale world transforms.
+    for (const target of targets) target.updateMatrixWorld(true);
     const hits = this._ray.intersectObjects(targets, true);
     this.showTracer(range, hits[0]?.point ?? null);
     if (!hits.length) return true;

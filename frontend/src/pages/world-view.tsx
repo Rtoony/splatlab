@@ -435,7 +435,7 @@ export default function WorldViewPage() {
         <div className="pointer-events-none absolute inset-0 bg-red-600/25 transition-opacity" />
       )}
       {phase === "ready" && gameReady && (!gameHud || gameHud.phase === "idle") && (
-        <div className="absolute bottom-5 right-5">
+        <div className="absolute inset-x-0 bottom-5 z-40 flex justify-center">
           <button
             type="button"
             onClick={startGame}
