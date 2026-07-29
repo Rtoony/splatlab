@@ -127,6 +127,22 @@ def build_shell_mesh(job_dir: Path, boxes, out_ply: Path, margin: float = 0.05) 
         except Exception as exc:  # noqa: BLE001 — ground is an enhancement, not a gate
             stats["ground_error"] = f"{type(exc).__name__}: {exc}"[:160]
 
+    # Painted surface patches (PW-A8): the same union the ground TIN gets —
+    # paint-synthesized walls join the visual shell and ride its bake, so
+    # they come out capture-coloured with zero extra texture work.
+    stats["surfaces_merged"] = 0
+    for patch in sorted((job_dir / "_scene" / "surfaces").glob("patch_*.ply")):
+        try:
+            pm = trimesh.load(str(patch), force="mesh", process=False)
+            if len(pm.faces):
+                mesh = trimesh.util.concatenate([mesh, pm])
+                stats["surfaces_merged"] += 1
+                stats["surface_faces"] = (stats.get("surface_faces", 0)
+                                          + int(len(pm.faces)))
+        except Exception as exc:  # noqa: BLE001 — an enhancement, the ground's own rule
+            stats.setdefault("surface_errors", []).append(
+                f"{patch.name}: {type(exc).__name__}: {exc}"[:160])
+
     out_ply.parent.mkdir(parents=True, exist_ok=True)
     mesh.export(str(out_ply))
     stats["faces_out"] = int(len(mesh.faces))
@@ -662,6 +678,14 @@ def main() -> int:
     ap.add_argument("--prefer-generated", action="store_true",
                     help="use a placed generative reconstruction in place of the captured "
                          "geometry when one exists (render lane only; survey still refuses it)")
+    ap.add_argument("--element-source", default="{}",
+                    help='per-slug source override, JSON '
+                         '{"slug": "captured"|"generated"} — beats '
+                         '--prefer-generated for that slug. An unknown slug, '
+                         'or a "generated" request with no PLACED candidate, '
+                         'is a hard FATAL before any element builds: a '
+                         'deliberate creative choice must never degrade '
+                         'silently into best-effort.')
     ap.add_argument("--auto-generate", action="store_true",
                     help="when a captured prop trips a measured quality floor "
                          "(build failed / gate-failing connectivity / too few "
@@ -760,6 +784,35 @@ def main() -> int:
             _log("  --patch-elements implies --skip-shell (element-only run)")
             args.skip_shell = True
 
+    # Per-slug source overrides: validated UP FRONT, before any element build
+    # (the scene_assemble fail-loud shape) — a wrong slug or an unavailable
+    # generated candidate refuses the whole run rather than building around it.
+    try:
+        overrides = json.loads(args.element_source)
+    except json.JSONDecodeError as exc:
+        print(f"FATAL: --element-source is not valid JSON: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(overrides, dict) or any(
+            value not in ("captured", "generated") for value in overrides.values()):
+        print('FATAL: --element-source values must be "captured" or "generated"',
+              file=sys.stderr)
+        return 1
+    known_slugs = {(inst.get("slug") or inst.get("label", "object").replace(" ", "-"))
+                   for inst in instances}
+    unknown = sorted(set(overrides) - known_slugs)
+    if unknown:
+        print(f"FATAL: --element-source names unknown slug(s): "
+              f"{', '.join(unknown)} — known: {', '.join(sorted(known_slugs))}",
+              file=sys.stderr)
+        return 1
+    for override_slug, want in sorted(overrides.items()):
+        if want == "generated" and _generated_candidate(job_dir, override_slug) is None:
+            print(f"FATAL: --element-source requests generated for "
+                  f"{override_slug!r} but no PLACED candidate exists (run "
+                  "object_generate, or its placement/mask gates refused)",
+                  file=sys.stderr)
+            return 1
+
     elements = []
     for inst in instances:
         slug = inst.get("slug") or inst.get("label", "object").replace(" ", "-")
@@ -800,7 +853,18 @@ def main() -> int:
         # enforced for lane="survey" (geo_export.py, ground_extract.py) and is
         # untouched — measurement must never consume invented geometry. The
         # world manifest records the substitution so a viewer can label it.
-        gen = _generated_candidate(job_dir, slug) if args.prefer_generated else None
+        requested = overrides.get(slug)
+        use_generated = (requested == "generated"
+                         or (requested is None and args.prefer_generated))
+        gen = _generated_candidate(job_dir, slug) if use_generated else None
+        # The choice and WHY it was made ride into world.json — the per-element
+        # UI reads this to show what shipped and what was asked for.
+        entry["selection"] = {
+            "requested": requested,
+            "chosen": "generated" if gen else "captured",
+            "reason": (f"override:{requested}" if requested
+                       else ("prefer-generated" if gen else "captured-default")),
+        }
         if gen:
             entry.update(geometry_source="generated", generated=gen["report"])
             res = place_generated(gen, out, mpu=mpu, faces=args.prop_faces,
@@ -824,6 +888,8 @@ def main() -> int:
                  f"falling back to captured geometry")
             entry.pop("provenance", None)
             entry["geometry_source"] = "tsdf" if tsdf.is_file() else "gaussians"
+            entry["selection"]["chosen"] = "captured"
+            entry["selection"]["reason"] = "generated-placement-failed:fallback-captured"
 
         _log(f"  prop {slug} ...")
         res = run_object_texture(py, script, geom, splat_ply, out, mpu=mpu,

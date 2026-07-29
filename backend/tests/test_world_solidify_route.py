@@ -193,6 +193,10 @@ def test_body_options_reach_the_command(client, monkeypatch):
     http, outputs = client
     job_dir = _mk_job(outputs)
     calls = _stub_runs(monkeypatch, job_dir)
+    # --only is a patch of an EXISTING world; seed one so the guard passes.
+    world = job_dir / "_world"
+    world.mkdir(parents=True)
+    (world / "world.json").write_text(json.dumps({"elements": ["chair"]}))
 
     http.post(f"/api/splat/jobs/{JOB}/world/solidify", json={
         "prop_faces": 4000, "shell_faces": 90000, "shell_source": "voxel",
@@ -203,7 +207,67 @@ def test_body_options_reach_the_command(client, monkeypatch):
     assert cmd[cmd.index("--shell-faces") + 1] == "90000"
     assert cmd[cmd.index("--shell-source") + 1] == "voxel"
     assert cmd[cmd.index("--only") + 1] == "chair,table"
+    # The review footgun: bare --only over HTTP rewrote world.json to just the
+    # filtered slugs. The route now ALWAYS patches.
+    assert "--patch-elements" in cmd
     assert "--skip-shell" in cmd and "--prefer-generated" in cmd
+
+
+def test_only_without_an_existing_world_409s(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls = _stub_runs(monkeypatch, job_dir)
+    r = http.post(f"/api/splat/jobs/{JOB}/world/solidify",
+                  json={"only": "chair"})
+    assert r.status_code == 409
+    assert "full solidify" in r.json()["detail"]
+    assert calls == []  # refused before any subprocess ran
+
+
+def test_only_plus_shell_only_400s(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls = _stub_runs(monkeypatch, job_dir)
+    world = job_dir / "_world"
+    world.mkdir(parents=True)
+    (world / "world.json").write_text(json.dumps({"elements": ["chair"]}))
+    r = http.post(f"/api/splat/jobs/{JOB}/world/solidify",
+                  json={"only": "chair", "shell_only": True})
+    assert r.status_code == 400
+    assert "conflict" in r.json()["detail"]
+    assert calls == []
+
+
+def test_overrides_reach_the_command_as_sorted_json(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls = _stub_runs(monkeypatch, job_dir)
+    r = http.post(f"/api/splat/jobs/{JOB}/world/solidify", json={
+        "overrides": {"chair": "captured", "bench": "generated"}})
+    assert r.status_code == 200
+    cmd = calls[0]
+    assert cmd[cmd.index("--element-source") + 1] == json.dumps(
+        {"bench": "generated", "chair": "captured"}, sort_keys=True)
+
+
+def test_override_values_are_a_closed_vocabulary(client, monkeypatch):
+    http, outputs = client
+    _mk_job(outputs)
+    r = http.post(f"/api/splat/jobs/{JOB}/world/solidify",
+                  json={"overrides": {"chair": "proxy"}})
+    assert r.status_code == 422  # Literal["captured","generated"] refuses
+
+
+def test_override_keys_are_slug_safe(client, monkeypatch):
+    http, outputs = client
+    job_dir = _mk_job(outputs)
+    calls = _stub_runs(monkeypatch, job_dir)
+    for key in ("UPPER", "../x", "a b"):
+        r = http.post(f"/api/splat/jobs/{JOB}/world/solidify",
+                      json={"overrides": {key: "captured"}})
+        assert r.status_code == 400, key
+        assert "bad override slug" in r.json()["detail"]
+    assert calls == []  # refused before any subprocess ran
 
 
 def test_follow_on_stages_can_be_skipped(client, monkeypatch):

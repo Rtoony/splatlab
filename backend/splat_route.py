@@ -5718,6 +5718,7 @@ SCENE_SEMANTIC_GROUND_SCRIPT = MESH_DIR / "semantic_ground.py"
 GROUND_MESH_BUILD_SCRIPT = MESH_DIR / "ground_mesh_build.py"
 GROUND_MESH_RECEIPT_SCRIPT = MESH_DIR / "ground_mesh_receipt.py"
 GROUND_TEXTURE_SCRIPT = MESH_DIR / "ground_texture.py"
+SURFACE_PATCHES_SCRIPT = MESH_DIR / "surface_patches.py"
 SCENE_GROUND_VRAM_MB = 6_000  # floor: SigLIP2 text encoder + workspace
 
 
@@ -5949,6 +5950,156 @@ async def get_scene_ground_file(
     return FileResponse(str(path), media_type=media, filename=path.name)
 
 
+def _structure_paint_present(job_dir: Path) -> bool:
+    """Any valid structure-category paint record on disk — the stdlib gate
+    both the surfaces route and the prepare ladder's skip decision use."""
+    lf = job_dir / LANGFIELD_DIRNAME / "class_labels.json"
+    if not lf.is_file():
+        return False
+    try:
+        records = json.loads(lf.read_text())
+        structure = {c["id"]
+                     for c in class_taxonomy.load_taxonomy(job_dir)["classes"]
+                     if c.get("category") == "structure"}
+    except (OSError, ValueError, class_taxonomy.TaxonomyError):
+        return False
+    return any(isinstance(r, dict) and not r.get("invalid_reason")
+               and r.get("class_id") in structure
+               for r in (records if isinstance(records, list) else []))
+
+
+class SceneSurfacesBody(BaseModel):
+    """Knobs mirroring surface_patches.py's CLI — all bounded."""
+    plane_dist_units: float = Field(default=0.05, gt=0.0, le=0.5)
+    min_cluster_points: int = Field(default=200, ge=50, le=100_000)
+    cluster_cell_units: float = Field(default=0.10, gt=0.0, le=1.0)
+    patch_cell_units: float = Field(default=0.05, gt=0.0, le=0.5)
+    close_cells: int = Field(default=2, ge=0, le=8)
+    pad_cells: int = Field(default=1, ge=0, le=10)
+    max_patches: int = Field(default=16, ge=1, le=64)
+    max_rms_frac: float = Field(default=0.6, gt=0.0, le=1.0)
+    # THE curvature refusal — rms alone is capped at ~0.577x the inlier band
+    # and cannot catch a curve (measured by the half-cylinder test).
+    min_inlier_frac: float = Field(default=0.7, gt=0.0, le=1.0)
+    texture_size: int = Field(default=1024, ge=256, le=4096)
+
+
+@router.post("/jobs/{job_id}/scene/surfaces")
+async def scene_surfaces(request: Request, job_id: str, body: SceneSurfacesBody):
+    """PW-A8: painted structure regions -> planar fill patches + a
+    capture-coloured preview. CPU mesh-env work (no GPU lease); reads DISK
+    paint records only, so re-running never depends on the langfield worker.
+    Loud fail on refusal — a run that fills nothing must say why."""
+    require_heavy_work_admitted()
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    if meta["status"] != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Surface build requires a completed job. "
+                   f"Current status: {meta['status']}")
+    output_dir = Path(meta["output_dir"])
+    lf_dir = output_dir / LANGFIELD_DIRNAME
+    _langfield_stale_guard(lf_dir)
+    if not _structure_paint_present(output_dir):
+        raise HTTPException(
+            status_code=409,
+            detail="No structure-category paint records — paint a wall "
+                   "(structure class) in the viewer first")
+    color_splat = output_dir / "_preview" / "splat.ply"
+    if not color_splat.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail="No exported scene splat.ply available for coloring.")
+    if not (SURFACE_PATCHES_SCRIPT.is_file() and MESH_ENV_PYTHON.is_file()):
+        raise HTTPException(status_code=400,
+                            detail="Surface-patch toolchain unavailable.")
+
+    out_dir = output_dir / SCENE_DIRNAME / "surfaces"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    lock = _mesh_export_lock(job_id)
+    if lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail=f"A mesh/object/scene build is already running for {job_id}.")
+    async with lock:
+        cmd = [
+            str(MESH_ENV_PYTHON), str(SURFACE_PATCHES_SCRIPT),
+            str(lf_dir), str(color_splat),
+            str(class_taxonomy.TAXONOMY_PATH), str(out_dir),
+            "--plane-dist-units", str(body.plane_dist_units),
+            "--min-cluster-points", str(body.min_cluster_points),
+            "--cluster-cell-units", str(body.cluster_cell_units),
+            "--patch-cell-units", str(body.patch_cell_units),
+            "--close-cells", str(body.close_cells),
+            "--pad-cells", str(body.pad_cells),
+            "--max-patches", str(body.max_patches),
+            "--max-rms-frac", str(body.max_rms_frac),
+            "--min-inlier-frac", str(body.min_inlier_frac),
+            "--texture-size", str(body.texture_size),
+        ]
+        mpu = meta.get("meters_per_unit")
+        if mpu:
+            cmd += ["--meters-per-unit", str(mpu)]
+        rc, _out, stderr = await _run_capture_subprocess(cmd)
+        report_path = out_dir / "surface_patches.json"
+        if rc != 0 or not report_path.is_file():
+            tail = "\n".join(
+                stderr.decode("utf-8", errors="replace").splitlines()[-8:])
+            raise HTTPException(
+                status_code=500,
+                detail=f"Surface patches failed (exit {rc}): {tail}")
+
+        await _run_capture_subprocess([  # receipt renders are best-effort
+            str(MESH_ENV_PYTHON), str(GROUND_MESH_RECEIPT_SCRIPT),
+            str(out_dir / "surfaces_preview.glb"), str(out_dir),
+        ])
+        report = json.loads(report_path.read_text())
+        fresh_scene_meta = (_read_meta(job_id) or {}).get("scene") or {}
+        _patch_meta(job_id, scene={
+            **fresh_scene_meta,
+            "surfaces": {"patches": len(report.get("patches") or []),
+                         "built_at": _utc_now()},
+        })
+
+    await audit_operator_event(
+        request=request,
+        title="Built painted surface patches",
+        description=f"{job_id}: {len(report.get('patches') or [])} patch(es)",
+        variant="success",
+        action="splat.scene_surfaces",
+        target=meta.get("mode", "3d"),
+        metadata={"job_id": job_id},
+    )
+    return report
+
+
+@router.get("/jobs/{job_id}/scene/surfaces/file")
+async def get_scene_surfaces_file(
+    job_id: str,
+    fmt: Literal["report", "glb", "atlas", "top", "oblique"] = "report",
+):
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    out_dir = _job_dir(job_id) / SCENE_DIRNAME / "surfaces"
+    if fmt == "report":
+        path, media = out_dir / "surface_patches.json", "application/json"
+    elif fmt == "glb":
+        path, media = out_dir / "surfaces_preview.glb", "model/gltf-binary"
+    elif fmt == "atlas":
+        path, media = out_dir / "surfaces_atlas.png", "image/png"
+    else:
+        path, media = out_dir / f"receipt_{fmt}.png", "image/png"
+    if not path.is_file():
+        raise HTTPException(status_code=404,
+                            detail="Surface-patch artifact not built yet")
+    return FileResponse(str(path), media_type=media, filename=path.name)
+
+
 # ── P6f: scene assembly (with an explicit fidelity dial) ─────────────────────
 # Assembles P6b-e's outputs into one scene.blend/scene.glb. `provenance`
 # (P6a) stays a FACT about what a file is; `mode`/`overrides` here is a
@@ -6133,6 +6284,9 @@ class WorldPrepareBody(BaseModel):
     shell_faces: int = Field(default=120_000, ge=1_000, le=1_000_000)
     auto_generate: bool = False
     install_scenario: bool = True
+    # Default preserves the ladder's historical behaviour (generated geometry
+    # wins when a placed candidate exists); false = captured-only worlds.
+    prefer_generated: bool = True
 
 
 @router.post("/jobs/{job_id}/world/prepare")
@@ -6173,7 +6327,7 @@ async def world_prepare(request: Request, job_id: str, body: WorldPrepareBody):
 
     world_dir = job_dir / WORLD_DIRNAME
     stages: list[str] = ["mesh", "inventory", "isolate", "ground",
-                         "solidify", "affordances", "scenario"]
+                         "surfaces", "solidify", "affordances", "scenario"]
     # A force name that matches no stage used to no-op in silence: the caller
     # who asked to redo "gound" got a 200 whose only tell was "skipped" buried
     # in the stages map (review finding). Say it out loud instead.
@@ -6228,6 +6382,8 @@ async def _world_prepare_run(
             "isolate": (job_dir / SCENE_DIRNAME / "isolated"
                         / "batch_isolate.json"),
             "ground": job_dir / SCENE_DIRNAME / "ground" / "ground_mesh_raw.ply",
+            "surfaces": (job_dir / SCENE_DIRNAME / "surfaces"
+                         / "surface_patches.json"),
             "scenario": world_dir / "scenario.json",
         }.get(stage)
 
@@ -6283,11 +6439,18 @@ async def _world_prepare_run(
                     await scene_batch_isolate(request, job_id, SceneIsolateBody())
                 elif stage == "ground":
                     await scene_ground(request, job_id, SceneGroundBody())
+                elif stage == "surfaces":
+                    if not _structure_paint_present(job_dir):
+                        # No structure paint = nothing to fill; an unpainted
+                        # scene must not fail (or pretend to run) this stage.
+                        outcome[stage] = "skipped"
+                        continue
+                    await scene_surfaces(request, job_id, SceneSurfacesBody())
                 elif stage == "solidify":
                     result = await world_solidify(job_id, WorldSolidifyBody(
                         shell_source=body.shell_source,
                         shell_faces=body.shell_faces,
-                        prefer_generated=True,
+                        prefer_generated=body.prefer_generated,
                         auto_generate=body.auto_generate,
                         run_collision=True,
                         run_gate=True,
@@ -6473,6 +6636,11 @@ class WorldSolidifyBody(BaseModel):
     auto_generate: bool = False
     run_collision: bool = True
     run_gate: bool = True
+    # Per-slug source override — beats prefer_generated for that slug. A
+    # "generated" request without a placed candidate is a hard solidify FATAL
+    # downstream (a deliberate creative choice never degrades silently).
+    overrides: dict[str, Literal["captured", "generated"]] = Field(
+        default_factory=dict)
 
 
 @router.post("/jobs/{job_id}/world/solidify")
@@ -6524,6 +6692,31 @@ async def world_solidify(job_id: str, body: WorldSolidifyBody):
     mpu = meta.get("meters_per_unit")
     world_dir = output_dir / WORLD_DIRNAME
 
+    if body.only.strip():
+        # --only over HTTP is ALWAYS a patch: the CLI's bare --only REWRITES
+        # world.json to just the filtered slugs (scene_solidify.py:656-661
+        # documents the hazard) — over an API that is a destructive footgun,
+        # not a feature. The full-rewrite behaviour stays CLI-only.
+        if body.shell_only:
+            raise HTTPException(
+                status_code=400,
+                detail="only + shell_only conflict: one patches elements, "
+                       "the other rebuilds the shell — pick one")
+        if not (world_dir / "world.json").is_file():
+            raise HTTPException(
+                status_code=409,
+                detail="Per-element rebuild needs an existing world — run a "
+                       "full solidify first")
+    if body.overrides:
+        if len(body.overrides) > 64:
+            raise HTTPException(status_code=400,
+                                detail="at most 64 override slugs")
+        bad = [slug for slug in body.overrides if _object_slug(slug) != slug]
+        if bad:
+            raise HTTPException(
+                status_code=400,
+                detail=f"bad override slug(s): {', '.join(bad)}")
+
     async with lock:
         op_id = opregistry.start("world_solidify", job_id, step="solidify",
                                  detail=f"shell_source={body.shell_source}")
@@ -6542,7 +6735,10 @@ async def world_solidify(job_id: str, body: WorldSolidifyBody):
             if isinstance(mpu, (int, float)) and math.isfinite(mpu) and mpu > 0:
                 solidify_cmd += ["--meters-per-unit", str(mpu)]
             if body.only.strip():
-                solidify_cmd += ["--only", body.only.strip()]
+                solidify_cmd += ["--only", body.only.strip(), "--patch-elements"]
+            if body.overrides:
+                solidify_cmd += ["--element-source",
+                                 json.dumps(body.overrides, sort_keys=True)]
             if body.skip_shell:
                 solidify_cmd.append("--skip-shell")
             if body.drop_unobserved:

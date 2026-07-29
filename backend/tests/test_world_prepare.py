@@ -271,3 +271,91 @@ def test_a_second_concurrent_prepare_is_refused_with_the_running_op(client, monk
     splat_route._WORLD_PREPARE_OPS.pop(JOB, None)
     assert r.status_code == 409
     assert "op-already-running" in r.json()["detail"]
+
+
+def _seed_structure_paint(job: Path) -> None:
+    (job / "_langfield" / "class_labels.json").write_text(json.dumps([
+        {"id": "ab12cd34", "class_id": "structure", "count": 500}]))
+
+
+def _mock_surfaces(monkeypatch, job: Path, calls: list):
+    async def surfaces(request, job_id, body):
+        calls.append("surfaces")
+        d = job / "_scene" / "surfaces"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "surface_patches.json").write_text("{}")
+        return {}
+    monkeypatch.setattr(splat_route, "scene_surfaces", surfaces)
+
+
+def test_surfaces_stage_runs_between_ground_and_solidify_when_painted(
+    client, monkeypatch
+):
+    tc, outputs = client
+    job = _mk_job(outputs)
+    calls = _mock_stages(monkeypatch, job)
+    _mock_surfaces(monkeypatch, job, calls)
+    _seed_structure_paint(job)
+
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={})
+    assert r.status_code == 200
+    assert r.json()["stages"]["surfaces"] == "done"
+    assert calls.index("ground") < calls.index("surfaces") < calls.index("solidify")
+
+
+def test_surfaces_stage_skips_without_paint(client, monkeypatch):
+    tc, outputs = client
+    job = _mk_job(outputs)
+    calls = _mock_stages(monkeypatch, job)
+    _mock_surfaces(monkeypatch, job, calls)
+
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={})
+    assert r.status_code == 200
+    assert r.json()["stages"]["surfaces"] == "skipped"
+    assert "surfaces" not in calls
+
+
+def test_force_surfaces_redoes_it(client, monkeypatch):
+    tc, outputs = client
+    job = _mk_job(outputs)
+    calls = _mock_stages(monkeypatch, job)
+    _mock_surfaces(monkeypatch, job, calls)
+    _seed_structure_paint(job)
+
+    assert tc.post(f"/api/splat/jobs/{JOB}/world/prepare",
+                   json={}).status_code == 200
+    first = calls.count("surfaces")
+    assert first == 1
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare",
+                json={"force": ["surfaces"]})
+    assert r.status_code == 200
+    assert calls.count("surfaces") == 2
+    assert r.json()["stages"]["surfaces"] == "done"
+
+
+def test_prepare_passes_prefer_generated_through(client, monkeypatch):
+    """The ladder used to HARDCODE prefer_generated=True into its solidify
+    stage; the body flag now carries it (default preserves history)."""
+    tc, outputs = client
+    job = _mk_job(outputs)
+    _mock_stages(monkeypatch, job)
+    seen: list = []
+
+    async def capture(job_id, body):
+        seen.append(body)
+        w = job / "_world"
+        w.mkdir(exist_ok=True)
+        (w / "world.json").write_text("{}")
+        (w / "navmesh.json").write_text("{}")
+        return {"gate": {"passed": True}}
+
+    monkeypatch.setattr(splat_route, "world_solidify", capture)
+
+    assert tc.post(f"/api/splat/jobs/{JOB}/world/prepare",
+                   json={}).status_code == 200
+    assert seen[0].prefer_generated is True  # historical default
+
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare",
+                json={"force": ["solidify"], "prefer_generated": False})
+    assert r.status_code == 200
+    assert seen[1].prefer_generated is False

@@ -608,6 +608,24 @@ def route_voxel(
         samples.append(np.asarray(tm.sample(n)))
         samples.append(np.asarray(tm.vertices))
         rec["source"] = f"{mesh_ply.name} ({len(tm.faces)} tris, {n} surface samples)"
+    # Painted surface patches (PW-A8): higher-authority gap-closers — a wall
+    # the user painted must reach the COLLISION solid, or it stays
+    # walk-through-able on the mainline (voxel) route.
+    patch_faces = 0
+    for patch in sorted((job_dir / "_scene" / "surfaces").glob("patch_*.ply")):
+        try:
+            pm = trimesh.load(str(patch), process=False)
+            if len(pm.faces):
+                pm.vertices = to_yup(np.asarray(pm.vertices, dtype=np.float64))
+                n_patch = int(min(500_000,
+                                  max(20_000, float(pm.area) / (voxel * 0.4) ** 2)))
+                samples.append(np.asarray(pm.sample(n_patch)))
+                samples.append(np.asarray(pm.vertices))
+                patch_faces += int(len(pm.faces))
+        except Exception as exc:  # noqa: BLE001 — recorded, never fatal
+            rec.setdefault("surface_patch_errors", []).append(
+                f"{patch.name}: {type(exc).__name__}: {exc}"[:160])
+    rec["surface_patches_sampled"] = patch_faces
     samples.append(pts_yup)  # gaussians close the gaps the TSDF never carved
     pts = np.concatenate(samples, axis=0)
     pts = pts[np.all((pts >= lo) & (pts <= hi), axis=1)]
