@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
+import { useLocation } from "wouter";
 import type { SplatJob } from "@/lib/contracts";
-import { Badge, Button, Card } from "@/components/ui";
+import { apiRequest } from "@/lib/api";
+import { Badge, Button, Card, useToast } from "@/components/ui";
 import { DownloadMenu } from "@/components/gallery/download-menu";
 import { HealthBadge } from "@/components/jobs/health-badge";
 import { fmtCount, relTime, sceneHue } from "@/lib/format";
@@ -8,7 +10,9 @@ import {
   AlertTriangle,
   Camera,
   Layers,
+  Loader2,
   MapPin,
+  Mountain,
   Orbit,
   Pin,
   RefreshCw,
@@ -45,6 +49,27 @@ export function SceneCard({
     const t = window.setTimeout(() => setConfirmDel(false), 3000);
     return () => window.clearTimeout(t);
   }, [confirmDel]);
+
+  // One-click into playable mode, straight from the gallery — same ladder the
+  // scene page's Make walkable runs (resumable; skips existing stages).
+  const [, navigate] = useLocation();
+  const pushToast = useToast();
+  const [worldPrep, setWorldPrep] = useState(false);
+  const startWorldPrep = () => {
+    if (worldPrep) return;
+    setWorldPrep(true);
+    pushToast("Preparing walkable world — heavy stages can take many minutes. Progress lives in Activity.", "info");
+    apiRequest(`/api/splat/jobs/${encodeURIComponent(job.job_id)}/world/prepare`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    }).then(() => {
+      pushToast("World ready — walking in.", "success");
+      navigate(`/world/${job.job_id}`);
+    }).catch((e: unknown) => {
+      pushToast(`World preparation failed: ${e instanceof Error ? e.message : String(e)}`, "error");
+    }).finally(() => setWorldPrep(false));
+  };
 
   return (
     <Card className={`group relative p-3 transition-colors ${active ? "border-cyan-400/40" : "hover:border-white/20"}`}>
@@ -97,6 +122,14 @@ export function SceneCard({
               </span>
             ) : null}
             <HealthBadge job={job} />
+            {job.world_available ? (
+              <span
+                title="A solidified, walkable world exists — Walk takes you straight in"
+                className="flex items-center gap-0.5 rounded bg-cyan-400/20 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-200 backdrop-blur-sm"
+              >
+                <Mountain className="h-3 w-3" /> walkable
+              </span>
+            ) : null}
             {job.langfield_available ? (
               <span className="rounded bg-cyan-400/20 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-200 backdrop-blur-sm">
                 searchable
@@ -162,6 +195,31 @@ export function SceneCard({
             <Orbit className="h-3.5 w-3.5" /> Open
           </Button>
         </a>
+        {job.world_available ? (
+          <a href={`/world/${job.job_id}`} target="_blank" rel="noreferrer" className="flex-1">
+            <Button
+              size="sm"
+              variant="outline"
+              className="w-full border-cyan-300/40 text-cyan-200"
+              title="Walk this scene in first person — zombie waves live here"
+            >
+              <Mountain className="h-3.5 w-3.5" /> Walk
+            </Button>
+          </a>
+        ) : job.status === "completed" ? (
+          <Button
+            size="sm"
+            variant="outline"
+            className="flex-1 border-cyan-300/40 text-cyan-200"
+            disabled={worldPrep || computeBlocked}
+            onClick={startWorldPrep}
+            title="Build the walkable world right from here — mesh through scenario in one go; takes minutes, resumes after a failure"
+          >
+            {worldPrep
+              ? (<><Loader2 className="h-3.5 w-3.5 animate-spin" /> Preparing…</>)
+              : (<><Mountain className="h-3.5 w-3.5" /> Make walkable</>)}
+          </Button>
+        ) : null}
         <DownloadMenu job={job} />
       </div>
       <div className="mt-1.5 flex items-center gap-2">

@@ -4,7 +4,7 @@ import { Badge, Button, Card, SectionLabel } from "@/components/ui";
 import { DownloadMenu } from "@/components/gallery/download-menu";
 import { SceneCard } from "@/components/gallery/scene-card";
 import { CaptureHealthCard } from "@/components/jobs/capture-health-card";
-import { Orbit } from "lucide-react";
+import { Mountain, Orbit } from "lucide-react";
 
 // Featured live preview — lazy so the 3D engine chunk never loads unless a
 // previewable scene exists on the landing page.
@@ -53,6 +53,13 @@ export function ResultsGallery({
           <div className="flex items-center justify-between gap-2 p-3">
             <p className="truncate text-sm text-zinc-300">{featuredJob.input_path.split("/").pop()}</p>
             <div className="flex items-center gap-2">
+              {featuredJob.world_available && (
+                <a href={`/world/${featuredJob.job_id}`} target="_blank" rel="noreferrer">
+                  <Button size="sm" variant="outline" className="border-cyan-300/40 text-cyan-200">
+                    <Mountain className="h-3.5 w-3.5" /> Walk
+                  </Button>
+                </a>
+              )}
               <a href={`/view/${featuredJob.job_id}`} target="_blank" rel="noreferrer">
                 <Button size="sm">
                   <Orbit className="h-3.5 w-3.5" /> Fullscreen
