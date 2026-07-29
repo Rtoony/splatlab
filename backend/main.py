@@ -31,6 +31,7 @@ import geo_route  # noqa: E402  (locate-in-the-world: geo anchor, map footprint,
 import dimensions_route  # noqa: E402  (survey dimensions: pure-stdlib manifest CRUD, no GPU/ML)
 import export_route  # noqa: E402  (portable splat formats, collision, and Unreal handoff)
 import polish_route  # noqa: E402  (polished-GLB return leg: Blender/UE edits land back)
+import restyle_bake_route  # noqa: E402  (permanent restyle bake: fantasy looks survive export)
 import splat_edit_route  # noqa: E402  (audited splat-edit lane: versioned gaussian edits + guarded promote)
 import activity_route  # noqa: E402  (read-only busy-now snapshot: GPU holder + held per-job locks)
 import feedback  # noqa: E402  (small SQLite-backed in-app feedback loop)
@@ -230,6 +231,8 @@ app.include_router(export_route.router, prefix="/api/splat", dependencies=[Depen
 
 # Polished-GLB ingest (the Blender/UE polish round-trip's one audited door).
 app.include_router(polish_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
+
+app.include_router(restyle_bake_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
 
 # Audited splat-edit lane: versioned gaussian edits, guarded promotion to live.
 app.include_router(splat_edit_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])

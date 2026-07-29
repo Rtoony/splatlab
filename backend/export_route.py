@@ -976,6 +976,26 @@ def _safe_export_relative(value: Any) -> PurePosixPath | None:
 BundleCandidate = tuple[Path, str, str, str, dict[str, Any]]
 
 
+def _world_marker_provenance(world_dir: Path, polish_rel: str,
+                             restyle_rel: str) -> tuple[str, bool]:
+    """("polished" | "restyled" | "captured-derived", atlas_is_current).
+
+    When both markers exist the newer one wins — a polish after a bake
+    supersedes it and vice versa (ISO timestamps compare lexicographically).
+    atlas_is_current is True only for a winning bake that refreshed the
+    sidecar PNG; polish leaves the solidify-era PNG stale on purpose."""
+    polish = manifests.read_json(world_dir / polish_rel)
+    restyle = manifests.read_json(world_dir / restyle_rel)
+    if not polish and not restyle:
+        return "captured-derived", False
+    newer_is_restyle = bool(restyle) and (
+        not polish
+        or str(restyle.get("baked_at") or "") >= str(polish.get("uploaded_at") or ""))
+    if newer_is_restyle:
+        return "restyled", bool(restyle.get("atlas_updated"))
+    return "polished", False
+
+
 def _world_bundle_candidates(job_dir: Path) -> list[BundleCandidate]:
     """Everything the navigable-world lane produced, for the World/ section.
 
@@ -992,13 +1012,13 @@ def _world_bundle_candidates(job_dir: Path) -> list[BundleCandidate]:
 
     shell = world.get("shell") if isinstance(world.get("shell"), dict) else {}
     if shell.get("built"):
-        shell_polished = (world_dir / "shell.polish.json").is_file()
+        shell_prov, shell_atlas_current = _world_marker_provenance(
+            world_dir, "shell.polish.json", "shell.restyle.json")
         out.append((world_dir / (shell.get("glb") or "shell.glb"),
-                    "World/shell.glb",
-                    "polished" if shell_polished else "captured-derived",
-                    "world-visual-shell", {}))
+                    "World/shell.glb", shell_prov, "world-visual-shell", {}))
         out.append((world_dir / "shell_atlas.png", "World/shell_atlas.png",
-                    "captured-derived", "world-atlas", {}))
+                    "restyled" if shell_atlas_current else "captured-derived",
+                    "world-atlas", {}))
         out.append((world_dir / "shell.json", "World/shell.json",
                     "captured-derived", "world-receipt", {}))
     for name in ("collision_shell.glb", "collision_shell.json"):
@@ -1019,14 +1039,16 @@ def _world_bundle_candidates(job_dir: Path) -> list[BundleCandidate]:
         if (not isinstance(slug, str) or not slug
                 or not isinstance(glb, str) or "/" in glb or "\\" in glb):
             continue
-        polished = (world_dir / "elements" / f"{slug}.polish.json").is_file()
+        prov, atlas_current = _world_marker_provenance(
+            world_dir, f"elements/{slug}.polish.json",
+            f"elements/{slug}.restyle.json")
         out.append((world_dir / "elements" / glb, f"World/Elements/{glb}",
-                    "polished" if polished else "captured-derived",
-                    "world-element",
+                    prov, "world-element",
                     {"element_role": element.get("role") or "prop"}))
         out.append((world_dir / "elements" / f"{slug}_atlas.png",
                     f"World/Elements/{slug}_atlas.png",
-                    "captured-derived", "world-atlas", {}))
+                    "restyled" if atlas_current else "captured-derived",
+                    "world-atlas", {}))
         collision = element.get("collision")
         collision = collision if isinstance(collision, dict) else {}
         for hull in collision.get("files") or []:

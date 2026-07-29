@@ -6772,6 +6772,23 @@ def _world_polish_marker(marker: Path) -> dict[str, Any] | None:
     }
 
 
+def _world_restyle_marker(marker: Path) -> dict[str, Any] | None:
+    """The bake receipt beside a re-baked element, or None when never baked.
+    Present => the GLB's atlas carries a permanent restyle; unlike polish, the
+    sidecar _atlas.png was refreshed with it (atlas_updated)."""
+    if not marker.is_file():
+        return None
+    try:
+        doc = json.loads(marker.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"error": "unreadable restyle-bake receipt"}
+    return {
+        "baked_at": doc.get("baked_at"),
+        "applied": doc.get("applied") or {},
+        "atlas_updated": bool(doc.get("atlas_updated")),
+    }
+
+
 @router.get("/jobs/{job_id}/world/manifest")
 async def get_splat_world_manifest(job_id: str):
     """The solidified world as one viewer-ready document: merged element list
@@ -6826,6 +6843,7 @@ async def get_splat_world_manifest(job_id: str):
             "files": _world_artifact_urls(world_dir, job_id, "elements/", slug),
             "collision": _world_collision(world_dir, job_id, grade.get("collision")),
             "polished": _world_polish_marker(world_dir / "elements" / f"{slug}.polish.json"),
+            "restyled": _world_restyle_marker(world_dir / "elements" / f"{slug}.restyle.json"),
         })
 
     shell_report = world.get("shell") or {}
@@ -6844,6 +6862,7 @@ async def get_splat_world_manifest(job_id: str):
             "files": _world_artifact_urls(world_dir, job_id, "", "shell"),
             "collision": _world_collision(world_dir, job_id, shell_grade.get("collision")),
             "polished": _world_polish_marker(world_dir / "shell.polish.json"),
+            "restyled": _world_restyle_marker(world_dir / "shell.restyle.json"),
         }
 
     # The WALKABLE solid, which is a different mesh from the one you look at.
