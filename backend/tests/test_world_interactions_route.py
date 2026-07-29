@@ -582,3 +582,22 @@ def test_scenario_validation_is_fail_loud(client):
     alien["waves"][0]["actors"][0]["type"] = "dragon"
     assert http.put(f"/api/splat/jobs/{JOB}/world/scenario",
                     json={"scenario": alien}).status_code == 400
+
+
+def test_uncalibrated_worlds_never_propose_pickups(client):
+    """Measured live on the Stump: without real scale the carryable rule
+    proposed picking up a tree stump. No calibration, no size claims."""
+    http, outputs = client
+    world = _mk_world(outputs, "stump")
+    (world / "world_manifest.json").write_text(json.dumps({
+        "v": 1, "job_id": JOB, "units": "scene-units (uncalibrated)",
+        "meters_per_unit": None,
+        "elements": [{"slug": "stump", "label": "stump", "role": "prop",
+                      "extent": [0.5, 0.4, 0.5]}],
+        "shell": {"slug": "shell", "role": "static"},
+    }))
+    r = http.post(f"/api/splat/jobs/{JOB}/world/affordances/propose", json={})
+    assert r.status_code == 200, r.text
+    proposal = r.json()["proposals"][0]
+    assert proposal["record"]["verb"] == "inspect"
+    assert "uncalibrated" in proposal["rationale"]

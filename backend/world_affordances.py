@@ -85,6 +85,7 @@ def propose_affordances(
         extent_m = _extent_metres(element, mpu, units)
         name = f"{label} {slug}"
 
+        calibrated = bool(mpu) or units == "meters"
         if element.get("role") == "static":
             verb, states, initial, effects = "inspect", ["seen"], "seen", {}
             rationale = "static: the environment can be looked at, not moved"
@@ -92,6 +93,13 @@ def propose_affordances(
             verb, states, initial = "toggle", ["off", "on"], "off"
             effects = {"on": {"tint": "#ffd27f"}, "off": {"tint": None}}
             rationale = "its name suggests something that switches on and off"
+        elif not calibrated:
+            # Without real-world scale, "small enough to carry" is a guess in
+            # arbitrary units — measured live: an UNCALIBRATED forest scene
+            # proposed picking up a tree stump. No size claims, no pickups.
+            verb, states, initial, effects = "inspect", ["seen"], "seen", {}
+            rationale = ("uncalibrated capture: real size unknown, so no "
+                         "carry proposal (calibrate, then re-propose)")
         elif extent_m is not None and max(extent_m) <= CARRYABLE_MAX_M:
             verb, states, initial = "pickup", ["placed", "held"], "placed"
             effects = {"held": {"tint": "#9be7ff"}, "placed": {"tint": None}}
