@@ -169,3 +169,45 @@ def test_scene_ground_file_404_before_build(client):
     _mk_job(outputs)
     r = http.get("/api/splat/jobs/splat_0b0005/scene/ground/file", params={"fmt": "glb"})
     assert r.status_code == 404
+
+
+def test_ground_tunables_reach_the_build_argv(client, monkeypatch):
+    """The coverage floors were hardcoded in the CLI — the "37 cells (floor:
+    50)" refusals on tight orbits were un-tunable from the UI until now."""
+    http, outputs = client
+    _mk_job(outputs)
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(calls))
+
+    r = http.post("/api/splat/jobs/splat_0b0005/scene/ground",
+                  json={"min_ground_points": 20, "min_pts_cell": 1})
+    assert r.status_code == 200
+    build_call = [str(x) for x in next(
+        c for c in calls if "ground_mesh_build" in " ".join(str(x) for x in c))]
+    assert "--min-ground-points" in build_call and "20" in build_call
+    assert "--min-pts-cell" in build_call and "1" in build_call
+
+
+def test_ground_tunables_are_bounded(client):
+    """A typo must not disable the honesty floor entirely."""
+    http, outputs = client
+    _mk_job(outputs)
+    for payload in ({"min_ground_points": 9}, {"min_ground_points": 501},
+                    {"min_pts_cell": 0}, {"min_pts_cell": 11}):
+        r = http.post("/api/splat/jobs/splat_0b0005/scene/ground", json=payload)
+        assert r.status_code == 422, payload
+
+
+def test_ground_defaults_unchanged_for_old_callers(client, monkeypatch):
+    """prepare's SceneGroundBody() path and every old client stay
+    byte-compatible: {} still sends the historical 50/3 floors."""
+    http, outputs = client
+    _mk_job(outputs)
+    calls: list = []
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", _fake_subprocess(calls))
+    assert http.post("/api/splat/jobs/splat_0b0005/scene/ground",
+                     json={}).status_code == 200
+    build_call = [str(x) for x in next(
+        c for c in calls if "ground_mesh_build" in " ".join(str(x) for x in c))]
+    assert "--min-ground-points" in build_call and "50" in build_call
+    assert "--min-pts-cell" in build_call and "3" in build_call

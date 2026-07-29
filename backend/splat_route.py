@@ -5769,6 +5769,11 @@ def _scene_ground_vram_mb(gauss_emb: Path) -> int:
 class SceneGroundBody(BaseModel):
     semantic_thresh: float = Field(default=0.5, gt=0.0, lt=1.0)
     cell_units: float = Field(default=0.03, gt=0.0)
+    # Coverage floors, previously hardcoded in the CLI and un-tunable from the
+    # UI — the "only 37 ground cells (floor: 50)" refusals on tight orbits.
+    # Bounded so a typo cannot disable the honesty floor entirely.
+    min_ground_points: int = Field(default=50, ge=10, le=500)
+    min_pts_cell: int = Field(default=3, ge=1, le=10)
 
 
 @router.post("/jobs/{job_id}/scene/ground")
@@ -5841,6 +5846,8 @@ async def scene_ground(request: Request, job_id: str, body: SceneGroundBody):
         rc, _out, stderr = await _run_capture_subprocess([
             str(MESH_ENV_PYTHON), str(GROUND_MESH_BUILD_SCRIPT), str(gg), str(out_dir),
             "--semantic-thresh", str(body.semantic_thresh), "--cell-units", str(body.cell_units),
+            "--min-ground-points", str(body.min_ground_points),
+            "--min-pts-cell", str(body.min_pts_cell),
         ])
         if rc != 0 or not (out_dir / "ground_mesh_raw.ply").is_file():
             tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-8:])
