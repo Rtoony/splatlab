@@ -3125,3 +3125,59 @@ overlay-free band.
 
 **Suites:** backend 1195 green (+39 this lane), frontend 136 green, tsc clean.
 `prove-game-live` (Stump) and `prove-restyle-live` re-run green — nothing regressed.
+
+---
+
+## 2026-07-29 — PW A9: LIVE RECEIPTS — Truck game proof GREEN, courtyard wall-fill CAUGHT A REAL GAP
+
+Phase-0 handoff executed (Kimi review pass → unconfined re-run). Suites first:
+**backend 1256 green** (+61 since W3), **frontend 139 green** (+3, see below), serve
+restarted at HEAD with /scene/surfaces + tunables + pluck stage.
+
+**PROOF 1 — Truck (splat_716a9122) game loop: GREEN, after finding two real bugs.**
+The 07-29 timeout was NOT flakiness. Root cause chain, proven with a live walker dump
+(`window.__worldWalker`): the uncalibrated scale guess (1.9245 u/m) made the 1.7 m
+player 3.27 units tall inside the probe's 2.27-unit headroom; respawn clamped the EYE
+but the physics capsule kept full height, its feet sat ~1.9 u inside the floor solid,
+and ONE depenetration pass hurled the spawn from the proven seed (0.42, 1.04, -0.46)
+to (2.12, -9.97, 8.46) — an eject/fall/respawn loop (ground=air forever), which the
+game read as "no reachable spawn ground" and refused to start. **Fix (3005c6c):**
+`capsuleHeight` clamps the capsule extent (height + radius) into the probe headroom;
+respawn stands feet-on-the-proven-floor at that height. Contract test fails 2/12 with
+the clamp disabled; worlds with real headroom byte-identical.
+Second bug, in the proof tool itself: its receipts (kills/HP/OVERRUN) were read from
+the FINAL frame, after the endgame dialog had vanished — and its own blind fight-clicks
+are what dismissed the dialog ("kills 0 absent" then counted as a kill). The tool now
+accumulates evidence DURING the fight and stops shooting the moment an endgame dialog
+appears. Honest receipts this run: **wave 1 spawns 3 undead, ground=on at the seed,
+HP 100→10 real damage, 60 fps, exit 0.**
+Found, not yet fixed (cosmetic): game notices render under the "Shared-coordinate-frame
+check flagged N element(s)" banner title (world-view.tsx wires game.onNotice into the
+same warnings list) — the mislabel sent this debug down a frame-check rabbit hole.
+
+**PROOF 2 — courtyard (splat_5c1db781) wall fill: pipeline lands, UNION DOESN'T — a
+real, caught defect.** After two wall-args corrections (calibrated 1.0 m/u lives in
+_world/world.json, NOT meta.json's stale 8.58; anchor the wall to room_box_scene, not
+a raw-band quantile that painted 4,920 orbit floaters OUTSIDE the +x wall — that junk
+record was deleted via DELETE /class-labels, receipt 8243944b): **PAINT 5,327 gaussians
+→ 1 planar patch (rms 0.02508, 183 inliers, 0.365 u²) → GENERATIVE provenance tag
+verified in the ply header.** Then `/world/prepare {force:[solidify]}` ran solidify
+'done' — and **no artifact records the union** (shell surfaces_merged=None, collision
+surface_patches_sampled absent). Why, precisely:
+1. Both live proof worlds win EXTERIOR collision routes (Truck `exterior/faces`,
+   courtyard `exterior/smooth+carve`); patch sampling only exists in the voxel
+   candidate (`candidates[3].surface_patches_sampled` — present, loses the vote).
+2. scene_solidify's voxel shell path REUSES an existing collision_shell.glb
+   (route=auto + file exists → no rebuild), so a solid built at 06:07 — before the
+   paint existed — was re-textured into shell.glb at 16:28 untouched by the patch.
+3. `cut=None` on the voxel route means surfaces_merged can never exist there either
+   (it's a tsdf/mesh-route receipt from build_shell_mesh).
+**Decision needed (RToony):** where should painted patches reach the collision solid —
+sample them in every route candidate, force the voxel route when patches exist, or
+post-union patch voxels into whichever solid wins? Plus the staleness rule: solidify
+must rebuild collision when a patch postdates it. Until then the A8 wall-fill is
+UNREACHABLE on every current world, and prove-surfaces-live's 4c receipt stays red.
+
+**Artifacts:** proof screenshots /tmp/splat_716a9122-paint-rescue-proof/ (01-wave1,
+02-fight); courtyard receipts _scene/surfaces/ (patch_00.ply + receipt_top/oblique).
+The corrected WALL_ARGS + mpu-source math lives in the phase0 handoff script.
