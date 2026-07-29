@@ -16,7 +16,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { TargetInfo } from "@/lib/world-interactions";
 import { Link, useRoute } from "wouter";
-import { uploadPolishedWorldElement , fetchWorldInteractions, setWorldElementState, setWorldPlayerPoses, solidifyWorld} from "@/lib/api";
+import { uploadPolishedWorldElement , fetchWorldInteractions, fetchWorldNavmesh, fetchWorldScenario, setWorldElementState, setWorldPlayerPoses, solidifyWorld} from "@/lib/api";
+import { WorldGame, type GameHudState, type Scenario } from "@/lib/world-game";
+import type { parseNavmesh } from "@/lib/world-navmesh";
 import { PolishUploadZone } from "@/components/workspace/polish-upload";
 import {
   DEFAULT_WALK_PARAMS,
@@ -121,6 +123,14 @@ export default function WorldViewPage() {
   const [rows, setRows] = useState<ElementRow[]>([]);
   const [hidden, setHidden] = useState<Set<string>>(() => new Set());
   const [warnings, setWarnings] = useState<string[]>([]);
+  const gameRef = useRef<WorldGame | null>(null);
+  const gameDataRef = useRef<{
+    navmeshDoc: Parameters<typeof parseNavmesh>[0];
+    scenario: Scenario;
+  } | null>(null);
+  const [gameHud, setGameHud] = useState<GameHudState | null>(null);
+  const [gameReady, setGameReady] = useState(false);
+  const [damageFlash, setDamageFlash] = useState(0);
   const [sceneInfo, setSceneInfo] = useState<SceneInfo | null>(null);
   const [walkParams, setWalkParams] = useState<WalkParams>(DEFAULT_WALK_PARAMS);
   const [stats, setStats] = useState<WalkerStats>({
@@ -270,6 +280,24 @@ export default function WorldViewPage() {
           controller.signal.addEventListener("abort", stopSaving, { once: true });
         }
 
+        // Game data (optional): a scenario + navmesh make the world playable.
+        if (source.kind === "api") {
+          void Promise.all([
+            fetchWorldScenario(jobId, controller.signal),
+            fetchWorldNavmesh(jobId, controller.signal),
+          ]).then(([scenarioPayload, navmeshDoc]) => {
+            if (cancelled) return;
+            const scenario = scenarioPayload.scenario as Scenario | null;
+            if (scenario && navmeshDoc && Array.isArray((navmeshDoc as { rows?: unknown }).rows)) {
+              gameDataRef.current = {
+                navmeshDoc: navmeshDoc as Parameters<typeof parseNavmesh>[0],
+                scenario,
+              };
+              setGameReady(true);
+            }
+          }).catch(() => { /* no scenario/navmesh: the world simply is not playable yet */ });
+        }
+
         // The splat backdrop. The mesh is what you collide with and act on;
         // the splat is what you look at. Measured: a shell that encloses the
         // capture cameras cannot resemble it, and the ground TIN alone covers
@@ -298,10 +326,43 @@ export default function WorldViewPage() {
     return () => {
       cancelled = true;
       controller.abort();
+      gameRef.current?.dispose();
+      gameRef.current = null;
+      setGameHud(null);
+      setGameReady(false);
       walker.dispose();
       if (walkerRef.current === walker) walkerRef.current = null;
     };
   }, [source, reloadNonce]);
+
+  const startGame = useCallback(() => {
+    const walker = walkerRef.current;
+    const data = gameDataRef.current;
+    if (!walker || !data) return;
+    if (!gameRef.current) {
+      const game = new WorldGame({
+        scene: walker.scene,
+        camera: walker.camera,
+        navmeshDoc: data.navmeshDoc,
+        scenario: data.scenario,
+        unitsPerMetre: walker.params.unitsPerMetre,
+      });
+      game.onHud = setGameHud;
+      game.onPlayerHit = () => {
+        setDamageFlash(1);
+        window.setTimeout(() => setDamageFlash(0), 220);
+      };
+      walker.onFrame = (dt) => game.update(dt);
+      walker.combatClick = () => game.shoot();
+      gameRef.current = game;
+    }
+    gameRef.current.start();
+    walker.requestLock();
+  }, []);
+
+  const stopGame = useCallback(() => {
+    gameRef.current?.stop();
+  }, []);
 
   /* ---------------------------------------------------------------- */
 
@@ -366,6 +427,70 @@ export default function WorldViewPage() {
           <span className="rounded bg-cyan-500/20 px-2 py-0.5 font-mono text-[11px] text-cyan-200 ring-1 ring-cyan-400/40">
             FLY — no gravity, no collision · F to land
           </span>
+        </div>
+      )}
+
+      {/* ---- Game mode HUD ---- */}
+      {phase === "ready" && damageFlash > 0 && (
+        <div className="pointer-events-none absolute inset-0 bg-red-600/25 transition-opacity" />
+      )}
+      {phase === "ready" && gameReady && (!gameHud || gameHud.phase === "idle") && (
+        <div className="absolute bottom-5 right-5">
+          <button
+            type="button"
+            onClick={startGame}
+            className="rounded-xl border border-red-400/40 bg-red-950/70 px-4 py-2 text-sm font-semibold text-red-200 backdrop-blur hover:border-red-300 hover:text-white"
+          >
+            ▶ {gameDataRef.current?.scenario.name ?? "Play scenario"}
+          </button>
+        </div>
+      )}
+      {phase === "ready" && gameHud && gameHud.phase !== "idle" && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-5 flex justify-center">
+          <div className="flex items-center gap-4 rounded-xl bg-black/70 px-4 py-2 font-mono text-xs text-zinc-200 backdrop-blur">
+            <span>
+              HP
+              <span className="ml-2 inline-block h-2 w-28 overflow-hidden rounded bg-zinc-800 align-middle">
+                <span
+                  className={`block h-full ${gameHud.health / gameHud.maxHealth > 0.35 ? "bg-emerald-400" : "bg-red-500"}`}
+                  style={{ width: `${(100 * gameHud.health) / gameHud.maxHealth}%` }}
+                />
+              </span>
+              <span className="ml-2">{gameHud.health}</span>
+            </span>
+            <span>wave {Math.min(gameHud.wave, gameHud.totalWaves)}/{gameHud.totalWaves}</span>
+            <span>kills {gameHud.kills}</span>
+            {gameHud.phase === "rest" && <span className="text-cyan-300">next wave in {gameHud.restSeconds}s</span>}
+            {gameHud.phase === "wave" && <span className="text-red-300">{gameHud.alive} undead</span>}
+          </div>
+        </div>
+      )}
+      {phase === "ready" && gameHud && (gameHud.phase === "won" || gameHud.phase === "lost") && (
+        <div className="absolute inset-0 flex items-center justify-center bg-black/60">
+          <div className="rounded-2xl border border-white/10 bg-zinc-950/90 px-8 py-6 text-center backdrop-blur">
+            <div className={`text-2xl font-bold ${gameHud.phase === "won" ? "text-emerald-300" : "text-red-300"}`}>
+              {gameHud.phase === "won" ? "YOU SURVIVED" : "OVERRUN"}
+            </div>
+            <div className="mt-1 font-mono text-xs text-zinc-400">
+              {gameHud.kills} zombies down · wave {Math.min(gameHud.wave, gameHud.totalWaves)}/{gameHud.totalWaves}
+            </div>
+            <div className="mt-4 flex justify-center gap-3">
+              <button
+                type="button"
+                onClick={startGame}
+                className="rounded-lg border border-emerald-400/40 bg-emerald-950/60 px-4 py-1.5 text-sm font-semibold text-emerald-200 hover:text-white"
+              >
+                Play again
+              </button>
+              <button
+                type="button"
+                onClick={stopGame}
+                className="rounded-lg border border-white/10 bg-zinc-900 px-4 py-1.5 text-sm text-zinc-300 hover:text-white"
+              >
+                Back to walking
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

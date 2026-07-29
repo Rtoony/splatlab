@@ -390,6 +390,33 @@ export function fetchWorldInteractions(
   );
 }
 
+export type WorldScenarioPayload = {
+  job_id: string;
+  scenario: Record<string, unknown> | null;
+  default: Record<string, unknown> | null;
+};
+
+/** The scenario document (validated backend-side) + the navmesh grid. */
+export function fetchWorldScenario(
+  jobId: string,
+  signal?: AbortSignal,
+): Promise<WorldScenarioPayload> {
+  return apiRequest<WorldScenarioPayload>(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/world/scenario`,
+    { signal },
+  );
+}
+
+export function fetchWorldNavmesh(
+  jobId: string,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown>> {
+  return apiRequest<Record<string, unknown>>(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/world/file?name=navmesh.json`,
+    { signal },
+  );
+}
+
 /** Persist physics-disturbed prop poses under the reserved player seam. */
 export function setWorldPlayerPoses(
   jobId: string,

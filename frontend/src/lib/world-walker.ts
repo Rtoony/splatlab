@@ -395,6 +395,11 @@ export class WorldWalker {
   private physics: WorldPhysics | null = null;
   /** Fired when physics engages/disengages, so the HUD can say so. */
   onPhysicsChange: ((active: boolean, propCount: number) => void) | null = null;
+  /** Per-frame hook for layered systems (game mode). Called after physics. */
+  onFrame: ((dt: number) => void) | null = null;
+  /** Consulted FIRST on left-click while locked; return true = click consumed
+   *  (game mode's hitscan outranks the carry-throw). */
+  combatClick: (() => boolean) | null = null;
   /** Fired when the carried prop changes (slug, or null on release). */
   onCarryChange: ((slug: string | null) => void) | null = null;
 
@@ -1250,7 +1255,9 @@ export class WorldWalker {
 
   /** Left-click while carrying = throw. Wired in the constructor. */
   private handleMouseDown = (e: MouseEvent): void => {
-    if (!this.controls.isLocked || e.button !== 0 || !this.physics) return;
+    if (!this.controls.isLocked || e.button !== 0) return;
+    if (this.combatClick?.()) return; // game mode shot; carry-throw yields
+    if (!this.physics) return;
     const slug = this.physics.carrying;
     if (!slug) return;
     this.physics.release(this.camera, true);
@@ -1407,6 +1414,8 @@ export class WorldWalker {
     // Props simulate in fly mode too — a shoved box keeps tumbling while you
     // inspect it from the air.
     this.physics?.step(dt, this.camera.position, this.eyeHeight, this.camera);
+
+    this.onFrame?.(dt);
 
     this.renderer.render(this.scene, this.camera);
 
