@@ -1,6 +1,6 @@
 {
   "schema": "dev.splatlab.class-taxonomy/v1",
-  "version": 1,
+  "version": 2,
   "classes": [
     {
       "id": "grass",
@@ -126,6 +126,97 @@
         "metallic": 0.0,
         "blend_capture": 0.3,
         "noise": {"scale": 30, "luma_jitter": 0.05, "speckle": 0.1}
+      }
+    },
+    {
+      "id": "cobblestone",
+      "display": "Cobblestone",
+      "color": "#8a8377",
+      "category": "fantasy",
+      "generative": {
+        "base_rgb": [0.45, 0.42, 0.38],
+        "roughness": 0.85,
+        "metallic": 0.0,
+        "blend_capture": 0.2,
+        "noise": {"scale": 20, "luma_jitter": 0.14, "speckle": 0.5}
+      }
+    },
+    {
+      "id": "mossy-stone",
+      "display": "Mossy Stone",
+      "color": "#5c704f",
+      "category": "fantasy",
+      "generative": {
+        "base_rgb": [0.32, 0.38, 0.28],
+        "roughness": 0.9,
+        "metallic": 0.0,
+        "blend_capture": 0.2,
+        "noise": {"scale": 16, "luma_jitter": 0.16, "speckle": 0.45}
+      }
+    },
+    {
+      "id": "obsidian",
+      "display": "Obsidian",
+      "color": "#14121a",
+      "category": "fantasy",
+      "generative": {
+        "base_rgb": [0.07, 0.06, 0.09],
+        "roughness": 0.25,
+        "metallic": 0.1,
+        "blend_capture": 0.1,
+        "noise": {"scale": 6, "luma_jitter": 0.08, "speckle": 0.15}
+      }
+    },
+    {
+      "id": "lava",
+      "display": "Lava",
+      "color": "#e04a10",
+      "category": "fantasy",
+      "generative": {
+        "base_rgb": [0.85, 0.28, 0.06],
+        "roughness": 0.6,
+        "metallic": 0.0,
+        "blend_capture": 0.05,
+        "noise": {"scale": 12, "luma_jitter": 0.35, "speckle": 0.6}
+      }
+    },
+    {
+      "id": "sandstone",
+      "display": "Sandstone",
+      "color": "#c2a36b",
+      "category": "fantasy",
+      "generative": {
+        "base_rgb": [0.76, 0.64, 0.44],
+        "roughness": 0.9,
+        "metallic": 0.0,
+        "blend_capture": 0.2,
+        "noise": {"scale": 10, "luma_jitter": 0.1, "speckle": 0.3}
+      }
+    },
+    {
+      "id": "timber-planks",
+      "display": "Timber Planks",
+      "color": "#6b4a2b",
+      "category": "fantasy",
+      "generative": {
+        "base_rgb": [0.4, 0.28, 0.16],
+        "roughness": 0.8,
+        "metallic": 0.0,
+        "blend_capture": 0.2,
+        "noise": {"scale": 8, "luma_jitter": 0.12, "speckle": 0.25}
+      }
+    },
+    {
+      "id": "thatch",
+      "display": "Thatch",
+      "color": "#8c7340",
+      "category": "fantasy",
+      "generative": {
+        "base_rgb": [0.55, 0.45, 0.24],
+        "roughness": 0.95,
+        "metallic": 0.0,
+        "blend_capture": 0.25,
+        "noise": {"scale": 22, "luma_jitter": 0.18, "speckle": 0.5}
       }
     }
   ]

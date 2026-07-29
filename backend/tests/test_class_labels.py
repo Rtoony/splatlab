@@ -35,6 +35,23 @@ def test_builtin_taxonomy_loads_and_is_valid() -> None:
         assert entry["generative"]["base_rgb"]
 
 
+def test_fantasy_classes_are_restyle_only() -> None:
+    """The v2 fantasy surfaces exist, and none can leak into the semantic
+    ground lane: no queries, category "fantasy" (semantic_ground filters
+    category=="ground"), full generative recipes so preview==bake holds."""
+    tax = ct.load_taxonomy()
+    fantasy = [c for c in tax["classes"] if c["category"] == "fantasy"]
+    assert {"cobblestone", "mossy-stone", "obsidian", "lava",
+            "sandstone", "timber-planks", "thatch"} == {c["id"] for c in fantasy}
+    for entry in fantasy:
+        assert "queries" not in entry, entry["id"]
+        gen = entry["generative"]
+        assert len(gen["base_rgb"]) == 3
+        assert 0.0 <= gen["roughness"] <= 1.0
+        assert 0.0 <= gen["metallic"] <= 1.0
+        assert set(gen["noise"]) == {"scale", "luma_jitter", "speckle"}
+
+
 def test_job_extras_extend_but_cannot_redefine(tmp_path: Path) -> None:
     lf = tmp_path / "_langfield"
     lf.mkdir(parents=True)

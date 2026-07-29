@@ -17,7 +17,11 @@ from typing import Any
 
 TAXONOMY_PATH = Path(__file__).with_name("class_taxonomy.json")
 EXTRA_NAME = "class_taxonomy_extra.json"
-CATEGORIES = ("ground", "vegetation", "structure", "water", "object")
+# "fantasy" = restyle-only surfaces (cobblestone, lava, ...). They carry no
+# queries and never enter the SigLIP ground lane — semantic_ground pulls only
+# category=="ground" — so the classifier cannot propose them; only a human
+# restyle or paint can.
+CATEGORIES = ("ground", "vegetation", "structure", "water", "object", "fantasy")
 
 _ID_OK = set("abcdefghijklmnopqrstuvwxyz0123456789-_")
 

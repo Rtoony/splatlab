@@ -46,7 +46,9 @@ def test_empty_world_restyles_to_as_captured(client):
     assert body["restyle"]["lighting"]["preset"] == "as-captured"
     # The catalogue the author picks from comes from the SAME taxonomy the
     # ground/object bakes use, so a preview and a re-bake cannot disagree.
-    assert {c["id"] for c in body["materials"]} >= {"grass", "concrete", "water"}
+    # Fantasy classes (v2) ride the same file, so they need no extra wiring.
+    assert {c["id"] for c in body["materials"]} >= {
+        "grass", "concrete", "water", "cobblestone", "obsidian", "lava"}
     assert "dungeon" in body["presets"]
 
 
@@ -70,7 +72,8 @@ def test_unknown_slug_class_preset_and_bad_tint_are_all_refused(client):
     http, _world = client
     for payload, expect in [
         ({"elements": {"ghost": {"tint": "#ffffff"}}}, "no such element"),
-        ({"elements": {"wall": {"material": "obsidian"}}}, "unknown material class"),
+        ({"elements": {"wall": {"material": "vaporwave-chrome"}}},
+         "unknown material class"),
         ({"elements": {"wall": {"tint": "blue"}}}, "#rrggbb"),
         ({"elements": {"wall": {}}}, "at least one of"),
         ({"lighting": {"preset": "vaporwave"}}, "unknown lighting preset"),
