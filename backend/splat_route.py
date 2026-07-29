@@ -6103,6 +6103,145 @@ WORLD_COLLISION_SCRIPT = MESH_DIR / "world_collision.py"
 WORLD_GATE_SCRIPT = MESH_DIR / "world_gate.py"
 
 
+class WorldPrepareBody(BaseModel):
+    """One command: any completed scene -> a walkable, playable world."""
+    force: list[str] = Field(default_factory=list)
+    shell_source: Literal["tsdf", "voxel"] = "voxel"
+    shell_faces: int = Field(default=120_000, ge=1_000, le=1_000_000)
+    auto_generate: bool = False
+    install_scenario: bool = True
+
+
+@router.post("/jobs/{job_id}/world/prepare")
+async def world_prepare(request: Request, job_id: str, body: WorldPrepareBody):
+    """The one-command world pipeline (W2-C1).
+
+    Until now a walkable world took FIVE separate blocking POSTs (mesh,
+    inventory, isolate, ground, solidify) with progress reported by only the
+    last — a chain that is invisible in /activity and dies silently to a
+    service restart (measured: the Stump's lift got SIGTERMed by exactly
+    that). This route runs the whole ladder under ONE opregistry op with
+    per-stage progress, skipping every stage whose artifact already exists —
+    so re-POSTing after any failure resumes instead of redoing, and a
+    finished world is a cheap no-op. Stage bodies are the EXISTING route
+    handlers called in-process (their preconditions, GPU leases, locks and
+    audits all apply unchanged); `force: ["ground", ...]` redoes named
+    stages. Ground is allowed to finish partially (its class-texture step
+    can 500 after the mesh landed — a recorded quirk); anything else fails
+    the op loudly with the stage named.
+    """
+    require_heavy_work_admitted()
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    if meta.get("status") != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"World prepare requires a completed job "
+                   f"(status: {meta.get('status')})")
+    job_dir = Path(meta["output_dir"])
+    if not (job_dir / LANGFIELD_DIRNAME / "gauss_emb.npz").is_file():
+        raise HTTPException(
+            status_code=409,
+            detail="No language field — the scene must be (re)trained with "
+                   "Language search on; every later stage depends on it")
+
+    world_dir = job_dir / WORLD_DIRNAME
+    force = set(body.force)
+    stages: list[str] = ["mesh", "inventory", "isolate", "ground",
+                         "solidify", "affordances", "scenario"]
+    op_id = opregistry.start("world_prepare", job_id, step="mesh")
+    outcome: dict[str, str] = {}
+    warnings: list[str] = []
+    gate: dict[str, Any] | None = None
+
+    def _exists(stage: str) -> bool:
+        return {
+            "mesh": (job_dir / "_mesh" / "mesh.ply").is_file(),
+            "inventory": (job_dir / SCENE_DIRNAME / "inventory.json").is_file(),
+            "isolate": (job_dir / SCENE_DIRNAME / "isolated"
+                        / "batch_isolate.json").is_file(),
+            "ground": (job_dir / SCENE_DIRNAME / "ground"
+                       / "ground_mesh_raw.ply").is_file(),
+            "solidify": (world_dir / "world.json").is_file()
+            and (world_dir / "navmesh.json").is_file(),
+            "affordances": False,  # propose is no-clobber; always cheap-safe
+            "scenario": (world_dir / "scenario.json").is_file(),
+        }[stage]
+
+    try:
+        for index, stage in enumerate(stages):
+            opregistry.update(op_id, step=stage,
+                              progress=round(index / len(stages), 2))
+            if stage not in force and _exists(stage):
+                outcome[stage] = "skipped"
+                continue
+            try:
+                if stage == "mesh":
+                    await generate_splat_mesh(request, job_id, None)
+                elif stage == "inventory":
+                    await scene_inventory(request, job_id, SceneInventoryBody())
+                elif stage == "isolate":
+                    await scene_batch_isolate(request, job_id, SceneIsolateBody())
+                elif stage == "ground":
+                    await scene_ground(request, job_id, SceneGroundBody())
+                elif stage == "solidify":
+                    result = await world_solidify(job_id, WorldSolidifyBody(
+                        shell_source=body.shell_source,
+                        shell_faces=body.shell_faces,
+                        prefer_generated=True,
+                        auto_generate=body.auto_generate,
+                        run_collision=True,
+                        run_gate=True,
+                    ))
+                    gate = (result or {}).get("gate")
+                elif stage == "affordances":
+                    import world_interactions_route
+                    await world_interactions_route.propose_world_affordances(
+                        job_id,
+                        world_interactions_route.AffordanceProposeBody(apply=True),
+                    )
+                elif stage == "scenario" and body.install_scenario:
+                    import world_scenario as ws
+                    scenario = ws.validate_scenario(ws.default_scenario(job_id))
+                    (world_dir / "scenario.json").write_text(
+                        json.dumps(scenario, indent=2))
+                outcome[stage] = "done"
+            except HTTPException as exc:
+                if stage == "ground" and _exists("ground"):
+                    outcome[stage] = "partial"
+                    warnings.append(f"ground finished partially: {exc.detail}")
+                    continue
+                outcome[stage] = "failed"
+                opregistry.finish(op_id, status=opregistry.FAILED,
+                                  result={"stage": stage, "detail": str(exc.detail)})
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail=f"stage '{stage}' failed: {exc.detail} — completed "
+                           "stages are kept; re-POST to resume from here",
+                ) from exc
+    except Exception:
+        with contextlib.suppress(Exception):
+            opregistry.finish(op_id, status=opregistry.FAILED)
+        raise
+
+    opregistry.finish(op_id, result={"stages": outcome})
+    await audit_operator_event(
+        request=request,
+        title="World prepared",
+        description=f"{job_id}: " + ", ".join(
+            f"{s}={outcome.get(s, '-')}" for s in stages),
+        variant="success",
+        action="splat.world_prepare",
+        target=meta.get("mode", "3d"),
+        metadata={"job_id": job_id, "stages": outcome},
+    )
+    return {"ok": True, "op_id": op_id, "stages": outcome,
+            "warnings": warnings, "gate": gate}
+
+
 class WorldRegradeBody(BaseModel):
     slug: str = Field(..., min_length=1, max_length=64)
     role: Literal["prop", "static"]
