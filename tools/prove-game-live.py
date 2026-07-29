@@ -51,6 +51,15 @@ with sync_playwright() as p:
     fps = page.evaluate("() => { const m = document.body.innerText.match(/fps\\s*\\n?\\s*(\\d+)/); return m ? m[1] : '?'; }")
     print(f"fps={fps} took_damage={took_damage} killed_something={killed}", flush=True)
     assert took_damage or killed or "OVERRUN" in final, "no combat evidence — loop did not engage"
+
+    # The endgame dialog must be CLICKABLE (review finding: it soft-locked
+    # behind the pointer lock + the click-to-walk overlay).
+    if "OVERRUN" in final or "SURVIVED" in final:
+        page.get_by_role("button", name="Play again").click(timeout=10_000)
+        time.sleep(2.5)
+        again = page.evaluate("() => document.body.innerText")
+        assert ("wave 1/3" in again) or ("next wave" in again), "Play again did not restart"
+        print("endgame dialog clickable; scenario restarted", flush=True)
     browser.close()
 print(f"screenshots: {OUT}")
 if errors:

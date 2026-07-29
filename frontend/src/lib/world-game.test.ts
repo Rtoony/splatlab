@@ -110,3 +110,45 @@ describe("WorldGame", () => {
     expect(game.shoot()).toBe(false);
   });
 });
+
+describe("review-finding regressions", () => {
+  it("an unspawnable scenario goes back to idle with a notice — never a fake win", () => {
+    const island = {
+      cell: 0.5, origin: [0, 0], shape: [3, 3], floor_y: 0,
+      rows: ["100", "000", "001"], // player island + one unreachable cell
+    };
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, 1);
+    camera.position.set(0.25, 1.7, 0.25); // on the lone island
+    camera.updateMatrixWorld(true);
+    const game = new WorldGame({
+      scene, camera, navmeshDoc: island, scenario: scenario(), unitsPerMetre: 1, seed: 3,
+    });
+    let hud: GameHudState | null = null;
+    let notice = "";
+    game.onHud = (h) => { hud = h; };
+    game.onNotice = (m) => { notice = m; };
+    game.start();
+    for (let t = 0; t < 10; t += 1 / 60) game.update(1 / 60);
+    expect(hud!.phase).toBe("idle");
+    expect(hud!.phase).not.toBe("won");
+    expect(notice).toMatch(/could not spawn/);
+    game.dispose();
+  });
+
+  it("keeps fading corpses and the tracer after the game ends", () => {
+    const { scene, camera, game, step, hud } = rig(scenario({
+      waves: [{ actors: [{ type: "zombie", count: 1, health: 50, speed_mps: 0.5,
+                           damage: 100, reach_m: 0.9, attack_cooldown_s: 5 }] }],
+    }));
+    game.start();
+    step(2);
+    const target = zombieGroups(scene)[0];
+    camera.lookAt(target.position.clone().setY(0.8));
+    camera.updateMatrixWorld(true);
+    game.shoot(); // kill -> last wave clears -> won while the corpse falls
+    step(3);
+    expect(hud().phase).toBe("won");
+    expect(zombieGroups(scene).length).toBe(0); // corpse finished dying post-win
+  });
+});

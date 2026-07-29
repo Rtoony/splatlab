@@ -163,14 +163,19 @@ async def get_world_scenario(job_id: str) -> dict[str, Any]:
     _job_dir, world_dir, _wm = _require_world(job_id)
     path = world_dir / "scenario.json"
     if not path.is_file():
-        return {"job_id": job_id, "scenario": None,
+        return {"job_id": job_id, "scenario": None, "scenario_error": "",
                 "default": ws.default_scenario(job_id)}
     try:
         scenario = ws.validate_scenario(json.loads(path.read_text()))
     except (OSError, json.JSONDecodeError, ws.ScenarioError) as exc:
-        raise HTTPException(status_code=500,
-                            detail=f"stored scenario is invalid: {exc}") from exc
-    return {"job_id": job_id, "scenario": scenario, "default": None}
+        # Same posture as a foreign state.json: report the problem and offer
+        # the default rather than 500ing the whole page (review finding — a
+        # validator tightened in a later release must not brick old worlds).
+        return {"job_id": job_id, "scenario": None,
+                "scenario_error": f"stored scenario is invalid: {exc}",
+                "default": ws.default_scenario(job_id)}
+    return {"job_id": job_id, "scenario": scenario, "scenario_error": "",
+            "default": None}
 
 
 @router.put("/jobs/{job_id}/world/scenario")
@@ -182,7 +187,7 @@ async def put_world_scenario(job_id: str, body: ScenarioBody) -> dict[str, Any]:
 
     _job_dir, world_dir, _wm = _require_world(job_id)
     raw = body.scenario if body.scenario is not None else ws.default_scenario(job_id)
-    raw.setdefault("job_id", job_id)
+    raw["job_id"] = job_id  # the path is the identity; a body value never is
     try:
         scenario = ws.validate_scenario(raw)
     except ws.ScenarioError as exc:

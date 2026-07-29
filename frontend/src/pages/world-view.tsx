@@ -339,24 +339,33 @@ export default function WorldViewPage() {
     const walker = walkerRef.current;
     const data = gameDataRef.current;
     if (!walker || !data) return;
-    if (!gameRef.current) {
-      const game = new WorldGame({
-        scene: walker.scene,
-        camera: walker.camera,
-        navmeshDoc: data.navmeshDoc,
-        scenario: data.scenario,
-        unitsPerMetre: walker.params.unitsPerMetre,
-      });
-      game.onHud = setGameHud;
-      game.onPlayerHit = () => {
-        setDamageFlash(1);
-        window.setTimeout(() => setDamageFlash(0), 220);
-      };
-      walker.onFrame = (dt) => game.update(dt);
-      walker.combatClick = () => game.shoot();
-      gameRef.current = game;
-    }
-    gameRef.current.start();
+    // A fresh game per start: unitsPerMetre is baked into actor speeds and
+    // reaches at construction, and the scale dial may have moved since the
+    // last round (review finding) — rebuilding is idle-time-cheap.
+    gameRef.current?.dispose();
+    const game = new WorldGame({
+      scene: walker.scene,
+      camera: walker.camera,
+      navmeshDoc: data.navmeshDoc,
+      scenario: data.scenario,
+      unitsPerMetre: walker.params.unitsPerMetre,
+    });
+    game.onHud = (h) => {
+      setGameHud(h);
+      // The endgame dialog needs a cursor: release the pointer lock the
+      // moment the game decides (review finding — the dialog was
+      // unclickable behind a locked pointer).
+      if (h.phase === "won" || h.phase === "lost") walker.controls.unlock();
+    };
+    game.onPlayerHit = () => {
+      setDamageFlash(1);
+      window.setTimeout(() => setDamageFlash(0), 220);
+    };
+    game.onNotice = (message) => setWarnings((w) => [...w, message]);
+    walker.onFrame = (dt) => game.update(dt);
+    walker.combatClick = () => game.shoot();
+    gameRef.current = game;
+    game.start();
     walker.requestLock();
   }, []);
 
@@ -466,7 +475,7 @@ export default function WorldViewPage() {
         </div>
       )}
       {phase === "ready" && gameHud && (gameHud.phase === "won" || gameHud.phase === "lost") && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/60">
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60">
           <div className="rounded-2xl border border-white/10 bg-zinc-950/90 px-8 py-6 text-center backdrop-blur">
             <div className={`text-2xl font-bold ${gameHud.phase === "won" ? "text-emerald-300" : "text-red-300"}`}>
               {gameHud.phase === "won" ? "YOU SURVIVED" : "OVERRUN"}
@@ -630,8 +639,11 @@ export default function WorldViewPage() {
         </>
       )}
 
-      {/* ---- Click-to-walk ---- */}
-      {phase === "ready" && !locked && (
+      {/* ---- Click-to-walk ----
+           Suppressed while the endgame dialog is up: at z-10 it painted OVER
+           the dialog and swallowed the Play-again click (review finding). */}
+      {phase === "ready" && !locked
+        && !(gameHud && (gameHud.phase === "won" || gameHud.phase === "lost")) && (
         <button
           type="button"
           onClick={() => walkerRef.current?.requestLock()}

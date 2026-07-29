@@ -112,6 +112,8 @@ function buildZombie(scale: number): ZombieActor["parts"] & { group: THREE.Group
 export class WorldGame {
   onHud: ((state: GameHudState) => void) | null = null;
   onPlayerHit: (() => void) | null = null;
+  /** Fired for player-facing problems (e.g. no spawnable ground). */
+  onNotice: ((message: string) => void) | null = null;
 
   private readonly scene: THREE.Scene;
   private readonly camera: THREE.Camera;
@@ -210,9 +212,20 @@ export class WorldGame {
   }
 
   update(dt: number): void {
-    if (this.phase === "idle" || this.phase === "won" || this.phase === "lost") return;
-    this.shotClock = Math.max(0, this.shotClock - dt);
+    if (this.phase === "idle") return;
+    // The endgame is not a freeze-frame: the final tracer still fades and
+    // mid-fall corpses finish dying (review finding — they hung forever).
     if (this.tracer && (this.tracerTtl -= dt) <= 0) this.killTracer();
+    if (this.phase === "won" || this.phase === "lost") {
+      for (const zombie of this.zombies) {
+        if (zombie.dying >= 0) zombie.dying += dt;
+      }
+      for (let k = this.zombies.length - 1; k >= 0; k--) {
+        if (this.zombies[k].dying >= DEATH_SECONDS) this.removeZombie(k);
+      }
+      return;
+    }
+    this.shotClock = Math.max(0, this.shotClock - dt);
 
     if (this.phase === "rest") {
       this.restClock -= dt;
@@ -286,11 +299,14 @@ export class WorldGame {
         torsoMat.emissive.setHex(0x000000);
       }
 
-      // Melee when in reach.
+      // Melee when in reach — in 3D: a zombie must not chew a player on a
+      // balcony above it (review finding). The bite point is chest height.
       zombie.attackClock -= dt;
       const reach = zombie.stats.reach_m * upm;
+      const chestY = zombie.group.position.y + 1.05 * (ZOMBIE_HEIGHT_M / 1.6) * upm;
       const toPlayer = Math.hypot(
         this._pos.x - zombie.group.position.x,
+        this._pos.y - chestY,
         this._pos.z - zombie.group.position.z,
       );
       if (toPlayer <= reach && zombie.attackClock <= 0) {
@@ -356,6 +372,16 @@ export class WorldGame {
     for (const stats of wave.actors) {
       const cells = chooseSpawnCells(this.nav, playerCell, stats.count, minDistCells, this.rng);
       for (const cell of cells) this.spawnZombie(stats, cell);
+    }
+    if (!this.zombies.length) {
+      // An empty wave must never quietly count as a survived one (review
+      // finding: a cramped or islanded room fake-won in silence).
+      this.phase = "idle";
+      this.onNotice?.(
+        "The scenario could not spawn any actors — no reachable spawn "
+        + "ground from where you stand.");
+      this.emitHud(true);
+      return;
     }
     this.emitHud(true);
   }

@@ -97,3 +97,33 @@ describe("nearestWalkable + spawns", () => {
     }
   });
 });
+
+describe("spawn robustness (review findings)", () => {
+  const rng = (() => { let s = 9; return () => { s = (s * 1103515245 + 12345) % 2 ** 31; return s / 2 ** 31; }; })();
+
+  it("never stacks spawns on the same cell", () => {
+    const nav = grid(["111111111"]);
+    const spawns = chooseSpawnCells(nav, { i: 0, j: 0 }, 4, 3, rng);
+    const keys = new Set(spawns.map((c) => `${c.i}:${c.j}`));
+    expect(keys.size).toBe(spawns.length);
+  });
+
+  it("relaxes distance in a cramped room instead of spawning nothing", () => {
+    const nav = grid(["111", "111", "111"]);
+    const spawns = chooseSpawnCells(nav, { i: 1, j: 1 }, 2, 50, rng);
+    expect(spawns.length).toBe(2);
+  });
+
+  it("returns [] fast when the player stands on an unreachable island", () => {
+    const rows = ["1101" + "1".repeat(60)];
+    for (let k = 0; k < 40; k++) rows.push("0001" + "1".repeat(60));
+    const nav = grid(rows.map((r) => r.slice(0, 30)));
+    // player isolated at (0,0)-(0,1); the big field cannot reach them
+    const started = performance.now();
+    const spawns = chooseSpawnCells(nav, { i: 0, j: 0 }, 7, 5, rng);
+    expect(performance.now() - started).toBeLessThan(100); // one BFS, not 210 A*s
+    expect(spawns.length).toBeLessThanOrEqual(7);
+    // every spawn, if any, can genuinely reach the player
+    for (const s of spawns) expect(findPath(nav, s, { i: 0, j: 0 })).not.toBeNull();
+  });
+});

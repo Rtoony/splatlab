@@ -159,11 +159,38 @@ export function findPath(
   return null;
 }
 
+/** ONE flood fill from the player: every cell that can reach them, with its
+ *  BFS distance. O(cells) — replaces per-candidate A* reachability checks
+ *  that could burn seconds on the render thread (review finding). */
+export function reachableFrom(nav: Navmesh, playerCell: Cell): Map<number, number> {
+  const [nx, nz] = nav.shape;
+  const index = (c: Cell) => c.i * nz + c.j;
+  const dist = new Map<number, number>();
+  if (!isWalkable(nav, playerCell)) return dist;
+  const queue: Cell[] = [playerCell];
+  dist.set(index(playerCell), 0);
+  for (let head = 0; head < queue.length; head++) {
+    const current = queue[head];
+    const d = dist.get(index(current))!;
+    for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+      const next = { i: current.i + di, j: current.j + dj };
+      if (next.i < 0 || next.j < 0 || next.i >= nx || next.j >= nz) continue;
+      if (!isWalkable(nav, next)) continue;
+      const ni = index(next);
+      if (dist.has(ni)) continue;
+      dist.set(ni, d + 1);
+      queue.push(next);
+    }
+  }
+  return dist;
+}
+
 /**
- * Spawn placement: walkable cells at least `minDistCells` from the player,
- * spread by rejection sampling over the walkable set (deterministic given
- * the provided rng). Cells that cannot REACH the player are rejected — a
- * zombie on an unreachable island is a wave that never ends.
+ * Spawn placement: REACHABLE cells at least `minDistCells` from the player,
+ * sampled without replacement (no stacked spawns — review finding). When the
+ * room is too small for the requested distance, the farthest reachable cells
+ * are used instead: a cramped scenario spawns close rather than silently
+ * spawning nothing and fake-winning.
  */
 export function chooseSpawnCells(
   nav: Navmesh,
@@ -172,20 +199,23 @@ export function chooseSpawnCells(
   minDistCells: number,
   rng: () => number,
 ): Cell[] {
-  const [nx, nz] = nav.shape;
-  const candidates: Cell[] = [];
-  for (let i = 0; i < nx; i++) {
-    for (let j = 0; j < nz; j++) {
-      if (nav.walk[i * nz + j] !== 1) continue;
-      const d = Math.abs(i - playerCell.i) + Math.abs(j - playerCell.j);
-      if (d >= minDistCells) candidates.push({ i, j });
-    }
+  const [, nz] = nav.shape;
+  const reach = reachableFrom(nav, playerCell);
+  const far: Cell[] = [];
+  const near: Array<{ cell: Cell; d: number }> = [];
+  for (const [flat, d] of reach) {
+    if (d === 0) continue;
+    const cell = { i: Math.floor(flat / nz), j: flat % nz };
+    if (d >= minDistCells) far.push(cell);
+    else near.push({ cell, d });
   }
+  const pool = far.length
+    ? far
+    : near.sort((a, b) => b.d - a.d).slice(0, count * 4).map((n) => n.cell);
   const chosen: Cell[] = [];
-  let guard = 0;
-  while (chosen.length < count && candidates.length && guard++ < count * 30) {
-    const pick = candidates[Math.floor(rng() * candidates.length) % candidates.length];
-    if (findPath(nav, pick, playerCell) !== null) chosen.push(pick);
+  while (chosen.length < count && pool.length) {
+    const at = Math.floor(rng() * pool.length) % pool.length;
+    chosen.push(pool.splice(at, 1)[0]);
   }
   return chosen;
 }

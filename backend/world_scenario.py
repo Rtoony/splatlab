@@ -99,8 +99,11 @@ def validate_scenario(document: Any) -> dict[str, Any]:
         raise ScenarioError(f"waves must be a list of 1..{MAX_WAVES}")
     out_waves = []
     for w_index, wave in enumerate(waves):
-        if not isinstance(wave, dict) or not isinstance(wave.get("actors"), list):
-            raise ScenarioError(f"waves[{w_index}] must have an actors list")
+        if (not isinstance(wave, dict) or not isinstance(wave.get("actors"), list)
+                or not wave["actors"]):
+            raise ScenarioError(
+                f"waves[{w_index}] must have a NON-EMPTY actors list — an "
+                "actorless wave is an instant win, not a wave")
         out_actors = []
         total = 0
         for a_index, actor in enumerate(wave["actors"]):
@@ -110,8 +113,11 @@ def validate_scenario(document: Any) -> dict[str, Any]:
             if actor.get("type") not in ACTOR_TYPES:
                 raise ScenarioError(
                     f"{where}.type must be one of {ACTOR_TYPES}")
-            count = int(_number(actor.get("count"), f"{where}.count", 1,
-                                MAX_ACTORS_PER_WAVE))
+            raw_count = _number(actor.get("count"), f"{where}.count", 1,
+                                MAX_ACTORS_PER_WAVE)
+            if not float(raw_count).is_integer():
+                raise ScenarioError(f"{where}.count must be a whole number")
+            count = int(raw_count)
             total += count
             out_actors.append({
                 "type": actor["type"],
@@ -138,7 +144,7 @@ def validate_scenario(document: Any) -> dict[str, Any]:
     return {
         "schema": SCENARIO_SCHEMA,
         "version": VERSION,
-        "job_id": str(document.get("job_id") or ""),
+        "job_id": str(document.get("job_id") or "")[:80],
         "name": name,
         "player": out_player,
         "waves": out_waves,

@@ -895,6 +895,12 @@ def main() -> int:
                 mesh.update_faces(keep)
                 mesh.remove_unreferenced_vertices()
                 _log(f"      dropped {dropped} collision crumb component(s)")
+                # The gates and the navmesh were measured BEFORE the drop —
+                # exporting a different mesh than the report describes would
+                # make every number a lie (review finding). Re-grade the
+                # dropped mesh and let THOSE numbers ship.
+                winner["gates"] = evaluate(mesh, probe, args.player_radius,
+                                           args.player_height)
         mesh.export(str(out_glb))
         # MANDATORY readback: the export is only real if it reloads identically.
         import trimesh
