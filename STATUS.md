@@ -3038,3 +3038,45 @@ shows the reconstructed geometry instead. 7 backend + 11 frontend tests.
 
 **Wave totals:** backend 1140 green, frontend 134 green. Branch `w2-world-tools` pushed;
 merge is RToony's call.
+
+---
+
+## 2026-07-28 — W3 Lane A: the restyle BAKES (fantasy looks survive export)
+
+**Fantasy taxonomy (e14a40d).** Seven restyle-only surface classes — cobblestone,
+mossy-stone, obsidian, lava, sandstone, timber-planks, thatch — as full generative
+recipes in `class_taxonomy.json` (v2), category `"fantasy"` so they can never enter the
+SigLIP ground lane (no queries; semantic_ground filters `category=="ground"`). The
+preview dropdown, `tile_for`, and the bake all read the same numbers by construction.
+
+**The baker (892b62e).** `mesh/restyle_bake.py` writes the walker's preview into the
+element's OWN atlas, in the GLB's frame (no capture-frame inversion — deliberate):
+triplanar planes X→(z,y)/Y→(x,z)/Z→(x,y) via `class_textures.sample_world_triplanar`,
+`texels_per_unit = tile_px/(material_scale_m×unitsPerMetre)`, tint multiplied in LINEAR
+space (what `material.color` actually does). Material bakes build a FRESH atlas so chart
+gutters carry the new surface; painted texels floor-clamp to 1 so `texture_coverage`
+never counts them as background. Geometry passes through behind a readback face-count
+gate. All-or-nothing into staging.
+
+**The landing (a6f70e8).** `POST /world/restyle/bake` (+`/revert`): mesh lock +
+opregistry + audit; priors versioned as GLB+atlas PAIRS at one `-vNNNN` seq; marker
+`<slug>.restyle.json` with `atlas_updated: true` (the opposite of polish's
+`atlas_superseded` — the fresh sidecar DOES describe the file); `restyle_bake.json`
+archives the full pre-bake overlay; the overlay clears (lighting mood preserved —
+lighting is never baked, the atlas already carries the capture's light). Manifest gains
+`restyled` beside `polished`; UE-bundle provenance = polished|restyled|captured-derived,
+newer marker wins.
+
+**The walker rule (ef6ba1d).** After a bake the overlay is empty, so the splat backdrop
+— still the un-restyled photograph — would hide the baked shell. `setBakedLook` folds a
+`baked_elements` signal (on the restyle payload) into `restyleShowsMesh`. RestylePanel:
+armed "Bake this look" / "Revert bake".
+
+**Live proof (`tools/prove-bake-live.py`, splat_aea04ab3, 5090 ANGLE/GL):** preview
+moved the frame **28.2** mean RGB; the bake held **28.6** with the overlay cleared;
+**preview↔bake agreed within 0.4**; revert restored the capture to **0.0**. Post-bake
+object truth: 0 restyle-shader meshes of 6; the bicycle's tint lives in its atlas
+(material colour ffffff) — and that bicycle was a POLISHED GLB (v0003), so Blender UV
+charts bake correctly. Also proven: a fantasy class (cobblestone) end-to-end.
+
+**Suites:** backend 1156 green (+16), frontend 136 green (+2), tsc clean.

@@ -105,7 +105,7 @@ async def bake_world_restyle(job_id: str, body: RestyleBakeBody,
         raise HTTPException(
             status_code=409,
             detail="Nothing to bake — no element carries a tint or material. "
-                   f"(A {LIGHTING_NOTE}.)")
+                   f"(Note: {LIGHTING_NOTE}.)")
     missing = [slug for slug in sorted(entries)
                if not _target_path(world_dir, slug).is_file()]
     if missing:
