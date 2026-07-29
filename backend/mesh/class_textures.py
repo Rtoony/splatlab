@@ -81,3 +81,19 @@ def sample_world(tile: np.ndarray, x: np.ndarray, y: np.ndarray,
     u = np.mod((x * texels_per_unit).astype(np.int64), size)
     v = np.mod((y * texels_per_unit).astype(np.int64), size)
     return tile[v, u]
+
+
+def sample_world_triplanar(tile: np.ndarray, pos: np.ndarray, nrm: np.ndarray,
+                           texels_per_unit: float) -> np.ndarray:
+    """Triplanar world-space sampling — the same projection the walker's
+    triplanarMaterial injects (frontend/src/lib/world-restyle.ts): weights
+    |n|/Σ|n|, plane X samples (z,y), plane Y samples (x,z), plane Z samples
+    (x,y). `pos`/`nrm` are in the SAME frame the preview shades in — the
+    shipped GLB's own Y-up frame — so the restyle bake does no capture-frame
+    inversion, on purpose. Returns float32 [N, 3] in 0..255."""
+    w = np.abs(np.asarray(nrm, np.float32)) + 1e-5
+    w = w / w.sum(axis=1, keepdims=True)
+    cx = sample_world(tile, pos[:, 2], pos[:, 1], texels_per_unit).astype(np.float32)
+    cy = sample_world(tile, pos[:, 0], pos[:, 2], texels_per_unit).astype(np.float32)
+    cz = sample_world(tile, pos[:, 0], pos[:, 1], texels_per_unit).astype(np.float32)
+    return cx * w[:, :1] + cy * w[:, 1:2] + cz * w[:, 2:]
