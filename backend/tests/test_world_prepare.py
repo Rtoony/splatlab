@@ -273,6 +273,37 @@ def test_a_second_concurrent_prepare_is_refused_with_the_running_op(client, monk
     assert "op-already-running" in r.json()["detail"]
 
 
+def test_pluck_stage_runs_last_and_only_warns_on_refusal(client, monkeypatch):
+    """The default fixture has no _preview/splat.ply, so the REAL pluck
+    builder 409s — the ladder must record 'partial' + a warning, never fail.
+    With a mocked builder the stage lands 'done' LAST and skips on re-POST."""
+    tc, outputs = client
+    job = _mk_job(outputs)
+    calls = _mock_stages(monkeypatch, job)
+
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={})
+    assert r.status_code == 200
+    assert r.json()["stages"]["pluck"] == "partial"
+    assert any("pluck data not built" in w for w in r.json()["warnings"])
+
+    import world_pluck_route
+
+    async def fake_pluck(job_id, request):
+        calls.append("pluck")
+        (job / "_world" / "pluck.json").write_text("{}")
+        return {"ok": True}
+
+    monkeypatch.setattr(world_pluck_route, "build_world_pluck", fake_pluck)
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={})
+    assert r.status_code == 200
+    assert r.json()["stages"]["pluck"] == "done"
+    assert calls[-1] == "pluck"
+
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={})
+    assert r.json()["stages"]["pluck"] == "skipped"
+    assert calls.count("pluck") == 1
+
+
 def _seed_structure_paint(job: Path) -> None:
     (job / "_langfield" / "class_labels.json").write_text(json.dumps([
         {"id": "ab12cd34", "class_id": "structure", "count": 500}]))

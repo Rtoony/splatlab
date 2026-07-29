@@ -33,6 +33,7 @@ import export_route  # noqa: E402  (portable splat formats, collision, and Unrea
 import polish_route  # noqa: E402  (polished-GLB return leg: Blender/UE edits land back)
 import restyle_bake_route  # noqa: E402  (permanent restyle bake: fantasy looks survive export)
 import place_route  # noqa: E402  (set-dressing create/delete door: authored world elements)
+import world_pluck_route  # noqa: E402  (pluck data: per-prop backdrop-splat rows)
 import splat_edit_route  # noqa: E402  (audited splat-edit lane: versioned gaussian edits + guarded promote)
 import activity_route  # noqa: E402  (read-only busy-now snapshot: GPU holder + held per-job locks)
 import feedback  # noqa: E402  (small SQLite-backed in-app feedback loop)
@@ -236,6 +237,8 @@ app.include_router(polish_route.router, prefix="/api/splat", dependencies=[Depen
 app.include_router(restyle_bake_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
 
 app.include_router(place_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
+
+app.include_router(world_pluck_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
 
 # Audited splat-edit lane: versioned gaussian edits, guarded promotion to live.
 app.include_router(splat_edit_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])

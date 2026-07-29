@@ -6327,7 +6327,8 @@ async def world_prepare(request: Request, job_id: str, body: WorldPrepareBody):
 
     world_dir = job_dir / WORLD_DIRNAME
     stages: list[str] = ["mesh", "inventory", "isolate", "ground",
-                         "surfaces", "solidify", "affordances", "scenario"]
+                         "surfaces", "solidify", "affordances", "scenario",
+                         "pluck"]
     # A force name that matches no stage used to no-op in silence: the caller
     # who asked to redo "gound" got a 200 whose only tell was "skipped" buried
     # in the stages map (review finding). Say it out loud instead.
@@ -6385,6 +6386,7 @@ async def _world_prepare_run(
             "surfaces": (job_dir / SCENE_DIRNAME / "surfaces"
                          / "surface_patches.json"),
             "scenario": world_dir / "scenario.json",
+            "pluck": world_dir / "pluck.json",
         }.get(stage)
 
     def _stamp(stage: str) -> float | None:
@@ -6482,6 +6484,16 @@ async def _world_prepare_run(
                     scenario = ws.validate_scenario(ws.default_scenario(job_id))
                     (world_dir / "scenario.json").write_text(
                         json.dumps(scenario, indent=2))
+                elif stage == "pluck":
+                    import world_pluck_route
+                    try:
+                        await world_pluck_route.build_world_pluck(job_id, request)
+                    except HTTPException as exc:
+                        # A world without pluck data is today's world — warn,
+                        # never fail the ladder for it.
+                        outcome[stage] = "partial"
+                        warnings.append(f"pluck data not built: {exc.detail}")
+                        continue
                 outcome[stage] = "done"
             except HTTPException as exc:
                 # "Partial" means THIS run left a usable artifact behind, not
