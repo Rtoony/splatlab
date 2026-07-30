@@ -279,3 +279,58 @@ def test_delete_captured_409_and_unknown_404(client) -> None:
         f"/api/splat/jobs/{JOB}/world/elements/ghost").status_code == 404
     assert http.delete(
         f"/api/splat/jobs/{JOB}/world/elements/shell").status_code == 404
+
+
+# ── environment role (Lane 6, layer 1) ──────────────────────────────────────────
+
+
+def test_place_environment_lands_and_422s_on_node_transforms(client) -> None:
+    http, outputs = client
+    world = _mk_world(_mk_job(outputs))
+
+    response = _place(http, "terrain-skirt", _authored_glb(), role="environment")
+    assert response.status_code == 200
+    manifest = json.loads((world / "world_manifest.json").read_text())
+    rec = next(e for e in manifest["elements"] if e["slug"] == "terrain-skirt")
+    assert rec["role"] == "environment"
+    assert rec["provenance"] == "authored"
+    assert rec["collision"] == {"ok": True, "strategy": "complex_as_simple",
+                                "hulls": 0}
+    assert rec["classification"] == [
+        "authored environment geometry (placed.json)"]
+
+    # Environment is held to the prop standard: the recorded AABB must match
+    # the walked-on collider, so node transforms are a 422, not a warning.
+    moved = _authored_glb(nodes=[{"mesh": 0, "translation": [1.0, 0.0, 0.0]}])
+    response = _place(http, "moved-skirt", moved, role="environment")
+    assert response.status_code == 422
+    assert "bake_world_transform" in response.json()["detail"]
+    assert not (world / "elements" / "moved-skirt.glb").exists()
+
+
+def test_environment_origin_warning_relaxed(client) -> None:
+    http, outputs = client
+    _mk_world(_mk_job(outputs))
+    # Shell half-diagonal ~5.85: centre (10, 0.25, 10) is ~14.1 away — beyond
+    # the 1.5x static band, inside the 4x environment band.
+    mid = _authored_glb(aabb_min=(9.75, 0.0, 9.75), aabb_max=(10.25, 0.5, 10.25))
+    warns = _place(http, "mid-static", mid, role="static").json()["warnings"]
+    assert any("half-diagonal" in w for w in warns)
+    warns = _place(http, "mid-skirt", mid, role="environment").json()["warnings"]
+    assert not any("half-diagonal" in w for w in warns)
+    # Past 4x it warns for environment too.
+    far = _authored_glb(aabb_min=(99.0, 0.0, 99.0), aabb_max=(99.5, 0.5, 99.5))
+    warns = _place(http, "far-skirt", far, role="environment").json()["warnings"]
+    assert any("half-diagonal" in w for w in warns)
+
+
+def test_affordances_skip_environment_with_honest_reason(client) -> None:
+    http, outputs = client
+    world = _mk_world(_mk_job(outputs))
+    assert _place(http, "terrace", _authored_glb(),
+                  role="environment").status_code == 200
+    manifest = json.loads((world / "world_manifest.json").read_text())
+    result = world_affordances.propose_affordances(manifest, set())
+    skip = next(s for s in result["skipped"] if s["slug"] == "terrace")
+    assert "walked on" in skip["reason"]
+    assert all(p["record"]["slug"] != "terrace" for p in result["proposals"])

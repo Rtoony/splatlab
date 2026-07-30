@@ -72,6 +72,11 @@ def propose_affordances(
         slug = element.get("slug")
         if not slug:
             continue
+        if element.get("role") == "environment":
+            skipped.append({"slug": slug, "reason":
+                            "environment geometry is walked on, not "
+                            "interacted with"})
+            continue
         if element.get("role") not in ("prop", "static"):
             skipped.append({"slug": slug, "reason": "element is not built"})
             continue

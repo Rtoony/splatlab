@@ -34,7 +34,7 @@ import artifact_manifest as manifests
 
 PLACED_SCHEMA = "dev.splatlab.world-placed/v1"
 PLACED_FILENAME = "placed.json"
-ROLES = ("static", "prop")
+ROLES = ("static", "prop", "environment")
 MAX_PLACED = 64
 MAX_LABEL = 80
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
@@ -173,15 +173,24 @@ def manifest_element(entry: dict[str, Any]) -> dict[str, Any]:
     the walker builds a convex hull from the prop's own render mesh, so
     "render_mesh_fallback" describes what physics actually does. The next
     collision run upgrades it to real CoACD hulls.
+
+    "environment" is authored walked-on architecture (terrain skirts, walls,
+    platforms): the walker merges its render triangles straight into the
+    player BVH, so complex_as_simple with zero hulls is the truthful record —
+    no hull is ever built for it.
     """
-    collision = ({"ok": True, "strategy": "complex_as_simple", "hulls": 0}
-                 if entry["role"] == "static"
-                 else {"ok": True, "strategy": "render_mesh_fallback",
-                       "hulls": 0})
+    if entry["role"] == "prop":
+        collision = {"ok": True, "strategy": "render_mesh_fallback",
+                     "hulls": 0}
+    else:  # static and environment both collide as their own render mesh
+        collision = {"ok": True, "strategy": "complex_as_simple", "hulls": 0}
+    classification = (["authored environment geometry (placed.json)"]
+                      if entry["role"] == "environment"
+                      else ["authored set-dressing (placed.json)"])
     return {"slug": entry["slug"], "label": entry["label"],
             "role": entry["role"], "provenance": "authored",
             "glb": entry["glb"], "extent": entry["extent"],
-            "classification": ["authored set-dressing (placed.json)"],
+            "classification": classification,
             "collision": collision}
 
 

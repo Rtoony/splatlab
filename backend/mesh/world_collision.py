@@ -310,7 +310,7 @@ def main() -> int:
             _log(f"  {slug}: authored prop -> "
                  f"{rec['collision'].get('hulls', 0)} hulls")
         else:
-            _log(f"  {slug}: authored static -> complex-as-simple")
+            _log(f"  {slug}: authored {rec['role']} -> complex-as-simple")
         out.append(rec)
 
     shell_rec = None
@@ -337,6 +337,7 @@ def main() -> int:
         "counts": {
             "props": sum(1 for e in out if e.get("role") == "prop"),
             "static": sum(1 for e in out if e.get("role") == "static"),
+            "environment": sum(1 for e in out if e.get("role") == "environment"),
             "unbuilt": sum(1 for e in out if e.get("role") == "unbuilt"),
             "authored": sum(1 for e in out if e.get("provenance") == "authored"),
             "hulls_total": sum((e.get("collision") or {}).get("hulls", 0) or 0 for e in out),

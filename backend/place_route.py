@@ -132,12 +132,15 @@ async def place_world_element(
 
         warnings: list[str] = []
         if not bounds["identity_transforms"]:
-            if role == "prop":
+            if role in ("prop", "environment"):
                 raise HTTPException(
                     status_code=422,
-                    detail="prop physics requires world-frame-baked vertices "
-                           "under identity node transforms — re-export from "
-                           "the Blender loop with bake_world_transform "
+                    detail=f"{role} placement requires world-frame-baked "
+                           "vertices under identity node transforms (props: "
+                           "Rapier reads raw POSITION; environment: the "
+                           "recorded AABB must match the walked-on collider) "
+                           "— re-export from the Blender loop with "
+                           "bake_world_transform "
                            f"(transformed nodes: {bounds['transformed_nodes']})")
             warnings.append(
                 "GLB carries node transforms; statics tolerate them (the "
@@ -153,11 +156,15 @@ async def place_world_element(
                       zip(bounds["aabb"]["min"], bounds["aabb"]["max"])]
             half_diag = sum((float(e) / 2) ** 2 for e in shell_extent) ** 0.5
             distance = sum(c * c for c in centre) ** 0.5
-            if half_diag > 0 and distance > half_diag * 1.5:
+            # Environment pieces (terrain skirts, boundary walls) legitimately
+            # sit at or past the shell edge — a wider band before crying wolf.
+            band = 4.0 if role == "environment" else 1.5
+            if half_diag > 0 and distance > half_diag * band:
                 warnings.append(
                     f"asset centre is {distance:.1f} units from the origin — "
-                    f"beyond ~1.5x the shell's half-diagonal ({half_diag:.1f}); "
-                    "verify the placement (the shared-frame rule)")
+                    f"beyond ~{band}x the shell's half-diagonal "
+                    f"({half_diag:.1f}); verify the placement "
+                    "(the shared-frame rule)")
 
         lock = splat_route._mesh_export_lock(job_id)
         if lock.locked():
