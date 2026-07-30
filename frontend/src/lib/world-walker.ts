@@ -419,6 +419,8 @@ export class WorldWalker {
   /** The curtain: a Spark SDF edit fading the photograph OUTSIDE a boundary. */
   private curtainEdit: SplatEdit | null = null;
   private curtainSdf: SplatEditSdf | null = null;
+  /** Eye-toggle intent per slug — outranks the computed visibility default. */
+  private visibilityOverrides = new Map<string, boolean>();
   /** Fired when fly mode toggles, so the HUD can say so. */
   onFlyChange: ((flying: boolean) => void) | null = null;
 
@@ -1256,28 +1258,27 @@ export class WorldWalker {
     // An active restyle keeps the mesh world on top of the photograph.
     if (this.restyleShowsMesh) {
       splat.visible = false;
-      this.setElementVisible("shell", true);
+      this.refreshElementVisibility();
       return;
     }
 
-    // Hide the shell while the splat is showing. This is the whole point of the
-    // split: the shell is a 24k-tri blocky solid whose entire job is to be
-    // COLLIDED with, and drawing it on top of the splat replaces a photoreal
-    // park with white slabs that box the player in. Collision is untouched —
-    // rebuildCollider builds from collisionShellGeom, which is loaded but never
-    // added to the scene graph, so hiding the visual shell cannot let anyone
-    // fall through anything.
-    this.setElementVisible("shell", false);
+    // Photograph-first: with the splat showing, the shell AND captured
+    // element meshes hide behind their own photograph (crude tracings drawn
+    // over a photoreal frame box the player in and read as garbage blobs).
+    // Collision is untouched — rebuildCollider builds from collisionShellGeom
+    // plus authored merges, none of which live in the visible scene graph.
+    this.refreshElementVisibility();
   }
 
   clearBackdrop(): void {
-    // Put the shell back: with no splat it is the only environment there is.
-    if (this.backdrop) this.setElementVisible("shell", true);
+    const had = this.backdrop !== null;
     if (this.backdrop) {
       this.scene.remove(this.backdrop);
       this.backdrop.dispose?.();
       this.backdrop = null;
     }
+    // Meshes are the only visual now — everything computed-visible again.
+    if (had) this.refreshElementVisibility();
   }
 
   get hasBackdrop(): boolean {
@@ -1367,6 +1368,8 @@ export class WorldWalker {
     }
     this.pluckedSlugs.add(slug);
     this.refreshPluckModifier(numSplats);
+    // Its photograph ghost is gone — the mesh IS the prop now.
+    this.refreshElementVisibility();
     return true;
   }
 
@@ -1380,6 +1383,7 @@ export class WorldWalker {
       if (row >= 0 && row < numSplats) this.pluckMask[row] = 0;
     }
     this.refreshPluckModifier(numSplats);
+    this.refreshElementVisibility();
   }
 
   /** Structural receipt for tests and live proofs: mapped rows, pluck state,
@@ -1487,8 +1491,46 @@ export class WorldWalker {
   setElementVisible(slug: string, visible: boolean): void {
     const el = this.elements.find((e) => e.slug === slug);
     if (!el) return;
+    // The USER door: an explicit eye-toggle outranks every computed default
+    // until the world reloads.
+    this.visibilityOverrides.set(slug, visible);
     el.visible = visible;
     el.object.visible = visible;
+  }
+
+  /**
+   * Photograph until you touch it, mesh once it is yours.
+   *
+   * While the splat backdrop is the visual, a CAPTURED element's mesh is a
+   * crude tracing drawn over its own photograph — the "blobs of garbage"
+   * problem. So captured meshes default to hidden behind the photograph, and
+   * an element earns its mesh by being: authored (the mesh is all it has),
+   * plucked (its photograph ghost is gone — the mesh IS it now), restyled
+   * (a look needs geometry to live on), or genuinely interactive (a toggle
+   * with effects; inspect-only prompts don't earn a blob). With no backdrop,
+   * or with a restyle showing the mesh world, everything is visible — the
+   * mesh is the only visual there is. Eye-toggles override everything.
+   */
+  private defaultElementVisible(el: LoadedElement): boolean {
+    const photographShowing = this.backdrop !== null && !this.restyleShowsMesh;
+    if (!photographShowing) return true;
+    if (el.role === "shell") return false; // the photograph IS the shell
+    if (el.provenance === "authored") return true;
+    if (this.pluckedSlugs.has(el.slug)) return true;
+    if (this.restyle?.elements?.[el.slug]) return true;
+    const record = this.interactions.get(el.slug);
+    if (record && record.verb !== "inspect") return true;
+    return false;
+  }
+
+  /** Re-apply the visibility rule to every element (overrides win). */
+  refreshElementVisibility(): void {
+    for (const el of this.elements) {
+      const visible = this.visibilityOverrides.get(el.slug)
+        ?? this.defaultElementVisible(el);
+      el.visible = visible;
+      el.object.visible = visible;
+    }
   }
 
   /* ---------------------------------------------------------------- *
@@ -1515,9 +1557,7 @@ export class WorldWalker {
     const restyled = Object.keys(entries);
     this.restyleShowsMesh = relighting || restyled.length > 0 || this.bakedLook;
     if (this.backdrop) this.backdrop.visible = !this.restyleShowsMesh;
-    for (const slug of restyled) this.setElementVisible(slug, true);
-    if (this.restyleShowsMesh) this.setElementVisible("shell", true);
-    else if (this.backdrop) this.setElementVisible("shell", false);
+    this.refreshElementVisibility();
 
     for (const el of this.elements) {
       const entry = entries[el.slug];
@@ -1578,8 +1618,7 @@ export class WorldWalker {
     const restyledCount = Object.keys(this.restyle?.elements ?? {}).length;
     this.restyleShowsMesh = relighting || restyledCount > 0 || this.bakedLook;
     if (this.backdrop) this.backdrop.visible = !this.restyleShowsMesh;
-    if (this.restyleShowsMesh) this.setElementVisible("shell", true);
-    else if (this.backdrop) this.setElementVisible("shell", false);
+    this.refreshElementVisibility();
   }
 
   /** Cached per class id — one tile serves every element using that class. */
@@ -1623,6 +1662,9 @@ export class WorldWalker {
     this.interactionState = new Map(Object.entries(state));
     for (const [slug, value] of this.interactionState) this.applyElementState(slug, value);
     this.lastTargetKey = null;
+    // Interactivity earns a mesh (a toggleable lamp must be seen to be
+    // toggled) — re-derive now that the walker knows the verbs.
+    this.refreshElementVisibility();
     this.pollTarget();
   }
 
@@ -2061,6 +2103,7 @@ export class WorldWalker {
     }
     this.elements = [];
     this.sceneBox = new THREE.Box3();
+    this.visibilityOverrides.clear();
     // The curtain belongs to the WORLD, not the walker: a new world's
     // curtain arrives from its own curtain.json, and the old one leaking
     // across loads would silently hide a fresh photograph.

@@ -481,3 +481,80 @@ describe("curtain (SplatEdit SDF)", () => {
     expect(w.curtainState()!.shape).toBe("sphere");
   });
 });
+
+describe("photograph-first visibility (triage lane)", () => {
+  function visRig(opts: { backdrop?: boolean; restyleShowsMesh?: boolean }) {
+    const mk = (slug: string, role: string, provenance: string | null) => ({
+      slug, role, provenance, visible: true, collides: false,
+      object: new THREE.Group(),
+    });
+    const els = {
+      shell: mk("shell", "shell", null),
+      capturedProp: mk("bicycle", "prop", null),
+      capturedStatic: mk("building", "static", null),
+      authored: mk("torch", "environment", "authored"),
+      lamp: mk("lamp-post", "prop", null),
+    };
+    const walker = Object.create(WorldWalker.prototype) as WorldWalker;
+    Object.assign(walker, {
+      elements: Object.values(els),
+      backdrop: opts.backdrop === false ? null : { visible: true },
+      restyleShowsMesh: opts.restyleShowsMesh ?? false,
+      restyle: null,
+      pluckedSlugs: new Set(),
+      interactions: new Map([["lamp-post", { slug: "lamp-post", verb: "toggle" }]]),
+      visibilityOverrides: new Map(),
+      pluckRows: new Map(), pluckNRows: 0, pluckMask: null,
+      pluckClock: 0, pluckWarned: false,
+    });
+    return { walker, els };
+  }
+
+  it("photograph showing: captured meshes hide; authored/interactive stay", () => {
+    const { walker, els } = visRig({});
+    walker.refreshElementVisibility();
+    expect(els.shell.visible).toBe(false);
+    expect(els.capturedProp.visible).toBe(false);
+    expect(els.capturedStatic.visible).toBe(false);
+    expect(els.authored.visible).toBe(true);      // mesh is all it has
+    expect(els.lamp.visible).toBe(true);          // a toggle earns its mesh
+  });
+
+  it("a PLUCKED prop shows its mesh — the photograph ghost is gone", () => {
+    const { walker, els } = visRig({});
+    (walker as unknown as { pluckedSlugs: Set<string> })
+      .pluckedSlugs.add("bicycle");
+    walker.refreshElementVisibility();
+    expect(els.capturedProp.visible).toBe(true);
+    expect(els.capturedStatic.visible).toBe(false);
+  });
+
+  it("eye-toggles override the computed default in both directions", () => {
+    const { walker, els } = visRig({});
+    walker.setElementVisible("bicycle", true);
+    walker.setElementVisible("torch", false);
+    walker.refreshElementVisibility();
+    expect(els.capturedProp.visible).toBe(true);
+    expect(els.authored.visible).toBe(false);
+  });
+
+  it("no backdrop, or a restyle showing the mesh world: everything visible", () => {
+    const a = visRig({ backdrop: false });
+    a.walker.refreshElementVisibility();
+    expect(Object.values(a.els).every((e) => e.visible)).toBe(true);
+    const b = visRig({ restyleShowsMesh: true });
+    b.walker.refreshElementVisibility();
+    expect(Object.values(b.els).every((e) => e.visible)).toBe(true);
+  });
+
+  it("a restyled element earns its mesh while the photograph shows", () => {
+    const { walker, els } = visRig({});
+    Object.assign(walker, {
+      restyle: { v: 1, job_id: "j", elements: { building: { tint: "#ff0000" } },
+                 lighting: { preset: "as-captured", intensity: 1 } },
+    });
+    walker.refreshElementVisibility();
+    expect(els.capturedStatic.visible).toBe(true);
+    expect(els.capturedProp.visible).toBe(false);
+  });
+});

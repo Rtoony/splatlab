@@ -3349,3 +3349,29 @@ run in the safe legs.
 
 Lane 6 layer 1 is COMPLETE: E1 role -> E2 collider -> E3 curtain -> E4
 library -> E5 integration, five commits, each gated green.
+
+---
+
+## 2026-07-30 — TRIAGE LANE OPENS: photograph until you touch it, mesh once it's yours
+
+Lane 6 merged to main (fast-forward 333ddc2 -> f3a013a, branch pruned). The
+triage lane's first slice ships the redirect's quick win — STOP DRAWING MUSH.
+
+**The rule (walker `defaultElementVisible` + `refreshElementVisibility`):**
+while the splat backdrop is the visual, a CAPTURED element's mesh is a crude
+tracing drawn over its own photograph — so captured meshes now default to
+HIDDEN. An element earns its mesh by being: authored (the mesh is all it
+has), plucked (its photograph ghost is gone — the mesh IS it now), restyled
+(a look needs geometry to live on), or genuinely interactive (toggle verbs;
+inspect-only prompts don't earn a blob). No backdrop, or a restyle showing
+the mesh world: everything visible. Eye-toggles override everything, both
+directions, world-scoped. All the old shell/restyle visibility juggling now
+routes through the one computed rule (applyRestyle, setBackdrop,
+clearBackdrop, setBakedLook, pluck transitions, setInteractions).
+
+**Live receipts (Bicycle — the world that prompted the redirect):** all 5
+captured meshes hidden behind the photograph on load (the crumpled-blob
+scene is now a clean photograph), eye-toggle brings any of them back on
+demand, collider untouched at SOLID 332.4k tris.
+
+Frontend 154 green (+5), tsc clean. Backend untouched (1294).
