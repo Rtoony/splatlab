@@ -601,3 +601,72 @@ def test_uncalibrated_worlds_never_propose_pickups(client):
     proposal = r.json()["proposals"][0]
     assert proposal["record"]["verb"] == "inspect"
     assert "uncalibrated" in proposal["rationale"]
+
+
+# ── curtain (Lane 6, layer 1) ───────────────────────────────────────────────────
+
+
+def test_curtain_default_installs_and_round_trips(client):
+    http, outputs = client
+    _mk_world(outputs, "lamp")
+
+    empty = http.get(f"/api/splat/jobs/{JOB}/world/curtain").json()
+    assert empty["curtain"] is None
+    default = empty["default"]
+    assert default["enabled"] is False and default["shape"] == "sphere"
+
+    put = http.put(f"/api/splat/jobs/{JOB}/world/curtain", json={})
+    assert put.status_code == 200, put.text
+    assert put.json()["curtain"]["enabled"] is False
+
+    authored = dict(default, enabled=True, shape="box",
+                    center=[1.0, 0.5, -2.0], half_extents=[4.0, 3.0, 4.0],
+                    soft_edge=1.5)
+    put = http.put(f"/api/splat/jobs/{JOB}/world/curtain",
+                   json={"curtain": authored})
+    assert put.status_code == 200, put.text
+    got = http.get(f"/api/splat/jobs/{JOB}/world/curtain").json()
+    assert got["curtain"]["shape"] == "box"
+    assert got["curtain"]["center"] == [1.0, 0.5, -2.0]
+    assert got["default"] is None
+
+
+def test_curtain_validation_is_fail_loud(client):
+    http, outputs = client
+    _mk_world(outputs, "lamp")
+    import pytest as _pytest
+
+    import world_curtain as wc
+    base = wc.default_curtain(JOB, None)
+
+    for mutate in (
+        lambda d: d.update(shape="dodecahedron"),
+        lambda d: d.update(radius=0.0),
+        lambda d: d.update(soft_edge=-1.0),
+        lambda d: d.update(surprise_key=True),
+        lambda d: d.update(enabled="yes"),
+        lambda d: d.update(center=[0.0, 0.0]),
+    ):
+        doc = json.loads(json.dumps(base))
+        mutate(doc)
+        r = http.put(f"/api/splat/jobs/{JOB}/world/curtain",
+                     json={"curtain": doc})
+        assert r.status_code == 400, f"{r.status_code} {r.text[:120]}"
+
+    # NaN cannot ride HTTP JSON — pin the validator refusal directly.
+    doc = json.loads(json.dumps(base))
+    doc["center"] = [0.0, float("nan"), 0.0]
+    with _pytest.raises(wc.CurtainError):
+        wc.validate_curtain(doc)
+
+
+def test_curtain_invalid_stored_doc_reports_instead_of_500(client):
+    http, outputs = client
+    world = _mk_world(outputs, "lamp")
+    (world / "curtain.json").write_text('{"schema": "wrong/v0"}')
+    got = http.get(f"/api/splat/jobs/{JOB}/world/curtain")
+    assert got.status_code == 200
+    payload = got.json()
+    assert payload["curtain"] is None
+    assert "invalid" in payload["curtain_error"]
+    assert payload["default"]["shape"] == "sphere"

@@ -9,7 +9,14 @@
 import { describe, expect, it } from "vitest";
 import * as THREE from "three";
 import { MeshBVH } from "three-mesh-bvh";
-import { WorldWalker } from "./world-walker";
+import {
+  SplatEdit,
+  SplatEditRgbaBlendMode,
+  SplatEditSdf,
+  SplatEditSdfType,
+  SplatMesh,
+} from "@sparkjsdev/spark";
+import { WorldWalker, type CurtainParams } from "./world-walker";
 
 /** A slab whose top is at `topY` and underside at `topY - thickness`. */
 function slab(topY: number, thickness: number, size = 20): THREE.BufferGeometry {
@@ -410,5 +417,67 @@ describe("baked look (setBakedLook)", () => {
     walker.setBakedLook(true);
     const internals = walker as unknown as { restyleShowsMesh: boolean };
     expect(internals.restyleShowsMesh).toBe(true);
+  });
+});
+
+describe("curtain (SplatEdit SDF)", () => {
+  function curtainRig() {
+    const walker = Object.create(WorldWalker.prototype) as WorldWalker;
+    Object.assign(walker, {
+      scene: new THREE.Scene(),
+      curtainEdit: null,
+      curtainSdf: null,
+    });
+    return walker;
+  }
+  const params: CurtainParams = {
+    enabled: true, shape: "sphere", center: [1, 2, 3],
+    radius: 5, halfExtents: [5, 5, 5], softEdge: 1.2,
+  };
+
+  it("builds ONE scene-level SplatEdit: inverted zero-opacity SDF, MULTIPLY", () => {
+    const w = curtainRig();
+    w.setCurtain(params);
+    const scene = (w as unknown as { scene: THREE.Scene }).scene;
+    const edits = scene.children.filter((c) => c instanceof SplatEdit);
+    expect(edits.length).toBe(1);
+    const edit = edits[0] as SplatEdit;
+    expect(edit.rgbaBlendMode).toBe(SplatEditRgbaBlendMode.MULTIPLY);
+    expect(edit.softEdge).toBeCloseTo(1.2, 6);
+    const sdf = (w as unknown as { curtainSdf: SplatEditSdf }).curtainSdf;
+    expect(sdf.invert).toBe(true);
+    expect(sdf.opacity).toBe(0);
+    expect(sdf.type).toBe(SplatEditSdfType.SPHERE);
+    expect(sdf.radius).toBe(5);
+    expect(sdf.position.toArray()).toEqual([1, 2, 3]);
+    // No SplatMesh ancestor: the edit is scene-global, in walker frame.
+    let node: THREE.Object3D | null = sdf;
+    let underSplatMesh = false;
+    while (node) {
+      if (node instanceof SplatMesh) underSplatMesh = true;
+      node = node.parent;
+    }
+    expect(underSplatMesh).toBe(false);
+  });
+
+  it("mutates IN PLACE (identity preserved), box shape, disable, round-trip", () => {
+    const w = curtainRig();
+    w.setCurtain(params);
+    const internals = w as unknown as { curtainEdit: SplatEdit; curtainSdf: SplatEditSdf };
+    const edit1 = internals.curtainEdit;
+    const sdf1 = internals.curtainSdf;
+    w.setCurtain({ ...params, shape: "box", halfExtents: [2, 3, 4], softEdge: 0.5 });
+    expect(internals.curtainEdit).toBe(edit1); // the no-rebuild contract
+    expect(internals.curtainSdf).toBe(sdf1);
+    const st = w.curtainState();
+    expect(st).toMatchObject({
+      enabled: true, shape: "box", halfExtents: [2, 3, 4],
+    });
+    expect(st!.softEdge).toBeCloseTo(0.5, 6);
+    w.setCurtain(null);
+    expect(w.curtainState()!.enabled).toBe(false); // visible flipped, kept
+    w.setCurtain(params);
+    expect(w.curtainState()!.enabled).toBe(true);
+    expect(w.curtainState()!.shape).toBe("sphere");
   });
 });

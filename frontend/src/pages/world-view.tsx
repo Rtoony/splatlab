@@ -16,7 +16,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { TargetInfo } from "@/lib/world-interactions";
 import { Link, useRoute } from "wouter";
-import { uploadPolishedWorldElement , bakeWorldRestyle, fetchWorldInteractions, fetchWorldNavmesh, fetchWorldPluck, fetchWorldRestyle, fetchWorldScenario, removePlacedWorldElement, resetWorldRestyle, revertWorldRestyleBake, setWorldElementState, setWorldPlayerPoses, setWorldRestyle, solidifyWorld, uploadPlacedWorldElement} from "@/lib/api";
+import { uploadPolishedWorldElement , bakeWorldRestyle, fetchWorldCurtain, fetchWorldInteractions, fetchWorldNavmesh, fetchWorldPluck, fetchWorldRestyle, fetchWorldScenario, removePlacedWorldElement, resetWorldRestyle, revertWorldRestyleBake, setWorldCurtain, setWorldElementState, setWorldPlayerPoses, setWorldRestyle, solidifyWorld, uploadPlacedWorldElement, type WorldCurtainDoc} from "@/lib/api";
 import { LIGHT_PRESETS, emptyRestyle, type RestyleDoc, type RestyleEntry, type RestyleMaterial } from "@/lib/world-restyle";
 import { WorldGame, type GameHudState, type Scenario } from "@/lib/world-game";
 import type { parseNavmesh } from "@/lib/world-navmesh";
@@ -26,6 +26,7 @@ import {
   WorldWalker,
   apiWorldSource,
   localWorldSource,
+  type CurtainParams,
   type LoadedElement,
   type WalkParams,
   type WalkerStats,
@@ -91,6 +92,17 @@ function toRow(e: LoadedElement): ElementRow {
   };
 }
 
+function curtainDocToParams(doc: WorldCurtainDoc): CurtainParams {
+  return {
+    enabled: doc.enabled,
+    shape: doc.shape,
+    center: doc.center,
+    radius: doc.radius,
+    halfExtents: doc.half_extents,
+    softEdge: doc.soft_edge,
+  };
+}
+
 export default function WorldViewPage() {
   const [, params] = useRoute("/world/:jobId");
   const routeJobId = params?.jobId ?? "";
@@ -118,6 +130,8 @@ export default function WorldViewPage() {
   const [target, setTarget] = useState<TargetInfo | null>(null);
   const [flying, setFlying] = useState(false);
   const [backdrop, setBackdrop] = useState(true);
+  const [curtainDoc, setCurtainDoc] = useState<WorldCurtainDoc | null>(null);
+  const curtainSaveTimer = useRef<number | null>(null);
 
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -157,6 +171,20 @@ export default function WorldViewPage() {
    * Engine lifecycle. StrictMode double-invokes this in dev, so the   *
    * async load is guarded by `cancelled` and the walker is disposed.  *
    * ---------------------------------------------------------------- */
+  const updateCurtain = useCallback((patch: Partial<WorldCurtainDoc>) => {
+    setCurtainDoc((prev) => {
+      if (!prev) return prev;
+      const next = { ...prev, ...patch };
+      walkerRef.current?.setCurtain(curtainDocToParams(next));
+      if (curtainSaveTimer.current) window.clearTimeout(curtainSaveTimer.current);
+      curtainSaveTimer.current = window.setTimeout(() => {
+        void setWorldCurtain(jobId, next).catch(() =>
+          setWarnings((w) => [...w, "Curtain could not be saved."]));
+      }, 600);
+      return next;
+    });
+  }, [jobId]);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -307,6 +335,17 @@ export default function WorldViewPage() {
               setGameReady(true);
             }
           }).catch(() => { /* no scenario/navmesh: the world simply is not playable yet */ });
+
+          // The stored curtain: where the photograph ends. Absent or
+          // invalid docs degrade to the (disabled) default — never fatal.
+          void fetchWorldCurtain(jobId, controller.signal).then((payload) => {
+            if (cancelled) return;
+            const doc = payload.curtain ?? payload.default;
+            if (doc) {
+              setCurtainDoc(doc);
+              walker.setCurtain(curtainDocToParams(doc));
+            }
+          }).catch(() => { /* no world yet, or curtain unavailable */ });
 
           // The stored look. A world with no restyle.json simply reads as
           // "as captured" — never a reason to fail the load.
@@ -774,6 +813,68 @@ export default function WorldViewPage() {
                     </span>
                   </span>
                 </label>
+              </Panel>
+              <Panel icon={<Layers className="h-3.5 w-3.5" />} title="Curtain">
+                <p className="mb-2 text-[10px] leading-snug text-zinc-500">
+                  Where the photograph ends: the splat fades out beyond this
+                  boundary (over the soft edge) so built geometry takes over
+                  past the seam. Non-destructive — nothing on disk changes.
+                </p>
+                {curtainDoc ? (
+                  <>
+                    <label className="mb-2 flex items-center gap-2 text-[11px] text-zinc-300">
+                      <input
+                        type="checkbox"
+                        checked={curtainDoc.enabled}
+                        onChange={(e) => updateCurtain({ enabled: e.target.checked })}
+                      />
+                      Enabled
+                    </label>
+                    <div className="mb-2 flex items-center gap-2">
+                      <select
+                        value={curtainDoc.shape}
+                        onChange={(e) => updateCurtain({ shape: e.target.value as "sphere" | "box" })}
+                        className="rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[11px] text-zinc-200"
+                      >
+                        <option value="sphere">sphere</option>
+                        <option value="box">box</option>
+                      </select>
+                      <button
+                        type="button"
+                        onClick={() => updateCurtain({
+                          center: [stats.position[0], stats.position[1], stats.position[2]],
+                        })}
+                        className="rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[11px] text-zinc-300 hover:text-white"
+                        title="Move the boundary centre to where you stand"
+                      >
+                        Center on me
+                      </button>
+                    </div>
+                    <Slider
+                      label="Size"
+                      unit="u"
+                      min={0.5}
+                      max={60}
+                      step={0.1}
+                      value={curtainDoc.shape === "sphere" ? curtainDoc.radius : curtainDoc.half_extents[0]}
+                      onChange={(v) =>
+                        updateCurtain(curtainDoc.shape === "sphere"
+                          ? { radius: v }
+                          : { half_extents: [v, v, v] })}
+                    />
+                    <Slider
+                      label="Soft edge"
+                      unit="u"
+                      min={0}
+                      max={10}
+                      step={0.1}
+                      value={curtainDoc.soft_edge}
+                      onChange={(v) => updateCurtain({ soft_edge: v })}
+                    />
+                  </>
+                ) : (
+                  <p className="text-[10px] text-zinc-500">No world loaded yet.</p>
+                )}
               </Panel>
               <RebuildPanel jobId={jobId} onRebuilt={() => setReloadNonce((n) => n + 1)} />
             </div>

@@ -3261,3 +3261,30 @@ at eye y=1.86 (platform top 0.28 + clamped capsule 1.575; captured floor would
 be 1.26, the drop height was 2.60 — the first cut of this receipt read a stale
 grounded flag at the drop height and false-passed; settled-stand polling fixed
 it) → DELETE returns the collider to the bare shell, tris -12 exact.
+
+---
+
+## 2026-07-30 — LANE 6 / E3: THE CURTAIN — where the photograph ends
+
+A sparse capture has a good core and a fringe of orbit floaters; the curtain
+is the boundary. `_world/curtain.json` (dev.splatlab.world-curtain/v1 —
+closed vocabulary, bounded finite numbers, fail-loud validator, GET/PUT
+cloned from the scenario pair with the same invalid-stored-doc degradation)
+describes a sphere/box in walker-frame scene units; the walker renders it as
+ONE Spark SplatEdit SDF layer (opacity 0 x MULTIPLY x invert; softEdge = the
+fade band; WHITE so the band fades, never tints). Scene-parented, NOT under
+the backdrop — the backdrop carries -90degX + m/u scale and scene-parenting
+keeps authored params in plain scene units. Runs at the world-space edit
+stage BEFORE worldModifiers, so it composes with pluck without touching that
+slot. Param changes mutate the same objects (no generator rebuild); the
+curtain is removed on world clear so it can never leak across loads.
+CurtainPanel in the walker: enable, shape, size + soft-edge sliders,
+Center-on-me; live apply + debounced PUT.
+
+**Live receipts (`tools/prove-curtain-live.py`, Truck, dead-still fly-cam,
+drift 0.00):** tight sphere around the spawn -> OUTSIDE band faded Δ63.99
+mean-RGB while the INSIDE band moved Δ5.49 — a 12:1 two-sided verdict that
+this is a spatial boundary, not global dimming. Fresh page load reinstalls
+from curtain.json (curtainState round-trip + outside Δ65.22 vs baseline).
+
+Backend 1262 green (+3), frontend 149 green (+2), tsc clean.

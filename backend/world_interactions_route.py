@@ -197,6 +197,51 @@ async def put_world_scenario(job_id: str, body: ScenarioBody) -> dict[str, Any]:
     return {"job_id": job_id, "scenario": scenario}
 
 
+class CurtainBody(BaseModel):
+    """PUT replaces the whole curtain; {} means 'install the default'."""
+    curtain: dict[str, Any] | None = None
+
+
+@router.get("/jobs/{job_id}/world/curtain")
+async def get_world_curtain(job_id: str) -> dict[str, Any]:
+    import world_curtain as wc
+
+    _job_dir, world_dir, world_manifest = _require_world(job_id)
+    path = world_dir / "curtain.json"
+    if not path.is_file():
+        return {"job_id": job_id, "curtain": None, "curtain_error": "",
+                "default": wc.default_curtain(job_id, world_manifest)}
+    try:
+        curtain = wc.validate_curtain(json.loads(path.read_text()))
+    except (OSError, json.JSONDecodeError, wc.CurtainError) as exc:
+        # The scenario posture: report and offer the default rather than
+        # 500ing the page — a tightened validator must not brick old worlds.
+        return {"job_id": job_id, "curtain": None,
+                "curtain_error": f"stored curtain is invalid: {exc}",
+                "default": wc.default_curtain(job_id, world_manifest)}
+    return {"job_id": job_id, "curtain": curtain, "curtain_error": "",
+            "default": None}
+
+
+@router.put("/jobs/{job_id}/world/curtain")
+async def put_world_curtain(job_id: str, body: CurtainBody) -> dict[str, Any]:
+    """Author the curtain through the same fail-loud gate every world
+    document gets; omitting `curtain` installs the (disabled) default.
+    Atomic write: the walker may fetch concurrently."""
+    import world_curtain as wc
+
+    _job_dir, world_dir, world_manifest = _require_world(job_id)
+    raw = (body.curtain if body.curtain is not None
+           else wc.default_curtain(job_id, world_manifest))
+    raw["job_id"] = job_id  # the path is the identity; a body value never is
+    try:
+        curtain = wc.validate_curtain(raw)
+    except wc.CurtainError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    manifests.atomic_write_json(world_dir / "curtain.json", curtain)
+    return {"job_id": job_id, "curtain": curtain}
+
+
 class AffordanceProposeBody(BaseModel):
     apply: bool = False
 

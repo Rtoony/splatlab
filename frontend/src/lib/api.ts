@@ -541,6 +541,51 @@ export function fetchWorldRestyle(
   );
 }
 
+/** The curtain document (`_world/curtain.json`): where the photograph ends.
+ *  snake_case on the wire (the server schema), camelCase in the walker. */
+export interface WorldCurtainDoc {
+  schema?: string;
+  version?: number;
+  job_id?: string;
+  enabled: boolean;
+  shape: "sphere" | "box";
+  center: [number, number, number];
+  radius: number;
+  half_extents: [number, number, number];
+  soft_edge: number;
+}
+
+export interface WorldCurtainPayload {
+  job_id: string;
+  curtain: WorldCurtainDoc | null;
+  curtain_error: string;
+  default: WorldCurtainDoc | null;
+}
+
+export function fetchWorldCurtain(
+  jobId: string,
+  signal?: AbortSignal,
+): Promise<WorldCurtainPayload> {
+  return apiRequest<WorldCurtainPayload>(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/world/curtain`,
+    { signal },
+  );
+}
+
+export function setWorldCurtain(
+  jobId: string,
+  curtain: WorldCurtainDoc,
+): Promise<{ job_id: string; curtain: WorldCurtainDoc }> {
+  return apiRequest(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/world/curtain`,
+    {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ curtain }),
+    },
+  );
+}
+
 /** Per-prop backdrop-splat rows (`_world/pluck.json`). Rows address the RAW
  *  served splat's row order (fmt=langweb / splat.ply — never the decimated
  *  fmt=web), and the payload carries the server's staleness verdict. */

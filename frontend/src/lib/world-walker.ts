@@ -37,7 +37,16 @@ import {
   reoriginObject,
   type PropTransforms,
 } from "./world-physics";
-import { RgbaArray, SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
+import {
+  RgbaArray,
+  SparkRenderer,
+  SplatEdit,
+  SplatEditRgbaBlendMode,
+  SplatEditSdf,
+  SplatEditSdfType,
+  SplatFileType,
+  SplatMesh,
+} from "@sparkjsdev/spark";
 import { buildPluckModifier, packChannelsRgba } from "./spark-heatmap";
 import {
   classTile,
@@ -273,6 +282,17 @@ export interface LoadedElement {
   frameWarning: string | null;
 }
 
+/** Boundary of the photograph — walker-frame scene units (Y-up). Mirrors the
+ *  server's dev.splatlab.world-curtain/v1 document. */
+export interface CurtainParams {
+  enabled: boolean;
+  shape: "sphere" | "box";
+  center: [number, number, number];
+  radius: number;
+  halfExtents: [number, number, number];
+  softEdge: number;
+}
+
 export interface WalkerStats {
   fps: number;
   position: [number, number, number];
@@ -396,6 +416,9 @@ export class WorldWalker {
   private pluckMask: Uint8Array | null = null;
   private pluckClock = 0;
   private pluckWarned = false;
+  /** The curtain: a Spark SDF edit fading the photograph OUTSIDE a boundary. */
+  private curtainEdit: SplatEdit | null = null;
+  private curtainSdf: SplatEditSdf | null = null;
   /** Fired when fly mode toggles, so the HUD can say so. */
   onFlyChange: ((flying: boolean) => void) | null = null;
 
@@ -1388,6 +1411,79 @@ export class WorldWalker {
     }
   }
 
+  /* -------------------------------------------------------------- *
+   * Curtain — where the photograph ends                             *
+   * -------------------------------------------------------------- */
+
+  /**
+   * Fade the splat photograph OUTSIDE a boundary shape so authored
+   * environment geometry takes over past the seam instead of competing with
+   * the capture's floater fringe.
+   *
+   * Non-destructive: a Spark SplatEdit SDF layer (opacity 0 x MULTIPLY x
+   * invert; softEdge = linear fade band in scene units) that runs at the
+   * world-space edit stage — BEFORE worldModifiers, so it composes with the
+   * pluck row mask without touching that slot's contract. Parented under
+   * this.scene, NOT the backdrop: the backdrop carries a -90-degree X
+   * rotation and the metres-per-unit scale, and a scene-parented SDF keeps
+   * the authored params in plain walker-frame scene units. (Scene-level
+   * SplatEdits apply to every SplatMesh; the walker owns exactly one.)
+   * Param changes mutate the existing objects — no generator rebuild.
+   */
+  setCurtain(params: CurtainParams | null): void {
+    if (!params || !params.enabled) {
+      if (this.curtainEdit) this.curtainEdit.visible = false;
+      return;
+    }
+    if (!this.curtainEdit || !this.curtainSdf) {
+      // WHITE + opacity 0 under MULTIPLY: rgb is untouched through the fade
+      // band while alpha runs to zero — a fade, never a tint.
+      const sdf = new SplatEditSdf({
+        invert: true, opacity: 0, color: new THREE.Color(1, 1, 1),
+      });
+      const edit = new SplatEdit({
+        rgbaBlendMode: SplatEditRgbaBlendMode.MULTIPLY,
+        sdfSmooth: 0,
+        softEdge: params.softEdge,
+      });
+      edit.add(sdf);
+      this.scene.add(edit);
+      this.curtainEdit = edit;
+      this.curtainSdf = sdf;
+    }
+    const sdf = this.curtainSdf;
+    sdf.position.set(params.center[0], params.center[1], params.center[2]);
+    if (params.shape === "box") {
+      // BOX reads half-extents from scale; radius becomes corner rounding.
+      sdf.type = SplatEditSdfType.BOX;
+      sdf.scale.set(params.halfExtents[0], params.halfExtents[1], params.halfExtents[2]);
+      sdf.radius = 0;
+    } else {
+      sdf.type = SplatEditSdfType.SPHERE;
+      sdf.scale.set(1, 1, 1);
+      sdf.radius = params.radius;
+    }
+    sdf.updateMatrixWorld(true);
+    this.curtainEdit.softEdge = params.softEdge;
+    this.curtainEdit.visible = true;
+  }
+
+  /** Live receipt, read back from the actual scene objects. */
+  curtainState(): CurtainParams | null {
+    const edit = this.curtainEdit;
+    const sdf = this.curtainSdf;
+    if (!edit || !sdf) return null;
+    const shape = sdf.type === SplatEditSdfType.BOX ? "box" as const : "sphere" as const;
+    return {
+      enabled: edit.visible,
+      shape,
+      center: [sdf.position.x, sdf.position.y, sdf.position.z],
+      radius: sdf.radius,
+      halfExtents: [sdf.scale.x, sdf.scale.y, sdf.scale.z],
+      softEdge: edit.softEdge,
+    };
+  }
+
   setElementVisible(slug: string, visible: boolean): void {
     const el = this.elements.find((e) => e.slug === slug);
     if (!el) return;
@@ -1965,6 +2061,14 @@ export class WorldWalker {
     }
     this.elements = [];
     this.sceneBox = new THREE.Box3();
+    // The curtain belongs to the WORLD, not the walker: a new world's
+    // curtain arrives from its own curtain.json, and the old one leaking
+    // across loads would silently hide a fresh photograph.
+    if (this.curtainEdit) {
+      this.scene.remove(this.curtainEdit);
+      this.curtainEdit = null;
+      this.curtainSdf = null;
+    }
   }
 
   dispose(): void {
