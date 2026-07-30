@@ -4339,7 +4339,12 @@ async def get_splat_preview_file(job_id: str, fmt: Literal["ply", "spz", "web", 
         suffix = "ply"
     if not preview_file.is_file():
         raise HTTPException(status_code=404, detail="Preview file not generated yet")
-    return FileResponse(str(preview_file), media_type="application/octet-stream", filename=f"{job_id}.{suffix}")
+    # no-cache, same reason as /world/file: re-exports rewrite these in place
+    # and heuristic caching serves a stale splat under a fresh manifest. The
+    # ETag/304 path keeps unchanged multi-hundred-MB files from re-downloading.
+    return FileResponse(str(preview_file), media_type="application/octet-stream",
+                        filename=f"{job_id}.{suffix}",
+                        headers={"Cache-Control": "no-cache"})
 
 
 TWIN_FINISH_SCRIPT = MESH_DIR / "twin_finish.py"
@@ -7161,7 +7166,14 @@ async def get_splat_world_file(job_id: str, name: str):
     if path is None:
         raise HTTPException(status_code=404, detail="World artifact not found")
     media = _WORLD_MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream")
-    return FileResponse(str(path), media_type=media, filename=path.name)
+    # no-cache (NOT no-store): world artifacts are rewritten in place by every
+    # rebuild, and without Cache-Control the browser HEURISTICALLY caches them
+    # (ETag alone does not force revalidation) — a walker load after a rebuild
+    # then mixes the fresh API state with a stale manifest and stale GLBs
+    # (observed live: pre-calibration elements over a recalibrated world).
+    # no-cache keeps the ETag/304 path, so unchanged files stay cheap.
+    return FileResponse(str(path), media_type=media, filename=path.name,
+                        headers={"Cache-Control": "no-cache"})
 
 
 @router.get("/jobs/{job_id}/mesh/file")
