@@ -9,7 +9,6 @@
 import { describe, expect, it } from "vitest";
 import * as THREE from "three";
 import { MeshBVH } from "three-mesh-bvh";
-
 import { WorldWalker } from "./world-walker";
 
 /** A slab whose top is at `topY` and underside at `topY - thickness`. */
@@ -199,6 +198,69 @@ describe("seeded respawn vs low headroom (real BVH + collisions)", () => {
     Object.assign(w, { spawnTopY: FLOOR + 6, params: { eyeHeightM: 1.7, radiusM: 0.32, unitsPerMetre: 1.0 } });
     const internals = w as unknown as { capsuleHeight: number; eyeHeight: number };
     expect(internals.capsuleHeight).toBeCloseTo(internals.eyeHeight, 6);
+  });
+});
+
+describe("pluck (per-prop backdrop-splat rows)", () => {
+  // Pluck ships through the mesh's worldModifier lane (mutating the packed
+  // array after load is a visual no-op — the pipeline never re-reads it), so
+  // the rig fakes a SplatMesh: numSplats + the modifier slot + the
+  // updateGenerator call the module rule demands after every (re)assignment.
+  const N = 6;
+  function pluckRig() {
+    const backdrop = {
+      packedSplats: { numSplats: N },
+      worldModifier: undefined as unknown,
+      generatorCalls: 0,
+      updateGenerator() { this.generatorCalls += 1; },
+    };
+    const walker = Object.create(WorldWalker.prototype) as WorldWalker;
+    Object.assign(walker, {
+      backdrop,
+      elements: [],
+      physics: null,
+      pluckRows: new Map(), pluckNRows: 0, pluckedSlugs: new Set(),
+      pluckMask: null, pluckClock: 0, pluckWarned: false,
+    });
+    return { walker, backdrop };
+  }
+
+  it("masks a prop's rows, leaves the rest, and clears on unpluck", () => {
+    const { walker, backdrop } = pluckRig();
+    walker.setPluckDoc({ n_rows: N, elements: { bike: { rows: [1, 4] }, table: { rows: [2] } } });
+    expect(walker.pluckElement("bike")).toBe(true);
+    const mask = (walker as unknown as { pluckMask: Uint8Array }).pluckMask;
+    expect([...mask]).toEqual([0, 255, 0, 0, 255, 0]);
+    expect(backdrop.worldModifier).toBeDefined();
+    expect(backdrop.generatorCalls).toBe(1);
+    expect(walker.pluckState().bike).toMatchObject({ rows: 2, plucked: true, sampleOpacity: 0 });
+    expect(walker.pluckState().table.sampleOpacity).toBe(1); // untouched row
+    walker.unpluckElement("bike");
+    expect([...mask]).toEqual([0, 0, 0, 0, 0, 0]);
+    // Last slug removed -> the modifier slot is handed back entirely.
+    expect(backdrop.worldModifier).toBeUndefined();
+    expect(backdrop.generatorCalls).toBe(2);
+    expect(walker.pluckState().bike.plucked).toBe(false);
+  });
+
+  it("REFUSES when the backdrop row count mismatches the doc (fmt=web trap)", () => {
+    const { walker, backdrop } = pluckRig();
+    walker.setPluckDoc({ n_rows: 999, elements: { bike: { rows: [1] } } });
+    expect(walker.pluckElement("bike")).toBe(false);
+    expect(backdrop.worldModifier).toBeUndefined();
+    expect(backdrop.generatorCalls).toBe(0);
+  });
+
+  it("physics-disturbed props get plucked; undisturbed ones keep their ghosts", () => {
+    const { walker } = pluckRig();
+    walker.setPluckDoc({ n_rows: N, elements: { bike: { rows: [1] }, table: { rows: [2] } } });
+    Object.assign(walker, {
+      physics: { disturbedTransforms: () => ({ bike: { position: [0, 0, 0], quaternion: [0, 0, 0, 1] } }) },
+    });
+    (walker as unknown as { checkPluckDisturbed(): void }).checkPluckDisturbed();
+    const state = walker.pluckState();
+    expect(state.bike.plucked).toBe(true);
+    expect(state.table.plucked).toBe(false);
   });
 });
 

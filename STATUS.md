@@ -3181,3 +3181,47 @@ UNREACHABLE on every current world, and prove-surfaces-live's 4c receipt stays r
 **Artifacts:** proof screenshots /tmp/splat_716a9122-paint-rescue-proof/ (01-wave1,
 02-fight); courtyard receipts _scene/surfaces/ (patch_00.ply + receipt_top/oblique).
 The corrected WALL_ARGS + mpu-source math lives in the phase0 handoff script.
+
+---
+
+## 2026-07-29 pm — PLUCK CONSUMER: a disturbed prop takes its photograph ghost with it
+
+The walker now consumes `_world/pluck.json`. When physics marks a prop disturbed
+(shove, carry, restored save — rapier's own one-way `disturbed` flag), its
+backdrop-splat rows fade to zero through a dyno worldModifier (`RgbaArray` mask
+read per splat index, `buildPluckModifier` in spark-heatmap.ts). world-view fetches
+GET /world/pluck FIRST and upgrades the backdrop to **fmt=langweb** (row-identical;
+the server falls back to the raw ply) only when the doc is fresh — fmt=web is
+decimated and would address the wrong rows; the walker additionally refuses to
+pluck on any row-count mismatch. One-way by design: the frame loop re-plucks a
+still-disturbed prop, so a moved prop's ghost can never return on its own.
+
+**The dead lane, measured so nobody walks it again:** mutating
+`packedSplats.packedArray` after load is a visual no-op — the pipeline never
+re-reads it. Δ0.00 through every dirty-flag combo (packed.needsUpdate,
+source.needsUpdate, mesh.updateVersion, mesh.needsUpdate); the SAME mask through
+the worldModifier lane wiped the whole photograph (Δ103.8). Also: `worldModifier`
+is a setter-only property — reading it back is always undefined.
+
+**Live receipts (`tools/prove-pluck-live.py`, Truck, 161 MB raw backdrop):** doc
+fresh, 7 props mapped (pickup 27,712 rows); physics-disturbed umbrella
+auto-plucked WITHOUT being asked; the yellow-umbrella ghost visibly vanished
+(band Δ2.21 vs 0.00 measured drift, dead-still fly-cam, mesh eye-hidden so the
+ghost stands alone); unpluck restored the bytes (opacity 1.000) and the frame
+loop re-plucked the still-disturbed prop on its own. The pickup auto-plucks at
+load (its body wakes on settle) — aggressive but correct under the contract.
+
+**CAUGHT by the same proof on the courtyard (splat_5c1db781): its isolate claims
+predate the 07-28 calibration.** `object_indices` select a 4,015-splat blob 9 cm
+wide at (-0.62,-0.22,-0.07) — the table at 1/9.577 scale, the OLD normalized
+frame — while the real table sits at (-6.1..-5.0). The index-map chain is
+self-consistent (map verified point-exact, object.ply agrees with the indices),
+so `world_pluck`'s freshness verdict CANNOT see the staleness, and re-running the
+isolate stage reproduces it (the claims themselves are stale). **Decision needed
+(RToony):** re-claim the courtyard props against the calibrated cloud, or teach
+calibration to migrate isolate claims (scale transform + row remap) — and either
+way the pluck freshness verdict should compare isolate claim revisions against
+the checkpoint revision, not just artifact identities.
+
+Frontend 142 green (3 new pluck tests), tsc clean. Suites + game proof re-run
+green via `~/scripts/splatlab-pw-verify.sh` (10/10).

@@ -37,7 +37,8 @@ import {
   reoriginObject,
   type PropTransforms,
 } from "./world-physics";
-import { SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
+import { RgbaArray, SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
+import { buildPluckModifier, packChannelsRgba } from "./spark-heatmap";
 import {
   classTile,
   presetFor,
@@ -382,6 +383,14 @@ export class WorldWalker {
   private spawnFloorY = 0;
   private spawnTopY = 0;
   private backdrop: SplatMesh | null = null;
+  /** Per-prop backdrop-splat rows (`_world/pluck.json`) — see setPluckDoc. */
+  private pluckRows = new Map<string, number[]>();
+  private pluckNRows = 0;
+  private pluckedSlugs = new Set<string>();
+  /** 0/255 per backdrop row — the source array of the modifier's RgbaArray. */
+  private pluckMask: Uint8Array | null = null;
+  private pluckClock = 0;
+  private pluckWarned = false;
   /** Fired when fly mode toggles, so the HUD can say so. */
   onFlyChange: ((flying: boolean) => void) | null = null;
 
@@ -1192,6 +1201,18 @@ export class WorldWalker {
     splat.renderOrder = -1;
     this.scene.add(splat);
     this.backdrop = splat;
+    // Rows can only be masked once the splat data exists — and a reloaded
+    // backdrop is a fresh photograph, so whatever was already plucked (or is
+    // already disturbed) gets re-plucked against a fresh mask.
+    void splat.initialized.then(() => {
+      if (this.backdrop !== splat) return;
+      const already = [...this.pluckedSlugs];
+      this.pluckedSlugs.clear();
+      this.pluckMask = null;
+      this.pluckWarned = false;
+      for (const slug of already) this.pluckElement(slug);
+      this.checkPluckDisturbed();
+    }).catch(() => { /* a failed load is reported by setBackdrop's caller */ });
     // An active restyle keeps the mesh world on top of the photograph.
     if (this.restyleShowsMesh) {
       splat.visible = false;
@@ -1221,6 +1242,133 @@ export class WorldWalker {
 
   get hasBackdrop(): boolean {
     return this.backdrop !== null;
+  }
+
+  /* -------------------------------------------------------------- *
+   * Pluck — per-prop backdrop-splat rows                            *
+   * -------------------------------------------------------------- */
+
+  /**
+   * Install the pluck doc (`_world/pluck.json`): which backdrop-splat rows
+   * belong to each interactive prop, so a prop that moves can take its
+   * photograph ghost with it. The page validates the doc's FRESHNESS via
+   * GET /world/pluck before calling this; the walker still refuses to touch
+   * rows unless the backdrop's row count matches the doc — a decimated
+   * fmt=web backdrop or a stale doc would pluck the wrong gaussians, and
+   * wrong is worse than none.
+   */
+  setPluckDoc(doc: { n_rows?: number; elements?: Record<string, { rows?: number[] }> } | null): void {
+    this.pluckRows.clear();
+    this.pluckNRows = Number(doc?.n_rows ?? 0);
+    this.pluckWarned = false;
+    for (const [slug, entry] of Object.entries(doc?.elements ?? {})) {
+      if (Array.isArray(entry?.rows) && entry.rows.length) {
+        this.pluckRows.set(slug, entry.rows);
+      }
+    }
+  }
+
+  /** Row count of the backdrop splat, or 0 when the guard fails. Mutating
+   *  packedSplats.packedArray after load is a visual no-op (the pipeline
+   *  never re-reads it — measured Δ0.00 through every dirty-flag combo), so
+   *  pluck ships through the mesh's worldModifier lane instead; this guard
+   *  only certifies the rows ADDRESS the right splat. The backdrop must be
+   *  the row-identical fmt=langweb artifact, never the decimated fmt=web. */
+  private pluckNumSplats(): number {
+    const splat = this.backdrop;
+    if (!splat) return 0;
+    const numSplats = splat.packedSplats?.numSplats ?? 0;
+    if (!numSplats) return 0;
+    if (this.pluckNRows && numSplats !== this.pluckNRows) {
+      if (!this.pluckWarned) {
+        this.pluckWarned = true;
+        console.warn(
+          `pluck: backdrop has ${numSplats} splats but the doc maps `
+          + `${this.pluckNRows} — the backdrop must be the row-identical `
+          + `fmt=langweb artifact, not the decimated fmt=web. Not plucking.`);
+      }
+      return 0;
+    }
+    return numSplats;
+  }
+
+  /** Rebuild the backdrop's pluck modifier from the current mask. The
+   *  worldModifier slot on the BACKDROP belongs to pluck (nothing else in the
+   *  walker writes it); an empty mask clears it entirely. */
+  private refreshPluckModifier(numSplats: number): void {
+    const splat = this.backdrop;
+    if (!splat) return;
+    if (!this.pluckedSlugs.size || !this.pluckMask) {
+      splat.worldModifier = undefined;
+      splat.updateGenerator();
+      return;
+    }
+    const maskArray = new RgbaArray({
+      array: packChannelsRgba([this.pluckMask], numSplats),
+      count: numSplats,
+    });
+    splat.worldModifier = buildPluckModifier({ maskArray });
+    splat.updateGenerator();
+  }
+
+  /** Remove a prop's splats from the photograph (idempotent, non-destructive
+   *  — a 0/255 mask byte per row drives a zero-opacity modifier). Returns
+   *  whether the rows are now plucked. */
+  pluckElement(slug: string): boolean {
+    if (this.pluckedSlugs.has(slug)) return true;
+    const rows = this.pluckRows.get(slug);
+    const numSplats = this.pluckNumSplats();
+    if (!rows || !numSplats) return false;
+    if (!this.pluckMask || this.pluckMask.length !== numSplats) {
+      this.pluckMask = new Uint8Array(numSplats);
+    }
+    for (const row of rows) {
+      if (row >= 0 && row < numSplats) this.pluckMask[row] = 255;
+    }
+    this.pluckedSlugs.add(slug);
+    this.refreshPluckModifier(numSplats);
+    return true;
+  }
+
+  /** Put a plucked prop's splats back — clears its rows from the mask. */
+  unpluckElement(slug: string): void {
+    const had = this.pluckedSlugs.delete(slug);
+    const rows = this.pluckRows.get(slug);
+    const numSplats = this.pluckNumSplats();
+    if (!had || !rows || !numSplats || !this.pluckMask) return;
+    for (const row of rows) {
+      if (row >= 0 && row < numSplats) this.pluckMask[row] = 0;
+    }
+    this.refreshPluckModifier(numSplats);
+  }
+
+  /** Structural receipt for tests and live proofs: mapped rows, pluck state,
+   *  and the effective opacity of each slug's first row per the LIVE mask
+   *  (the very array the modifier's RgbaArray is built from). */
+  pluckState(): Record<string, { rows: number; plucked: boolean; sampleOpacity: number | null }> {
+    const numSplats = this.pluckNumSplats();
+    const out: Record<string, { rows: number; plucked: boolean; sampleOpacity: number | null }> = {};
+    for (const [slug, rows] of this.pluckRows) {
+      let sampleOpacity: number | null = null;
+      const row = rows[0];
+      if (numSplats && row !== undefined && row >= 0 && row < numSplats) {
+        sampleOpacity = this.pluckMask && this.pluckMask[row] === 255 ? 0 : 1;
+      }
+      out[slug] = { rows: rows.length, plucked: this.pluckedSlugs.has(slug), sampleOpacity };
+    }
+    return out;
+  }
+
+  /** Physics-disturbed props lose their photograph ghosts. One-way by design:
+   *  a knocked-over prop's ghost must not flicker back when the body sleeps —
+   *  and `disturbed` itself is one-way, covering restored saved poses too. */
+  private checkPluckDisturbed(): void {
+    if (!this.pluckRows.size || !this.backdrop || !this.physics) return;
+    for (const slug of Object.keys(this.physics.disturbedTransforms())) {
+      if (this.pluckRows.has(slug) && !this.pluckedSlugs.has(slug)) {
+        this.pluckElement(slug);
+      }
+    }
   }
 
   setElementVisible(slug: string, visible: boolean): void {
@@ -1628,6 +1776,14 @@ export class WorldWalker {
     // Props simulate in fly mode too — a shoved box keeps tumbling while you
     // inspect it from the air.
     this.physics?.step(dt, this.camera.position, this.eyeHeight, this.camera);
+
+    // A disturbed prop takes its photograph ghost with it. 4 Hz is plenty —
+    // the ghost matters on the timescale of a shove, not a frame.
+    this.pluckClock += raw;
+    if (this.pluckClock >= 0.25) {
+      this.pluckClock = 0;
+      this.checkPluckDisturbed();
+    }
 
     this.onFrame?.(dt);
 

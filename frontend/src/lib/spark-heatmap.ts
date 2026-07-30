@@ -53,6 +53,23 @@ export function buildHeatmapModifier({
   });
 }
 
+// Pluck: a 0/255 mask byte per splat (R channel of an RgbaArray); masked
+// splats render at zero opacity. Non-destructive — the photograph's packed
+// data is untouched, the generator just refuses to draw those rows. (Mutating
+// packedSplats.packedArray after load is a visual no-op: the pipeline never
+// re-reads it — measured Δ0.00 through every dirty-flag combo. This modifier
+// lane is how live per-splat changes actually ship; see the module rule
+// above about mesh.updateGenerator()/updateVersion().)
+export function buildPluckModifier({ maskArray }: { maskArray: RgbaArray }) {
+  return dyno.dynoBlock({ gsplat: dyno.Gsplat }, { gsplat: dyno.Gsplat }, ({ gsplat }) => {
+    if (!gsplat) throw new Error("pluck modifier: no gsplat input");
+    const { opacity, index } = dyno.splitGsplat(gsplat).outputs;
+    const mask = dyno.split(readRgbaArray(maskArray.dyno, index)).outputs.x;
+    const outOpacity = dyno.mix(opacity, dyno.dynoFloat(0.0), mask);
+    return { gsplat: dyno.combineGsplat({ gsplat, opacity: outOpacity }) };
+  });
+}
+
 // One relevancy byte per splat -> the RGBA layout readRgbaArray expects.
 export function packRelevancyRgba(bytes: Uint8Array): Uint8Array {
   const rgba = new Uint8Array(bytes.length * 4);

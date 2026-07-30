@@ -16,7 +16,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { TargetInfo } from "@/lib/world-interactions";
 import { Link, useRoute } from "wouter";
-import { uploadPolishedWorldElement , bakeWorldRestyle, fetchWorldInteractions, fetchWorldNavmesh, fetchWorldRestyle, fetchWorldScenario, removePlacedWorldElement, resetWorldRestyle, revertWorldRestyleBake, setWorldElementState, setWorldPlayerPoses, setWorldRestyle, solidifyWorld, uploadPlacedWorldElement} from "@/lib/api";
+import { uploadPolishedWorldElement , bakeWorldRestyle, fetchWorldInteractions, fetchWorldNavmesh, fetchWorldPluck, fetchWorldRestyle, fetchWorldScenario, removePlacedWorldElement, resetWorldRestyle, revertWorldRestyleBake, setWorldElementState, setWorldPlayerPoses, setWorldRestyle, solidifyWorld, uploadPlacedWorldElement} from "@/lib/api";
 import { LIGHT_PRESETS, emptyRestyle, type RestyleDoc, type RestyleEntry, type RestyleMaterial } from "@/lib/world-restyle";
 import { WorldGame, type GameHudState, type Scenario } from "@/lib/world-game";
 import type { parseNavmesh } from "@/lib/world-navmesh";
@@ -329,11 +329,26 @@ export default function WorldViewPage() {
         // ~40% of a frame — trees, hedge and sky come from the splat or from
         // nowhere.
         if (source.kind === "api") {
-          void walker
-            .setBackdrop(
-              `/api/splat/jobs/${encodeURIComponent(jobId)}/preview/file?fmt=web`,
-              m.meters_per_unit ?? null,
-            )
+          // Pluck rows address the RAW splat's row order and fmt=web is
+          // decimated — so the backdrop upgrades to fmt=langweb (row-identical;
+          // the server falls back to the raw ply) only when a FRESH pluck doc
+          // exists. A stale doc never chooses rows: wrong rows would pluck the
+          // wrong gaussians, and wrong is worse than none.
+          void fetchWorldPluck(jobId)
+            .catch(() => null)
+            .then((pluckRes) => {
+              if (cancelled) return undefined;
+              const fresh = pluckRes && pluckRes.ok && !pluckRes.stale ? pluckRes.pluck : null;
+              if (fresh) walker.setPluckDoc(fresh);
+              if (pluckRes?.stale) {
+                setWarnings((w) => [...w,
+                  "Pluck data is stale — moved props keep their splat ghosts (rebuild via POST /world/pluck)."]);
+              }
+              return walker.setBackdrop(
+                `/api/splat/jobs/${encodeURIComponent(jobId)}/preview/file?fmt=${fresh ? "langweb" : "web"}`,
+                m.meters_per_unit ?? null,
+              );
+            })
             .catch(() => {
               if (!cancelled) setWarnings((w) => [...w, "Splat backdrop failed to load."]);
             });

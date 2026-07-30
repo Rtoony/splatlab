@@ -541,6 +541,29 @@ export function fetchWorldRestyle(
   );
 }
 
+/** Per-prop backdrop-splat rows (`_world/pluck.json`). Rows address the RAW
+ *  served splat's row order (fmt=langweb / splat.ply — never the decimated
+ *  fmt=web), and the payload carries the server's staleness verdict. */
+export interface WorldPluckPayload {
+  ok: boolean;
+  stale: boolean;
+  reasons: string[];
+  pluck: {
+    n_rows: number;
+    elements: Record<string, { rows: number[] }>;
+  } | null;
+}
+
+export function fetchWorldPluck(
+  jobId: string,
+  signal?: AbortSignal,
+): Promise<WorldPluckPayload> {
+  return apiRequest<WorldPluckPayload>(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/world/pluck`,
+    { signal },
+  );
+}
+
 export function setWorldRestyle(
   jobId: string,
   doc: { elements: Record<string, RestyleEntry>; lighting: RestyleDoc["lighting"] },
