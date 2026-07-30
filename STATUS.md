@@ -3225,3 +3225,39 @@ the checkpoint revision, not just artifact identities.
 
 Frontend 142 green (3 new pluck tests), tsc clean. Suites + game proof re-run
 green via `~/scripts/splatlab-pw-verify.sh` (10/10).
+
+---
+
+## 2026-07-30 — LANE 6 / E1+E2: THE ENVIRONMENT ROLE — authored geometry is real floor
+
+RToony's redirect made concrete: worlds are built deliberately. New role
+`environment` = authored, world-frame-baked, walked-on architecture (terrain
+skirts, walls, platforms) through the existing create door.
+
+**Backend (E1, ac21b18):** ROLES gains "environment"; the door 422s it on node
+transforms like props (the recorded AABB must match the walked-on collider);
+origin-distance warning relaxes to 4x the shell half-diagonal for environment
+only; collision manifest records complex_as_simple with an honest
+classification + counts.environment (also recomputed AT THE DOOR — an
+environment piece is countable the moment it lands); affordances skip it with
+"walked on, not interacted with". Captured elements can never become
+environment. Backend 1259 green (+3).
+
+**Walker (E2):** `buildStaticColliderGeometry()` — ONE builder shared by the
+player BVH and Rapier so they can never disagree. Fast path = collision shell
+PLUS authored static/environment placements (captured statics stay represented
+by the shell and never double in); colliderSource gains
+"collision_shell+authored" so the HUD says what the BVH contains. This also
+ends the era of authored statics reporting collides=true while contributing
+zero triangles (the pre-existing fast-path lie). enablePhysics uses the same
+builder with props excluded — a prop cannot be baked-static AND dynamic.
+Frontend 147 green (+5: merge rules, captured-static pin, surfaceNear finds an
+authored platform as real floor, real-Rapier prop settles ON the platform).
+
+**Live proof (`tools/prove-environment-live.py`, Truck):** baked 2x0.3x2
+platform through the door as environment → walker loads it collides=true,
+colliderSource=collision_shell+authored → the player DROPS ONTO IT and stands
+at eye y=1.86 (platform top 0.28 + clamped capsule 1.575; captured floor would
+be 1.26, the drop height was 2.60 — the first cut of this receipt read a stale
+grounded flag at the drop height and false-passed; settled-stand polling fixed
+it) → DELETE returns the collider to the bare shell, tris -12 exact.

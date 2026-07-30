@@ -64,7 +64,7 @@ import {
  * module must not depend on (or race) that file.                      *
  * ------------------------------------------------------------------ */
 
-export type WorldRole = "prop" | "static";
+export type WorldRole = "prop" | "static" | "environment";
 
 export interface WorldCollisionBlock {
   ok?: boolean;
@@ -265,6 +265,10 @@ export interface LoadedElement {
   collides: boolean;
   visible: boolean;
   object: THREE.Object3D;
+  /** "authored" for placed assets — the collider merges authored static/
+   *  environment geometry into the BVH; captured statics are already
+   *  represented by the collision shell and must not double in. */
+  provenance: string | null;
   /** Populated when this GLB disagreed with the shared-frame assumption. */
   frameWarning: string | null;
 }
@@ -292,8 +296,9 @@ export interface WorldLoadResult {
   frameWarnings: string[];
   colliderTris: number;
   /** Which geometry the BVH was built from — surfaced so a fallback to the
-   *  fragmented visual shell is visible rather than silent. */
-  colliderSource: "collision_shell" | "visual_shell";
+   *  fragmented visual shell is visible rather than silent, and so merged
+   *  authored geometry (environment/static placements) is visible too. */
+  colliderSource: "collision_shell" | "collision_shell+authored" | "visual_shell";
   suggestedUnitsPerMetre: number;
 }
 
@@ -410,7 +415,7 @@ export class WorldWalker {
 
   /** Geometry of the dedicated collision solid, when the manifest ships one. */
   private collisionShellGeom: THREE.BufferGeometry | null = null;
-  private colliderSource: "collision_shell" | "visual_shell" = "visual_shell";
+  private colliderSource: "collision_shell" | "collision_shell+authored" | "visual_shell" = "visual_shell";
   private collider: THREE.Mesh | null = null;
   private colliderWire: THREE.LineSegments | null = null;
   private bvh: MeshBVH | null = null;
@@ -559,6 +564,7 @@ export class WorldWalker {
         collides: false, // filled in by rebuildCollider()
         visible: true,
         object,
+        provenance: entry.provenance ?? null,
         frameWarning: null,
       });
     }
@@ -707,36 +713,17 @@ export class WorldWalker {
     const physics = new WorldPhysics(rapier, this.params.unitsPerMetre);
     try {
 
-    // Props rest on the same solid the capsule walks on. Without a dedicated
-    // collision shell, fall back to the merged shell+static visual geometry —
-    // the same degradation rebuildCollider() applies to the player.
-    let shellGeom = this.collisionShellGeom;
-    let owned = false;
-    if (!shellGeom) {
-      const geoms: THREE.BufferGeometry[] = [];
-      for (const el of this.elements) {
-        if (el.role !== "shell" && el.role !== "static") continue;
-        el.object.updateWorldMatrix(true, true);
-        el.object.traverse((o) => {
-          const mesh = o as THREE.Mesh;
-          if (!mesh.isMesh) return;
-          const g = positionOnly(mesh.geometry as THREE.BufferGeometry);
-          g.applyMatrix4(mesh.matrixWorld);
-          geoms.push(g);
-        });
-      }
-      if (geoms.length) {
-        shellGeom = geoms.length === 1 ? geoms[0] : mergeGeometries(geoms, false);
-        if (geoms.length > 1) for (const g of geoms) g.dispose();
-        owned = true;
-      }
-    }
-    if (!shellGeom) {
+    // Props rest on the same solid the capsule walks on — built by the same
+    // builder the BVH uses (authored environment platforms included), so the
+    // player's floor and the props' floor can never disagree. Never with
+    // props merged in: a prop cannot be baked-static AND dynamic.
+    const built = this.buildStaticColliderGeometry(false);
+    if (!built) {
       physics.dispose();
       throw new Error("no static geometry for props to rest on");
     }
-    physics.addStaticShell(shellGeom);
-    if (owned) shellGeom.dispose();
+    physics.addStaticShell(built.geom);
+    built.geom.dispose();
 
     let registered = 0;
     for (const el of props) {
@@ -872,20 +859,49 @@ export class WorldWalker {
   rebuildCollider(): void {
     this.disposeCollider();
     if (!this.elements.length) return;
-
-    // Prefer the purpose-built solid. Props still opt in separately, so
-    // collideProps continues to work on top of it.
-    if (this.collisionShellGeom && !this.params.collideProps) {
-      for (const el of this.elements) el.collides = el.role === "shell" || el.role === "static";
-      this.installCollider(this.collisionShellGeom.clone(), "collision_shell");
-      return;
-    }
-
-    const geoms: THREE.BufferGeometry[] = [];
+    const useShell = !!this.collisionShellGeom && !this.params.collideProps;
     for (const el of this.elements) {
-      const collides = el.role === "shell" || el.role === "static" || this.params.collideProps;
-      el.collides = collides;
-      if (!collides) continue;
+      // In the fast path a captured static is represented by the collision
+      // solid itself, an authored static/environment by its merged triangles
+      // — either way collides=true is the truth. Props opt in only on the
+      // fallback path (physics forces collideProps off when it engages).
+      el.collides = el.role === "shell" || el.role === "static"
+        || el.role === "environment" || (!useShell && this.params.collideProps);
+    }
+    const built = this.buildStaticColliderGeometry(this.params.collideProps);
+    if (!built) return;
+    this.installCollider(built.geom, built.source);
+  }
+
+  /**
+   * The static solid the capsule AND resting props collide with, built once
+   * and shared by the BVH and Rapier so the two can never disagree.
+   *
+   * Fast path (a purpose-built collision shell exists): the shell solid PLUS
+   * authored static/environment placements. Captured statics are already
+   * inside the collision solid and must not double in — but a placed
+   * platform or terrain skirt exists nowhere else, so its render triangles
+   * ARE its collider (the environment role's whole point; this also ends the
+   * era of authored statics reporting collides=true while contributing zero
+   * triangles). Fallback path (no collision shell, or collideProps): the
+   * merged visual geometry, the pre-existing degradation.
+   */
+  private buildStaticColliderGeometry(includeProps: boolean): {
+    geom: THREE.BufferGeometry;
+    source: "collision_shell" | "collision_shell+authored" | "visual_shell";
+  } | null {
+    const useShell = !!this.collisionShellGeom && !includeProps;
+    const geoms: THREE.BufferGeometry[] = [];
+    if (useShell) geoms.push(this.collisionShellGeom!.clone());
+    let authored = 0;
+    for (const el of this.elements) {
+      const merge = useShell
+        ? el.provenance === "authored"
+          && (el.role === "static" || el.role === "environment")
+        : el.role === "shell" || el.role === "static"
+          || el.role === "environment" || includeProps;
+      if (!merge) continue;
+      if (useShell) authored += 1;
       el.object.updateWorldMatrix(true, true);
       el.object.traverse((o) => {
         const mesh = o as THREE.Mesh;
@@ -895,8 +911,7 @@ export class WorldWalker {
         geoms.push(g);
       });
     }
-    if (!geoms.length) return;
-
+    if (!geoms.length) return null;
     const merged = geoms.length === 1 ? geoms[0] : mergeGeometries(geoms, false);
     if (geoms.length > 1) for (const g of geoms) g.dispose();
     if (!merged) {
@@ -905,13 +920,15 @@ export class WorldWalker {
       // silently shipping a world with no floor.
       throw new Error("Collider merge failed — geometries had incompatible attributes.");
     }
-
-    this.installCollider(merged, "visual_shell");
+    const source = useShell
+      ? (authored ? "collision_shell+authored" as const : "collision_shell" as const)
+      : "visual_shell" as const;
+    return { geom: merged, source };
   }
 
   private installCollider(
     merged: THREE.BufferGeometry,
-    source: "collision_shell" | "visual_shell",
+    source: "collision_shell" | "collision_shell+authored" | "visual_shell",
   ): void {
     this.colliderSource = source;
     merged.computeBoundingBox();

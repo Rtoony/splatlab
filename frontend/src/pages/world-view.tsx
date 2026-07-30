@@ -71,7 +71,7 @@ interface SceneInfo {
   shellHeightUnits: number;
   sceneSize: [number, number, number];
   colliderTris: number;
-  colliderSource: "collision_shell" | "visual_shell";
+  colliderSource: "collision_shell" | "collision_shell+authored" | "visual_shell";
   metersPerUnit: number | null;
 }
 
@@ -1327,7 +1327,7 @@ function ElementsPanel({
   hidden: Set<string>;
   upm: number;
   colliderTris: number;
-  colliderSource: "collision_shell" | "visual_shell";
+  colliderSource: "collision_shell" | "collision_shell+authored" | "visual_shell";
   jobId: string;
   onToggle: (slug: string) => void;
   onGo: (slug: string) => void;
@@ -1341,16 +1341,17 @@ function ElementsPanel({
         collider: {compact(colliderTris)} tris{" "}
         <span
           title={
-            colliderSource === "collision_shell"
+            colliderSource.startsWith("collision_shell")
               ? "Walking on the watertight voxel solid (collision_shell.glb)."
               : "No collision solid in the manifest — falling back to the visual shell, which is fragmented and can be fallen through. Run world_shell.py."
           }
           style={{
-            color: colliderSource === "collision_shell" ? "#4ade80" : "#fbbf24",
+            color: colliderSource.startsWith("collision_shell") ? "#4ade80" : "#fbbf24",
             fontWeight: 600,
           }}
         >
-          [{colliderSource === "collision_shell" ? "SOLID" : "VISUAL — may fall through"}]
+          [{colliderSource === "collision_shell+authored" ? "SOLID+AUTHORED"
+            : colliderSource === "collision_shell" ? "SOLID" : "VISUAL — may fall through"}]
         </span>{" "}
         ·{" "}
         {rows.filter((r) => r.collides).length}/{rows.length} solid
@@ -1403,7 +1404,7 @@ function ElementsPanel({
                 </div>
               </div>
               <div className="mt-1 flex flex-wrap items-center gap-1">
-                <Tag tone={r.role === "shell" ? "accent" : r.role === "static" ? "emerald" : "zinc"}>
+                <Tag tone={r.role === "shell" ? "accent" : r.role === "static" ? "emerald" : r.role === "environment" ? "cyan" : "zinc"}>
                   {r.role}
                 </Tag>
                 <Tag tone={r.collides ? "emerald" : "zinc"}>{r.collides ? "solid" : "pass-through"}</Tag>
@@ -1674,7 +1675,7 @@ function PlacedPanel({
   const placed = (manifest.elements ?? []).filter(
     (e) => e.provenance === "authored");
   const [slug, setSlug] = useState("");
-  const [role, setRole] = useState<"static" | "prop">("static");
+  const [role, setRole] = useState<"static" | "prop" | "environment">("static");
   // Armed like every other destructive control: first click arms, second
   // fires, 4 s to change your mind.
   const [armedRemove, setArmedRemove] = useState<string | null>(null);
@@ -1754,11 +1755,12 @@ function PlacedPanel({
         />
         <select
           value={role}
-          onChange={(e) => setRole(e.target.value as "static" | "prop")}
+          onChange={(e) => setRole(e.target.value as "static" | "prop" | "environment")}
           className="rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[11px] text-zinc-200"
         >
           <option value="static">static</option>
           <option value="prop">prop</option>
+          <option value="environment">environment</option>
         </select>
       </div>
       {slug && !slugOk && (
@@ -1774,7 +1776,7 @@ function PlacedPanel({
       )}
       <PolishUploadZone
         title="Drop a world-frame GLB to place"
-        hint={"Author in Blender: import_asset → transform_object → export with bake_world_transform=true. The slug must be NEW — placement invents, polish replaces."}
+        hint={"Author in Blender: import_asset → transform_object → export with bake_world_transform=true. The slug must be NEW — placement invents, polish replaces. environment = player-walkable architecture (requires baked identity transforms, like props)."}
         confirmLabel={slugOk ? `Place as '${slug}' (${role})` : "Enter a slug first"}
         disabled={!slugOk}
         onUpload={(file, onProgress) => onPlace(slug, role, slug, file, onProgress)}
@@ -1869,13 +1871,15 @@ function Toggle({
   );
 }
 
-function Tag({ children, tone }: { children: ReactNode; tone: "accent" | "emerald" | "zinc" }) {
+function Tag({ children, tone }: { children: ReactNode; tone: "accent" | "emerald" | "cyan" | "zinc" }) {
   const cls =
     tone === "accent"
       ? "border-accent/40 text-accent"
       : tone === "emerald"
         ? "border-emerald-500/40 text-emerald-300"
-        : "border-white/10 text-zinc-400";
+        : tone === "cyan"
+          ? "border-cyan-400/40 text-cyan-300"
+          : "border-white/10 text-zinc-400";
   return (
     <span className={`rounded border px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide ${cls}`}>
       {children}

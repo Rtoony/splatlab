@@ -201,6 +201,121 @@ describe("seeded respawn vs low headroom (real BVH + collisions)", () => {
   });
 });
 
+describe("collider merge (environment role)", () => {
+  // A BoxGeometry is 12 tris; positionOnly-style shells carry position+index
+  // only, so the fixture shell mimics the load product's attribute shape.
+  function bareBox(w: number, h: number, d: number): THREE.BufferGeometry {
+    const g = new THREE.BoxGeometry(w, h, d);
+    const out = new THREE.BufferGeometry();
+    out.setAttribute("position", (g.getAttribute("position") as THREE.BufferAttribute).clone());
+    out.setIndex(g.index!.clone());
+    return out;
+  }
+
+  function mkEl(role: string, provenance: string | null, y = 0) {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(2, 0.2, 2));
+    mesh.position.y = y;
+    const object = new THREE.Group();
+    object.add(mesh);
+    return {
+      slug: `${role}-${provenance ?? "captured"}-${y}`,
+      role, provenance, object, collides: false, visible: true,
+    };
+  }
+
+  function colliderRig(opts: { shell?: boolean; collideProps?: boolean;
+                               elements: ReturnType<typeof mkEl>[] }) {
+    const walker = Object.create(WorldWalker.prototype) as WorldWalker;
+    Object.assign(walker, {
+      scene: new THREE.Scene(),
+      params: { collideProps: opts.collideProps ?? false, showCollider: false },
+      collisionShellGeom: opts.shell === false ? null : bareBox(20, 0.2, 20),
+      elements: opts.elements,
+      collider: null, colliderWire: null, bvh: null,
+      sceneBox: new THREE.Box3(new THREE.Vector3(-10, -1, -10),
+                               new THREE.Vector3(10, 5, 10)),
+    });
+    return walker;
+  }
+
+  const internals = (w: WorldWalker) =>
+    w as unknown as { colliderTris: number; colliderSource: string };
+
+  it("fast path merges AUTHORED environment/static into the shell BVH", () => {
+    const env = mkEl("environment", "authored", 2);
+    const authoredStatic = mkEl("static", "authored", 4);
+    const w = colliderRig({ elements: [env, authoredStatic] });
+    w.rebuildCollider();
+    expect(internals(w).colliderTris).toBe(36); // shell 12 + 12 + 12
+    expect(internals(w).colliderSource).toBe("collision_shell+authored");
+    expect(env.collides).toBe(true);
+    expect(authoredStatic.collides).toBe(true);
+  });
+
+  it("fast path does NOT double captured statics in (the shell already has them)", () => {
+    const captured = mkEl("static", null, 1);
+    const w = colliderRig({ elements: [captured] });
+    w.rebuildCollider();
+    expect(internals(w).colliderTris).toBe(12); // shell only
+    expect(internals(w).colliderSource).toBe("collision_shell");
+    // Truthful: the collision solid represents it, so collides stays true.
+    expect(captured.collides).toBe(true);
+  });
+
+  it("fallback path (no collision shell) merges shell+static+environment", () => {
+    const els = [mkEl("shell", null, 0), mkEl("static", null, 1),
+                 mkEl("environment", "authored", 2), mkEl("prop", null, 3)];
+    const w = colliderRig({ shell: false, elements: els });
+    w.rebuildCollider();
+    expect(internals(w).colliderTris).toBe(36); // prop excluded
+    expect(internals(w).colliderSource).toBe("visual_shell");
+    expect(els[3].collides).toBe(false);
+  });
+
+  it("an authored platform becomes REAL floor the probes can stand on", () => {
+    const env = mkEl("environment", "authored", 2); // top face at y=2.1
+    const w = colliderRig({ elements: [env] });
+    w.rebuildCollider();
+    // Off-centre probes (the box-centre ray grazes shared diagonals) and a
+    // ref above the slab midplane so top/bottom faces cannot tie.
+    expect(w.surfaceNear(0.5, 0.3, 2.0, 1.0)).toBeCloseTo(2.1, 3);
+    expect(w.surfaceNear(3.3, -2.1, 0.15, 0.5)).toBeCloseTo(0.1, 3); // shell top intact
+  });
+
+  it("Rapier gets the SAME solid: a prop settles on the authored platform", async () => {
+    const { WorldPhysics, loadRapier, reoriginObject } = await import("./world-physics");
+    const env = mkEl("environment", "authored", 2);
+    const w = colliderRig({ elements: [env] });
+    const built = (w as unknown as {
+      buildStaticColliderGeometry(p: boolean): { geom: THREE.BufferGeometry } | null;
+    }).buildStaticColliderGeometry(false);
+    expect(built).not.toBeNull();
+    const rapier = await loadRapier();
+    const physics = new WorldPhysics(rapier, 1);
+    physics.addStaticShell(built!.geom);
+    const object = new THREE.Group();
+    const box = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 0.4));
+    object.add(box);
+    object.position.set(0, 4, 0);
+    object.updateWorldMatrix(true, true);
+    reoriginObject(object);
+    const pts = new Float32Array([
+      -0.2, -0.2, -0.2, 0.2, -0.2, -0.2, -0.2, 0.2, -0.2, -0.2, -0.2, 0.2,
+      0.2, 0.2, -0.2, 0.2, -0.2, 0.2, -0.2, 0.2, 0.2, 0.2, 0.2, 0.2,
+    ]);
+    const prop = physics.addProp("crate", object, [pts]);
+    expect(prop).not.toBeNull();
+    prop!.body.wakeUp();
+    const eye = new THREE.Vector3(50, 2, 50);
+    const cam = new THREE.PerspectiveCamera();
+    for (let i = 0; i < 240; i++) physics.step(1 / 60, eye, 1.7, cam);
+    // Settled ON the platform (top 2.1 + half-height 0.2), not the shell.
+    expect(object.position.y).toBeGreaterThan(2.0);
+    expect(object.position.y).toBeLessThan(2.6);
+    physics.dispose();
+  });
+});
+
 describe("pluck (per-prop backdrop-splat rows)", () => {
   // Pluck ships through the mesh's worldModifier lane (mutating the packed
   // array after load is a visual no-op — the pipeline never re-reads it), so

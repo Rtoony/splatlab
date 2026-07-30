@@ -218,5 +218,10 @@ def apply_placed_to_manifest(manifest_doc: dict[str, Any],
     counts = merged.get("counts")
     if isinstance(counts, dict):
         counts["authored"] = len(appended)
+        # The door is often the only writer between collision runs — an
+        # environment piece must be countable the moment it lands, not only
+        # after the next world_collision pass.
+        counts["environment"] = sum(
+            1 for e in merged["elements"] if e.get("role") == "environment")
     merged["authored_conflicts"] = conflicts
     return merged, conflicts
