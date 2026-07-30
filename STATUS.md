@@ -3320,3 +3320,32 @@ tool takes their zips unchanged whenever one click lands them in a dir:
 --source-dir <unzipped dir> --pieces ...`. Noted, not blocked on.
 
 Backend 1294 green (+32: 30 auto-parametrized contract tests + 2 catalog).
+
+---
+
+## 2026-07-30 — LANE 6 / E5: THE INTEGRATION RECEIPT — a fantasy scene on a splat foundation
+
+**`tools/prove-fantasy-live.py` (Truck), all receipts landed:** three CC0
+library pieces authored through the REAL Blender loop (import_asset ->
+transform_object -> export bake_world_transform) and landed through the door
+as role=environment (raised dungeon platform, doorway wall, graveyard fence;
+counts.environment=3); the walker builds collision_shell+authored (HUD:
+SOLID+AUTHORED); the player drops onto authored stone and STANDS at eye
+y=3.30 vs the captured floor's 1.26; the curtain wraps the capture core
+(sphere r=2.5) while the fantasy geometry past the seam remains; the zombie
+scenario still runs unchanged on the captured ground (min_hp=10, 60 fps);
+cleanup tombstones everything and the manifest returns to
+counts.environment=0. Prereq discovered en route: the Blender loop needs the
+job's scene assembly — POST /scene/assemble {mode: faithful} built it for
+the Truck.
+
+**Composition note (not a defect):** KayKit metre-scale architecture lands
+visually HUGE against the Truck's miniature scene units (1 u = 0.52 m) — the
+demo pass wants intake --scale or per-piece transform tuning. The receipts
+stand regardless.
+
+`splatlab-pw-verify.sh` gains step 6/7: both lane-6 proofs (self-cleaning)
+run in the safe legs.
+
+Lane 6 layer 1 is COMPLETE: E1 role -> E2 collider -> E3 curtain -> E4
+library -> E5 integration, five commits, each gated green.
