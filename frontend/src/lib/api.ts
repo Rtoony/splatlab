@@ -586,6 +586,52 @@ export function setWorldCurtain(
   );
 }
 
+/** Propose-generated (triage treatment 3): candidate review + HITL apply. */
+export interface GeneratedCandidate {
+  job_id: string;
+  slug: string;
+  placed: boolean;
+  report: { mask_alignment_gate?: { iou_vs_captured_object?: number };
+            capture_frame_placement?: { mesh_glb?: { placement_resolved?: boolean; iou?: number } };
+            [k: string]: unknown };
+  files: Partial<Record<"mesh" | "preview" | "alignment" | "input" | "report", string>>;
+  marker: { promoted_at?: string; prior_glb_version?: string } | null;
+}
+
+export function proposeGenerated(jobId: string, slug: string): Promise<GeneratedCandidate> {
+  return apiRequest(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/objects/${encodeURIComponent(slug)}/generate/propose`,
+    { method: "POST" },
+  );
+}
+
+export function fetchGeneratedCandidate(jobId: string, slug: string): Promise<GeneratedCandidate> {
+  return apiRequest(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/objects/${encodeURIComponent(slug)}/generate/candidate`,
+  );
+}
+
+export function promoteGenerated(jobId: string, slug: string): Promise<{ ok: boolean }> {
+  return apiRequest(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/objects/${encodeURIComponent(slug)}/generate/promote`,
+    { method: "POST" },
+  );
+}
+
+export function revertGenerated(jobId: string, slug: string): Promise<{ ok: boolean }> {
+  return apiRequest(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/objects/${encodeURIComponent(slug)}/generate/revert`,
+    { method: "POST" },
+  );
+}
+
+export function discardGeneratedCandidate(jobId: string, slug: string): Promise<{ ok: boolean }> {
+  return apiRequest(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/objects/${encodeURIComponent(slug)}/generate/candidate`,
+    { method: "DELETE" },
+  );
+}
+
 /** The curated asset library (assets/library) with catalog provenance. */
 export interface AssetLibraryEntry {
   name: string;

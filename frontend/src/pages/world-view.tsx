@@ -16,7 +16,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { TargetInfo } from "@/lib/world-interactions";
 import { Link, useRoute } from "wouter";
-import { uploadPolishedWorldElement , bakeWorldRestyle, fetchWorldCurtain, fetchWorldInteractions, fetchWorldNavmesh, fetchWorldPluck, fetchWorldRestyle, fetchWorldScenario, removePlacedWorldElement, replaceWorldElement, fetchAssetLibrary, resetWorldRestyle, revertWorldRestyleBake, setWorldCurtain, setWorldElementState, setWorldPlayerPoses, setWorldRestyle, solidifyWorld, uploadPlacedWorldElement, type WorldCurtainDoc} from "@/lib/api";
+import { uploadPolishedWorldElement , bakeWorldRestyle, fetchWorldCurtain, fetchWorldInteractions, fetchWorldNavmesh, fetchWorldPluck, fetchWorldRestyle, fetchWorldScenario, removePlacedWorldElement, replaceWorldElement, fetchAssetLibrary, fetchGeneratedCandidate, proposeGenerated, promoteGenerated, revertGenerated, discardGeneratedCandidate, type GeneratedCandidate, resetWorldRestyle, revertWorldRestyleBake, setWorldCurtain, setWorldElementState, setWorldPlayerPoses, setWorldRestyle, solidifyWorld, uploadPlacedWorldElement, type WorldCurtainDoc} from "@/lib/api";
 import { LIGHT_PRESETS, emptyRestyle, type RestyleDoc, type RestyleEntry, type RestyleMaterial } from "@/lib/world-restyle";
 import { WorldGame, type GameHudState, type Scenario } from "@/lib/world-game";
 import type { parseNavmesh } from "@/lib/world-navmesh";
@@ -1465,6 +1465,30 @@ function ElementsPanel({
   const [polishSlug, setPolishSlug] = useState<string | null>(null);
   const [swapSlug, setSwapSlug] = useState<string | null>(null);
   const [swapAsset, setSwapAsset] = useState<string>("");
+  const [genSlug, setGenSlug] = useState<string | null>(null);
+  const [genBusy, setGenBusy] = useState(false);
+  const [genCandidate, setGenCandidate] = useState<GeneratedCandidate | null>(null);
+  const [genNote, setGenNote] = useState<string>("");
+  const openGenZone = (slug: string) => {
+    if (genSlug === slug) { setGenSlug(null); return; }
+    setGenSlug(slug);
+    setGenCandidate(null);
+    setGenNote("");
+    fetchGeneratedCandidate(jobId, slug)
+      .then(setGenCandidate)
+      .catch(() => setGenCandidate(null));
+  };
+  const runGen = (slug: string, fn: () => Promise<unknown>, done: string) => {
+    setGenBusy(true);
+    setGenNote("");
+    fn()
+      .then(() => {
+        setGenNote(done);
+        return fetchGeneratedCandidate(jobId, slug).then(setGenCandidate).catch(() => setGenCandidate(null));
+      })
+      .catch((e: unknown) => setGenNote(e instanceof Error ? e.message : String(e)))
+      .finally(() => setGenBusy(false));
+  };
   return (
     <Panel icon={<Shapes className="h-3.5 w-3.5" />} title={`Loaded elements (${rows.length})`}>
       <p className="mb-2 font-mono text-[10px] text-zinc-500">
@@ -1519,6 +1543,20 @@ function ElementsPanel({
                     <MapPin className="h-3 w-3" />
                     Go
                   </button>
+                  {r.provenance !== "authored" && r.role !== "shell" && (
+                    <button
+                      type="button"
+                      onClick={() => openGenZone(r.slug)}
+                      title="Propose a generated reconstruction (SAM-3D) as a reviewable candidate — never auto-applied"
+                      className={`rounded-md border px-1.5 py-1 text-[10px] font-semibold transition ${
+                        genSlug === r.slug
+                          ? "border-fuchsia-400/50 text-fuchsia-200"
+                          : "border-white/10 text-zinc-300 hover:text-white"
+                      }`}
+                    >
+                      Gen
+                    </button>
+                  )}
                   {r.provenance !== "authored" && r.role !== "shell" && library.length > 0 && (
                     <button
                       type="button"
@@ -1561,6 +1599,65 @@ function ElementsPanel({
                 </Tag>
               </div>
               {r.frameWarning && <p className="mt-1 text-[10px] text-amber-300">{r.frameWarning}</p>}
+              {genSlug === r.slug && (
+                <div className="mt-2 rounded-md border border-white/10 bg-black/40 p-2">
+                  {genCandidate ? (
+                    <>
+                      <div className="mb-1 flex items-center gap-2 text-[10px]">
+                        <Tag tone={genCandidate.placed ? "emerald" : "zinc"}>
+                          {genCandidate.placed ? "PLACED candidate" : "not placeable"}
+                        </Tag>
+                        {typeof genCandidate.report?.mask_alignment_gate?.iou_vs_captured_object === "number" && (
+                          <span className="text-zinc-400">mask IoU {genCandidate.report.mask_alignment_gate.iou_vs_captured_object.toFixed(2)}</span>
+                        )}
+                        {genCandidate.marker && <Tag tone="cyan">PROMOTED</Tag>}
+                      </div>
+                      {genCandidate.files.preview && (
+                        <img src={genCandidate.files.preview} alt="generated preview"
+                             className="mb-1 max-h-28 rounded border border-white/10" />
+                      )}
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {genCandidate.marker ? (
+                          <button type="button" disabled={genBusy}
+                            onClick={() => runGen(r.slug, () => revertGenerated(jobId, r.slug).then(() => onPolished()), "Reverted — captured element restored.")}
+                            className="rounded-md border border-amber-400/40 px-2 py-1 text-[10px] font-semibold text-amber-200 hover:text-white disabled:opacity-40">
+                            Revert to captured
+                          </button>
+                        ) : (
+                          <>
+                            <button type="button" disabled={genBusy || !genCandidate.placed}
+                              onClick={() => runGen(r.slug, () => promoteGenerated(jobId, r.slug).then(() => onPolished()), "Promoted — the generated mesh is the element now.")}
+                              title={genCandidate.placed ? "Version the captured element and apply the candidate" : "The placement gate did not resolve — cannot promote"}
+                              className="rounded-md border border-emerald-400/40 px-2 py-1 text-[10px] font-semibold text-emerald-200 hover:text-white disabled:opacity-40">
+                              Promote
+                            </button>
+                            <button type="button" disabled={genBusy}
+                              onClick={() => runGen(r.slug, () => discardGeneratedCandidate(jobId, r.slug).then(() => setGenCandidate(null)), "Candidate discarded.")}
+                              className="rounded-md border border-white/10 px-2 py-1 text-[10px] font-semibold text-zinc-300 hover:text-white disabled:opacity-40">
+                              Discard
+                            </button>
+                          </>
+                        )}
+                        <button type="button" disabled={genBusy || !!genCandidate.marker}
+                          onClick={() => runGen(r.slug, () => proposeGenerated(jobId, r.slug), "New candidate proposed.")}
+                          className="rounded-md border border-white/10 px-2 py-1 text-[10px] font-semibold text-zinc-300 hover:text-white disabled:opacity-40">
+                          Re-propose
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <button type="button" disabled={genBusy}
+                      onClick={() => runGen(r.slug, () => proposeGenerated(jobId, r.slug), "Candidate ready for review.")}
+                      className="rounded-md border border-fuchsia-400/40 px-2 py-1 text-[10px] font-semibold text-fuchsia-200 hover:text-white disabled:opacity-40">
+                      {genBusy ? "Generating… (~2–4 min GPU)" : "Propose generated (SAM-3D, ~2–4 min GPU)"}
+                    </button>
+                  )}
+                  {genBusy && !genCandidate && (
+                    <p className="mt-1 text-[10px] text-zinc-500">The gates decide: a refusal comes back as a first-class verdict, nothing is applied.</p>
+                  )}
+                  {genNote && <p className="mt-1 text-[10px] text-zinc-400">{genNote}</p>}
+                </div>
+              )}
               {swapSlug === r.slug && (
                 <div className="mt-2 flex items-center gap-2">
                   <select

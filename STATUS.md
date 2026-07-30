@@ -3403,3 +3403,45 @@ within 0.3u); umbrella mesh hidden + ghost auto-plucked via the 4 Hz tick;
 DELETE + reload restores the photograph untouched — perfectly reversible.
 
 Backend 1298 green (+4), frontend 156 green (+2), tsc clean.
+
+---
+
+## 2026-07-30 — TRIAGE SLICE 3: PROPOSE-GENERATED — the gates speak, the human decides
+
+The third treatment. `auto_generate` (solidify) auto-APPLIES; this lane never
+decides. New `backend/generate_route.py`:
+
+- `POST .../objects/{slug}/generate/propose` — runs SAM-3D **under the GPU
+  arbiter** (a lease the solidify path never took — a 13 GB CUDA load now
+  serializes like every other generative lane), own process group so a
+  timeout kills the CUDA grandchild. The candidate lands in
+  `_regen/objects/<slug>/`; NOTHING is applied; a gate refusal is a
+  first-class verdict, not an error.
+- `GET .../generate/candidate` + `GET .../generate/file?slug&fmt` — the
+  review payload and the previously-unreachable candidate artifacts
+  (preview/alignment/mesh/report), no-cache.
+- `POST .../generate/promote` — the HITL apply: place_generated (mesh env:
+  capture-frame transform + decimate to 8k + bake) into a staged GLB, then
+  the prior element GLB+atlas pair is VERSIONED with exact filenames in a
+  `<slug>.generated.json` marker; world.json reads geometry_source=generated.
+- `POST .../generate/revert` — restores the exact versioned pair;
+  `DELETE .../generate/candidate` — discard (refused while promoted).
+
+Walker UI: a "Gen" zone per captured element — propose (with the ~2-4 min
+GPU honesty label), verdict chips (PLACED / mask IoU), preview thumbnail,
+Promote / Discard / Re-propose / Revert.
+
+**Live receipts (`tools/prove-generated-live.py`, fire-hydrant — the
+operator's own reference case):** fresh arbitrated SAM-3D run -> PLACED,
+mask IoU 0.8869; preview served no-cache; PROMOTE: element became the
+generated hydrant (8,000 faces, sha changed, prior versioned as
+fire-hydrant-v0001.glb, world.json geometry_source=generated); REVERT:
+**byte-exact restore** (sha 85ebfe10 both sides), marker gone. Found and
+fixed en route: the mesh-env promote snippet passed a str where
+_generated_candidate needs a Path; the report's IoU lives at
+mask_alignment_gate.iou_vs_captured_object (all readers aligned).
+
+All three triage treatments now exist: Photo-only (default) / Show mesh /
+Replace-with-asset / Propose-generated — deliberate, per-object, reversible.
+
+Backend 1302 green (+4), frontend 156 green, tsc clean.
