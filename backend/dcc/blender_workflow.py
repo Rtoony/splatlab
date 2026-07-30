@@ -159,10 +159,25 @@ def _contained_library_file(path: Path) -> Path:
 
 def list_asset_library() -> list[dict[str, Any]]:
     """The curated GLBs import_asset may pull in — name, size, extent in
-    metres, validation state. Broken files are REPORTED with their error,
-    never hidden: an operator must see why an asset is unavailable."""
+    metres, validation state, and (when catalog.json knows the asset) its
+    pack/license provenance. Broken files are REPORTED with their error,
+    never hidden: an operator must see why an asset is unavailable — and a
+    corrupt catalog is reported per-entry the same way, never swallowed."""
     if not ASSET_LIBRARY_ROOT.is_dir():
         return []
+    catalog: dict[str, Any] = {}
+    catalog_error: str | None = None
+    catalog_path = ASSET_LIBRARY_ROOT / "catalog.json"
+    if catalog_path.is_file():
+        try:
+            doc = json.loads(catalog_path.read_text())
+            if doc.get("schema") != "dev.splatlab.asset-catalog/v1":
+                catalog_error = (f"catalog schema is {doc.get('schema')!r}, "
+                                 "expected dev.splatlab.asset-catalog/v1")
+            else:
+                catalog = doc.get("assets") or {}
+        except (OSError, ValueError) as exc:
+            catalog_error = f"catalog.json unreadable: {exc}"
     out: list[dict[str, Any]] = []
     for path in sorted(ASSET_LIBRARY_ROOT.glob("*.glb")):
         if path.is_symlink():
@@ -179,6 +194,10 @@ def list_asset_library() -> list[dict[str, Any]]:
                 entry["identity_transforms"] = bounds["identity_transforms"]
             except ValueError as exc:
                 entry["error"] = str(exc)
+        if catalog_error:
+            entry["catalog_error"] = catalog_error
+        elif path.stem in catalog:
+            entry["catalog"] = catalog[path.stem]
         out.append(entry)
     return out
 

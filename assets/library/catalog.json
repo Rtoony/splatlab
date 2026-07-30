@@ -1,0 +1,215 @@
+{
+  "assets": {
+    "dungeon-banner-red": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-barrel-large": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-chest": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-column": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-floor-tile-large": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-floor-tile-small": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-floor-tile-small-corner": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-stairs": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-stairs-wide": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-torch": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-wall": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-wall-arched": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-wall-broken": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-wall-corner": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-wall-doorway": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-wall-endcap": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-wall-pillar": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "dungeon-wall-window-open": {
+      "imported_at": "2026-07-30T14:26:54+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-dungeon-remastered",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0"
+    },
+    "graveyard-arch-gate": {
+      "imported_at": "2026-07-30T14:27:19+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-halloween-bits",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Halloween-Bits-1.0"
+    },
+    "graveyard-crypt": {
+      "imported_at": "2026-07-30T14:27:19+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-halloween-bits",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Halloween-Bits-1.0"
+    },
+    "graveyard-fence": {
+      "imported_at": "2026-07-30T14:27:19+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-halloween-bits",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Halloween-Bits-1.0"
+    },
+    "graveyard-fence-gate": {
+      "imported_at": "2026-07-30T14:27:19+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-halloween-bits",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Halloween-Bits-1.0"
+    },
+    "graveyard-fence-pillar": {
+      "imported_at": "2026-07-30T14:27:19+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-halloween-bits",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Halloween-Bits-1.0"
+    },
+    "graveyard-grave-a": {
+      "imported_at": "2026-07-30T14:27:19+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-halloween-bits",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Halloween-Bits-1.0"
+    },
+    "graveyard-grave-b": {
+      "imported_at": "2026-07-30T14:27:19+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-halloween-bits",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Halloween-Bits-1.0"
+    },
+    "graveyard-gravestone": {
+      "imported_at": "2026-07-30T14:27:19+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-halloween-bits",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Halloween-Bits-1.0"
+    },
+    "graveyard-lantern-standing": {
+      "imported_at": "2026-07-30T14:27:19+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-halloween-bits",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Halloween-Bits-1.0"
+    },
+    "graveyard-post-lantern": {
+      "imported_at": "2026-07-30T14:27:19+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-halloween-bits",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Halloween-Bits-1.0"
+    },
+    "graveyard-shrine": {
+      "imported_at": "2026-07-30T14:27:19+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-halloween-bits",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Halloween-Bits-1.0"
+    },
+    "graveyard-tree-dead-large": {
+      "imported_at": "2026-07-30T14:27:19+00:00",
+      "license": "CC0-1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "pack": "kaykit-halloween-bits",
+      "source_url": "https://github.com/KayKit-Game-Assets/KayKit-Halloween-Bits-1.0"
+    }
+  },
+  "schema": "dev.splatlab.asset-catalog/v1"
+}

@@ -3288,3 +3288,35 @@ this is a spatial boundary, not global dimming. Fresh page load reinstalls
 from curtain.json (curtainState round-trip + outside Δ65.22 vs baseline).
 
 Backend 1262 green (+3), frontend 149 green (+2), tsc clean.
+
+---
+
+## 2026-07-30 — LANE 6 / E4: CC0 FANTASY LIBRARY — 30 pieces, license-bookkept
+
+`assets/library/intake_pack.py` (pinned Blender, headless): imports a pack
+piece (glTF/GLB), refuses ARMATUREs (static environment only — rigged actors
+wait for the actor lane), strips to geometry, joins to ONE mesh, applies
+transforms, re-origins bottom-centre, exports Y-up with textures embedded,
+and self-validates against the exact starter contract (glb_check structure,
+single mesh, identity transforms, floor within 5 mm, 0.05–30 m extent). A
+failed piece aborts loudly. Every export lands in
+`assets/library/catalog.json` (dev.splatlab.asset-catalog/v1: pack,
+source_url, license, license_url, imported_at) and `list_asset_library`
+attaches the catalog entry per asset — a corrupt catalog is reported as
+`catalog_error`, never swallowed.
+
+**First batch, committed (KayKit, CC0, pulled scriptably from GitHub):**
+18 dungeon pieces (walls incl. doorway/arched/broken/pillar/window, floor
+tiles, stairs, column, torch, banner, chest, barrel) + 12 graveyard pieces
+(arch-gate, crypt, fences, graves, gravestone, lanterns, shrine, dead tree)
+— 30 assets, 20–75 KB each, palette-textured. The old 3 m "human-scale"
+ceiling in the library contract test widened to the intake's 30 m band: the
+library now holds architecture, not just hand props.
+
+**Kenney Castle/Graveyard + Quaternius (RToony's other two picks):** their
+downloads are browser-gated (no scrapeable zip URL, no API) — the intake
+tool takes their zips unchanged whenever one click lands them in a dir:
+`blender --background --python assets/library/intake_pack.py -- --pack ...
+--source-dir <unzipped dir> --pieces ...`. Noted, not blocked on.
+
+Backend 1294 green (+32: 30 auto-parametrized contract tests + 2 catalog).
