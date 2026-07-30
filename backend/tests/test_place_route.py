@@ -334,3 +334,100 @@ def test_affordances_skip_environment_with_honest_reason(client) -> None:
     skip = next(s for s in result["skipped"] if s["slug"] == "terrace")
     assert "walked on" in skip["reason"]
     assert all(p["record"]["slug"] != "terrace" for p in result["proposals"])
+
+
+# ── replace-with-asset (triage lane, slice 2) ───────────────────────────────────
+
+
+LIBRARY = Path(__file__).resolve().parents[2] / "assets" / "library"
+
+
+def _mk_real_captured(world: Path, slug: str = "crate") -> None:
+    """The pose source must be a real GLB — reuse a committed library asset."""
+    (world / "elements" / f"{slug}.glb").write_bytes(
+        (LIBRARY / "dungeon-torch.glb").read_bytes())
+
+
+def test_replace_lands_scaled_at_the_captured_pose(client) -> None:
+    import glb_check
+    http, outputs = client
+    world = _mk_world(_mk_job(outputs))
+    _mk_real_captured(world)  # crate is a prop in the fixture manifest
+
+    r = http.post(f"/api/splat/jobs/{JOB}/world/elements/crate/replace",
+                  params={"asset": "graveyard-lantern-standing"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["slug"] == "re-crate" and body["replaces"] == "crate"
+    assert body["element"]["replaces"] == "crate"
+    assert body["element"]["role"] == "prop"  # inherited from the captured
+
+    # The replacement stands at the captured floor point at captured height.
+    cap = glb_check.position_bounds(world / "elements" / "crate.glb")
+    new = glb_check.position_bounds(world / "elements" / "re-crate.glb")
+    cap_c = [(a + b) / 2 for a, b in zip(cap["aabb"]["min"], cap["aabb"]["max"])]
+    new_c = [(a + b) / 2 for a, b in zip(new["aabb"]["min"], new["aabb"]["max"])]
+    assert abs(new["aabb"]["min"][1] - cap["aabb"]["min"][1]) < 0.01  # floor
+    assert abs(new_c[0] - cap_c[0]) < 0.01 and abs(new_c[2] - cap_c[2]) < 0.01
+    assert abs(new["extent"][1] - cap["extent"][1]) < 0.02  # height-matched
+
+    # One replacement per captured element.
+    dup = http.post(f"/api/splat/jobs/{JOB}/world/elements/crate/replace",
+                    params={"asset": "dungeon-torch"})
+    assert dup.status_code == 409
+
+    # Deleting the replacement frees the captured element again.
+    assert http.delete(
+        f"/api/splat/jobs/{JOB}/world/elements/re-crate").status_code == 200
+    again = http.post(f"/api/splat/jobs/{JOB}/world/elements/crate/replace",
+                      params={"asset": "dungeon-torch"})
+    assert again.status_code == 200
+
+
+def test_replace_refusals(client) -> None:
+    http, outputs = client
+    world = _mk_world(_mk_job(outputs))
+    _mk_real_captured(world)
+
+    # Unknown asset names the library's actual contents.
+    r = http.post(f"/api/splat/jobs/{JOB}/world/elements/crate/replace",
+                  params={"asset": "excalibur"})
+    assert r.status_code == 404
+
+    # Unbuilt captured element (bench has no GLB) -> 409.
+    r = http.post(f"/api/splat/jobs/{JOB}/world/elements/bench/replace",
+                  params={"asset": "dungeon-torch"})
+    assert r.status_code == 409
+
+    # Authored elements are not replaceable.
+    assert _place(http, "torch-a", _authored_glb()).status_code == 200
+    r = http.post(f"/api/splat/jobs/{JOB}/world/elements/torch-a/replace",
+                  params={"asset": "dungeon-torch"})
+    assert r.status_code == 409
+
+
+def test_asset_library_route_lists_catalogued_assets(client) -> None:
+    http, _outputs = client
+    r = http.get("/api/splat/assets/library")
+    assert r.status_code == 200
+    assets = {a["name"]: a for a in r.json()["assets"]}
+    assert "dungeon-torch" in assets
+    assert assets["dungeon-torch"]["catalog"]["license"] == "CC0-1.0"
+
+
+def test_glb_transform_translate_scale_roundtrip() -> None:
+    import glb_check
+    import glb_transform
+    src = (LIBRARY / "dungeon-torch.glb").read_bytes()
+    before = glb_check.position_bounds_bytes if False else None  # noqa: F841
+    out = glb_transform.translate_scale_glb(src, (2.0, 0.5, -1.0), 2.0)
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".glb") as fh:
+        fh.write(out)
+        fh.flush()
+        glb_check.validate_glb(Path(fh.name))
+        b = glb_check.position_bounds(Path(fh.name))
+    assert abs(b["aabb"]["min"][1] - 0.5) < 1e-3          # floor translated
+    assert abs(b["extent"][1] - 2 * 1.04) < 0.03          # torch 1.04m doubled
+    centre_x = (b["aabb"]["min"][0] + b["aabb"]["max"][0]) / 2
+    assert abs(centre_x - 2.0) < 1e-3

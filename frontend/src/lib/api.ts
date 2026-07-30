@@ -586,6 +586,37 @@ export function setWorldCurtain(
   );
 }
 
+/** The curated asset library (assets/library) with catalog provenance. */
+export interface AssetLibraryEntry {
+  name: string;
+  bytes: number;
+  extent?: [number, number, number];
+  identity_transforms?: boolean;
+  error?: string;
+  catalog?: { pack: string; license: string; license_url: string;
+              source_url: string; imported_at: string };
+  catalog_error?: string;
+}
+
+export function fetchAssetLibrary(): Promise<{ assets: AssetLibraryEntry[] }> {
+  return apiRequest("/api/splat/assets/library");
+}
+
+/** Replace a CAPTURED element with a library asset (scaled + posed
+ *  server-side); the walker hides the captured mesh and plucks its ghost. */
+export function replaceWorldElement(
+  jobId: string,
+  capturedSlug: string,
+  asset: string,
+): Promise<{ ok: boolean; slug: string; replaces: string; warnings: string[] }> {
+  return apiRequest(
+    `/api/splat/jobs/${encodeURIComponent(jobId)}/world/elements/`
+    + `${encodeURIComponent(capturedSlug)}/replace`
+    + `?asset=${encodeURIComponent(asset)}`,
+    { method: "POST" },
+  );
+}
+
 /** Per-prop backdrop-splat rows (`_world/pluck.json`). Rows address the RAW
  *  served splat's row order (fmt=langweb / splat.ply — never the decimated
  *  fmt=web), and the payload carries the server's staleness verdict. */

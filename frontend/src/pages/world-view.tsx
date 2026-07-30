@@ -16,7 +16,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { TargetInfo } from "@/lib/world-interactions";
 import { Link, useRoute } from "wouter";
-import { uploadPolishedWorldElement , bakeWorldRestyle, fetchWorldCurtain, fetchWorldInteractions, fetchWorldNavmesh, fetchWorldPluck, fetchWorldRestyle, fetchWorldScenario, removePlacedWorldElement, resetWorldRestyle, revertWorldRestyleBake, setWorldCurtain, setWorldElementState, setWorldPlayerPoses, setWorldRestyle, solidifyWorld, uploadPlacedWorldElement, type WorldCurtainDoc} from "@/lib/api";
+import { uploadPolishedWorldElement , bakeWorldRestyle, fetchWorldCurtain, fetchWorldInteractions, fetchWorldNavmesh, fetchWorldPluck, fetchWorldRestyle, fetchWorldScenario, removePlacedWorldElement, replaceWorldElement, fetchAssetLibrary, resetWorldRestyle, revertWorldRestyleBake, setWorldCurtain, setWorldElementState, setWorldPlayerPoses, setWorldRestyle, solidifyWorld, uploadPlacedWorldElement, type WorldCurtainDoc} from "@/lib/api";
 import { LIGHT_PRESETS, emptyRestyle, type RestyleDoc, type RestyleEntry, type RestyleMaterial } from "@/lib/world-restyle";
 import { WorldGame, type GameHudState, type Scenario } from "@/lib/world-game";
 import type { parseNavmesh } from "@/lib/world-navmesh";
@@ -65,6 +65,7 @@ interface ElementRow {
   size: [number, number, number];
   center: [number, number, number];
   collides: boolean;
+  provenance: string | null;
   frameWarning: string | null;
 }
 
@@ -88,6 +89,7 @@ function toRow(e: LoadedElement): ElementRow {
     size: e.size,
     center: e.center,
     collides: e.collides,
+    provenance: e.provenance,
     frameWarning: e.frameWarning,
   };
 }
@@ -131,6 +133,7 @@ export default function WorldViewPage() {
   const [flying, setFlying] = useState(false);
   const [backdrop, setBackdrop] = useState(true);
   const [curtainDoc, setCurtainDoc] = useState<WorldCurtainDoc | null>(null);
+  const [assetLibrary, setAssetLibrary] = useState<string[]>([]);
   const curtainSaveTimer = useRef<number | null>(null);
 
   const [phase, setPhase] = useState<Phase>("idle");
@@ -171,6 +174,24 @@ export default function WorldViewPage() {
    * Engine lifecycle. StrictMode double-invokes this in dev, so the   *
    * async load is guarded by `cancelled` and the walker is disposed.  *
    * ---------------------------------------------------------------- */
+  useEffect(() => {
+    if (source.kind !== "api") return;
+    fetchAssetLibrary()
+      .then((r) => setAssetLibrary(
+        r.assets.filter((a) => !a.error).map((a) => a.name)))
+      .catch(() => { /* the Swap control simply stays hidden */ });
+  }, [source.kind]);
+
+  const replaceCaptured = useCallback((capturedSlug: string, asset: string) => {
+    replaceWorldElement(jobId, capturedSlug, asset)
+      .then((r) => {
+        if (r.warnings?.length) setWarnings((w) => [...w, ...r.warnings]);
+        setReloadNonce((n) => n + 1);
+      })
+      .catch((e: unknown) => setWarnings((w) => [...w,
+        `Replace failed: ${e instanceof Error ? e.message : String(e)}`]));
+  }, [jobId]);
+
   const updateCurtain = useCallback((patch: Partial<WorldCurtainDoc>) => {
     setCurtainDoc((prev) => {
       if (!prev) return prev;
@@ -894,9 +915,11 @@ export default function WorldViewPage() {
                 colliderTris={sceneInfo?.colliderTris ?? 0}
                 colliderSource={sceneInfo?.colliderSource ?? "visual_shell"}
                 jobId={jobId}
+                library={assetLibrary}
                 onToggle={toggleVisible}
                 onGo={(slug) => walkerRef.current?.teleportTo(slug)}
                 onPolished={() => setReloadNonce((n) => n + 1)}
+                onReplace={replaceCaptured}
               />
             </div>
           )}
@@ -1420,9 +1443,11 @@ function ElementsPanel({
   colliderTris,
   colliderSource,
   jobId,
+  library,
   onToggle,
   onGo,
   onPolished,
+  onReplace,
 }: {
   rows: ElementRow[];
   hidden: Set<string>;
@@ -1430,12 +1455,16 @@ function ElementsPanel({
   colliderTris: number;
   colliderSource: "collision_shell" | "collision_shell+authored" | "visual_shell";
   jobId: string;
+  library: string[];
   onToggle: (slug: string) => void;
   onGo: (slug: string) => void;
   onPolished: () => void;
+  onReplace: (capturedSlug: string, asset: string) => void;
 }) {
   // One expanded polish zone at a time — the HUD column is narrow.
   const [polishSlug, setPolishSlug] = useState<string | null>(null);
+  const [swapSlug, setSwapSlug] = useState<string | null>(null);
+  const [swapAsset, setSwapAsset] = useState<string>("");
   return (
     <Panel icon={<Shapes className="h-3.5 w-3.5" />} title={`Loaded elements (${rows.length})`}>
       <p className="mb-2 font-mono text-[10px] text-zinc-500">
@@ -1490,6 +1519,20 @@ function ElementsPanel({
                     <MapPin className="h-3 w-3" />
                     Go
                   </button>
+                  {r.provenance !== "authored" && r.role !== "shell" && library.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => { setSwapSlug(swapSlug === r.slug ? null : r.slug); setSwapAsset(""); }}
+                      title="Replace with a curated library asset (the fire-hydrant pattern)"
+                      className={`rounded-md border px-1.5 py-1 text-[10px] font-semibold transition ${
+                        swapSlug === r.slug
+                          ? "border-cyan-400/50 text-cyan-200"
+                          : "border-white/10 text-zinc-300 hover:text-white"
+                      }`}
+                    >
+                      Swap
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => setPolishSlug(polishSlug === r.slug ? null : r.slug)}
@@ -1518,6 +1561,29 @@ function ElementsPanel({
                 </Tag>
               </div>
               {r.frameWarning && <p className="mt-1 text-[10px] text-amber-300">{r.frameWarning}</p>}
+              {swapSlug === r.slug && (
+                <div className="mt-2 flex items-center gap-2">
+                  <select
+                    value={swapAsset}
+                    onChange={(e) => setSwapAsset(e.target.value)}
+                    className="min-w-0 flex-1 rounded-md border border-white/10 bg-black/60 px-2 py-1 text-[11px] text-zinc-200"
+                  >
+                    <option value="">Pick a library asset…</option>
+                    {library.map((name) => (
+                      <option key={name} value={name}>{name}</option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    disabled={!swapAsset}
+                    onClick={() => { onReplace(r.slug, swapAsset); setSwapSlug(null); }}
+                    className="rounded-md border border-cyan-400/40 px-2 py-1 text-[10px] font-semibold text-cyan-200 hover:text-white disabled:opacity-40"
+                    title="Sized to this element, placed at its spot; its mesh hides and its photograph ghost is plucked"
+                  >
+                    Replace
+                  </button>
+                </div>
+              )}
               {polishSlug === r.slug && (
                 <PolishUploadZone
                   title="Drop a polished .glb or click"

@@ -3375,3 +3375,31 @@ scene is now a clean photograph), eye-toggle brings any of them back on
 demand, collider untouched at SOLID 332.4k tris.
 
 Frontend 154 green (+5), tsc clean. Backend untouched (1294).
+
+---
+
+## 2026-07-30 — TRIAGE SLICE 2: REPLACE-WITH-ASSET — the fire-hydrant pattern, two clicks
+
+**One call replaces a captured element with a curated library asset.**
+`POST /world/elements/{captured}/replace?asset=<name>`: the asset (metre
+scale, bottom-centre origin — the library contract doing its job) is
+uniform-scaled to the captured element's height and translated to its floor
+point entirely server-side (`glb_transform.py` — stdlib POSITION-accessor
+surgery, no Blender round-trip; sparse/external-buffer GLBs refused loudly),
+then lands through the same registry/manifest path as the door carrying
+`replaces: <captured>`. One replacement per captured element; authored
+elements refuse; deleting the replacement frees everything.
+
+**The walker acts on the link with no hand-holding:** the captured mesh can
+never default visible while replaced (outranks plucked/interactive earns),
+and its photograph ghost is plucked unconditionally the moment rows exist —
+the authored asset IS the object now. `GET /assets/library` feeds the new
+per-element "Swap" control in the ElementsPanel (captured, non-shell rows):
+pick an asset, Replace, world reloads.
+
+**Live receipts (`tools/prove-replace-live.py`, Truck):** dungeon-torch ->
+umbrella at scale 0.327, standing at the umbrella's floor point (centre
+within 0.3u); umbrella mesh hidden + ghost auto-plucked via the 4 Hz tick;
+DELETE + reload restores the photograph untouched — perfectly reversible.
+
+Backend 1298 green (+4), frontend 156 green (+2), tsc clean.

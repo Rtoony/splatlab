@@ -343,6 +343,8 @@ describe("pluck (per-prop backdrop-splat rows)", () => {
       physics: null,
       pluckRows: new Map(), pluckNRows: 0, pluckedSlugs: new Set(),
       pluckMask: null, pluckClock: 0, pluckWarned: false,
+      replacedSlugs: new Set(), visibilityOverrides: new Map(),
+      restyleShowsMesh: false, restyle: null, interactions: new Map(),
     });
     return { walker, backdrop };
   }
@@ -504,6 +506,7 @@ describe("photograph-first visibility (triage lane)", () => {
       pluckedSlugs: new Set(),
       interactions: new Map([["lamp-post", { slug: "lamp-post", verb: "toggle" }]]),
       visibilityOverrides: new Map(),
+      replacedSlugs: new Set(),
       pluckRows: new Map(), pluckNRows: 0, pluckMask: null,
       pluckClock: 0, pluckWarned: false,
     });
@@ -556,5 +559,53 @@ describe("photograph-first visibility (triage lane)", () => {
     walker.refreshElementVisibility();
     expect(els.capturedStatic.visible).toBe(true);
     expect(els.capturedProp.visible).toBe(false);
+  });
+});
+
+describe("replace-with-asset (triage lane slice 2)", () => {
+  it("a REPLACED captured slug never defaults visible — even earned", () => {
+    const mk = (slug: string, provenance: string | null) => ({
+      slug, role: "prop", provenance, visible: true, collides: false,
+      object: new THREE.Group(),
+    });
+    const captured = mk("umbrella", null);
+    const replacement = mk("re-umbrella", "authored");
+    const walker = Object.create(WorldWalker.prototype) as WorldWalker;
+    Object.assign(walker, {
+      elements: [captured, replacement],
+      backdrop: { visible: true }, restyleShowsMesh: false, restyle: null,
+      pluckedSlugs: new Set(["umbrella"]),           // plucked would earn it…
+      interactions: new Map([["umbrella", { slug: "umbrella", verb: "toggle" }]]),
+      visibilityOverrides: new Map(),
+      replacedSlugs: new Set(["umbrella"]),          // …but replaced wins
+      pluckRows: new Map(), pluckNRows: 0, pluckMask: null,
+      pluckClock: 0, pluckWarned: false,
+    });
+    walker.refreshElementVisibility();
+    expect(captured.visible).toBe(false);
+    expect(replacement.visible).toBe(true);
+  });
+
+  it("checkPluckDisturbed plucks a replaced slug's ghost without physics", () => {
+    const N = 6;
+    const backdrop = {
+      packedSplats: { numSplats: N },
+      worldModifier: undefined as unknown,
+      updateGenerator() { /* counted elsewhere */ },
+    };
+    const walker = Object.create(WorldWalker.prototype) as WorldWalker;
+    Object.assign(walker, {
+      backdrop, elements: [], physics: null,
+      pluckRows: new Map([["umbrella", [1, 2]]]), pluckNRows: N,
+      pluckedSlugs: new Set(), pluckMask: null,
+      pluckClock: 0, pluckWarned: false,
+      replacedSlugs: new Set(["umbrella"]),
+      visibilityOverrides: new Map(),
+      restyleShowsMesh: false, restyle: null,
+      interactions: new Map(),
+      scene: new THREE.Scene(),
+    });
+    (walker as unknown as { checkPluckDisturbed(): void }).checkPluckDisturbed();
+    expect(walker.pluckState().umbrella.plucked).toBe(true);
   });
 });

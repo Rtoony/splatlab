@@ -103,6 +103,8 @@ export interface WorldEntry {
   faces?: number;
   extent?: [number, number, number];
   collision?: WorldCollisionBlock;
+  /** Authored replacement: the CAPTURED slug this element stands in for. */
+  replaces?: string | null;
   classification?: string[];
   /** "authored" for placed set-dressing (world_placed registry); absent for
    *  capture-derived elements. */
@@ -421,6 +423,8 @@ export class WorldWalker {
   private curtainSdf: SplatEditSdf | null = null;
   /** Eye-toggle intent per slug — outranks the computed visibility default. */
   private visibilityOverrides = new Map<string, boolean>();
+  /** Captured slugs that an authored replacement stands in for. */
+  private replacedSlugs = new Set<string>();
   /** Fired when fly mode toggles, so the HUD can say so. */
   onFlyChange: ((flying: boolean) => void) | null = null;
 
@@ -551,6 +555,12 @@ export class WorldWalker {
     push(manifest.shell, "", "shell");
     for (const el of manifest.elements ?? []) push(el, "elements/", el?.role ?? "prop");
     if (!entries.length) throw new Error("Manifest listed no loadable GLB files.");
+    // Authored replacements stand in for captured slugs: the captured mesh
+    // stays hidden and its photograph ghost is plucked once rows exist.
+    this.replacedSlugs = new Set(
+      (manifest.elements ?? [])
+        .map((el) => el?.replaces)
+        .filter((s): s is string => typeof s === "string" && s.length > 0));
 
     const loaded: LoadedElement[] = [];
     const warnings: string[] = [];
@@ -1407,7 +1417,15 @@ export class WorldWalker {
    *  a knocked-over prop's ghost must not flicker back when the body sleeps —
    *  and `disturbed` itself is one-way, covering restored saved poses too. */
   private checkPluckDisturbed(): void {
-    if (!this.pluckRows.size || !this.backdrop || !this.physics) return;
+    if (!this.pluckRows.size || !this.backdrop) return;
+    // A REPLACED element's ghost goes unconditionally: the authored asset is
+    // the object now, and the photograph must not show its predecessor.
+    for (const slug of this.replacedSlugs) {
+      if (this.pluckRows.has(slug) && !this.pluckedSlugs.has(slug)) {
+        this.pluckElement(slug);
+      }
+    }
+    if (!this.physics) return;
     for (const slug of Object.keys(this.physics.disturbedTransforms())) {
       if (this.pluckRows.has(slug) && !this.pluckedSlugs.has(slug)) {
         this.pluckElement(slug);
@@ -1513,6 +1531,7 @@ export class WorldWalker {
    */
   private defaultElementVisible(el: LoadedElement): boolean {
     const photographShowing = this.backdrop !== null && !this.restyleShowsMesh;
+    if (this.replacedSlugs.has(el.slug)) return false; // stood in for
     if (!photographShowing) return true;
     if (el.role === "shell") return false; // the photograph IS the shell
     if (el.provenance === "authored") return true;
@@ -2104,6 +2123,7 @@ export class WorldWalker {
     this.elements = [];
     this.sceneBox = new THREE.Box3();
     this.visibilityOverrides.clear();
+    this.replacedSlugs.clear();
     // The curtain belongs to the WORLD, not the walker: a new world's
     // curtain arrives from its own curtain.json, and the old one leaking
     // across loads would silently hide a fresh photograph.

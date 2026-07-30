@@ -41,7 +41,7 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 
 _ENTRY_KEYS = {"slug", "label", "role", "provenance", "glb", "aabb", "extent",
                "gltf", "source_filename", "uploaded_bytes", "placed_at",
-               "file", "warnings"}
+               "file", "warnings", "replaces"}
 
 
 class PlacedError(ValueError):
@@ -115,6 +115,11 @@ def _validate_entry(raw: Any) -> dict[str, Any]:
                 or any(not isinstance(w, str) for w in warnings)):
             raise PlacedError(f"{slug}: warnings must be strings")
         entry["warnings"] = [w[:200] for w in warnings][:8]
+    if raw.get("replaces") is not None:
+        replaces = raw["replaces"]
+        if not isinstance(replaces, str) or not SLUG_RE.match(replaces):
+            raise PlacedError(f"{slug}: replaces must be a captured slug")
+        entry["replaces"] = replaces
     return entry
 
 
@@ -187,11 +192,14 @@ def manifest_element(entry: dict[str, Any]) -> dict[str, Any]:
     classification = (["authored environment geometry (placed.json)"]
                       if entry["role"] == "environment"
                       else ["authored set-dressing (placed.json)"])
-    return {"slug": entry["slug"], "label": entry["label"],
-            "role": entry["role"], "provenance": "authored",
-            "glb": entry["glb"], "extent": entry["extent"],
-            "classification": classification,
-            "collision": collision}
+    record = {"slug": entry["slug"], "label": entry["label"],
+              "role": entry["role"], "provenance": "authored",
+              "glb": entry["glb"], "extent": entry["extent"],
+              "classification": classification,
+              "collision": collision}
+    if entry.get("replaces"):
+        record["replaces"] = entry["replaces"]
+    return record
 
 
 def apply_placed_to_manifest(manifest_doc: dict[str, Any],

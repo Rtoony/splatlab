@@ -293,3 +293,181 @@ async def remove_placed_world_element(
     )
     return {"ok": True, "slug": slug, "tombstone": tombstone,
             "receipt": receipt}
+
+
+@router.get("/assets/library")
+async def get_asset_library() -> dict[str, Any]:
+    """The curated asset library, with catalog provenance attached — the
+    picker behind the Replace-with-asset flow."""
+    from dcc import blender_workflow as bw  # noqa: PLC0415 — host-side only
+    return {"assets": bw.list_asset_library()}
+
+
+@router.post("/jobs/{job_id}/world/elements/{captured_slug}/replace")
+async def replace_captured_element(
+    job_id: str, captured_slug: str, request: Request,
+    asset: str, role: str = "", label: str = "",
+) -> dict[str, Any]:
+    """Replace a CAPTURED element with a curated library asset — the
+    fire-hydrant pattern as one call.
+
+    The library asset (metre-scale, bottom-centre origin) is uniform-scaled
+    to the captured element's height and translated to its floor point,
+    entirely server-side (glb_transform — no Blender round-trip), then lands
+    through the same registry/manifest path as the door, carrying
+    `replaces: <captured_slug>`. The walker acts on that link: the captured
+    mesh stays hidden and its photograph ghost is plucked when the world has
+    fresh pluck rows. The captured element itself is untouched — deleting
+    the authored replacement brings everything back.
+    """
+    meta, job_dir = polish_route._require_job(job_id)
+    world_dir, manifest_path = _world_paths(job_dir)
+    if not wp.SLUG_RE.match(captured_slug or "") or captured_slug == "shell":
+        raise HTTPException(status_code=404, detail="Bad captured slug")
+    manifest = manifests.read_json(manifest_path)
+    if not isinstance(manifest, dict):
+        raise HTTPException(status_code=409,
+                            detail="World is ungraded — run the collision "
+                                   "stage before replacing elements")
+    captured = next((e for e in manifest.get("elements") or []
+                     if (e or {}).get("slug") == captured_slug), None)
+    if captured is None:
+        raise HTTPException(status_code=404,
+                            detail=f"'{captured_slug}' is not in this world")
+    if captured.get("provenance") == "authored":
+        raise HTTPException(
+            status_code=409,
+            detail="Only CAPTURED elements can be replaced — authored assets "
+                   "are removed/re-placed through their own doors")
+    captured_glb = world_dir / "elements" / f"{captured_slug}.glb"
+    if not captured_glb.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{captured_slug}' has no built GLB to take the pose from")
+
+    from dcc import blender_workflow as bw  # noqa: PLC0415
+    try:
+        asset_path = bw._contained_library_file(
+            bw.ASSET_LIBRARY_ROOT / f"{asset}.glb")
+        glb_check.validate_glb(asset_path)
+    except bw.BlenderWorkflowError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400,
+                            detail=f"library asset '{asset}': {exc}") from exc
+
+    slug = f"re-{captured_slug}"[:40].rstrip("-")
+    registry = _read_registry_or_500(world_dir, job_id)
+    world = manifests.read_json(world_dir / "world.json") or {}
+    taken = set(wi.world_slugs(manifest))
+    taken |= {e.get("slug") for e in world.get("elements") or []
+              if isinstance(e, dict)}
+    taken |= {e["slug"] for e in registry["elements"]}
+    target = world_dir / "elements" / f"{slug}.glb"
+    if slug in taken or target.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{captured_slug}' already has a replacement "
+                   f"('{slug}') — remove it first")
+    if len(registry["elements"]) >= wp.MAX_PLACED:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Placement registry is full ({wp.MAX_PLACED} assets)")
+
+    # Pose: the captured element's floor point + height, from its own GLB.
+    try:
+        cap_bounds = glb_check.position_bounds(captured_glb)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{captured_slug}' GLB is unreadable for pose "
+                   f"extraction: {exc}") from exc
+    cap_min, cap_max = cap_bounds["aabb"]["min"], cap_bounds["aabb"]["max"]
+    floor_point = ((cap_min[0] + cap_max[0]) / 2, cap_min[1],
+                   (cap_min[2] + cap_max[2]) / 2)
+    cap_height = cap_max[1] - cap_min[1]
+    asset_bounds = glb_check.position_bounds(asset_path)
+    asset_height = asset_bounds["extent"][1]
+    scale = 1.0
+    if cap_height > 1e-6 and asset_height > 1e-6:
+        scale = max(0.05, min(20.0, cap_height / asset_height))
+
+    import glb_transform  # noqa: PLC0415
+    try:
+        transformed = glb_transform.translate_scale_glb(
+            asset_path.read_bytes(), floor_point, scale)
+    except glb_transform.GlbTransformError as exc:
+        raise HTTPException(status_code=400,
+                            detail=f"library asset '{asset}' cannot be "
+                                   f"re-posed: {exc}") from exc
+    tmp = world_dir / f".building-replace-{uuid.uuid4().hex}.glb"
+    tmp.write_bytes(transformed)
+    try:
+        summary = glb_check.validate_glb(tmp)
+        bounds = glb_check.position_bounds(tmp)
+        warnings: list[str] = []
+        if world.get("units") != "meters":
+            warnings.append(
+                "world scale is a guess (uncalibrated) — the replacement is "
+                "sized to the captured element, not to real metres")
+        role = role or ("prop" if captured.get("role") == "prop" else "static")
+        if role not in wp.ROLES:
+            raise HTTPException(status_code=400,
+                                detail=f"role must be one of {wp.ROLES}")
+
+        lock = splat_route._mesh_export_lock(job_id)
+        if lock.locked():
+            raise HTTPException(
+                status_code=409,
+                detail="A mesh build or export is running for this scene — "
+                       "retry when it finishes")
+        async with lock:
+            placed_at = manifests.utc_now()
+            os.replace(tmp, target)
+            entry = {
+                "slug": slug, "label": label or f"{asset} (for {captured_slug})",
+                "role": role,
+                "extent": bounds["extent"], "aabb": bounds["aabb"],
+                "gltf": summary, "source_filename": f"library:{asset}.glb",
+                "uploaded_bytes": target.stat().st_size, "placed_at": placed_at,
+                "warnings": warnings, "replaces": captured_slug,
+                "file": manifests.file_identity(target),
+            }
+            registry["elements"].append(entry)
+            validated = wp.write_placed(world_dir, registry)
+            merged = _patch_manifest(manifest_path, manifest, validated)
+            element = next(e for e in merged["elements"] if e["slug"] == slug)
+            receipt = {
+                "schema": PLACED_RECEIPT_SCHEMA,
+                "provenance": "authored",
+                "slug": slug, "role": role, "label": entry["label"],
+                "source_filename": entry["source_filename"],
+                "uploaded_bytes": entry["uploaded_bytes"],
+                "gltf": summary, "aabb": bounds["aabb"],
+                "extent": bounds["extent"], "warnings": warnings,
+                "uploaded_at": placed_at,
+                "supersedes": None,
+                "replaces": captured_slug,
+                "pose": {"floor_point": [round(v, 4) for v in floor_point],
+                         "scale": round(scale, 4)},
+                **manifests.file_identity(target),
+            }
+            manifests.atomic_write_json(
+                world_dir / "elements" / f"{slug}.placed.json", receipt)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    await audit_operator_event(
+        request=request,
+        title="Captured element replaced",
+        description=f"{job_id}/{captured_slug} -> {asset} as {slug} "
+                    f"(scale {scale:.2f}, {role})",
+        variant="success",
+        action="splat.world_replace",
+        target=meta.get("mode", "3d"),
+        metadata={"job_id": job_id, "slug": slug, "asset": asset,
+                  "replaces": captured_slug, "scale": round(scale, 4)},
+    )
+    return {"ok": True, "slug": slug, "replaces": captured_slug,
+            "asset": asset, "element": element, "receipt": receipt,
+            "warnings": warnings}
