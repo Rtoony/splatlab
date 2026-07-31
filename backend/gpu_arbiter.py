@@ -82,8 +82,12 @@ def current_maintenance_reason() -> str:
 
 LOCK_KEY = "nexus:gpu:heavy_lock"
 HOLDER_KEY = "nexus:gpu:heavy_holder"
-LOCK_TTL_MS = 90_000  # holder's lock auto-expires after this if not refreshed
-HEARTBEAT_SEC = 15.0  # refresh interval while holding (TTL is 6x => wide margin)
+# Holder's lock auto-expires after this if not refreshed. 180s, not 90s: a
+# host-wide stall (measured 102s on 2026-07-31 while ns-train moved a 30 GB
+# image cache to the GPU) must not expire a healthy holder's lease. Worst-case
+# cost of the wider TTL is a crashed holder blocking the GPU 90s longer.
+LOCK_TTL_MS = 180_000
+HEARTBEAT_SEC = 15.0  # refresh interval while holding (TTL is 12x => wide margin)
 ACQUIRE_POLL_SEC = 0.5  # how often to retry acquiring a contended lock
 _CLIENT_RETRY_SEC = 30.0  # backoff before re-probing a down Redis
 

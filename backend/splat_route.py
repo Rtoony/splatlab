@@ -2566,6 +2566,14 @@ def _plan_3d_job(
         str(train_iters),
         "--viewer.quit-on-train-completion",
         "True",
+        # Image cache lives in system RAM, not VRAM. Nerfstudio's default
+        # ("gpu") moves the whole uint8 cache onto the card at train start:
+        # a 4920-image equirect job is 30.6 GB against the 32 GB RTX 5090 and
+        # the move itself stalled the entire host hard enough to expire the
+        # GPU lease (2026-07-31, four dead trains). Per-step PCIe upload is
+        # ~6 MB — noise. Jobs <=2560 images only survived by fitting.
+        "--pipeline.datamanager.cache-images",
+        "cpu",
     ]
     stages.extend(["train", "export"])
     # Capture-health fog gate: REPORT-ONLY verdict right after export, before the

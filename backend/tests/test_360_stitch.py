@@ -55,6 +55,7 @@ GOLDEN_STANDARD_VIDEO_PLAN = {
             "--output-dir", "/jobs/splat_snapshot",
             "--max-num-iterations", "30000",
             "--viewer.quit-on-train-completion", "True",
+            "--pipeline.datamanager.cache-images", "cpu",
         ],
     },
     "sfm_context": {
