@@ -487,3 +487,114 @@ def test_wait_backup_idle_noop_when_idle(monkeypatch: pytest.MonkeyPatch) -> Non
         await gpu_arbiter.wait_backup_idle(max_wait_sec=0.05, poll_sec=0.01)
 
     asyncio.run(scenario())  # returns immediately, no error
+
+
+def test_vram_fence_evicts_squatter_but_honors_protection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registered evictable resident appearing during a held lease is
+    evicted through the protection-flag path; `evictable: false` services
+    (live dictation) are never touched. (Regression: qwen3.6:35b-a3b loaded
+    24.5 GB beside ns-train mid-lease, 2026-07-31.)"""
+    lock = _TrackingLock()
+    _stub_runner_dependencies(monkeypatch, lock)
+    monkeypatch.setattr(gpu_arbiter, "VRAM_FENCE_INTERVAL_SEC", 0.01)
+
+    async def status():
+        return {
+            "vram_free_mb": 5000,
+            "services": [
+                {"id": "ollama-qwen", "resident": True, "evictable": True},
+                {"id": "nexus-voice", "resident": True, "evictable": False},
+            ],
+        }
+
+    evicted: list[str] = []
+
+    async def fake_evict(sid: str) -> bool:
+        evicted.append(sid)
+        return True
+
+    monkeypatch.setattr(gpu_arbiter, "gpu_status", status)
+    monkeypatch.setattr(gpu_arbiter, "evict", fake_evict)
+    messages: list[str] = []
+
+    async def scenario() -> None:
+        async def operation() -> str:
+            await asyncio.sleep(0.1)  # several fence intervals
+            return "done"
+
+        result = await gpu_arbiter.run_gpu_operation(
+            lane="test",
+            operation_id="fence-test",
+            vram_mb=1,
+            operation=operation,
+            status_callback=messages.append,
+        )
+        assert result == "done"
+
+    asyncio.run(scenario())
+    assert "ollama-qwen" in evicted
+    assert "nexus-voice" not in evicted
+    assert any("vram fence: evicted ollama-qwen" in m for m in messages)
+
+
+def test_vram_fence_failure_never_disturbs_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = _TrackingLock()
+    _stub_runner_dependencies(monkeypatch, lock)
+    monkeypatch.setattr(gpu_arbiter, "VRAM_FENCE_INTERVAL_SEC", 0.01)
+
+    async def broken_status():
+        raise RuntimeError("orchestrator down")
+
+    monkeypatch.setattr(gpu_arbiter, "gpu_status", broken_status)
+
+    async def scenario() -> None:
+        async def operation() -> str:
+            await asyncio.sleep(0.05)
+            return "done"
+
+        result = await gpu_arbiter.run_gpu_operation(
+            lane="test", operation_id="fence-broken", vram_mb=1, operation=operation
+        )
+        assert result == "done"
+
+    asyncio.run(scenario())
+
+
+def test_vram_fence_leaves_small_residents_alone_with_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No churn war: with ample free VRAM the fence evicts nothing."""
+    lock = _TrackingLock()
+    _stub_runner_dependencies(monkeypatch, lock)
+    monkeypatch.setattr(gpu_arbiter, "VRAM_FENCE_INTERVAL_SEC", 0.01)
+
+    async def status():
+        return {
+            "vram_free_mb": 20000,
+            "services": [{"id": "whisper-small", "resident": True, "evictable": True}],
+        }
+
+    evicted: list[str] = []
+
+    async def fake_evict(sid: str) -> bool:
+        evicted.append(sid)
+        return True
+
+    monkeypatch.setattr(gpu_arbiter, "gpu_status", status)
+    monkeypatch.setattr(gpu_arbiter, "evict", fake_evict)
+
+    async def scenario() -> None:
+        async def operation() -> str:
+            await asyncio.sleep(0.05)
+            return "done"
+
+        await gpu_arbiter.run_gpu_operation(
+            lane="test", operation_id="fence-headroom", vram_mb=1, operation=operation
+        )
+
+    asyncio.run(scenario())
+    assert evicted == []

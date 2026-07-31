@@ -742,6 +742,7 @@ async def run_gpu_operation(
         set_holder(lane, operation_id)
         op_task: asyncio.Task[_T] | None = None
         lost_task: asyncio.Task[None] | None = None
+        fence_task: asyncio.Task[None] | None = None
         try:
             ok, detail = await acquire_gpu(vram_mb)
             if status_callback is not None:
@@ -753,6 +754,9 @@ async def run_gpu_operation(
                 raise GPUArbiterUnavailable(f"GPU maintenance gate active: {reason}")
             op_task = asyncio.create_task(operation())
             lost_task = asyncio.create_task(HEAVY_GPU_LOCK.wait_coordination_lost())
+            fence_task = asyncio.create_task(
+                _vram_fence(operation_id, status_callback)
+            )
             done, _pending = await asyncio.wait(
                 {op_task, lost_task}, return_when=asyncio.FIRST_COMPLETED
             )
@@ -786,11 +790,66 @@ async def run_gpu_operation(
                     await op_task
             raise
         finally:
+            if fence_task is not None:
+                fence_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await fence_task
             if lost_task is not None:
                 lost_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await lost_task
             clear_holder()
+
+
+# How often the held-lease fence re-checks the card for squatters. Admission
+# evicts residents ONCE; nothing stopped a fleet agent's LiteLLM call from
+# reloading a 24.5 GB Ollama model DURING training (watched live 2026-07-31,
+# qwen3.6:35b-a3b beside ns-train). The fence closes that gap.
+VRAM_FENCE_INTERVAL_SEC = 60.0
+# Fence fires only under real pressure: a 24.5 GB model beside a training run
+# is fatal (the card is 32 GB and splat VRAM grows with densification), but a
+# small resident with plenty of headroom is harmless — evicting it every 60s
+# would churn-war against services that auto-reload.
+VRAM_FENCE_MIN_FREE_MB = 6000
+
+
+async def _vram_fence(
+    operation_id: str,
+    status_callback: Callable[[str], None] | None,
+) -> None:
+    """Continuously re-enforce what admission enforced once: while a lease is
+    held, any REGISTERED, evictable resident that appears on the card is a
+    squatter and is evicted through the same protection-flag-honouring path
+    (`evictable: false` services — e.g. live dictation — are never touched).
+    Best-effort by design: a fence hiccup must never disturb the operation."""
+    while True:
+        await asyncio.sleep(VRAM_FENCE_INTERVAL_SEC)
+        try:
+            status = await gpu_status()
+            if not status:
+                continue
+            if status.get("vram_free_mb", 0) >= VRAM_FENCE_MIN_FREE_MB:
+                continue
+            squatters = [
+                s
+                for s in status.get("services", [])
+                if s.get("resident")
+                and s.get("evictable", True) is not False
+                and s.get("enabled", True) is not False
+            ]
+            for svc in squatters:
+                if await evict(svc["id"]):
+                    message = (
+                        f"vram fence: evicted {svc['id']} "
+                        f"(loaded during held lease {operation_id})"
+                    )
+                    log.warning("gpu_arbiter: %s", message)
+                    if status_callback is not None:
+                        status_callback(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - fence is best-effort
+            log.debug("gpu_arbiter: vram fence check failed: %s", exc)
 
 
 async def run_host_operation(
