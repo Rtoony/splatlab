@@ -495,6 +495,10 @@ class SplatJob:
     # it is only populated for escalation-eligible jobs (video / image-folder,
     # incl. equirect — NOT a pre-processed dataset).
     sfm_tried: set[str] = field(default_factory=set)
+    # Stages whose artifacts a /resume request verified on disk: the runner
+    # skips each one (logging the skip) instead of re-running it. Consumed
+    # destructively so an escalation-injected duplicate name never re-skips.
+    resume_completed: set[str] = field(default_factory=set)
     reroute_count: int = 0
     # Structured reroute history ({from_solver, to_solver, registered, extracted,
     # pct, at}) — persisted to meta on every reroute so the frontend can show
@@ -3135,6 +3139,16 @@ async def _run_pipeline(job: SplatJob) -> None:
                 job.log_lines.append(error_message)
                 break
 
+            if stage in job.resume_completed:
+                job.resume_completed.discard(stage)
+                job.log_lines.append(
+                    f"[{stage}] resume: prior artifact verified on disk — skipping re-run."
+                )
+                _flush_log(job)
+                completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
+                _patch_meta(job.job_id, stages_completed=[*completed, stage])
+                continue
+
             if stage == "stitch":
                 # The stream layout was probed and classified AT PLAN TIME
                 # (_stitch_layout): single-stream -> legacy -vf v360, dual
@@ -3700,16 +3714,72 @@ def _backup_interlock_detail(unit: str, state: str) -> str:
     return f"Backup {unit} is {state}. Wait for it to finish before starting a SplatLab evaluation."
 
 
-def _restart_job(meta: dict[str, Any], req: SplatTrainRequest) -> None:
+# Resume trusts only stages whose artifact can be independently verified.
+# Anything not listed (escalation stages, best-effort tail stages) is cheap
+# or solver-specific and simply re-runs — conservative on purpose.
+def _stage_artifact_ok(job_dir: Path, stage: str) -> bool:
+    if stage == "stitch":
+        f = job_dir / "stitched" / "equirect.mp4"
+        try:
+            return f.is_file() and f.stat().st_size > 0
+        except OSError:
+            return False
+    if stage == "rig_sfm":
+        sparse = job_dir / "rig" / "sparse"
+        return sparse.is_dir() and any(sparse.glob("*/cameras.bin"))
+    if stage == "process":
+        return (job_dir / "processed" / "transforms.json").is_file()
+    if stage == "train":
+        # The canonical config finder knows the real nerfstudio layout
+        # (processed/<experiment>/splatfacto/<ts>/) and already excludes the
+        # DN fine-tune poison case; a checkpoint must sit beside it.
+        config = _find_latest_config(job_dir)
+        return config is not None and any(
+            (config.parent / "nerfstudio_models").glob("*.ckpt")
+        )
+    return False
+
+
+def _resume_verified_prefix(
+    job_dir: Path, planned: list[str], previously_completed: list[str]
+) -> list[str]:
+    """The stage PREFIX that may be skipped on resume: each stage must be in
+    the old run's stages_completed AND have its artifact verified on disk.
+    The walk stops at the first miss — later artifacts are ignored (their
+    inputs are being re-made), which keeps dependencies trivially correct."""
+    done = set(previously_completed)
+    prefix: list[str] = []
+    for stage in planned:
+        if stage in done and _stage_artifact_ok(job_dir, stage):
+            prefix.append(stage)
+        else:
+            break
+    return prefix
+
+
+def _restart_job(
+    meta: dict[str, Any], req: SplatTrainRequest, *, resume: bool = False
+) -> list[str]:
     """Re-plan and relaunch an orphaned job under its ORIGINAL job_id. Stage
     scripts are self-cleaning (each rm -rfs its own outputs), so restarting from
     the first stage is safe; prior escalation state is deliberately dropped
-    (worst case a rung is retried). Must run inside a live event loop."""
+    (worst case a rung is retried). Must run inside a live event loop.
+
+    With resume=True, stages whose artifacts survive verification are skipped
+    (2026-07-31: a job whose 30k-iteration training SUCCEEDED was killed at
+    export by a backup collision — the only remedy was a full 2.5h re-run).
+    Returns the list of stages that will be skipped (empty when resume=False).
+    """
     job_id = meta["job_id"]
     availability = _engine_availability()
     input_path = _resolve_input_path(req.input_path)
     job_dir = _job_dir(job_id)
     stages, commands, sfm_context = _plan_3d_job(req, availability, job_dir, input_path)
+    skipped: list[str] = []
+    if resume:
+        skipped = _resume_verified_prefix(
+            job_dir, stages, list(meta.get("stages_completed") or [])
+        )
     job = SplatJob(
         job_id=job_id,
         output_dir=str(job_dir),
@@ -3719,19 +3789,29 @@ def _restart_job(meta: dict[str, Any], req: SplatTrainRequest) -> None:
         sfm_tried=_seed_sfm_tried(sfm_context, stages),
         sfm_context=sfm_context,
         sfm_req=req if sfm_context else None,
+        resume_completed=set(skipped),
     )
     fresh = _new_meta(job_id, req, input_path, job_dir, stages, sfm_context)
     fresh["created_at"] = meta.get("created_at") or fresh["created_at"]
     fresh["pinned"] = bool(meta.get("pinned"))
     fresh["restart_count"] = int(meta.get("restart_count") or 0) + 1
     fresh["restarted_at"] = _utc_now()
+    if resume:
+        fresh["resumed_stages"] = skipped
     _write_meta(job_id, fresh)
     JOBS[job_id] = job
-    job.log_lines.append(
-        "Auto-restarted after a service restart (in-flight work does not survive "
-        "the restart; stages are self-cleaning). Planned stages: " + " -> ".join(stages)
-    )
+    if resume:
+        job.log_lines.append(
+            "Resumed by operator request. Verified artifacts let this run skip: "
+            + (" -> ".join(skipped) if skipped else "(none — full re-run)")
+        )
+    else:
+        job.log_lines.append(
+            "Auto-restarted after a service restart (in-flight work does not survive "
+            "the restart; stages are self-cleaning). Planned stages: " + " -> ".join(stages)
+        )
     job.runner_task = asyncio.create_task(_run_pipeline(job))
+    return skipped
 
 
 async def resume_orphan_jobs() -> int:
@@ -7708,6 +7788,65 @@ async def health_receipt(job_id: str, name: str):
         raise HTTPException(status_code=404, detail="receipt not rendered")
     media = "image/webp" if name.endswith(".webp") else "image/png"
     return FileResponse(str(receipt), media_type=media)
+
+
+@router.post("/jobs/{job_id}/resume")
+async def resume_failed_job(request: Request, job_id: str):
+    """Relaunch a FAILED job, skipping the verified-artifact stage prefix.
+
+    Born 2026-07-31: a job whose 30k-iteration training had SUCCEEDED was
+    killed at export by a backup collision, and the only remedy was a full
+    2.5-hour re-run of stitch/SfM/train. Now the surviving artifacts count:
+    each completed stage whose output verifies on disk is skipped, and the
+    pipeline resumes at the first gap. Conservative by design — verification
+    failure for any stage just means that stage re-runs.
+    """
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    if meta.get("status") != "failed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Only failed jobs can be resumed (status: {meta.get('status')})",
+        )
+    async with JOBS_LOCK:
+        live = JOBS.get(job_id)
+        if live is not None and live.runner_task is not None and not live.runner_task.done():
+            raise HTTPException(status_code=409, detail="Job is already running")
+    reason = maintenance_gate.maintenance_reason(TRAINING_DISABLED_REASON)
+    if reason:
+        raise HTTPException(status_code=409, detail=f"Hardware maintenance gate active: {reason}")
+    busy, unit, state = _backup_interlock_busy()
+    if busy:
+        raise HTTPException(status_code=409, detail=_backup_interlock_detail(unit, state))
+    req = _req_from_meta(meta)
+    if req is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Original request cannot be reconstructed from this job's metadata",
+        )
+    skipped = _restart_job(meta, req, resume=True)
+    planned = (JOBS.get(job_id).stages_planned if JOBS.get(job_id) else [])
+    resuming_from = next((s for s in planned if s not in skipped), None)
+    await audit_operator_event(
+        request=request,
+        title="Resumed failed Splat 3D job",
+        description=(
+            f"skipped {len(skipped)} verified stage(s) "
+            f"({' -> '.join(skipped) or 'none'}); resuming at {resuming_from}"
+        ),
+        action="splat.resume",
+        target=meta.get("mode", "3d"),
+        metadata={"job_id": job_id, "skipped_stages": skipped},
+    )
+    return {
+        "job_id": job_id,
+        "status": "starting",
+        "skipped_stages": skipped,
+        "resuming_from": resuming_from,
+    }
 
 
 @router.post("/jobs/{job_id}/stop")
