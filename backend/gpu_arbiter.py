@@ -26,6 +26,8 @@ from typing import Any, Awaitable, Callable, TypeVar
 
 import httpx
 
+import flight_recorder
+
 try:
     from . import maintenance_gate
 except ImportError:  # pragma: no cover - direct backend module import
@@ -433,6 +435,7 @@ class _CrossProcessLock:
             except RuntimeError:
                 pass  # loop already closed; the operation is gone anyway
 
+        last_beat = time.monotonic()
         while not stop.wait(HEARTBEAT_SEC):
             r = _redis()
             if r is None:
@@ -452,7 +455,10 @@ class _CrossProcessLock:
                 # reports an anonymous locked GPU, and external watchers
                 # (Flight A supervisor) treat that as an unauthorized holder.
                 r.pexpire(HOLDER_KEY, LOCK_TTL_MS * 2)
-                elapsed = time.monotonic() - started
+                now = time.monotonic()
+                elapsed = now - started
+                flight_recorder.record_heartbeat(token[-8:], now - last_beat, elapsed)
+                last_beat = now
                 if elapsed > HEARTBEAT_SEC:
                     log.warning(
                         "gpu_arbiter: lease refresh took %.1fs (Redis slow)",
@@ -724,9 +730,16 @@ async def run_gpu_operation(
             op_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await op_task
-            raise GPUArbiterUnavailable(
-                "Redis GPU coordination was lost during the operation; work was stopped fail-closed"
+            record = await asyncio.to_thread(
+                flight_recorder.write_record, "redis-coordination-lost", operation_id
             )
+            detail = (
+                "Redis GPU coordination was lost during the operation; "
+                "work was stopped fail-closed"
+            )
+            if record:
+                detail += f"; flight record: {record}"
+            raise GPUArbiterUnavailable(detail)
         except asyncio.CancelledError:
             if op_task is not None and not op_task.done():
                 op_task.cancel()
