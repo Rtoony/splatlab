@@ -2719,6 +2719,9 @@ async def _run_locked_stage(job: SplatJob, stage: str, command: list[str], vram_
         return await _run_stage(job, stage, command)
 
     try:
+        # A backup landing in the gap between two stages pauses the stage
+        # (bounded) instead of killing a multi-hour job — see wait_backup_idle.
+        await gpu_arbiter.wait_backup_idle(status_callback=status)
         return await gpu_arbiter.run_gpu_operation(
             lane="splat",
             operation_id=f"{job.job_id}:{stage}",

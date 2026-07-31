@@ -435,3 +435,55 @@ def test_heartbeat_survives_event_loop_starvation(
     assert len(calls) >= 3, (
         f"heartbeat starved during loop stall: only {len(calls)} refreshes"
     )
+
+
+def test_wait_backup_idle_returns_when_backup_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stage queues politely behind an active backup instead of dying
+    (regression: 2026-07-31 export killed by a backup in the stage gap)."""
+    states = iter([
+        (True, "backup-docker-services.service", "activating"),
+        (True, "backup-docker-services.service", "active"),
+        (False, "", "inactive"),
+    ])
+    monkeypatch.setattr(
+        gpu_arbiter, "backup_interlock_busy", lambda: next(states)
+    )
+    messages: list[str] = []
+
+    async def scenario() -> None:
+        await gpu_arbiter.wait_backup_idle(
+            max_wait_sec=5.0, poll_sec=0.01, status_callback=messages.append
+        )
+
+    asyncio.run(scenario())
+    assert len(messages) == 1  # announced once, not per poll
+    assert "backup-docker-services" in messages[0]
+
+
+def test_wait_backup_idle_still_fails_closed_at_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        gpu_arbiter,
+        "backup_interlock_busy",
+        lambda: (True, "nexus-backup.service", "active"),
+    )
+
+    async def scenario() -> None:
+        await gpu_arbiter.wait_backup_idle(max_wait_sec=0.05, poll_sec=0.01)
+
+    with pytest.raises(gpu_arbiter.GPUArbiterUnavailable, match="nexus-backup"):
+        asyncio.run(scenario())
+
+
+def test_wait_backup_idle_noop_when_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        gpu_arbiter, "backup_interlock_busy", lambda: (False, "", "inactive")
+    )
+
+    async def scenario() -> None:
+        await gpu_arbiter.wait_backup_idle(max_wait_sec=0.05, poll_sec=0.01)
+
+    asyncio.run(scenario())  # returns immediately, no error

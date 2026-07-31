@@ -177,6 +177,45 @@ def backup_interlock_busy() -> tuple[bool, str, str]:
     return False, "", "inactive"
 
 
+async def wait_backup_idle(
+    max_wait_sec: float = 900.0,
+    poll_sec: float = 10.0,
+    status_callback: Callable[[str], None] | None = None,
+) -> None:
+    """Wait (bounded) for an active backup to release the machine.
+
+    Born 2026-07-31: a backup unit that had queued all night behind a
+    training job's host lock went `activating` in the millisecond gap
+    between the train and export stages — export's admission then refused
+    ("backup activating; refusing overlapping heavy work") and a job whose
+    training had SUCCEEDED died terminally over a four-minute backup.
+
+    Backups still own the machine — nothing here overlaps them; a stage
+    just queues politely instead of dying. At the deadline this raises the
+    same GPUArbiterUnavailable the instant-refusal produced, so fail-closed
+    behaviour is unchanged, merely delayed by a bounded, logged wait.
+    """
+    deadline = time.monotonic() + max_wait_sec
+    announced = False
+    while True:
+        busy, unit, state = backup_interlock_busy()
+        if not busy:
+            return
+        if time.monotonic() >= deadline:
+            raise GPUArbiterUnavailable(
+                f"backup {unit} still {state} after waiting {int(max_wait_sec)}s; "
+                "refusing overlapping heavy work"
+            )
+        if not announced:
+            if status_callback is not None:
+                status_callback(
+                    f"waiting for backup {unit} ({state}) to finish "
+                    f"— up to {int(max_wait_sec)}s before refusing"
+                )
+            announced = True
+        await asyncio.sleep(poll_sec)
+
+
 def require_backup_idle() -> None:
     busy, unit, state = backup_interlock_busy()
     if not busy:
