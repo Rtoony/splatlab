@@ -50,6 +50,7 @@ import gpu_arbiter
 import maintenance_gate
 import opregistry  # persistent heavy-operation registry (pollable, restart-truthful)
 import scale_calibration  # pure metric-scale math; imports nothing from this app
+from train_preflight import train_preflight
 from health.precheck import precheck_input
 from health.probe import probe_capture
 from operator_audit import audit_operator_event
@@ -2733,8 +2734,27 @@ async def _run_locked_stage(job: SplatJob, stage: str, command: list[str], vram_
         return -1
 
 
+PREFLIGHT_REFUSED_CODE = 97  # distinct from tool exit codes; named in the log
+
+
 async def _run_train_stage(job: SplatJob, command: list[str]) -> int:
-    """Run the train stage under the cross-route heavy-GPU lock."""
+    """Run the train stage under the cross-route heavy-GPU lock.
+
+    A memory preflight runs FIRST — before the lock is even requested — so a
+    dataset that cannot fit the service's cgroup guard is refused in one
+    second with the exact numbers and knobs, instead of the kernel throttling
+    the whole service for hours (the 2026-07-31 four-dead-trains class).
+    """
+    try:
+        data_arg = command[command.index("--data") + 1]
+        processed_dir = Path(data_arg)
+    except (ValueError, IndexError):
+        processed_dir = Path(job.output_dir) / "processed"
+    verdict = train_preflight(processed_dir)
+    for line in verdict.log_lines:
+        job.log_lines.append(f"[train] {line}")
+    if not verdict.ok:
+        return PREFLIGHT_REFUSED_CODE
     return await _run_locked_stage(job, "train", command, TRAIN_VRAM_MB)
 
 
