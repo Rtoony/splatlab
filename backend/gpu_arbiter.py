@@ -17,6 +17,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -323,7 +324,8 @@ class _CrossProcessLock:
     def __init__(self) -> None:
         self._local = asyncio.Lock()
         self._token: str | None = None
-        self._hb: asyncio.Task | None = None
+        self._hb_thread: threading.Thread | None = None
+        self._hb_stop: threading.Event | None = None
         self._host_acquired = False
         self._coordination_lost = asyncio.Event()
 
@@ -357,7 +359,19 @@ class _CrossProcessLock:
                         break
                     await asyncio.sleep(ACQUIRE_POLL_SEC)
                 self._token = token
-                self._hb = asyncio.create_task(self._heartbeat(token))
+                # The heartbeat lives on a dedicated OS thread, not the event
+                # loop: during ns-train the loop and the shared to_thread pool
+                # both starve for 80-100s (measured 2026-07-30, three trains
+                # killed at 15s-cadence refreshes arriving 81/89/97s apart),
+                # which silently outlives the 90s TTL.
+                self._hb_stop = threading.Event()
+                self._hb_thread = threading.Thread(
+                    target=self._heartbeat_thread_main,
+                    args=(token, self._hb_stop, asyncio.get_running_loop()),
+                    name="gpu-lease-heartbeat",
+                    daemon=True,
+                )
+                self._hb_thread.start()
             except Exception as e:
                 _mark_redis_down(str(e))
                 enabled, _actor, _reason = _emergency_override()
@@ -377,13 +391,14 @@ class _CrossProcessLock:
 
     async def __aexit__(self, *_exc: Any) -> None:
         try:
-            hb, self._hb = self._hb, None
-            if hb is not None:
-                hb.cancel()
-                try:
-                    await hb
-                except asyncio.CancelledError:
-                    pass
+            hb_thread, self._hb_thread = self._hb_thread, None
+            hb_stop, self._hb_stop = self._hb_stop, None
+            if hb_stop is not None:
+                hb_stop.set()
+            if hb_thread is not None:
+                # join() on the loop would block it; a stuck join (Redis call
+                # wedged mid-refresh) must not wedge release, so bound it.
+                await asyncio.to_thread(hb_thread.join, 10.0)
             token, self._token = self._token, None
             if token is not None:
                 r = _redis()
@@ -400,33 +415,49 @@ class _CrossProcessLock:
                 HOST_WORK_LOCK.release()
             self._local.release()
 
-    async def _heartbeat(self, token: str) -> None:
-        try:
-            while True:
-                await asyncio.sleep(HEARTBEAT_SEC)
-                r = _redis()
-                if r is None:
-                    self._coordination_lost.set()
+    def _heartbeat_thread_main(
+        self,
+        token: str,
+        stop: threading.Event,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        lost = self._coordination_lost
+
+        def signal_lost() -> None:
+            try:
+                loop.call_soon_threadsafe(lost.set)
+            except RuntimeError:
+                pass  # loop already closed; the operation is gone anyway
+
+        while not stop.wait(HEARTBEAT_SEC):
+            r = _redis()
+            if r is None:
+                signal_lost()
+                return
+            try:
+                started = time.monotonic()
+                refreshed = r.eval(
+                    _REFRESH_LUA, 1, LOCK_KEY, token, str(LOCK_TTL_MS)
+                )
+                if not refreshed:
+                    log.error("gpu_arbiter: Redis lease ownership was lost")
+                    signal_lost()
                     return
-                try:
-                    refreshed = await asyncio.to_thread(
-                        r.eval, _REFRESH_LUA, 1, LOCK_KEY, token, str(LOCK_TTL_MS)
+                # The holder record must live exactly as long as the lease
+                # keeps renewing: if it expires mid-operation the status API
+                # reports an anonymous locked GPU, and external watchers
+                # (Flight A supervisor) treat that as an unauthorized holder.
+                r.pexpire(HOLDER_KEY, LOCK_TTL_MS * 2)
+                elapsed = time.monotonic() - started
+                if elapsed > HEARTBEAT_SEC:
+                    log.warning(
+                        "gpu_arbiter: lease refresh took %.1fs (Redis slow)",
+                        elapsed,
                     )
-                    if not refreshed:
-                        log.error("gpu_arbiter: Redis lease ownership was lost")
-                        self._coordination_lost.set()
-                        return
-                    # The holder record must live exactly as long as the lease
-                    # keeps renewing: if it expires mid-operation the status API
-                    # reports an anonymous locked GPU, and external watchers
-                    # (Flight A supervisor) treat that as an unauthorized holder.
-                    await asyncio.to_thread(r.pexpire, HOLDER_KEY, LOCK_TTL_MS * 2)
-                except Exception as exc:  # noqa: BLE001 - a lost heartbeat is unsafe
-                    _mark_redis_down(str(exc))
-                    self._coordination_lost.set()
-                    return
-        except asyncio.CancelledError:
-            pass
+            except Exception as exc:  # noqa: BLE001 - a lost heartbeat is unsafe
+                _mark_redis_down(str(exc))
+                signal_lost()
+                return
 
     def locked(self) -> bool:
         if self._local.locked():

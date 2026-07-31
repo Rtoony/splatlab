@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -368,13 +369,16 @@ def test_heartbeat_keeps_holder_record_alive(
     async def scenario() -> None:
         lock = gpu_arbiter._CrossProcessLock()
         lock._coordination_lost = asyncio.Event()
-        hb = asyncio.create_task(lock._heartbeat("test-token"))
+        stop = threading.Event()
+        hb = threading.Thread(
+            target=lock._heartbeat_thread_main,
+            args=("test-token", stop, asyncio.get_running_loop()),
+            daemon=True,
+        )
+        hb.start()
         await asyncio.wait_for(asyncio.to_thread(beats.wait, 5.0), timeout=6.0)
-        hb.cancel()
-        try:
-            await hb
-        except asyncio.CancelledError:
-            pass
+        stop.set()
+        await asyncio.to_thread(hb.join, 5.0)
 
     asyncio.run(scenario())
 
@@ -383,4 +387,51 @@ def test_heartbeat_keeps_holder_record_alive(
     assert all(
         c[1] == gpu_arbiter.HOLDER_KEY and c[2] == gpu_arbiter.LOCK_TTL_MS * 2
         for c in holder_refreshes
+    )
+
+
+def test_heartbeat_survives_event_loop_starvation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lease heartbeat must keep refreshing while the event loop is blocked.
+
+    Regression: during ns-train the backend's event loop and shared to_thread
+    pool starved for 80-100s (measured refresh gaps 81/89/97s on 2026-07-30),
+    so the asyncio-task heartbeat outlived the 90s TTL and three consecutive
+    trainings were killed "lease ownership lost". The heartbeat now runs on a
+    dedicated thread; a cold loop stall must not stop the refreshes.
+    """
+    calls: list[str] = []
+
+    class _FakeRedis:
+        # Mirrors redis-py's Redis.eval (server-side Lua), not Python eval().
+        def eval(self, *_args: object) -> int:
+            calls.append("eval")
+            return 1
+
+        def pexpire(self, *_args: object) -> int:
+            return 1
+
+    monkeypatch.setattr(gpu_arbiter, "_redis", lambda: _FakeRedis())
+    monkeypatch.setattr(gpu_arbiter, "HEARTBEAT_SEC", 0.01)
+
+    async def scenario() -> None:
+        lock = gpu_arbiter._CrossProcessLock()
+        lock._coordination_lost = asyncio.Event()
+        stop = threading.Event()
+        hb = threading.Thread(
+            target=lock._heartbeat_thread_main,
+            args=("test-token", stop, asyncio.get_running_loop()),
+            daemon=True,
+        )
+        hb.start()
+        # Block the event loop cold — the old asyncio-task heartbeat cannot
+        # run at all during this window; the thread heartbeat must not care.
+        time.sleep(0.5)
+        stop.set()
+        await asyncio.to_thread(hb.join, 5.0)
+
+    asyncio.run(scenario())
+    assert len(calls) >= 3, (
+        f"heartbeat starved during loop stall: only {len(calls)} refreshes"
     )
