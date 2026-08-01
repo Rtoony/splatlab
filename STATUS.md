@@ -3445,3 +3445,33 @@ All three triage treatments now exist: Photo-only (default) / Show mesh /
 Replace-with-asset / Propose-generated — deliberate, per-object, reversible.
 
 Backend 1302 green (+4), frontend 156 green, tsc clean.
+
+## 2026-07-31 — FIRST OWN CAPTURE WALKABLE + the resilience overhaul it forced
+
+RToony's first deliberate INSV capture (splat_f9f3b4fed4, storage room, 4920 frames —
+the densest dataset this pipeline has ever seen) is WALKABLE: health GOOD (registration
+1.0), voxel shell 52,294 faces (connectivity gate PASS), navmesh live, floor gate
+report-only at 76.5% standable (the rest is real shelving). Six attempts to get there;
+every failure bought a permanent fix, all on main, all deployed:
+
+- Three-layer lease-death root cause: asyncio heartbeat starvation (5980fa0, thread
+  heartbeat) → 30.6G uint8 cache vs 32G VRAM (fe0a5e6, cache-images cpu + TTL 180s) →
+  TRUE cause: service cgroup MemoryHigh=32G quicksand, 35M throttle hits (raised to
+  64G/80G in 60-safety-guard.conf — the canonical file, survives daemon-reload).
+- New standing armor: train memory preflight (c9322e0), coordination-death flight
+  recorder (185a12b), wait_backup_idle stage queueing (c198802), VRAM fence (f6add9a —
+  first production kill same day: evicted qwen3.6:35b loaded mid-langfield), POST
+  /jobs/{id}/resume with artifact-verified prefix skip (526b0a9, used twice same day),
+  instance-free worlds via solidify --allow-empty-inventory (this scene's 12 candidates
+  were ALL honestly vetoed; shell+ground worlds are legitimate).
+- Suite-isolation fix (b5ef7c2): the long-recorded "transient pytest hang" was tests
+  blocking on the LIVE GPU lock whenever a real job ran. Suite green mid-job now (1333).
+- Dense-scene knobs discovered: LANGFIELD_DEPTH_TOL=0.15 (drop-in), ground
+  semantic_thresh 0.35, voxel shell route for cluttered interiors. Langfield is now
+  ~2h/40% of the pipeline at this density — frame subsampling is the top optimization.
+- Ops: nexus-throttle-watch (5-min cgroup/PSI watchdog) + nexus-backup-reconciler
+  (daily 12:15) timers live; redis-key-forensics.sh staged as a reusable tool.
+
+Batch PARKED by RToony (system stays his): `bash ~/scripts/splatlab-hero-queue.sh --run`
+= capture-2@30k → capture-1@100k → capture-2@100k → walk Test Flight. 100k-vs-60k
+decision deferred until 30k/100k results compare side by side.
