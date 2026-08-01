@@ -178,7 +178,7 @@ def backup_interlock_busy() -> tuple[bool, str, str]:
 
 
 async def wait_backup_idle(
-    max_wait_sec: float = 900.0,
+    max_wait_sec: float = 2700.0,
     poll_sec: float = 10.0,
     status_callback: Callable[[str], None] | None = None,
 ) -> None:
