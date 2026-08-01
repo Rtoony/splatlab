@@ -129,3 +129,13 @@ def test_restart_job_resume_threads_skips_into_job(
     assert splat_route.JOBS[job_id].resume_completed == set(COMPLETED)
     assert written["resumed_stages"] == COMPLETED
     del splat_route.JOBS[job_id]
+
+
+def test_solidify_body_allows_empty_inventory_flag() -> None:
+    """The 2026-07-31 storage-room case: inventory exists, all 12 candidates
+    honestly vetoed — an instance-free (shell+ground) world must be buildable
+    via an explicit opt-in, never by default."""
+    body = splat_route.WorldSolidifyBody()
+    assert body.allow_empty_inventory is False  # fail-loud default preserved
+    body = splat_route.WorldSolidifyBody(allow_empty_inventory=True)
+    assert body.allow_empty_inventory is True

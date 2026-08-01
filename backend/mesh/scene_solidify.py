@@ -645,6 +645,9 @@ def main() -> int:
     ap.add_argument("--shell-texture-size", type=int, default=2048)
     ap.add_argument("--only", default=None, help="comma-separated slugs")
     ap.add_argument("--skip-shell", action="store_true")
+    ap.add_argument("--allow-empty-inventory", action="store_true",
+                    help="proceed with zero elements when the inventory exists "
+                         "but every candidate was vetoed (shell+ground world)")
     ap.add_argument("--shell-route", choices=["auto", "splat-transform", "voxel"],
                     default="auto",
                     help="which collision-shell route to build the visual shell "
@@ -755,9 +758,20 @@ def main() -> int:
 
     instances = load_inventory(job_dir)
     if not instances:
-        print("FATAL: no _scene/inventory.json (or instances.json) — run the scene "
-              "inventory first", file=sys.stderr)
-        return 1
+        # An inventory whose every candidate was HONESTLY vetoed (first seen
+        # 2026-07-31: storage-room capture, 12/12 vetoed on SAM3
+        # zero-detections + cluster floors) is a legitimate world state:
+        # shell + ground still make it walkable. --allow-empty-inventory
+        # proceeds with zero elements; the default stays fail-loud because
+        # an ABSENT inventory usually means the scene lane never ran.
+        if args.allow_empty_inventory and (job_dir / "_scene" / "inventory.json").is_file():
+            _log("  inventory present but empty (all candidates vetoed) — "
+                 "building an instance-free world (shell + ground only)")
+            instances = []
+        else:
+            print("FATAL: no _scene/inventory.json (or instances.json) — run the scene "
+                  "inventory first", file=sys.stderr)
+            return 1
     only = {s.strip() for s in args.only.split(",")} if args.only else None
     if args.patch_elements:
         if not only:

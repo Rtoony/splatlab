@@ -6755,6 +6755,9 @@ class WorldSolidifyBody(BaseModel):
     drop_unobserved: bool = False
     skip_shell: bool = False
     shell_only: bool = False
+    # Proceed with zero elements when the inventory exists but every candidate
+    # was honestly vetoed (2026-07-31 storage-room case) — shell+ground world.
+    allow_empty_inventory: bool = False
     prefer_generated: bool = False
     # Opt-in: a captured prop that trips a measured quality floor is
     # regenerated under object_generate's own gates, trigger + outcome
@@ -6875,6 +6878,8 @@ async def world_solidify(job_id: str, body: WorldSolidifyBody):
                 solidify_cmd += ["--shell-route", body.shell_route]
             if body.shell_only:
                 solidify_cmd.append("--shell-only")
+            if body.allow_empty_inventory:
+                solidify_cmd.append("--allow-empty-inventory")
             if body.prefer_generated:
                 solidify_cmd.append("--prefer-generated")
             if body.auto_generate:
