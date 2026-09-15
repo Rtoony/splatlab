@@ -56,6 +56,7 @@ GOLDEN_STANDARD_VIDEO_PLAN = {
             "--max-num-iterations", "30000",
             "--viewer.quit-on-train-completion", "True",
             "--pipeline.datamanager.cache-images", "cpu",
+            "--pipeline.model.rasterize-mode", "antialiased",   # 2026-09-15: measured win, Spark-verified
         ],
     },
     "sfm_context": {

@@ -822,6 +822,14 @@ def _append_mesh_stage(stages: list[str], req: "SplatTrainRequest") -> None:
         stages.append("mesh")
 
 
+def _train_rasterize_mode() -> str:
+    """gsplat rasterize mode for splatfacto training. Default antialiased (measured win,
+    see the train command); any value other than classic/antialiased falls back to the
+    default rather than handing ns-train a bad flag."""
+    mode = os.environ.get("SPLAT_TRAIN_RASTERIZE_MODE", "").strip().lower()
+    return mode if mode in ("classic", "antialiased") else "antialiased"
+
+
 def _eval_available() -> bool:
     """True iff nerfstudio's ns-eval is on the resolved toolchain path."""
     return _tool_path("ns-eval", "SPLAT_NS_EVAL_BIN") is not None
@@ -2591,6 +2599,13 @@ def _plan_3d_job(
         # ~6 MB — noise. Jobs <=2560 images only survived by fitting.
         "--pipeline.datamanager.cache-images",
         "cpu",
+        # Mip-Splatting anti-aliasing (2026-09-15 flag A/B, receipts in STATUS): +0.24 dB
+        # held-out on the bonsai, neutral on the storage room, zero training cost, and
+        # SparkJS reproduces antialiased-trained splats MORE faithfully than classic ones
+        # (37.2 vs 30.1 dB vs the training render; +0.41 dB vs photos in the walker).
+        # Kill-switch: SPLAT_TRAIN_RASTERIZE_MODE=classic restores the pre-09-15 command.
+        "--pipeline.model.rasterize-mode",
+        _train_rasterize_mode(),
     ]
     stages.extend(["train", "export"])
     # Capture-health fog gate: REPORT-ONLY verdict right after export, before the

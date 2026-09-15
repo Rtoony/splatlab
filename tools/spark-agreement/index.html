@@ -1,0 +1,38 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Spark agreement</title>
+<style>html,body{margin:0;background:#fff;overflow:hidden}canvas{display:block}</style>
+<script type="importmap">
+{"imports":{"three":"/node_modules/three/build/three.module.js","three/addons/":"/node_modules/three/examples/jsm/","@sparkjsdev/spark":"/node_modules/@sparkjsdev/spark/dist/spark.module.js"}}
+</script>
+<script>window.__pageErrors = []; window.addEventListener("error", e => window.__pageErrors.push(String(e.message || e)));
+window.addEventListener("unhandledrejection", e => window.__pageErrors.push("unhandled: " + String(e.reason)));</script>
+<script type="module">
+// Standalone mirror of spark-scene-viewer.tsx: SplatMesh({url, fileType: PLY}) + SparkRenderer({renderer}),
+// no coordinate flips, camera = position / up / lookAt(position + forward), fov_y from the intrinsics.
+import * as THREE from "three";
+import { SparkRenderer, SplatFileType, SplatMesh } from "@sparkjsdev/spark";
+const q = new URLSearchParams(location.search);
+const W = parseInt(q.get("w") || "640", 10), H = parseInt(q.get("h") || "427", 10);
+const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true, alpha: false });
+renderer.setPixelRatio(1); renderer.setSize(W, H); renderer.setClearColor(0xffffff, 1);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0xffffff);
+const camera = new THREE.PerspectiveCamera(50, W / H, 0.01, 1000);
+const spark = new SparkRenderer({ renderer }); scene.add(spark);
+const mesh = new SplatMesh({ url: q.get("ply"), fileType: SplatFileType.PLY });
+scene.add(mesh);
+let frames = 0;
+function loop() { renderer.render(scene, camera); frames++; requestAnimationFrame(loop); }
+window.__spark = {
+  ready: false, error: null, frames: () => frames, numSplats: () => mesh.numSplats,
+  setCamera: (c) => {
+    renderer.setSize(c.w, c.h); camera.aspect = c.w / c.h; camera.fov = c.fov_y_degrees; camera.updateProjectionMatrix();
+    const pos = new THREE.Vector3(...c.position), fwd = new THREE.Vector3(...c.forward).normalize(), up = new THREE.Vector3(...c.up).normalize();
+    camera.position.copy(pos); camera.up.copy(up); camera.lookAt(pos.clone().add(fwd));
+    camera.updateMatrixWorld(true);
+  },
+};
+try { await mesh.initialized; window.__spark.ready = true; } catch (e) { window.__spark.error = String(e); }
+loop();
+</script>

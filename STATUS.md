@@ -4047,3 +4047,32 @@ scope with throttle events AND idle GPU, then relaunches). The pipeline's train 
   delta, `prove-*` pattern) before changing `backend/splat_route.py`'s train command. The golden plan
   snapshot (`test_360_stitch.py`) pins the train command and will need the same one-line update.
 - Compute-gate scope guard 32G/48G → 64G/80G (`tools/splatlab-compute-gate.sh`) is in commit d.
+
+## 2026-09-15 — Spark side-by-side PASSED → `antialiased` adopted in the production train command
+
+**The check** (`tools/prove-spark-agreement.py`, runner `~/scripts/splatlab-spark-agreement-2026-09-15.sh`):
+export both bonsai arms (`ns-export`), render 8 held-out cameras in each arm's *own* rasterize mode
+(`render_views.py --rasterize-mode auto`, which now records c2w + intrinsics), then render the same
+cameras in a standalone SparkJS page that mirrors `spark-scene-viewer.tsx` exactly (SplatMesh PLY, no
+flips, position / up / lookAt(forward), fov from fy) and score vs the real photo and vs nerfstudio.
+
+| arm | Spark vs photo | nerfstudio vs photo | Spark vs nerfstudio | mean abs Δ /255 |
+|---|---|---|---|---|
+| baseline (classic) | 28.27 dB | 27.72 dB | 30.08 dB | 4.5 |
+| antialiased | **28.68 dB** | 29.67 dB | **37.19 dB** | 2.1 |
+
+- The feared opacity-compensation mismatch runs the *other* way: Spark reproduces antialiased-trained
+  splats far more faithfully (37 vs 30 dB) — it applies the same kind of 2D anti-aliasing itself. In the
+  walker, antialiased is +0.41 dB against photos, better on 7 of 8 cameras. Contact sheet + receipt:
+  `~/reports/2026-09-14-splatlab-research-sweep/spark-agreement/`.
+- **Adopted:** `--pipeline.model.rasterize-mode antialiased` in `backend/splat_route.py`'s train command
+  (`_train_rasterize_mode()`; kill-switch `SPLAT_TRAIN_RASTERIZE_MODE=classic`). Golden plan snapshot
+  updated with the flag. Applies to new training jobs after the next service restart.
+- Evidence chain for this one flag: bonsai held-out +0.24 dB · storage room neutral · zero cost · Spark
+  faithful. scale-reg stays off (neutral), camera optimizer off (−2.5 dB), bilateral grid out (20× slower).
+- Trap hit on the way: Spark's ESM imports `three/addons/postprocessing/Pass.js` — a standalone page
+  needs `"three/addons/": "/node_modules/three/examples/jsm/"` in its import map or the module dies
+  silently before any hook is defined. The proof now reports page/console errors instead of timing out.
+- The compute gate refuses heavy work while `nexus-backup.service` runs (07:00–07:3x daily; it mirrors
+  splat outputs to the NAS, so experiment trees make it longer). `systemctl is-active` reports
+  `activating` as inactive — wait on `ActiveState` instead.

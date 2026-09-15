@@ -142,3 +142,12 @@ def test_eval_planned_only_with_toolchain_and_without_kill_switch(monkeypatch):
     stages = []
     splat_route._append_health_stage(stages)
     assert stages == []
+
+
+def test_train_rasterize_mode_default_and_kill_switch(monkeypatch):
+    monkeypatch.delenv("SPLAT_TRAIN_RASTERIZE_MODE", raising=False)
+    assert splat_route._train_rasterize_mode() == "antialiased"
+    monkeypatch.setenv("SPLAT_TRAIN_RASTERIZE_MODE", "classic")
+    assert splat_route._train_rasterize_mode() == "classic"
+    monkeypatch.setenv("SPLAT_TRAIN_RASTERIZE_MODE", "bogus")
+    assert splat_route._train_rasterize_mode() == "antialiased"
