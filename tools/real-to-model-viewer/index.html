@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SplatLab — condo captured reality</title>
+<style>
+*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding:24px;background:#101923;color:#e6eff8;font:16px system-ui}main{max-width:1500px;margin:auto}
+h1{font-size:clamp(1.8rem,4vw,3rem);margin:8px 0}.tag{color:#82dac1;text-transform:uppercase;letter-spacing:.13em}p{line-height:1.55;max-width:1080px}
+a{color:#87d6fa}.layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:20px}canvas{display:block;width:100%;height:100%;touch-action:none}
+#viewport{aspect-ratio:1;overflow:hidden;border:1px solid #344452;border-radius:10px;position:relative;background:#080d13}figure{margin:0}figcaption{padding:8px 0;color:#adbed1}
+img{width:100%;display:block;border-radius:10px}.bar,.links{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin:16px 0}
+button,select{max-width:100%;background:#243545;color:#fff;border:1px solid #657a89;border-radius:6px;padding:10px;font:inherit}select{flex:1;min-width:200px}
+.notice{border-left:3px solid #e4b868;padding:10px 18px;background:#202b35}.error{color:#ffaf99}#status{min-height:1.5em}#surface-link[hidden]{display:none}
+@media(max-width:760px){body{padding:16px}.layout{grid-template-columns:1fr}}
+</style>
+<script type="importmap">{"imports":{"three":"./vendor/three.module.js","three/addons/postprocessing/Pass.js":"./vendor/Pass.js","@sparkjsdev/spark":"./vendor/spark.module.js"}}</script>
+<main>
+<div class="tag">SplatLab / real X5 video → navigable 3D</div>
+<h1>Your condo, beyond the photograph.</h1>
+<p id="summary">Loading the locally reconstructed exterior…</p>
+<p class="notice" id="representation-notice">This is a real Gaussian reconstruction, not an AI illustration or a photo sphere. It is an early exterior pilot: pavement, trees, thin edges and unobserved regions can break apart. Units and world up are unverified; it is not aligned to your accepted condo model.</p>
+<section id="native-tour" hidden><h2>Native model-rendered camera tour</h2><p>Reopened 2DGS parameters render this eight-second tour. It is not the source video or a photo slideshow. The camera interpolates between captured training poses; reconstruction defects remain visible.</p><video id="tour-video" controls muted loop playsinline preload="metadata" style="width:min(100%,640px)"></video></section>
+<nav id="geometry-links" class="links" aria-label="Geometry experiment comparisons"></nav>
+<section id="mesh-deliveries" hidden><h2>Condo Lab reference handoffs</h2><p>These meshes retain their original capture coordinates, verified triangle by triangle after Blender export. These manifests are ready for a separate registration review—not imported, aligned, measured or accepted condo edits.</p><div id="mesh-delivery-links" class="links"></div></section>
+<p id="candidate-tradeoff" class="notice" hidden>The 6,000-step candidate shown here has better photo fidelity and coverage. The separate 3,000-step anchored candidate has better mean depth agreement on the reserved tracked points. Neither is a measured or accepted architectural model. Both Blender scenes remain available for inspection.</p>
+<div class="bar"><label for="view">Held-out viewpoint</label><select id="view"></select><button id="reset">Reset to capture</button></div>
+<div class="bar" id="representation-bar" hidden><label for="representation">Inspect representation</label><select id="representation"><option value="splat">Live radiance preview</option></select></div>
+<div class="layout">
+<figure><figcaption id="live-caption">Live reconstructed 3D · drag to orbit, wheel to move closer</figcaption><div id="viewport" tabindex="0" aria-label="Interactive reconstructed condo"></div></figure>
+<figure><figcaption>Real held-out reference photo · never used for training</figcaption><img id="reference" alt="Real validation photograph of the condo exterior"></figure>
+</div>
+<p id="status" role="status">Loading the splat…</p><button id="reload-live" hidden>Reload live 3D</button>
+<p>Arrow keys shift the 3D viewpoint. Reset returns to the selected capture. The reference photo stays fixed while you explore, making parallax and reconstruction defects visible.</p>
+<div class="links"><a href="evaluation/index.html" id="comparison-link">All source/render/error comparisons</a><a href="splat.ply" id="splat-download" download>Full Gaussian PLY</a><a href="evaluation/surfels.npz" id="native-download" hidden download>Native 2DGS parameters</a><a href="reference/index.html">Sparse points + source cameras</a><a href="blender/condo-capture-review.blend" id="surface-link" hidden>Blender mesh + camera scene</a><a href="blender-alternative/condo-capture-review.blend" id="alternative-surface-link" hidden>3,000-step geometry candidate — Blender</a><a href="receipt.json">Provenance</a></div>
+</main>
+<script type="module" src="viewer.js"></script>
+</html>

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<title>__TITLE__ · SplatLab</title>
+<style>__STYLE__</style>
+</head>
+<body>
+<header><div class="eyebrow">SPLATLAB / CAPTURE ATLAS</div><h1>__TITLE__</h1><p>From a video walk to a connected place. Explore the evidence before building the world.</p><span class="badge">LOCAL REVIEW · NOT MODEL GEOMETRY</span></header>
+<main>
+<section id="stats" class="stats" aria-label="Capture statistics"></section>
+<div class="workspace">
+<aside class="panel"><div class="section-heading"><h2>Capture footprint</h2><span>North ↑</span></div>
+<svg id="map" viewBox="0 0 600 460" aria-label="Local GPS tracks, north up"></svg>
+<p class="hint">Separate colors = separate recordings. Click a numbered viewpoint. No line is drawn across missing GPS or a position jump.</p>
+<label for="clip">Recording</label><select id="clip"></select>
+<div id="clip-info" class="details"></div>
+<div class="downloads"><a href="atlas.json" download>Context JSON ↓</a><a href="tracks.geojson" download>GPS GeoJSON ↓</a></div>
+</aside>
+<section class="panel viewer-panel"><div class="section-heading"><h2 id="view-title">Captured viewpoint</h2><span id="view-count"></span></div>
+<div class="viewer"><canvas id="panorama" width="640" height="360" tabindex="0" aria-label="Panorama: drag or arrow keys to look around; plus and minus to zoom"></canvas><p id="empty" hidden>No review view for this recording.</p><div class="overlay">PROVISIONAL STITCH / NOT A RECONSTRUCTION</div></div>
+<div class="controls"><button id="previous" aria-label="Previous viewpoint">← Previous</button><button id="next" aria-label="Next viewpoint">Next →</button><button id="reset">Reset look</button><button id="flip">Rotate view 180°</button></div>
+<label for="timeline">Review timeline</label><input id="timeline" type="range" min="0" max="0" value="0">
+<p id="view-info" class="details" aria-live="polite"></p>
+<p id="render-status" class="hint">Drag to look · scroll to zoom · view direction is not compass calibrated.</p>
+<details><summary>Inspect the full source panorama and provenance</summary><img id="source-image" alt="Unmodified provisional source panorama"><pre id="provenance"></pre></details>
+</section>
+</div>
+<section class="panel"><div class="section-heading"><h2>Walkthrough contact strip</h2><span>Original review images, not generated previews</span></div><div id="filmstrip" class="filmstrip"></div></section>
+<div class="bottom-grid"><section class="panel"><h2>Readiness & capture gaps</h2><div id="readiness"></div></section><section class="panel"><h2>What this world layer means</h2><p class="hint">Observed photographs and telemetry stay separate from reconstructed surfaces, architectural truth and future generated additions.</p><ul id="limitations"></ul><p class="privacy">Private home-location evidence. No external tiles, models, APIs or cloud uploads are used by this explorer.</p></section></div>
+</main>
+<footer>Immutable review snapshot · <span id="snapshot"></span> · Originals preserved</footer>
+<script id="atlas-data" type="application/json">__ATLAS_DATA__</script>
+<script id="atlas-images" type="application/json">__ATLAS_IMAGES__</script>
+<script>__MATH__</script><script>__VIEWER__</script>
+</body>
+</html>

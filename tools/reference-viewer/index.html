@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Condo · reconstructed cameras and sparse geometry</title><style>__STYLE__</style></head>
+<body><header><p class="eyebrow">SPLATLAB / REAL-TO-MODEL / PRIVATE REFERENCE</p>
+<h1>From real footage into 3D space</h1>
+<p>Inspect the existing triangulated points and camera positions beside the photographs that constrain them. This is a sparse reference, not the finished condo reconstruction.</p>
+<div id="counts" class="counts"></div></header>
+<main><section class="panel"><div class="panel-heading"><h2>Reconstructed space</h2><button id="reset">Reset orbit</button></div>
+<p class="hint">Drag or use arrow keys to orbit · scroll or +/− to zoom. Cameras are estimated; their display size is symbolic.</p>
+<canvas id="orbit" width="900" height="720" tabindex="0" aria-label="Orbit reconstructed sparse points and source cameras"></canvas>
+<label class="toggle"><input type="checkbox" id="show-cameras" checked> Show source camera frustums</label>
+<p class="hint">Blue: estimated source cameras · amber: selected camera · colored dots: triangulated points. No surfaces are filled between points.</p></section>
+<section class="panel"><div class="panel-heading"><h2>Source-camera comparison</h2><span id="source-counter"></span></div>
+<label for="source">Choose a real source view</label><select id="source"></select>
+<div class="navigation"><button id="previous">Previous</button><button id="next">Next</button><label class="toggle"><input id="overlay" type="checkbox" checked> Project sparse points</label></div>
+<div id="photo-stack"><img id="photo" alt="Selected rectified raw-video source image"><canvas id="projected" aria-label="Sparse points projected onto selected source photograph"></canvas></div>
+<p id="source-details"></p><p id="projection-count" class="hint" aria-live="polite"></p>
+<p class="warning">Projection is not an occlusion test. A dot can fall over a nearer surface; missing points do not mean missing walls.</p></section></main>
+<section class="handoff"><div><p class="eyebrow">INDEPENDENT REFERENCE HANDOFF</p><h2>Take the real 3D evidence into your modeling workflow</h2>
+<p>The GLB contains a point primitive and named source cameras—not a watertight mesh. Use a separate Blender scene first. World up, scale, and condo alignment remain unverified; do not merge into accepted architecture as measured truth.</p>
+<div class="downloads"><a href="reference.glb" download>Download points + cameras GLB</a><a href="sparse.ply" download>Sparse PLY</a><a href="external-references.json" download>Condo handoff manifest</a></div>
+<p id="provenance" class="hint"></p></div><div><h3>What still needs doing</h3><ul id="limitations"></ul></div></section>
+<script type="application/json" id="reference-data">__DATA__</script><script>__MATH__</script><script>__VIEWER__</script></body></html>

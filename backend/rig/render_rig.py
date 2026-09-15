@@ -24,6 +24,7 @@ Run in the colmap4 env:
       [--yaw-steps 4] [--pitches=-35,0,35] [--hfov 90] [--vfov 90] [--workers N]
 """
 import argparse
+import hashlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -65,11 +66,31 @@ def main() -> None:
     ap.add_argument("--hfov", type=float, default=90.0)
     ap.add_argument("--vfov", type=float, default=90.0)
     ap.add_argument("--workers", type=int, default=max(2, min(16, (os.cpu_count() or 4) // 2)))
+    ap.add_argument("--reconstruction-plan", type=Path)
     args = ap.parse_args()
     pitches = [float(p) for p in args.pitches.split(",")]
 
     panos = sorted(p for p in args.equirect_dir.iterdir()
                    if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
+    planned_masks = {}
+    if args.reconstruction_plan:
+        plan = json.loads(args.reconstruction_plan.read_text())
+        if plan.get("schema") != "dev.splatlab.route-reconstruction/v1":
+            raise ValueError("Unsupported reconstruction plan")
+        records = {group["source_file"]: group for group in plan["groups"]}
+        panos = [path for path in panos if path.name in records]
+        if len(panos) != len(records):
+            raise ValueError("A planned panorama is missing")
+        for panorama in panos:
+            record = records[panorama.name]
+            if hashlib.sha256(panorama.read_bytes()).hexdigest() != record["sha256"]:
+                raise ValueError(f"Planned panorama changed: {panorama.name}")
+            mask_path = (args.reconstruction_plan.parent / record["mask"]).resolve()
+            if mask_path.parent != args.reconstruction_plan.parent.resolve():
+                raise ValueError("Mask must be contained in the reconstruction plan directory")
+            if hashlib.sha256(mask_path.read_bytes()).hexdigest() != record["mask_sha256"]:
+                raise ValueError(f"Planned mask changed: {panorama.name}")
+            planned_masks[panorama.name] = mask_path
     assert panos, f"no frames in {args.equirect_dir}"
     pano_w, pano_h = Image.open(panos[0]).size
     assert pano_w == pano_h * 2, f"not 2:1 equirect: {pano_w}x{pano_h}"
@@ -106,6 +127,12 @@ def main() -> None:
     def render(pano_path: Path) -> None:
         pano = np.asarray(Image.open(pano_path).convert("RGB"))
         assert pano.shape[1] == pano_w and pano.shape[0] == pano_h, f"size mismatch {pano_path.name}"
+        exclusion_mask = None
+        if pano_path.name in planned_masks:
+            with Image.open(planned_masks[pano_path.name]) as mask_image:
+                if mask_image.size != (pano_w, pano_h):
+                    raise ValueError(f"Mask dimensions do not match {pano_path.name}")
+                exclusion_mask = np.asarray(mask_image.convert("L"))
         for k, grid in enumerate(grids):
             view = cv2.remap(pano, grid[..., 0], grid[..., 1], cv2.INTER_LINEAR,
                              borderMode=cv2.BORDER_WRAP)
@@ -113,7 +140,12 @@ def main() -> None:
                                        quality=95)
             # COLMAP wants one mask per image: symlink to the shared ownership mask.
             mpath = args.out_dir / "masks" / f"pano_camera{k}" / f"{pano_path.name}.png"
-            if not mpath.exists():
+            if exclusion_mask is not None:
+                projected_mask = cv2.remap(exclusion_mask, grid[..., 0], grid[..., 1], cv2.INTER_NEAREST, borderMode=cv2.BORDER_WRAP)
+                if mpath.is_symlink():
+                    mpath.unlink()
+                Image.fromarray(np.minimum(masks[k], projected_mask)).save(mpath)
+            elif not mpath.exists():
                 mpath.symlink_to("_ownership.png")
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
