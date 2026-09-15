@@ -4076,3 +4076,47 @@ flips, position / up / lookAt(forward), fov from fy) and score vs the real photo
 - The compute gate refuses heavy work while `nexus-backup.service` runs (07:00–07:3x daily; it mirrors
   splat outputs to the NAS, so experiment trees make it longer). `systemctl is-active` reports
   `activating` as inactive — wait on `ActiveState` instead.
+
+## 2026-09-15 — R5.1 ISOLATE-BY-REFERENCE: first end-to-end, 61 s per object vs the 2 h language field
+
+**What was built** (`backend/isolate/`, `tools/isolate-by-reference.py`, runner
+`~/scripts/splatlab-isolate-by-reference-2026-09-15.sh`; Seed2GS idea, independently implemented):
+1. **ground** — 6 evenly spaced training PHOTOS staged at render size → the existing `scene_sam3_masks.py`
+   text grounding (`sam3` env). Reference = highest-score instance with a plausible mask fraction,
+   discounted ×0.3 when its box touches the image edge (cut-off object).
+2. **orbits** (`langfield-spike` env) — render expected depth at the reference camera, back-project the
+   mask, voxel-select gaussians (2× the scene's median NN spacing, dilated) and keep those projecting
+   into the dilated mask → **seed** (8.5k bicycle / 17.9k bonsai). 65 candidate cameras (8 azimuths ×
+   4 elevations × 2 dolly rings) scored by seed visibility (seed-only vs full-scene expected depth);
+   keep ≥ 0.3, top up to 8, cap 16, ordered as a nearest-camera path. Each kept view also writes the
+   seed's own silhouette.
+3. **track** (`sam3` env, SAM 3.1 multiplex predictor request API) — PER-FRAME prompts: the seed
+   silhouette's box (+4 %) plus the concept text; keep the returned mask that best overlaps the
+   silhouette (≥ 0.2 IoU). 16/16 frames found on both objects. Propagation-based tracking was tried
+   first and lost the object on 12/16 frames: orbit views are not a video. `predictor.shutdown()` is
+   mandatory (a worker keeps ~12 GB otherwise → claim 14 GB so the coordinator evicts residents).
+4. **fit** — one foreground logit per gaussian (seed +1, rest −1), rendered as a colour through gsplat and
+   fitted by BCE against the masks over valid frames (60 Adam steps, weak seed prior), threshold 0.5,
+   then **prune**: behind-the-front-surface in ≥ 80 % of views (packed rasterization, 8 % depth tol),
+   needles > 10 spacings, and the instance_lift silhouette vote (< 60 % inside over ≥ 3 views).
+   Writes `<job>/_isolate/<slug>/object_indices.npz` (checkpoint order) + `object.ply` (batch_isolate's
+   14-field layout) + `receipt.json` + `receipt_object.png` (full | object-only | baseline-only).
+
+**Results on the bonsai job (`splat_aea04ab3`)**
+
+| concept | seed → object | seed retained | mask IoU (mean/min) | frames | wall | verdict (receipt_object.png) |
+|---|---|---|---|---|---|---|
+| bonsai | 17,877 → 17,591 (prune −3,135) | 0.935 | 0.84 / 0.60 | 16/16 | **61 s** (20+11+17+12) | clean bonsai + pot + tray, two small residual blobs |
+| red bicycle | 8,530 → 8,826 (prune −4,262) | 0.879 | 0.86 / 0.66 | 16/16 | 42 s from orbits | clean **rear wheel only** — every staged photo shows the bike cut off; the reference is partial, so the object is |
+
+- vs the existing `_scene/isolated/red-bicycle` (instance_lift over training views, 6,715 gaussians):
+  IoU 0.10 — not because either is wrong but because they hold different parts (mine the wheel, the
+  baseline the frame tubes). There is no bonsai instance in the inventory to compare against.
+- **Limits recorded:** the object is whatever the reference shows (next step: re-ground the text prompt
+  on a pulled-back render around the seed so a full-object reference exists even when no photo has one);
+  floaters hovering inside the object's volume survive every silhouette test (the antialiased training
+  adopted today reduces them upstream); the fit uses one image-space channel, so thin far-side geometry
+  can be lost.
+- Tests: `backend/tests/test_isolate_orbits.py` (10: projection round-trip, voxel select, orbit
+  geometry, view selection, path order, border penalty, visibility, prompt points, PLY subset).
+  GPU steps are gated and run in their own envs; nothing new in the FastAPI venv.

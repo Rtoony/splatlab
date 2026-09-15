@@ -1072,7 +1072,7 @@
       "code_status": "no-code",
       "maturity": "paper-only",
       "relevance": "high",
-      "decision": "evaluate",
+      "decision": "implemented",
       "integration_mode": "paper-inspired-independent",
       "priority": "P1",
       "techniques": [
@@ -1083,13 +1083,21 @@
         "temporary-foreground-logit"
       ],
       "incorporation": {
-        "implemented": [],
+        "implemented": [
+          "backend/isolate (ground -> seed lift -> visibility-scored orbit -> per-frame SAM3 box+text masks -> per-gaussian logit fit -> prune)",
+          "tools/isolate-by-reference.py",
+          "receipts: bonsai clean in 61 s; bicycle = reference-bounded rear wheel"
+        ],
         "next": [
-          "prototype-on-bonsai-and-stump-instances"
+          "re-ground on a pulled-back render so a full-object reference exists",
+          "opt-in route beside /scene/isolate",
+          "compare on the Stump instances"
         ]
       },
       "gates": [
-        "miou-vs-current-isolation",
+        "seed-retained-fraction",
+        "mask-iou-vs-sam3",
+        "visual-receipt-object-only",
         "seconds-per-object"
       ],
       "risks": [
