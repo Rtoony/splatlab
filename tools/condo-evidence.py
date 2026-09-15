@@ -112,6 +112,7 @@ def main() -> int:
     ap.add_argument("--api", default="http://127.0.0.1:2286"); ap.add_argument("--apply", action="store_true")
     ap.add_argument("--resume", action="store_true", help="with --apply: skip records whose title already exists in the queue, add only missing attachments")
     ap.add_argument("--min-views", type=int, default=3); ap.add_argument("--uncertainty-floor", type=float, default=0.10)
+    ap.add_argument("--floor-datums", default="garage slab=0,studio FF=0.3048", help="named heights above the model's z=0 (m) to express sills/heads against, e.g. 'garage slab=0,studio FF=0.3048'")
     a = ap.parse_args()
     if a.output.exists() and any(a.output.iterdir()) and not a.resume:
         raise SystemExit(f"refusing to overwrite {a.output}")
@@ -122,6 +123,12 @@ def main() -> int:
     moge = json.loads((a.moge / "receipt.json").read_text()) if a.moge and (a.moge / "receipt.json").is_file() else None
     ratio = (moge["global_meters_per_unit"] / s_al) if moge else 1.0
     run_id = a.scaffold.name; walls = [p for p in S["patches"] if p["kind"] == "wall"]; pav = [p for p in S["patches"] if p["kind"] == "pavement"]
+    datums = []
+    for item in (a.floor_datums or "").split(","):
+        if "=" in item:
+            name, value = item.rsplit("=", 1); datums.append((name.strip(), float(value)))
+    def against_datums(z: float) -> str:
+        return "; ".join(f"{z - d:+.2f} m above {name}" for name, d in datums)
     street = max((w for w in walls if w.get("normal_canonical", [0, 0, 0])[1] < -0.9), key=lambda w: w["surfels"], default=None)
     main = street or max(walls, key=lambda w: w["surfels"], default=None)
     if main is None or not pav:
@@ -177,7 +184,8 @@ def main() -> int:
                 mrow(target, "sill", max(c["sill_above_ground_m"], 0.001), max(0.15, unc(c)), "ground line (pavement plane ∩ wall plane) to the mask's bottom edge", "above the pavement at the wall, not the level floor", ev)]
         body = (f"Capture-derived size of '{m['id']}' ({m['kind']}, {m['wall']}, {m['level']}) from the SplatLab architecture scaffold.\n"
                 f"Capture: {c['width_m']:.2f} × {c['height_m']:.2f} m (at the alignment scale; × {ratio:.3f} at the MoGe-2 scale → {c['width_m']*ratio:.2f} × {c['height_m']*ratio:.2f} m), "
-                f"sill {c['sill_above_ground_m']:.2f} m above the pavement, head {c['head_above_ground_m']:.2f} m; canonical z {c['sill_z_m']:.2f}..{c['head_z_m']:.2f} m; "
+                f"sill {c['sill_above_ground_m']:.2f} m above the pavement, head {c['head_above_ground_m']:.2f} m; canonical z {c['sill_z_m']:.2f}..{c['head_z_m']:.2f} m"
+                + (f" (sill {against_datums(c['sill_z_m'])}; head {against_datums(c['head_z_m'])})" if datums else "") + "; "
                 f"x {c['x_m'][0]:.2f}..{c['x_m'][1]:.2f} m. {c['n_views']} views, spread {c['width_spread_m']:.2f}/{c['height_spread_m']:.2f} m.\n"
                 f"Model: {m['width']:.3f} × {m['height']:.3f} m, sill {m['sill']:.3f} m above {m['level']} (elevation {m['sill_z']-m['sill']:.3f}) → sill z {m['sill_z']:.2f}, head z {m['head_z']:.2f}; confidence '{m['confidence']}'. "
                 f"Δwidth {c['width_m']-m['width']:+.2f} m, Δheight {c['height_m']-m['height']:+.2f} m, Δsill z {c['sill_z_m']-m['sill_z']:+.2f} m. Rectangle IoU {iou:.2f}.\n"

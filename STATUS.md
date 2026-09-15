@@ -4199,3 +4199,13 @@ model's level-2 elevation + sill. Wrapper `~/scripts/condo-evidence-2026-09-15.s
   model), recess 0.55 m vs 0.457. 6 records posted (`condo-second-clip-evidence-2026-09-15-06/evidence-receipt.json`).
 - Exporter: exterior-only matching, one capture rectangle per model opening (ghost duplicates dropped), position
   questions for openings the model has elsewhere on the same wall, wall-plane offsets vs model lines, generic heights question.
+
+## 2026-09-15 — sessions merged; owner datums → Condo Lab proposal; evidence heights against named floor datums
+
+RToony merged the Condo Lab session into this one and stated the condo's datums (garage slab 1 ft below the studio FF, two risers;
+garage 10 ft / studio 9 ft ceilings; bottom-floor window heads 8 ft above the studio FF; studio windows 34 × 58 in inside; entry +
+garage windows 46 × 22.5 in). Condo Lab side (see `~/reports/2026-09-10-reality-regenerator/floor-offset-checkpoint-2026-09-15.md`):
+evidence record `333b0674`, proposal `557b2c68` (Ready to Test), `Room.floorOffset` renderer/validator change staged as
+`review/floor-offset-2026-09-15-01/candidate-v1` (364 app tests, browser proof), follow-on proposal generator staged.
+SplatLab side: `tools/condo-evidence.py --floor-datums "garage slab=0,studio FF=0.3048"` now writes every sill/head against
+named datums (bay-window sill +4.36 m above the slab = +4.05 m above the studio FF = ~1.0 m above the proposed level-2 floor).
