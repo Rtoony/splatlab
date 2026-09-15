@@ -4014,3 +4014,36 @@ the GitHub API, `research/tests` 17 passed.
 - Not changed in production yet: the plan says "flags that win on **both** worlds". Storage-room arms
   (must run from a plain terminal, ~40 min each):
   `! bash ~/scripts/splatlab-flag-ab-2026-09-14.sh --apply --world=splat_f9f3b4fed4 --arms=baseline,antialiased,scalereg`
+
+## 2026-09-15 — storage-room flag run STUCK: the compute gate still carried the July 32G guard
+
+`tools/splatlab-compute-gate.sh` wraps manual runs in a transient scope with `MemoryHigh=32G /
+MemoryMax=48G`. The 2026-07-31 fix raised splatlab.service and splatlab.slice to 64G/80G but not this
+path. The storage-room baseline arm (4920 frames, ~63 GB cache) sat for an hour at 37 GB against a
+34 GB ceiling: `memory.events high 380,681`, PSI some 85 %, swap at its 8G cap, trainer in D state, GPU
+1 %. Fixed: gate scope now 64G/80G. Recovery: `~/scripts/splatlab-unstick-and-rerun.sh` (kills only a
+scope with throttle events AND idle GPU, then relaunches). The pipeline's train memory preflight
+(c9322e0) does not cover manual runs — a follow-up if manual trains keep growing.
+
+### Storage-room confirmation (splat_f9f3b4fed4, 15k iters, held-out eval; run 2026-09-15 06:36–07:00 after the guard fix)
+
+| arm | PSNR | SSIM | LPIPS | fog | TSDF LCC % |
+|---|---|---|---|---|---|
+| baseline | 18.05 | 0.752 | 0.637 | HEALTHY | 95.8 |
+| `rasterize-mode antialiased` | 18.05 | 0.752 | 0.638 | HEALTHY | 95.9 |
+| `use-scale-regularization` | 18.04 | 0.751 | 0.639 | HEALTHY | (see receipt) |
+
+- Both flags are **neutral** on the dense walk-through (Δ ≤ 0.01 dB). With the bonsai: antialiased is the
+  only flag with a measured win (+0.24 dB) and no loss anywhere; scale-reg is photometrically neutral on
+  both worlds (its +4.8 LCC on the bonsai is single-run noise-level).
+- Under the raised guard the storage room trained 15k in **2 min at 8.7 ms/iter** (cache 2 min) — the
+  earlier hour was entirely the throttle. 18 dB / 180k gaussians at 15k is far from the 30k production
+  fit; only the relative comparison is meaningful here.
+- **Not flipped in production yet — one check first.** gsplat's `antialiased` mode applies an opacity
+  compensation at render time; `ns-export` writes raw opacities, so SparkJS (which does not apply it)
+  may render an antialiased-trained splat differently from nerfstudio. The fog gate and `render_views.py`
+  already rasterize with `antialiased`, so the *health* path is consistent — the walker is the open
+  question. Next: export both bonsai arms' PLYs and compare them in Spark (mean-RGB / alpha coverage
+  delta, `prove-*` pattern) before changing `backend/splat_route.py`'s train command. The golden plan
+  snapshot (`test_360_stitch.py`) pins the train command and will need the same one-line update.
+- Compute-gate scope guard 32G/48G → 64G/80G (`tools/splatlab-compute-gate.sh`) is in commit d.

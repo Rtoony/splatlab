@@ -180,6 +180,10 @@ run_contained() {
 
     # No fallback is permitted: if the user manager cannot create the bounded
     # scope, the GPU command must not run outside the workstation safety limits.
+    # Memory guard matches splatlab.service.d/60-safety-guard.conf and splatlab.slice.d
+    # (64G/80G, raised 2026-07-31). Until 2026-09-15 this scope still carried the old
+    # 32G/48G: a 4920-frame manual train sat kernel-throttled for an hour (380k `high`
+    # events, PSI 85 %, swap capped) at 1 % GPU — the July quicksand through a side door.
     exec /usr/bin/systemd-run \
         --user \
         --scope \
@@ -193,8 +197,8 @@ run_contained() {
         --property=CPUAccounting=yes \
         --property=CPUQuota=400% \
         --property=MemoryAccounting=yes \
-        --property=MemoryHigh=32G \
-        --property=MemoryMax=48G \
+        --property=MemoryHigh=64G \
+        --property=MemoryMax=80G \
         --property=MemorySwapMax=8G \
         --property=TasksAccounting=yes \
         --property=TasksMax=512 \
