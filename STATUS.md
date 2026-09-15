@@ -4155,3 +4155,21 @@ measured steps on `splat_aea04ab3` (progress sheet, receipts and the 12-candidat
   (3,194 + 5,099 gaussians this run). Pull-backs that leave the capture hull render fog; the candidate
   sheet shows SAM3 simply finds nothing there and the fallback holds.
 - Backups of the one-pass artifacts: `<job>/_isolate/{red-bicycle,bonsai}.before-reground/`.
+
+## 2026-09-15 — R3.2 ARCHITECTURE SCAFFOLD on the condo exterior: planes + openings + an independent scale check
+
+`backend/architecture/scaffold_core.py` (8 tests) + `tools/condo-moge-depth.py` (MoGe-2 per view, scaled by each
+view's own SfM tracks, gated GPU, 8 s) + `tools/architecture-scaffold.py` (planes, up/Manhattan frame, plumb walls,
+track anchoring, coplanar merge, depth-free ray-cast openings, gap rectangles, reserved-track checks, overlays, PLY,
+receipt). Report: `~/reports/2026-09-15-splatlab-condo-architecture-scaffold.md`. Wrapper:
+`bash ~/scripts/splatlab-architecture-scaffold-2026-09-15.sh --apply`.
+
+- Measured dead ends first: the 3,000-step 2DGS surfel normals are ~random (4 % within 12° of the pavement plane);
+  the model's rendered depth fragments walls into layers 20–60 cm apart. MoGe-2 depth scaled by the tracks is
+  view-consistent: street wall = one plane, 64k points, RMS 9.7 cm, anchor shift 0.000, reserved tracks 11 cm.
+- **Independent scale:** MoGe-2 → 1.343 m/u vs the Condo Lab alignment's 1.357 m/u (from the photo-estimated
+  4.8768 × 2.1336 m garage opening): ratio 0.990. Wall normal 1.9° from the model's −Y, up 2.8° from +Z.
+- Openings, multi-view (5 views, spread ≤ 0.12 m): 2286 door leaf 4.56 × 2.31 m (alignment scale) / 4.51 × 2.29 m
+  (MoGe scale) vs the model's 16 × 7 ft; upper-wall windows 1.16 × 1.89 and 1.05 × 1.89 m; street-wall window
+  1.15 × 2.02 m — the model lists door/window sizes as an uncertainty, these are the first capture-derived values.
+- Not measured: the 2286 wall length (the plane spans all coplanar units). Nothing accepted; registration provisional.
