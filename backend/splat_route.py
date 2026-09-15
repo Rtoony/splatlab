@@ -5723,6 +5723,114 @@ async def get_scene_isolate_file(
     return FileResponse(str(path), media_type=media, filename=path.name)
 
 
+# ── R5.1: isolate-by-reference (2026-09-15) ───────────────────────────────────
+# Seed2GS-style named isolation WITHOUT the language field: one SAM3 text grounding
+# on a training photo -> seed gaussians -> pulled-back re-grounding render -> virtual
+# orbit -> SAM3 per-frame masks -> per-gaussian foreground logit fit. ~1-2 min per
+# object vs ~2 h for the SigLIP2 field. Opt-in beside /scene/isolate; the
+# orchestrator runs with --no-gate because this route's arbiter lease IS the claim.
+ISOLATE_REFERENCE_SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "isolate-by-reference.py"
+ISOLATE_DIRNAME = "_isolate"
+ISOLATE_REFERENCE_VRAM_MB = 14_000   # SAM3 multiplex tracker peak (~12 GB) + checkpoint renders
+_ISOLATE_SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+
+def _isolate_slug(concept: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", concept.lower()).strip("-") or "object"
+
+
+class IsolateReferenceBody(BaseModel):
+    concept: str = Field(min_length=1, max_length=80)
+    views: int = Field(default=6, ge=1, le=12)
+    iters: int = Field(default=60, ge=10, le=400)
+    threshold: float = Field(default=0.5, gt=0.0, lt=1.0)
+    reground: bool = True   # second SAM3 grounding on a pulled-back render (full-object reference)
+
+
+@router.post("/jobs/{job_id}/isolate/reference")
+async def isolate_by_reference(request: Request, job_id: str, body: IsolateReferenceBody):
+    """R5.1: isolate one named object from a frozen splat by SAM3 reference + orbit
+    tracking. Writes <job>/_isolate/<slug>/{object.ply, object_indices.npz, receipt.json}."""
+    require_heavy_work_admitted()
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    if meta["status"] != "completed":
+        raise HTTPException(status_code=409, detail=f"Isolate-by-reference requires a completed job. Current status: {meta['status']}")
+    output_dir = Path(meta["output_dir"])
+    if _find_latest_config(output_dir) is None:
+        raise HTTPException(status_code=409, detail="No splatfacto checkpoint found for this scene.")
+    if not (ISOLATE_REFERENCE_SCRIPT.is_file() and LANGFIELD_ENV_PYTHON.is_file() and SAM3_ENV_PYTHON.is_file()):
+        raise HTTPException(status_code=400, detail="Isolate-by-reference toolchain unavailable.")
+    slug = _isolate_slug(body.concept)
+    work = output_dir / ISOLATE_DIRNAME / slug
+
+    lock = _mesh_export_lock(job_id)  # one heavy build per job at a time
+    if lock.locked():
+        raise HTTPException(status_code=409, detail=f"A mesh/object/scene build is already running for {job_id}.")
+    async with lock:
+        cmd = [
+            sys.executable, str(ISOLATE_REFERENCE_SCRIPT), "--job", str(output_dir), "--concept", body.concept,
+            "--views", str(body.views), "--iters", str(body.iters), "--threshold", str(body.threshold), "--no-gate",
+        ]
+        if not body.reground:
+            cmd.append("--no-reground")
+
+        async def isolate_operation() -> tuple[int, bytes, bytes]:
+            return await _run_capture_subprocess(cmd)
+        try:
+            rc, _out, stderr = await gpu_arbiter.run_gpu_operation(
+                lane="isolate-reference", operation_id=job_id, vram_mb=ISOLATE_REFERENCE_VRAM_MB, operation=isolate_operation,
+            )
+        except gpu_arbiter.GPUArbiterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=f"Isolate-by-reference blocked: {exc}") from exc
+        if rc != 0 or not (work / "receipt.json").is_file() or not (work / "object.ply").is_file():
+            tail = "\n".join(stderr.decode("utf-8", errors="replace").splitlines()[-6:])
+            raise HTTPException(status_code=500, detail=f"Isolate-by-reference failed (exit {rc}): {tail}")
+
+        receipt = json.loads((work / "receipt.json").read_text())
+        receipt["job_id"] = job_id; receipt["slug"] = slug
+        fresh = (_read_meta(job_id) or {}).get("isolate_reference") or {}
+        _patch_meta(job_id, isolate_reference={
+            **fresh,
+            slug: {
+                "concept": body.concept, "n_object": receipt.get("n_object"), "n_seed": receipt.get("n_seed"),
+                "seed_retained": receipt.get("seed_retained"), "mask_iou_mean": receipt.get("mask_iou_mean"),
+                "reground_used": bool((receipt.get("reground") or {}).get("used")),
+                "seconds": (receipt.get("timing_s") or {}).get("total"), "built_at": _utc_now(),
+            },
+        })
+
+    await audit_operator_event(
+        request=request,
+        title="Isolated object by reference",
+        description=f"{job_id}: '{body.concept}' -> {receipt.get('n_object')} gaussians",
+        variant="success",
+        action="splat.isolate_reference",
+        target=meta.get("mode", "3d"),
+        metadata={"job_id": job_id, "slug": slug, "n_object": receipt.get("n_object"), "reground_used": bool((receipt.get("reground") or {}).get("used"))},
+    )
+    return receipt
+
+
+@router.get("/jobs/{job_id}/isolate/reference/file")
+async def get_isolate_reference_file(
+    job_id: str, slug: str,
+    fmt: Literal["report", "object", "indices", "receipt"] = "report",
+):
+    if not _safe_job_id(job_id) or not _ISOLATE_SLUG_RE.fullmatch(slug):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    work = _job_dir(job_id) / ISOLATE_DIRNAME / slug
+    name, media = {"report": ("receipt.json", "application/json"), "object": ("object.ply", "application/octet-stream"),
+                   "indices": ("object_indices.npz", "application/octet-stream"), "receipt": ("receipt_object.png", "image/png")}[fmt]
+    path = work / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Isolate-by-reference artifact not built yet")
+    return FileResponse(str(path), media_type=media, filename=f"{slug}-{name}")
+
+
 # ── P6d: batch proxy + gated registration ─────────────────────────────────────
 # Loops the unchanged, already-proven P5c crop -> TripoSplat -> ICP-register
 # chain over every P6c-built instance, under ONE shared GPU lease (TripoSplat

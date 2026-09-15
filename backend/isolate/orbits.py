@@ -70,9 +70,9 @@ def seed_stats(means: np.ndarray, idx: np.ndarray) -> dict[str, Any]:
     pts = np.asarray(means)[idx]
     if len(pts) == 0:
         return {"n": 0, "centroid": None, "radius": None}
-    c = pts.mean(axis=0)
-    r = float(np.percentile(np.linalg.norm(pts - c, axis=1), 95))
-    return {"n": int(len(pts)), "centroid": c.tolist(), "radius": r}
+    c = pts.mean(axis=0); dist = np.linalg.norm(pts - c, axis=1)
+    return {"n": int(len(pts)), "centroid": c.tolist(), "radius": float(np.percentile(dist, 95)),
+            "radius_median": float(np.median(dist))}
 
 
 # ── virtual orbit ────────────────────────────────────────────────────────────
@@ -287,3 +287,97 @@ def reference_quality(score: float, mask: np.ndarray) -> float:
     the image edge, further reduced by the share of mask pixels on the edge."""
     q = float(score) * (1.0 - min(1.0, 5.0 * border_fraction(mask)))
     return q * 0.3 if touches_border(mask) else q
+
+
+# ── pulled-back re-grounding cameras ─────────────────────────────────────────
+
+def pullback_cameras(ref_c2w: np.ndarray, centroid: np.ndarray, radius: float, fov_y_deg: float,
+                     aspect: float, margin: float = 1.6, azimuths_deg: list[float] | None = None,
+                     elevations_deg: list[float] | None = None, extra_scales: list[float] | None = None,
+                     up: np.ndarray = UP) -> list[dict[str, Any]]:
+    """Candidate cameras that frame the WHOLE seed: along the reference direction
+    (and a few azimuths/elevations), at the distance where a sphere of `radius`
+    fills 1/margin of the narrower field of view, plus optional further scales."""
+    ref_c2w = np.asarray(ref_c2w, dtype=np.float64); centroid = np.asarray(centroid, dtype=np.float64)
+    offset = ref_c2w[:3, 3] - centroid
+    d_ref = float(np.linalg.norm(offset))
+    half = math.radians(fov_y_deg) / 2.0
+    half_narrow = half if aspect >= 1.0 else math.atan(math.tan(half) * aspect)
+    d_fit = margin * float(radius) / max(math.tan(half_narrow), 1e-6)
+    d = max(d_ref, d_fit)
+    cams = []
+    for sc in [1.0] + list(extra_scales or []):
+        for el in (elevations_deg or [0.0]):
+            for az in (azimuths_deg or [0.0]):
+                v = _rotate_about(offset / d_ref, up, math.radians(az))
+                horiz = np.cross(up, v)
+                if np.linalg.norm(horiz) > 1e-9:
+                    v = _rotate_about(v, horiz, math.radians(el))
+                cams.append({"tag": f"pull_az{az:+.0f}_el{el:+.0f}_s{sc:.2f}", "distance": d * sc, "azimuth_deg": float(az),
+                             "elevation_deg": float(el), "c2w": look_at(centroid + v * d * sc, centroid, up).tolist()})
+    return cams
+
+
+def fits_in_frame(bbox: list[int] | None, w: int, h: int, margin_frac: float = 0.04) -> bool:
+    """True when the box sits inside the frame with a margin on every side."""
+    if bbox is None:
+        return False
+    mx, my = margin_frac * w, margin_frac * h
+    x0, y0, x1, y1 = bbox
+    return x0 >= mx and y0 >= my and x1 <= w - mx and y1 <= h - my
+
+
+def pick_reground(views: list[dict[str, Any]], load_npz, load_seed, min_containment: float = 0.5,
+                  margin_frac: float = 0.02, min_score: float = 0.5, max_growth: float = 4.0) -> dict[str, Any] | None:
+    """Second grounding on pulled-back renders: the SAM3 instance that CONTAINS the
+    seed silhouette (same object) and GROWS it the most (its full extent), preferring
+    one that fits inside the frame. quality = score x containment x sqrt(growth)
+    x (1 | 0.6 if it touches the frame edge). `load_seed(cam) -> bool silhouette | None`.
+    Measured 2026-09-15 (red bicycle): a plain score x containment pick with a hard
+    0.3 border penalty chose a rear-triangle mask over the whole bike two rows later."""
+    best = None
+    for row in views:
+        d = load_npz(int(row["cam"])); sil = load_seed(int(row["cam"]))
+        if d is None or sil is None:
+            continue
+        sil = np.asarray(sil, dtype=bool); n_sil = int(sil.sum())
+        if n_sil == 0:
+            continue
+        masks, scores = np.asarray(d["masks"]), np.asarray(d["scores"], dtype=np.float64)
+        h, w = sil.shape
+        for k in range(masks.shape[0]):
+            m = masks[k].astype(bool); frac = float(m.mean())
+            if not (MIN_MASK_FRAC <= frac <= MAX_MASK_FRAC) or float(scores[k]) < min_score:
+                continue
+            contain = float((m & sil).sum() / n_sil)
+            if contain < min_containment:
+                continue
+            fits = fits_in_frame(mask_bbox(m), w, h, margin_frac)
+            growth = float(m.sum()) / n_sil
+            q = float(scores[k]) * contain * math.sqrt(min(growth, max_growth)) * (1.0 if fits else 0.6)
+            if best is None or q > best["quality"]:
+                best = {"row": row, "mask": m, "score": float(scores[k]), "quality": q, "instance": int(k), "frac": frac,
+                        "containment": round(contain, 4), "fits": bool(fits), "growth": round(growth, 3)}
+    return best
+
+
+def mask_half_extent(bbox: list[int] | None, distance: float, fx: float, fy: float) -> float:
+    """World half-size of what a mask's bounding box spans at `distance` from a pinhole
+    camera (extent = distance x pixels / focal). Robust to depth outliers in the seed
+    (see-through spokes / leaves lift wall gaussians that blow up the seed radius)."""
+    if bbox is None:
+        return 0.0
+    x0, y0, x1, y1 = bbox
+    return float(distance) * max((x1 - x0) / (2.0 * fx), (y1 - y0) / (2.0 * fy))
+
+
+def depth_band_mask(mask: np.ndarray, depth: np.ndarray, rel: float = 0.3) -> np.ndarray:
+    """Drop mask pixels whose depth is far from the mask's median depth. A SAM3 mask
+    over a see-through object (spokes, leaves) contains pixels whose rendered depth
+    is the WALL behind it; lifting those puts wall gaussians in the seed (bonsai:
+    p95 seed radius 2.65 units at a 1.2-unit reference distance)."""
+    m = np.asarray(mask, dtype=bool) & np.isfinite(depth)
+    if not m.any():
+        return m
+    med = float(np.median(depth[m]))
+    return m & (np.abs(depth - med) <= rel * max(med, 1e-6))

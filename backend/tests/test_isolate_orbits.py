@@ -112,3 +112,57 @@ def test_border_fraction_and_reference_quality():
     assert abs(ob.border_fraction(m) - 20 / 120) < 1e-9 and ob.touches_border(m) and ob.reference_quality(0.8, m) < 0.8 * 0.2 * 0.3
     cut = np.zeros((20, 20), bool); cut[5:15, 0:10] = True   # box reaches the left edge with few edge pixels
     assert ob.touches_border(cut) and ob.reference_quality(1.0, cut) < 0.3
+
+
+def test_pullback_cameras_frame_the_seed_and_fits_in_frame():
+    ref = ob.look_at([0.0, -1.0, 1.0], [0.0, 0.0, 1.0])            # 1 unit away, looking along +y
+    cams = ob.pullback_cameras(ref, [0.0, 0.0, 1.0], radius=1.0, fov_y_deg=60.0, aspect=1.5, margin=1.6, extra_scales=[1.3])
+    assert len(cams) == 2 and cams[0]["distance"] > 1.0                # pulled back beyond the reference distance
+    d0 = cams[0]["distance"]; import math as _m
+    assert abs(d0 - 1.6 / _m.tan(_m.radians(30))) < 1e-9              # sphere fills 1/1.6 of the vertical FOV
+    for c in cams:
+        m = np.asarray(c["c2w"]); fwd = -m[:, 2]; to_c = np.array([0, 0, 1.0]) - m[:, 3]
+        assert np.dot(fwd, to_c / np.linalg.norm(to_c)) > 0.999 and abs(np.linalg.norm(to_c) - c["distance"]) < 1e-9
+    assert ob.fits_in_frame([10, 10, 90, 60], 100, 100) and not ob.fits_in_frame([0, 10, 90, 60], 100, 100)
+    assert not ob.fits_in_frame(None, 100, 100)
+
+
+def test_pick_reground_prefers_the_instance_that_contains_and_grows_the_seed():
+    h = w = 100
+    sil = np.zeros((h, w), bool); sil[40:60, 40:60] = True                   # partial seed silhouette (400 px)
+    whole = np.zeros((h, w), bool); whole[30:70, 20:80] = True               # full object, contains the seed, fits
+    other = np.zeros((h, w), bool); other[5:25, 5:25] = True                 # unrelated instance, higher score
+    edge = np.zeros((h, w), bool); edge[30:100, 20:80] = True                # contains the seed but touches the border
+    small = sil.copy()                                                       # identical to the seed: adds nothing, top score
+    blob = np.zeros((h, w), bool); blob[10:90, 10:90] = True                 # huge low-confidence blob (fog) — score floor drops it
+    views = [{"cam": 0}, {"cam": 1}, {"cam": 2}]
+    npz = {0: {"masks": np.stack([other, whole]), "scores": np.array([0.95, 0.7])},
+           1: {"masks": np.stack([edge]), "scores": np.array([0.9])},
+           2: {"masks": np.stack([small, blob]), "scores": np.array([0.99, 0.35])}}
+    best = ob.pick_reground(views, lambda c: npz[c], lambda c: sil)
+    assert best["row"]["cam"] == 0 and best["instance"] == 1 and best["fits"] and best["containment"] == 1.0
+    assert best["growth"] == 6.0                                             # 2400 / 400
+    # growth outranks a border touch: with the fitting candidate gone, the edge mask beats the no-growth high-score one
+    npz[0] = {"masks": np.stack([other]), "scores": np.array([0.95])}
+    best = ob.pick_reground(views, lambda c: npz[c], lambda c: sil)
+    assert best["row"]["cam"] == 1 and not best["fits"]
+    assert ob.pick_reground(views, lambda c: None, lambda c: sil) is None    # no masks at all
+    assert ob.pick_reground(views, lambda c: npz[c], lambda c: np.zeros((h, w), bool)) is None   # seed not visible
+
+
+def test_seed_stats_median_radius_and_mask_half_extent_ignore_depth_outliers():
+    rng = np.random.default_rng(0)
+    pts = np.concatenate([rng.normal(0, 0.1, (950, 3)), rng.normal(0, 3.0, (50, 3))])   # tight object + 5% wall outliers
+    st = ob.seed_stats(pts, np.arange(len(pts)))
+    assert st["radius_median"] < 0.3 < st["radius"]                                     # p95 is blown up, median is not
+    assert abs(ob.mask_half_extent([100, 100, 500, 300], 2.0, 1000.0, 1000.0) - 0.4) < 1e-9   # 400 px wide at f=1000, d=2
+    assert ob.mask_half_extent(None, 2.0, 1000.0, 1000.0) == 0.0
+
+
+def test_depth_band_mask_drops_wall_pixels_seen_through_the_object():
+    mask = np.zeros((10, 10), bool); mask[2:8, 2:8] = True
+    depth = np.full((10, 10), 1.0); depth[4:6, 4:6] = 2.2            # gaps between leaves: the wall, 2.2x further
+    depth[2, 2] = np.nan                                              # no alpha there
+    kept = ob.depth_band_mask(mask, depth, rel=0.3)
+    assert kept.sum() == 36 - 4 - 1 and not kept[4:6, 4:6].any() and not kept[2, 2]
+    assert not ob.depth_band_mask(np.zeros((3, 3), bool), depth[:3, :3]).any()

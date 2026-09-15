@@ -4120,3 +4120,38 @@ flips, position / up / lookAt(forward), fov from fy) and score vs the real photo
 - Tests: `backend/tests/test_isolate_orbits.py` (10: projection round-trip, voxel select, orbit
   geometry, view selection, path order, border penalty, visibility, prompt points, PLY subset).
   GPU steps are gated and run in their own envs; nothing new in the FastAPI venv.
+
+## 2026-09-15 — ISOLATE-BY-REFERENCE RE-GROUNDS ON A PULLED-BACK RENDER + opt-in route
+
+The object used to be whatever the best photo showed (red bicycle = one rear wheel). Fixed in three
+measured steps on `splat_aea04ab3` (progress sheet, receipts and the 12-candidate contact sheets in
+`~/reports/2026-09-14-splatlab-research-sweep/isolate-by-reference/`):
+
+- **Re-ground stage** (`render_orbits.py --stage seed|orbit`, orchestrator steps `ground → seed → reground →
+  orbits → track → fit`): after the photo seed, render 12 pulled-back views that frame the seed
+  (3 azimuths × 2 elevations × 2 distances; framing distance from the photo mask's pixel extent, never the
+  seed radius), run `scene_sam3_masks.py` on them, pick the instance that CONTAINS the seed silhouette and
+  grows it the most — quality = score × containment × √growth, ×0.6 if it touches the frame edge, score
+  floor 0.5 — then re-lift the seed from that render's depth and orbit from that camera. Rejected if the
+  new seed keeps < 40 % of the initial one (different object) → falls back to the photo seed, receipt says why.
+  The first picker (score × containment, hard ×0.3 border penalty) chose a rear-triangle mask over the
+  whole bike two rows later on the candidate sheet; the growth term fixed that.
+- **Depth-banded seed lift:** a SAM3 mask over a see-through object (spokes, leaves) contains pixels whose
+  rendered depth is the wall behind it. Lifting only pixels within ±30 % of the mask's median depth removed
+  the wall gaussians: the bonsai seed's 95th-percentile radius had been 2.65 units at a 1.2-unit reference
+  distance (a 13-unit pull-back where SAM3 saw nothing); the bonsai reference distance itself moved
+  1.21 → 0.91 once the centroid stopped being dragged toward the wall.
+- **Results** (66 s per object, SAM3 twice + tracker): red bicycle 8,826 → **29,603 gaussians = the whole
+  bike** (handlebars, bottle, both wheels), mask IoU 0.85 (min 0.73), recall vs the language-field instance
+  0.21 → 0.93 (precision 0.21 — that instance holds 6,715 frame-tube gaussians only). Bonsai 17,591 →
+  16,269 with IoU 0.84 → **0.89** (min 0.57 → 0.85): re-ground engages, same object, cleaner seed.
+- **Route:** `POST /api/splat/jobs/{job_id}/isolate/reference {concept, views=6, iters=60, threshold=0.5,
+  reground=true}` beside `/scene/isolate` — same lock/arbiter/audit pattern (lane `isolate-reference`,
+  14 GB), runs `tools/isolate-by-reference.py --no-gate` because the route's lease is the claim; writes
+  `meta.isolate_reference[slug]`; `GET …/isolate/reference/file?slug=&fmt=report|object|indices|receipt`.
+  5 route tests (`test_isolate_reference_route.py`), 14 orbit tests. Nothing in the viewer yet.
+- **Still open:** fog/floaters inside the object's volume (antialiased training reduces them upstream);
+  the bicycle's see-through wheels still lift some wall — the fit's behind-front + vote prune removes most
+  (3,194 + 5,099 gaussians this run). Pull-backs that leave the capture hull render fog; the candidate
+  sheet shows SAM3 simply finds nothing there and the fallback holds.
+- Backups of the one-pass artifacts: `<job>/_isolate/{red-bicycle,bonsai}.before-reground/`.
