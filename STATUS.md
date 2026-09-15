@@ -3967,3 +3967,50 @@ the GitHub API, `research/tests` 17 passed.
   Cross-world render agreement should come from **held-out `ns-eval`** (PSNR/LPIPS vs the never-trained
   eval photos), which SplatLab never recorded — staged as `~/scripts/splatlab-eval-agreement-2026-09-14.sh`.
 - Suites after the changes: backend green (see receipt in the sweep report), 19 new tests.
+
+## 2026-09-14 late — MoGe edge fix refuted, held-out eval SEPARATES the pair, flag bundle HURTS, eval stage LIVE
+
+- **MoGe-2 re-gate with `--window 3`**: 1.1361 m/u (+19.6 %) vs 1.1386 nearest-pixel — the edge-sampling
+  hypothesis moved it 0.3 %, refuted. The +20 % stands as MoGe-2 zero-shot bias vs one click-measured
+  reference; only a second measured dimension can arbitrate. Receipt `_scale/moge2-proposal.json` (+ v1, v2).
+- **Held-out render agreement (ns-eval on the never-trained eval split) does what SCODA could not:**
+  bonsai `splat_aea04ab3` **31.55 dB / SSIM 0.936 / LPIPS 0.143**; bicycle `splat_3aaf8067` ("looks
+  wrong, passes every gate") **22.93 dB / 0.716 / 0.173**. Receipts `<job>/_health/eval.json`.
+  ⚠️ ns-eval needs `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1` (nerfstudio 1.1.5 bare `torch.load` vs torch ≥ 2.6);
+  the pipeline already exports it, the two new scripts now do.
+- **`eval` is now a pipeline stage** (report-only, best-effort, after `health`; kill-switch
+  `SPLAT_EVAL_GATE=0`; `EVAL_VRAM_MB = 8000`): `backend/splat_route.py` `_append_health_stage` + runner
+  branch → `meta["health"]["eval"] = {psnr, psnr_std, ssim, lpips, checkpoint, checked_at, enforced: false}`.
+  6 bookkeeping tests (`test_eval_stage_bookkeeping.py`), golden plan pins `_eval_available` off. Suite
+  **2402 passed / 17 skipped**. Service restarted 20:04 (no jobs in flight; GPU coordinator is a separate
+  process, pid 4157430) — back in 1 s. `splatlab-where-am-i.sh` now prints held-out PSNR + MoGe proposals.
+- **Flag A/B on the bonsai, 15k iters (baseline trains in 2.5 min, 10 ms/iter — the 37-min estimate was the
+  storage room's):** all five flags together = **PSNR 30.69 → 26.39, SSIM 0.932 → 0.844, LPIPS 0.150 → 0.161,
+  mesh LCC 55.9 % → 73.9 %**. Confounded: the bilateral grid absorbs per-photo exposure (raw renders score low
+  unless `color-corrected-metrics` is on), the camera optimizer refines train poses but not eval poses, and
+  `use-absgrad` is already the 1.1.5 default (no-op). Single-flag ablation launched (`--ablate`, `--arms=`).
+  **Bilateral grid arm ABORTED at 46 %: 58 → 213 ms/iter (6–20× baseline), 28 min remaining — cost alone
+  rules it out on this stack.** antialiased / camopt / scalereg arms running; table appended when done.
+- Experiment tree: `~/projects/splatcli/outputs/experiments/flag-ab-2026-09-14/` (rollback = delete it).
+
+### Single-flag ablation result (bonsai, 15k iters, held-out eval split, one run each)
+
+| arm | PSNR | SSIM | LPIPS | fog | TSDF LCC % |
+|---|---|---|---|---|---|
+| baseline (today's train command) | 30.69 | 0.932 | 0.150 | HEALTHY | 55.9 |
+| `rasterize-mode antialiased` | **30.93** | **0.933** | **0.149** | HEALTHY | 37.2 |
+| `camera-optimizer SO3xR3` | 28.19 | 0.880 | 0.162 | HEALTHY | 41.4 |
+| `use-scale-regularization` | 30.63 | 0.931 | 0.153 | HEALTHY | **60.7** |
+| all five together | 26.39 | 0.844 | 0.161 | HEALTHY | 73.9 |
+| bilateral grid | aborted at 46 % (58 → 213 ms/iter) | | | | |
+
+- **antialiased** is a free +0.24 dB (no training cost) — adopt for photometrics.
+- **scale-regularization** is PSNR-neutral and +4.8 LCC points — adopt for mesh-bound worlds.
+- **camera optimizer** costs 2.5 dB on held-out views; the metric is unfair to it (eval poses are not
+  refined) but there is no evidence of benefit either — leave off unless the rig lane shows otherwise.
+- **bilateral grid**: ruled out on cost. **absgrad**: already the default.
+- ⚠️ TSDF LCC swings 37–74 % across arms from one run each — not stable evidence; the bundle's 73.9 % is
+  driven by camopt and/or bilateral, not by the two flags worth adopting. Do not read LCC as a gate here.
+- Not changed in production yet: the plan says "flags that win on **both** worlds". Storage-room arms
+  (must run from a plain terminal, ~40 min each):
+  `! bash ~/scripts/splatlab-flag-ab-2026-09-14.sh --apply --world=splat_f9f3b4fed4 --arms=baseline,antialiased,scalereg`

@@ -176,6 +176,7 @@ HEALTH_DIR = Path(__file__).resolve().parent / "health"
 HEALTH_RUNNER = HEALTH_DIR / "run_health.sh"
 HEALTH_DIRNAME = "_health"                # per-job artifact dir (sibling of _langfield)
 HEALTH_VRAM_MB = 4_000                    # checkpoint load + 2 rasterizations at 640px
+EVAL_VRAM_MB = 8_000                      # ns-eval: full-res renders of the held-out split + LPIPS
 # ── Splat→mesh export (opt-in, Digital Twin kernel) ──────────────────────────────
 # Champion TSDF recipe from the mesh-trial program (2026-07-10): vanilla splatfacto
 # checkpoint + Open3D TSDF fusion (voxel 0.015 / sdf-trunc 0.045 / depth-trunc 6 /
@@ -821,12 +822,23 @@ def _append_mesh_stage(stages: list[str], req: "SplatTrainRequest") -> None:
         stages.append("mesh")
 
 
+def _eval_available() -> bool:
+    """True iff nerfstudio's ns-eval is on the resolved toolchain path."""
+    return _tool_path("ns-eval", "SPLAT_NS_EVAL_BIN") is not None
+
+
 def _append_health_stage(stages: list[str]) -> None:
     """Append the report-only capture-health stage when the toolchain is present
     and the kill-switch (SPLAT_HEALTH_GATE=0) isn't set. Called exactly once by
-    _plan_3d_job, right after train/export — never by the generative lane."""
+    _plan_3d_job, right after train/export — never by the generative lane.
+
+    Also appends `eval` (2026-09-14): held-out render agreement via ns-eval —
+    the eval split (photos never trained on) rendered and scored against the
+    real photos. Report-only, kill-switch SPLAT_EVAL_GATE=0."""
     if _health_available() and os.environ.get("SPLAT_HEALTH_GATE", "").strip() != "0":
         stages.append("health")
+    if _eval_available() and os.environ.get("SPLAT_EVAL_GATE", "").strip() != "0":
+        stages.append("eval")
 
 
 _V360_CACHE: bool | None = None
@@ -3324,6 +3336,59 @@ async def _run_pipeline(job: SplatJob) -> None:
                             stage_ok = False
                 except Exception as exc:  # noqa: BLE001 — best-effort: never fail the splat
                     job.log_lines.append(f"[health] skipped (error: {exc}); the splat is unaffected.")
+                    _record_stage_failure(job.job_id, stage, f"error: {exc}")
+                    stage_ok = False
+                if stage_ok:
+                    completed = (_read_meta(job.job_id) or {}).get("stages_completed", [])
+                    _patch_meta(job.job_id, stages_completed=[*completed, stage])
+                continue
+            elif stage == "eval":
+                # Held-out render agreement (REPORT-ONLY, 2026-09-14). nerfstudio's
+                # own eval split — photos the model never trained on — is rendered
+                # and compared to the real photos: PSNR / SSIM / LPIPS. This is the
+                # number the world gates lacked: splat_3aaf8067 ("looks wrong, passes
+                # every gate") scores 22.9 dB where the all-green bonsai scores 31.6.
+                # Same never-fail contract as health; lands in meta["health"]["eval"].
+                stage_ok = True
+                try:
+                    config_path = _find_latest_config(job_dir)
+                    ns_eval = _tool_path("ns-eval", "SPLAT_NS_EVAL_BIN")
+                    if config_path is None or ns_eval is None:
+                        job.log_lines.append("[eval] skipped (no config or ns-eval unavailable).")
+                    else:
+                        hdir = job_dir / HEALTH_DIRNAME
+                        hdir.mkdir(parents=True, exist_ok=True)
+                        eval_json = hdir / "eval.json"
+                        command = [ns_eval, "--load-config", str(config_path), "--output-path", str(eval_json)]
+                        rc = await _run_locked_stage(job, stage, command, EVAL_VRAM_MB)
+                        results = None
+                        if rc == 0 and eval_json.is_file():
+                            results = (json.loads(eval_json.read_text()) or {}).get("results")
+                        if isinstance(results, dict) and results.get("psnr") is not None:
+                            record = {
+                                "v": 1,
+                                "enforced": False,  # report-only until thresholds are calibrated
+                                "split": "eval",
+                                "checkpoint": str(config_path),
+                                "checked_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+                                "psnr": float(results["psnr"]),
+                                "psnr_std": float(results["psnr_std"]) if results.get("psnr_std") is not None else None,
+                                "ssim": float(results["ssim"]) if results.get("ssim") is not None else None,
+                                "lpips": float(results["lpips"]) if results.get("lpips") is not None else None,
+                            }
+                            health_meta = (_read_meta(job.job_id) or {}).get("health") or {}
+                            health_meta["eval"] = record
+                            _patch_meta(job.job_id, health=health_meta)
+                            job.log_lines.append(
+                                f"[eval] held-out PSNR {record['psnr']:.2f} dB / SSIM {record['ssim']} / "
+                                f"LPIPS {record['lpips']} against the real eval photos. Report-only."
+                            )
+                        else:
+                            job.log_lines.append("[eval] ns-eval failed; the splat is unaffected.")
+                            _record_stage_failure(job.job_id, stage, f"exit code {rc}")
+                            stage_ok = False
+                except Exception as exc:  # noqa: BLE001 — best-effort: never fail the splat
+                    job.log_lines.append(f"[eval] skipped (error: {exc}); the splat is unaffected.")
                     _record_stage_failure(job.job_id, stage, f"error: {exc}")
                     stage_ok = False
                 if stage_ok:

@@ -75,6 +75,7 @@ def _plan(req: splat_route.SplatTrainRequest, input_path: str, monkeypatch: pyte
     # stage (Capture Coach, 2026-07-11) is machine-dependent (langfield-spike
     # toolchain) and has its own plan-guard tests in test_health_stage_bookkeeping.
     monkeypatch.setattr(splat_route, "_health_available", lambda: False)
+    monkeypatch.setattr(splat_route, "_eval_available", lambda: False)
     if probe is not None:
         monkeypatch.setattr(splat_route, "_tool_path", lambda binary, env: f"/bin/{binary}")
         monkeypatch.setattr(splat_route, "_probe_video_streams", lambda ffprobe, src: probe)

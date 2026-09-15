@@ -158,11 +158,22 @@ def test_health_skipped_no_config_is_not_recorded_as_failure(tmp_path, monkeypat
 
 def test_plan_guard_appends_after_export(monkeypatch):
     monkeypatch.setattr(splat_route, "_health_available", lambda: True)
+    monkeypatch.setattr(splat_route, "_eval_available", lambda: False)  # eval planning is covered in test_eval_stage_bookkeeping
     monkeypatch.delenv("SPLAT_HEALTH_GATE", raising=False)
     stages = ["stitch", "process", "train", "export"]
     splat_route._append_health_stage(stages)
     assert stages == ["stitch", "process", "train", "export", "health"]
     assert stages.count("health") == 1
+
+
+def test_plan_guard_eval_follows_health(monkeypatch):
+    monkeypatch.setattr(splat_route, "_health_available", lambda: True)
+    monkeypatch.setattr(splat_route, "_eval_available", lambda: True)
+    monkeypatch.delenv("SPLAT_HEALTH_GATE", raising=False)
+    monkeypatch.delenv("SPLAT_EVAL_GATE", raising=False)
+    stages = ["train", "export"]
+    splat_route._append_health_stage(stages)
+    assert stages == ["train", "export", "health", "eval"]
 
 
 def test_plan_guard_kill_switch(monkeypatch):
