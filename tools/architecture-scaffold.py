@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
@@ -28,7 +29,7 @@ from architecture import scaffold_core as sc            # noqa: E402
 from mesh.slugify import slug                            # noqa: E402
 
 CLASSES = sc.FACADE_CLASSES + sc.NUISANCE_CLASSES + (sc.PAVEMENT_CLASS,)
-WALL, GARAGE, WINDOW, PAVEMENT = 0, 1, 2, len(CLASSES) - 1
+WALL, GARAGE, WINDOW, DOOR, PAVEMENT = 0, 1, 2, 3, len(CLASSES) - 1
 SCHEMA = "dev.splatlab.architecture-scaffold/v1"
 PALETTE = [(230, 60, 60), (60, 160, 230), (60, 200, 90), (240, 180, 40), (180, 80, 220), (40, 210, 210), (250, 120, 30), (120, 120, 250)]
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
@@ -58,7 +59,7 @@ def load_views(structure: Path, evaluation: Path, receipt_eval: dict, mask_score
     return rec, views
 
 
-def patch_record(patch, points, tol, up=None, similarity=None):
+def patch_record(patch, points, tol, up=None, similarity=None, metres_per_unit=None):
     corners = sc.rect_corners_3d(patch, patch["lower_uv"], patch["upper_uv"])
     rec = {"centre": patch["centre"].tolist(), "normal": patch["normal"].tolist(), "basis": patch["basis"].tolist(),
            "lower_uv": np.asarray(patch["lower_uv"]).tolist(), "upper_uv": np.asarray(patch["upper_uv"]).tolist(),
@@ -70,38 +71,76 @@ def patch_record(patch, points, tol, up=None, similarity=None):
         R, s, _ = sc.similarity_parts(similarity)
         rec["corners_m"] = sc.apply_similarity(corners, similarity).tolist(); rec["normal_canonical"] = (R @ patch["normal"]).tolist()
         rec["extent_m"] = (np.asarray(patch["extent"]) * s).tolist(); rec["fit_rms_m"] = float(patch["rms"] * s)
+    elif metres_per_unit:
+        rec["extent_m"] = (np.asarray(patch["extent"]) * metres_per_unit).tolist(); rec["fit_rms_m"] = float(patch["rms"] * metres_per_unit); rec["metres_source"] = "moge-2 scale, unregistered"
     return rec
 
 
-def rect_record(patch, r, similarity=None):
+def rect_record(patch, r, similarity=None, metres_per_unit=None):
     corners = sc.rect_corners_3d(patch, r["lower_uv"], r["upper_uv"])
     out = {**r, "corners_units": corners.tolist()}
     if similarity is not None:
         _, s, _ = sc.similarity_parts(similarity)
         out["width_m"], out["height_m"] = r["width"] * s, r["height"] * s; out["corners_m"] = sc.apply_similarity(corners, similarity).tolist()
+    elif metres_per_unit:
+        out["width_m"], out["height_m"] = r["width"] * metres_per_unit, r["height"] * metres_per_unit
     return out
 
 
-def ray_openings(patch, views, prompt, min_frac=0.6, join_frac=0.15):
-    """Depth-free openings: every SAM3 instance of `prompt`, in every view where it
-    does not touch the image border, is cast onto the wall plane; instances whose hits
-    fall mostly inside this wall's footprint give one rectangle per view; rectangles
-    are then clustered across views (median bounds, view count, spread)."""
-    rects = []
+def ray_openings_all(walls, views, prompt, min_frac=0.6, join_frac=0.15, depth_rel=0.15):
+    """Depth-free openings, assigned EXCLUSIVELY: every SAM3 instance of `prompt`, in every
+    view where it does not touch the image border, is cast onto every wall plane whose
+    footprint contains most of its rays; among those walls the one whose ray-plane
+    distance agrees best with the view's depth map at the mask pixels wins (a door in a
+    recessed wall must not also become a door on the main face 0.5 m in front of it).
+    Per-view rectangles are then clustered per wall (median bounds, view count, spread)."""
+    per_wall = {w["name"]: [] for w in walls}
     for view in views:
+        depth = view.get("depth_used", view.get("depth"))
         for mask, score in view.get("instances", {}).get(prompt, []):
             if sc.touches_image_border(mask) or mask.sum() < 50:
                 continue
-            uv, ok = sc.ray_plane_uv(np.nonzero(mask), view["c2w"], view["fx"], view["fy"], view["cx"], view["cy"], patch)
-            if not ok.any():
-                continue
-            inside = ((uv >= patch["lower_uv"]) & (uv <= patch["upper_uv"])).all(axis=1)
-            if inside.mean() < min_frac:
-                continue
-            lo, hi = np.percentile(uv[inside], 1, axis=0), np.percentile(uv[inside], 99, axis=0)
-            rects.append({"lower_uv": lo.tolist(), "upper_uv": hi.tolist(), "view": int(view["ordinal"]), "score": score})
-    extent = float(np.max(np.asarray(patch["upper_uv"]) - np.asarray(patch["lower_uv"])))
-    return [r for r in sc.cluster_rectangles(rects, join_dist=join_frac * extent) if r["n_views"] >= 1]
+            rc = np.nonzero(mask)
+            # depth is judged on the RING of wall around the opening (glass fools monocular depth; the
+            # surrounding stucco does not): observed ring depth vs each plane's ray distance on the ring
+            ring = ndimage.binary_dilation(mask, iterations=6) & ~mask
+            ring[[0, -1], :] = False; ring[:, [0, -1]] = False
+            rr = np.nonzero(ring); observed = None
+            if depth is not None and len(rr[0]) >= 20:
+                dv = np.asarray(depth, dtype=np.float64)[rr]; good = np.isfinite(dv) & (dv > 0)
+                observed = (dv, good) if good.sum() >= 20 else None
+            m = np.asarray(view["c2w"], dtype=np.float64); R = m[:3, :3]
+            candidates = []
+            for w in walls:
+                uv, ok, dist = sc.ray_plane_uv(rc, view["c2w"], view["fx"], view["fy"], view["cx"], view["cy"], w, return_distance=True)
+                if not ok.any():
+                    continue
+                inside = ((uv >= w["lower_uv"]) & (uv <= w["upper_uv"])).all(axis=1)
+                if inside.mean() < min_frac:
+                    continue
+                # incidence: rays through the mask centre vs the plane normal (a perpendicular wall is hit at a grazing angle)
+                cen = np.array([(rc[1].mean() + 0.5 - view["cx"]) / view["fx"], -(rc[0].mean() + 0.5 - view["cy"]) / view["fy"], -1.0]); cen = R @ cen; cen /= np.linalg.norm(cen)
+                incidence = abs(float(cen @ np.asarray(w["normal"])))
+                if incidence < 0.2:
+                    continue
+                agreement = 0.0
+                if observed is not None:
+                    _, okr, dr = sc.ray_plane_uv(rr, view["c2w"], view["fx"], view["fy"], view["cx"], view["cy"], w, return_distance=True)
+                    dv, good = observed
+                    dv_ok, good_ok = dv[okr], good[okr]                 # dr is aligned with the rays that hit (okr)
+                    if good_ok.sum() >= 20:
+                        agreement = float(np.median(np.abs(dr[good_ok] - dv_ok[good_ok]) / dv_ok[good_ok]))
+                    else:
+                        agreement = 1.0
+                lo, hi = np.percentile(uv[inside], 1, axis=0), np.percentile(uv[inside], 99, axis=0)
+                candidates.append((agreement, w["name"], {"lower_uv": lo.tolist(), "upper_uv": hi.tolist(), "view": int(view["ordinal"]), "score": score, "depth_agreement": round(agreement, 3), "incidence": round(incidence, 2)}))
+            if candidates:
+                _, name, rect = min(candidates, key=lambda x: x[0]); per_wall[name].append(rect)
+    out = {}
+    for w in walls:
+        extent = float(np.max(np.asarray(w["upper_uv"]) - np.asarray(w["lower_uv"])))
+        out[w["name"]] = [r for r in sc.cluster_rectangles(per_wall[w["name"]], join_dist=join_frac * extent) if r["n_views"] >= 1]
+    return out
 
 
 def draw_overlay(view, points, patches, openings, out_path, font):
@@ -119,7 +158,7 @@ def draw_overlay(view, points, patches, openings, out_path, font):
             dr.polygon([(x, y) for x, y in zip(u, v)], outline=col + (255,), width=3)
             dr.text((float(u.min()) + 4, float(v.min()) + 4), patch["name"], fill=col + (255,), font=font, stroke_width=2, stroke_fill=(0, 0, 0, 255))
         for kind, rects in openings.get(patch["name"], {}).items():
-            ocol = {"garage_door": (255, 140, 0), "window": (0, 230, 255), "gap": (255, 0, 255)}[kind]
+            ocol = {"garage_door": (255, 140, 0), "window": (0, 230, 255), "door": (255, 230, 0), "gap": (255, 0, 255)}[kind]
             for r in rects:
                 c = sc.rect_corners_3d(patch, r["lower_uv"], r["upper_uv"])
                 u, v, _, ok = sc.project(c, view["c2w"], view["fx"], view["fy"], view["cx"], view["cy"], view["w"] * 4, view["h"] * 4)
@@ -163,6 +202,7 @@ def main() -> int:
     ap.add_argument("--wall-tol-frac", type=float, default=0.01, help="façade plane tolerance (fraction of span)")
     ap.add_argument("--opening-cell-frac", type=float, default=0.005, help="in-plane cell for opening/gap rectangles (fraction of span)")
     ap.add_argument("--merge-angle", type=float, default=6.0); ap.add_argument("--min-opening-frac", type=float, default=0.6)
+    ap.add_argument("--depth-rel", type=float, default=0.15, help="(recorded only) depth-agreement fraction considered good for an opening's wall assignment")
     ap.add_argument("--anchor-min-tracks", type=int, default=8); ap.add_argument("--anchor-dilate", type=float, default=0.1)
     ap.add_argument("--max-shift-frac", type=float, default=0.1, help="largest allowed track-anchoring shift, fraction of span (2DGS depth bias reached 0.62 m on the condo)")
     ap.add_argument("--band-frac", type=float, default=0.05, help="tracks further than this (fraction of span) from a plane belong to another surface")
@@ -201,6 +241,7 @@ def main() -> int:
                 depth = np.asarray(z["depth_m"], dtype=np.float64) * s_v; depth[~np.asarray(z["mask"], dtype=bool)] = np.nan
             if depth is None:
                 continue
+            view["depth_used"] = depth
             pts, nrm, rows, cols = sc.backproject_depth(depth, view["c2w"], view["fx"], view["fy"], view["cx"], view["cy"], step=a.step, edge_rel=a.edge_rel)
             lab = np.full(len(pts), -1, dtype=np.int64)
             for k, name in reversed(list(enumerate(CLASSES))):             # earlier classes win ties (wall > garage > window)
@@ -220,7 +261,7 @@ def main() -> int:
     counts = {name: int((cls == k).sum()) for k, name in enumerate(CLASSES)}
     print(f"[scaffold] views {len(views)} ({sum(v['has_depth'] for v in views)} with depth), span {span:.3f} u, tol {tol:.4f} u, labels {counts}", flush=True)
     n_or = sc.orient_towards(normals, points, cams.mean(axis=0))
-    fac_ids = np.flatnonzero(np.isin(cls, [WALL, GARAGE, WINDOW])); pav_ids = np.flatnonzero(cls == PAVEMENT)
+    fac_ids = np.flatnonzero(np.isin(cls, [WALL, GARAGE, WINDOW, DOOR])); pav_ids = np.flatnonzero(cls == PAVEMENT)
     wall_tol = (a.wall_tol_frac or a.tol_frac) * span
     fac = sc.extract_planes(points[fac_ids], n_or[fac_ids], weights[fac_ids], wall_tol, a.angle_tol, a.min_inliers, a.min_cells, a.max_planes)
     pav = sc.extract_planes(points[pav_ids], n_or[pav_ids], weights[pav_ids], tol, a.angle_tol, a.min_inliers, a.min_cells, 3)
@@ -267,20 +308,25 @@ def main() -> int:
                       "fit_rms_m": case["fit"].get("fitRmsMeters", case.get("fitRms")), "residuals": case["fit"].get("residuals"),
                       "scope": "provisional similarity from the Condo Lab alignment candidate; its scale comes from the modelled garage opening, so door dimensions measured through it are circular"}
     # openings + checks
+    # metres without a registration: the MoGe-2 scale alone (sizes, not positions)
+    mpu_only = None
+    if similarity is None and a.moge and (a.moge / "receipt.json").is_file():
+        mpu_only = json.loads((a.moge / "receipt.json").read_text()).get("global_meters_per_unit")
     cell = a.opening_cell_frac * span
+    ray_all = {prompt: ray_openings_all(walls, views, prompt, a.min_opening_frac, depth_rel=a.depth_rel) for prompt in ("garage door", "window", "door")}
     openings, patch_recs, checks = {}, [], {}
     for p in walls + pav:
-        rec = patch_record(p, points, wall_tol if p["kind"] == "wall" else tol, up, similarity); rec["name"] = p["name"]; rec["kind"] = p["kind"]
+        rec = patch_record(p, points, wall_tol if p["kind"] == "wall" else tol, up, similarity, mpu_only); rec["name"] = p["name"]; rec["kind"] = p["kind"]
         if p["name"] in anchors:
             rec["anchor"] = anchors[p["name"]]
             if similarity is not None:
                 rec["anchor"]["shift_m"] = anchors[p["name"]]["shift_units"] * sc.similarity_parts(similarity)[1]
         if p["kind"] == "wall":
             edge = sc.ground_edge(p, up) if up is not None else ()
-            o = {"garage_door": ray_openings(p, views, "garage door", a.min_opening_frac), "window": ray_openings(p, views, "window", a.min_opening_frac),
+            o = {"garage_door": ray_all["garage door"][p["name"]], "window": ray_all["window"][p["name"]], "door": ray_all["door"][p["name"]],
                  "gap": sc.gap_rectangles(p, points, cell, closed_edges=(edge,) if edge else ())}
             openings[p["name"]] = o
-            rec["openings"] = {k: [rect_record(p, r, similarity) for r in v] for k, v in o.items()}
+            rec["openings"] = {k: [rect_record(p, r, similarity, mpu_only) for r in v] for k, v in o.items()}
         if mem is not None:
             key = "facade_supported" if p["kind"] == "wall" else "pavement_supported"
             chk_pts = mem["points"][mem["plane_check_reserved"].astype(bool) & mem[key].astype(bool)]
@@ -337,10 +383,10 @@ def main() -> int:
         quads.append((sc.rect_corners_3d(p, p["lower_uv"], p["upper_uv"]), (200, 200, 200) if p["kind"] == "wall" else (120, 120, 120)))
         for kind, rects in openings.get(p["name"], {}).items():
             for r in rects:
-                quads.append((sc.rect_corners_3d(p, r["lower_uv"], r["upper_uv"]) + 0.01 * span * p["normal"], {"garage_door": (255, 140, 0), "window": (0, 200, 255), "gap": (255, 0, 255)}[kind]))
+                quads.append((sc.rect_corners_3d(p, r["lower_uv"], r["upper_uv"]) + 0.01 * span * p["normal"], {"garage_door": (255, 140, 0), "window": (0, 200, 255), "door": (255, 230, 0), "gap": (255, 0, 255)}[kind]))
     write_ply(a.output / "scaffold.ply", quads)
     scaffold = {"schema": SCHEMA, "status": "inferred-needs-review", "owner_accepted": False, "new_solid_geometry": False,
-                "registration": "provisional-similarity-from-alignment-candidate" if similarity is not None else None,
+                "registration": "provisional-similarity-from-alignment-candidate" if similarity is not None else None, "metres_per_unit_unregistered": mpu_only,
                 "frame": {"units": "arbitrary SfM units (original frame)", "up": up.tolist() if up is not None else None,
                           "manhattan_rows_right_out_up": frame.tolist() if frame is not None else None,
                           "pavement_patches": len(pav), "facade_patches": len(fac), "wall_patches": len(walls)},

@@ -17,7 +17,7 @@ from rig_diagnostics import read_poses
 from mesh.slugify import slug
 
 
-PROMPTS = ("building exterior wall", "pavement", "sky", "vegetation", "vehicle", "window", "garage door")
+PROMPTS = ("building exterior wall", "pavement", "sky", "vegetation", "vehicle", "window", "garage door", "door")   # "door" added 2026-09-15 for the garden side (entry / patio doors)
 SCHEMA = "dev.splatlab.capture-structure/v1"
 
 
@@ -295,7 +295,7 @@ def analyze(output):
         predictions = {prompt: semantic_union(output / "masks" / slug(prompt) / f"cam_{ordinal:03d}.npz", prompt, shape)
                        for prompt in receipt["prompts"]}
         nuisance = predictions["sky"] | predictions["vegetation"] | predictions["vehicle"]
-        wall = predictions["building exterior wall"] | predictions.get("garage door", np.zeros(shape, dtype=bool))
+        wall = predictions["building exterior wall"] | predictions.get("garage door", np.zeros(shape, dtype=bool)) | predictions.get("door", np.zeros(shape, dtype=bool))
         pavement = predictions["pavement"] & ~nuisance
         facade = (wall | predictions["window"]) & ~nuisance
         masks = {"facade": erode_mask(facade), "pavement": erode_mask(pavement)}

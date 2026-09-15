@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 from scipy import ndimage
 
-FACADE_CLASSES = ("building exterior wall", "garage door", "window")
+FACADE_CLASSES = ("building exterior wall", "garage door", "window", "door")
 NUISANCE_CLASSES = ("sky", "vegetation", "vehicle")
 PAVEMENT_CLASS = "pavement"
 
@@ -459,9 +459,11 @@ def merge_coplanar(patches: list[dict[str, Any]], points: np.ndarray, angle_deg:
     return out
 
 
-def ray_plane_uv(pixels_rc: np.ndarray, c2w: np.ndarray, fx: float, fy: float, cx: float, cy: float, patch: dict[str, Any]):
+def ray_plane_uv(pixels_rc: np.ndarray, c2w: np.ndarray, fx: float, fy: float, cx: float, cy: float, patch: dict[str, Any], return_distance: bool = False):
     """Intersect the rays through pixels (rows, cols) with the patch's plane; returns
-    plane-local (u, v) for rays that hit in front of the camera (depth-free)."""
+    plane-local (u, v) for rays that hit in front of the camera (depth-free). With
+    return_distance, also the hit's camera depth (rays are built with unit -z, so the
+    ray parameter equals the pinhole depth)."""
     m = np.asarray(c2w, dtype=np.float64); R, t = m[:3, :3], m[:3, 3]
     rows, cols = np.asarray(pixels_rc[0], dtype=np.float64), np.asarray(pixels_rc[1], dtype=np.float64)
     d_cam = np.stack([(cols + 0.5 - cx) / fx, -(rows + 0.5 - cy) / fy, -np.ones_like(rows)], axis=1)
@@ -472,7 +474,8 @@ def ray_plane_uv(pixels_rc: np.ndarray, c2w: np.ndarray, fx: float, fy: float, c
         s = ((c - t) @ n) / denom
     ok = np.isfinite(s) & (s > 0) & (np.abs(denom) > 1e-9)
     hit = t + d[ok] * s[ok, None]
-    return (hit - c) @ np.asarray(patch["basis"]).T, ok
+    uv = (hit - c) @ np.asarray(patch["basis"]).T
+    return (uv, ok, s[ok]) if return_distance else (uv, ok)
 
 
 def touches_image_border(mask: np.ndarray, margin: int = 2) -> bool:

@@ -4173,3 +4173,29 @@ receipt). Report: `~/reports/2026-09-15-splatlab-condo-architecture-scaffold.md`
   (MoGe scale) vs the model's 16 × 7 ft; upper-wall windows 1.16 × 1.89 and 1.05 × 1.89 m; street-wall window
   1.15 × 2.02 m — the model lists door/window sizes as an uncertainty, these are the first capture-derived values.
 - Not measured: the 2286 wall length (the plane spans all coplanar units). Nothing accepted; registration provisional.
+
+## 2026-09-15 — CONDO EVIDENCE: 11 capture-derived records in the Condo Lab review queue
+
+`tools/condo-evidence.py` (splatops env, CPU): capture openings (≥ 3 views) → matched to `building.json` openings by
+wall plane + rectangle IoU in the canonical frame (through the Condo Lab alignment similarity) → Measurement records
+(width / height / sill rows in metres, basis "visible opening edge (mask)", method + run id + receipt hash, two overlay
+attachments), Questions for unmodelled openings inside the 2286 footprint, one consolidated heights Question, References
+for the MoGe-2 scale check and the plane orientation, and the bay projection as a Measurement (0.88 m vs 0.8128
+documented). Dry-run default; `--apply` posts to the loopback review server (127.0.0.1:2286); `--resume` finishes a
+partial post. First post 2026-09-15: 11 records, 10 measurement rows, 20 attachments (`data/spatial/condo-evidence-2026-09-15-01/evidence-receipt.json`).
+Finding worth the owner's eye: main-floor window sills measure 4.5–4.9 m above the pavement vs 3.53 m implied by the
+model's level-2 elevation + sill. Wrapper `~/scripts/condo-evidence-2026-09-15.sh`.
+
+## 2026-09-15 — GARDEN SIDE registered by its own openings; ghost openings fixed; 6 more evidence records
+
+- Scaffold: SAM3 opening instances are now assigned to ONE wall (depth agreement on the wall ring around the mask +
+  incidence filter) — the first batch's four "unmodelled window" questions were ghosts of the bay windows and were
+  withdrawn in Condo Lab (Won't Fix + note). "door" added to the SAM3 prompts / façade classes.
+- `tools/condo-register-by-openings.py`: capture-derived registration (planes → rotation, MoGe-2 → scale, window pair or
+  door → translation) for clips without a manual alignment; output is `--alignment`-compatible.
+- Second clip (garden, structure study `condo-second-clip-structure-2026-09-15-01` with 24 masked views, MoGe
+  `condo-second-clip-moge-2026-09-15-01`, scaffold `…-scaffold-2026-09-15-06`): office windows 0.98 × 1.64 / 0.95 × 1.59 m,
+  door 1.00 × 2.71 m sitting 3.5 m from the modelled `office-garden-door` (east of the windows in the capture, west in the
+  model), recess 0.55 m vs 0.457. 6 records posted (`condo-second-clip-evidence-2026-09-15-06/evidence-receipt.json`).
+- Exporter: exterior-only matching, one capture rectangle per model opening (ghost duplicates dropped), position
+  questions for openings the model has elsewhere on the same wall, wall-plane offsets vs model lines, generic heights question.

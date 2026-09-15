@@ -42,7 +42,7 @@ def _scene():
     normals = np.concatenate([np.tile([0, 1.0, 0], (len(facade), 1)), np.tile([0, 0.02, 1.0], (len(pavement), 1))])
     normals += RNG.normal(0, 0.03, normals.shape); normals /= np.linalg.norm(normals, axis=1, keepdims=True)
     normals[: len(facade) // 2] *= -1                                    # half the surfel normals point the wrong way
-    labels = np.concatenate([f_lab, np.full(len(pavement), 6)])          # 6 = pavement
+    labels = np.concatenate([f_lab, np.full(len(pavement), CLASSES.index(sc.PAVEMENT_CLASS))])
     return pts, normals, labels, len(facade)
 
 
@@ -82,7 +82,7 @@ def test_scaffold_recovers_facade_pavement_up_frame_and_openings():
     views = _views(pts, labels)
     votes = sc.label_votes(pts, views, CLASSES)
     cls = sc.classify(votes, CLASSES, min_votes=2)
-    facade_ids = np.flatnonzero(np.isin(cls, [0, 1, 2])); pave_ids = np.flatnonzero(cls == 6)
+    facade_ids = np.flatnonzero(np.isin(cls, [CLASSES.index(n) for n in sc.FACADE_CLASSES])); pave_ids = np.flatnonzero(cls == CLASSES.index(sc.PAVEMENT_CLASS))
     assert (facade_ids < n_facade).mean() > 0.97 and (pave_ids >= n_facade).mean() > 0.97   # labels land on the right surfels
     cams = np.array([v["c2w"][:3, 3] for v in views])
     n_or = sc.orient_towards(normals, pts, cams.mean(axis=0))
