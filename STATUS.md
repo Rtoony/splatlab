@@ -3938,3 +3938,32 @@ the GitHub API, `research/tests` 17 passed.
   missing geometry + shell connectivity), R2.2 FullCircle (Apache-2.0, raw dual-fisheye + 3DGRT,
   operator-robust) vs the 12-view rig, R2.1 VGGT-SLAM 2.0 rung. Watch: TurboGS (~100 s/train, code
   pending), VidSplat, GSCompleter, LightBridge.
+
+## 2026-09-14 pm — first wave RAN (RToony): commit/push done, MoGe gate FAILED honestly, SCODA = no separation
+
+- **Committed + pushed** (`splatlab-wip-commit-2026-09-14.sh --apply --push`): 8 commits d9038eb…71646a4,
+  `origin/main` = 71646a4, tree clean. Six weeks of prior-session work is now on record.
+- **R1 MoGe-2 gate FAILED, twice, for two different reasons — both recorded:**
+  1. Raw run: 0.2518 m/unit vs measured 0.94975 → −73 %. Cause: **frame mismatch**, not depth error.
+     `ns-export gaussian-splat` writes raw `model.means`, so the viewer PLY (and every calibration measured in
+     it) is in nerfstudio's normalised frame = COLMAP units × `dataparser_transforms.json` scale (0.2211 here).
+     MoGe compares against COLMAP-frame sparse depth. Fixed: the proposal now carries both frames
+     (`meters_per_unit` = viewer frame, `meters_per_unit_colmap_frame`, `dataparser_scale`); `--rescore`
+     rebuilds a receipt on CPU.
+  2. Frame-corrected: **1.1386 m/unit vs 0.94975 → +19.9 %**, 12/12 frames used, relative MAD 9 %.
+     Two candidate causes, neither proven: MoGe-2 zero-shot metric bias (its papers report 10–20 %), or the
+     single click-measured reference (n = 1, no uncertainty). Staged fix for the known edge bias (SfM
+     features sit on edges where nearest-pixel depth reads the background): `--window 3` local-minimum
+     sampling + depth maps cached as `_scale/depth_*.npz` so variants rescore without the GPU. Re-gate with
+     `! bash ~/scripts/splatlab-moge2-scale-2026-09-14.sh --apply` (27 s). Independent tie-breaker: a second
+     measured dimension in the bonsai world via the Measure tab.
+- **R4.1 SCODA: NEGATIVE RESULT as designed.** Renders (8 eval cams + ±12° yaw variants, 640 px) scored on
+  the GPU env in ~45 s/world (the CPU venv needed >5 min/scene — runner switched to langfield-spike).
+  Means: bonsai −283.3 vs bicycle −285.7 (higher = better) → "correct" by 2.4 on a within-world spread of
+  ~150; **pairwise P(good view > bad view) = 0.50, Q_F 0.36, Q_R 0.45 — no separation.** SCODA scores a
+  render against *its own scene's* photo manifold, so absolute values are not comparable across worlds;
+  my cross-world gate design was wrong, the tool is fine. What it can still do: rank views *within* a
+  world (bonsai eval max −198 vs novel min −343) — a per-viewpoint "off-manifold" signal for the walker.
+  Cross-world render agreement should come from **held-out `ns-eval`** (PSNR/LPIPS vs the never-trained
+  eval photos), which SplatLab never recorded — staged as `~/scripts/splatlab-eval-agreement-2026-09-14.sh`.
+- Suites after the changes: backend green (see receipt in the sweep report), 19 new tests.

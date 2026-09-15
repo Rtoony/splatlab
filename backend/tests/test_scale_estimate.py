@@ -152,3 +152,35 @@ def test_load_transforms_accepts_per_frame_intrinsics(tmp_path: Path):
     assert t["per_frame_intrinsics"] is True and t["frames"][1]["fx"] == 257.0 and t["w"] == 512
     proj = se.project_frame(t["frames"][1], np.array([[0.0, 0.0, -2.0]]))
     assert proj["u"].tolist() == [256] and proj["v"].tolist() == [256]
+
+
+def test_build_proposal_converts_into_the_viewer_frame_when_dataparser_scale_is_known():
+    agg = se.aggregate([{"ratio": 0.25, "n_inliers": 100}] * 6)
+    rec = se.build_proposal(agg, [], model="m", source="s", job_id="j", dataparser_scale=0.25,
+                            existing={"meters_per_unit": 1.0, "method": "dimension"})
+    assert rec["frame"] == "viewer-normalized" and rec["meters_per_unit_colmap_frame"] == 0.25
+    assert abs(rec["meters_per_unit"] - 1.0) < 1e-9 and rec["existing"]["within_5_percent"] is True
+    raw = se.build_proposal(agg, [], model="m", source="s", job_id="j")
+    assert raw["frame"] == "colmap" and raw["meters_per_unit"] == 0.25
+
+
+def test_find_dataparser_scale_reads_the_checkpoint_file(tmp_path: Path):
+    assert se.find_dataparser_scale(tmp_path) is None
+    d = tmp_path / "processed" / "splatfacto" / "2026-07-01_060756"; d.mkdir(parents=True)
+    (d / "dataparser_transforms.json").write_text(json.dumps({"transform": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]], "scale": 0.2211}))
+    got = se.find_dataparser_scale(tmp_path)
+    assert got["scale"] == 0.2211 and got["path"].endswith("dataparser_transforms.json")
+
+
+def test_windowed_minimum_sampling_prefers_the_foreground_at_edges():
+    depth = np.full((10, 10), 5.0)          # background
+    depth[:, :5] = 1.0                       # foreground object on the left; edge between columns 4 and 5
+    u = np.array([5, 5, 0]); v = np.array([3, 8, 0])   # first two land one pixel INTO the background
+    nearest = se.sample_depth(depth, u, v, window=1)
+    local_min = se.sample_depth(depth, u, v, window=3)
+    assert nearest.tolist() == [5.0, 5.0, 1.0] and local_min.tolist() == [1.0, 1.0, 1.0]
+    depth[3, 5] = np.nan                     # a hole at the sample pixel is skipped, neighbours still answer
+    assert se.sample_depth(depth, np.array([5]), np.array([3]), window=3).tolist() == [1.0]
+    assert np.isnan(se.sample_depth(np.full((10, 10), np.nan), np.array([5]), np.array([3]), window=3))[0]
+    proj = {"u": u, "v": v, "depth": np.array([1.0, 1.0, 1.0]), "index": np.arange(3)}
+    assert se.frame_scale(np.full((10, 10), 2.0), None, proj, window=3)["n_points"] == 3

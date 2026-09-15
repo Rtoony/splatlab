@@ -19,8 +19,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import os
+
 SCODA_ROOT = Path.home() / "tools" / "research" / "scoda"
-SCODA_PY = SCODA_ROOT / ".venv" / "bin" / "python"
+# CPU venv by default; SPLATLAB_SCODA_PYTHON can point at a CUDA env that already
+# carries torch+timm+pandas+scipy (langfield-spike does) for --device cuda runs.
+SCODA_PY = Path(os.environ.get("SPLATLAB_SCODA_PYTHON") or (SCODA_ROOT / ".venv" / "bin" / "python"))
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 
 

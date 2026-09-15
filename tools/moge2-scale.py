@@ -42,6 +42,8 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="CPU only: dataset, keyframes, frame agreement, extents")
     ap.add_argument("--out", type=Path, default=None, help="default <job>/_scale")
     ap.add_argument("--brief", action="store_true", help="one-line dry-run summary instead of JSON")
+    ap.add_argument("--rescore", action="store_true", help="rebuild the proposal without inference: from saved depth_*.npy when present (re-applies --window), else from the receipt's per-frame ratios")
+    ap.add_argument("--window", type=int, default=3, help="local-minimum depth sampling window in px (1 = nearest pixel)")
     args = ap.parse_args()
 
     job_dir = Path(args.job) if Path(args.job).is_dir() else OUTPUTS / args.job
@@ -56,6 +58,8 @@ def main() -> int:
     meta = json.loads((job_dir / "meta.json").read_text()) if (job_dir / "meta.json").is_file() else {}
     existing = meta.get("scale_calibration") or ({"meters_per_unit": meta["meters_per_unit"], "method": "unknown"}
                                                  if meta.get("meters_per_unit") else None)
+    dp = se.find_dataparser_scale(job_dir)
+    dp_scale = dp["scale"] if dp else None
     extents = {"sparse_pc": robust_extent(sparse)}
     splat_ply = job_dir / "_preview" / "splat.ply"
     if splat_ply.is_file():
@@ -73,12 +77,13 @@ def main() -> int:
     summary = {"job_id": job_id, "frames_total": len(transforms["frames"]), "sparse_points": int(len(sparse)),
                "camera_model": transforms["camera_model"], "per_frame_intrinsics": transforms["per_frame_intrinsics"], "fov_x_deg": round(se.fov_x_degrees(transforms["fx"], transforms["w"]), 2),
                "frame_agreement": agreement, "extents": extents, "existing_calibration": existing,
+               "dataparser_scale": dp_scale,
                "keyframes": plan}
     if args.brief:
         ex = (existing or {}).get("meters_per_unit")
         print(f"   {job_id}: frames={summary['frames_total']} sparse={summary['sparse_points']} "
               f"fov_x={summary['fov_x_deg']} agreement={agreement['consistent']} "
-              f"(in-view {agreement['median_in_view_fraction']}) splat/sparse extent={extents.get('splat_over_sparse')} "
+              f"(in-view {agreement['median_in_view_fraction']}) dataparser_scale={dp_scale} "
               f"existing={ex}")
     else:
         print(json.dumps(summary, indent=1))
@@ -86,6 +91,46 @@ def main() -> int:
         print("!! cameras and sparse points do not share a frame — refusing", file=sys.stderr)
         return 2
     if args.dry_run:
+        return 0
+
+    def finish(results, model_id, t_start):
+        agg = se.aggregate(results)
+        proposal = se.build_proposal(agg, results, model=model_id, source="tools/moge2-scale.py", job_id=job_id,
+                                     frame_check=agreement, existing=existing, dataparser_scale=dp_scale)
+        proposal["extents"] = extents
+        proposal["runtime_s"] = round(time.time() - t_start, 1)
+        proposal["num_tokens"] = args.num_tokens
+        proposal["sample_window"] = args.window
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "moge2-proposal.json").write_text(json.dumps(proposal, indent=1) + "\n")
+        print(json.dumps({k: proposal[k] for k in ("meters_per_unit", "frame", "meters_per_unit_colmap_frame", "dataparser_scale",
+                                                   "confidence", "relative_mad", "frames_used", "existing", "runtime_s") if k in proposal}, indent=1))
+        print(f"receipt: {out / 'moge2-proposal.json'}")
+
+    if args.rescore:
+        receipt_path = out / "moge2-proposal.json"
+        old = json.loads(receipt_path.read_text())
+        depths = sorted(out.glob("depth_*.npz"))
+        if depths:
+            results = []
+            for npy in depths:
+                fi = int(npy.stem.split("_")[1])
+                f = transforms["frames"][fi]
+                arr = np.load(npy)
+                depth = arr["depth"].astype(np.float64) if hasattr(arr, "files") else arr.astype(np.float64)
+                mask = arr["mask"].astype(bool) if hasattr(arr, "files") and "mask" in arr.files else None
+                r = se.frame_scale(depth, mask, se.project_frame(f, sparse), window=args.window)
+                r.update({"frame": fi, "file_path": f["file_path"]}); results.append(r)
+                print(f"  frame {fi:>4} {Path(f['file_path']).name}: n={r['n_points']} inl={r['n_inliers']} ratio={r['ratio']} (window {args.window})", flush=True)
+        else:
+            print("  (no saved depth maps — reusing the receipt's per-frame ratios; --window has no effect)")
+            results = [{"frame": r.get("frame"), "file_path": r.get("file_path"), "n_points": r.get("n_points"),
+                        "n_inliers": r.get("n_inliers"), "ratio": r.get("meters_per_unit"), "mad_relative": r.get("mad_relative")}
+                       for r in old.get("references", [])]
+        keep = out / f"moge2-proposal.v{len(list(out.glob('moge2-proposal.v*.json'))) + 1}.json"
+        keep.write_text(json.dumps(old, indent=1) + "\n")
+        print(f"rescoring {len(results)} frames from {receipt_path.name} (previous kept as {keep.name})")
+        finish(results, old.get("model", MODEL_ID), t0)
         return 0
 
     import torch  # noqa: E402  (GPU half)
@@ -108,9 +153,12 @@ def main() -> int:
         depth = pred["depth"].detach().float().cpu().numpy()
         mask = pred["mask"].detach().cpu().numpy().astype(bool) if "mask" in pred else None
         proj = se.project_frame(f, sparse)
-        r = se.frame_scale(depth, mask, proj)
+        r = se.frame_scale(depth, mask, proj, window=args.window)
         r.update({"frame": entry["frame"], "file_path": f["file_path"]})
         results.append(r)
+        # keep the metric depth (float16, ~3 MB/frame) so sampling variants can be rescored on CPU
+        np.savez_compressed(out / f"depth_{entry['frame']:04d}.npz", depth=depth.astype(np.float16),
+                            mask=(mask if mask is not None else np.ones_like(depth, dtype=bool)))
         print(f"  frame {entry['frame']:>4} {Path(f['file_path']).name}: n={r['n_points']} inl={r['n_inliers']} ratio={r['ratio']}", flush=True)
         # preview: depth as 8-bit PNG for the receipt (not a metric artifact)
         finite = np.isfinite(depth) & (depth > 0)
@@ -118,15 +166,7 @@ def main() -> int:
             lo, hi = np.percentile(depth[finite], [2, 98])
             img8 = np.clip((depth - lo) / max(hi - lo, 1e-6), 0, 1)
             Image.fromarray((img8 * 255).astype(np.uint8)).save(out / f"depth_{entry['frame']:04d}.png")
-    agg = se.aggregate(results)
-    proposal = se.build_proposal(agg, results, model=MODEL_ID, source="tools/moge2-scale.py", job_id=job_id,
-                                 frame_check=agreement, existing=existing)
-    proposal["extents"] = extents
-    proposal["runtime_s"] = round(time.time() - t0, 1)
-    proposal["num_tokens"] = args.num_tokens
-    (out / "moge2-proposal.json").write_text(json.dumps(proposal, indent=1) + "\n")
-    print(json.dumps({k: proposal[k] for k in ("meters_per_unit", "confidence", "relative_mad", "frames_used", "existing", "runtime_s") if k in proposal}, indent=1))
-    print(f"receipt: {out / 'moge2-proposal.json'}")
+    finish(results, MODEL_ID, t0)
     return 0
 
 

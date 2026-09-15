@@ -165,19 +165,43 @@ def select_keyframes(n_frames: int, k: int) -> list[int]:
 
 # ── estimation ────────────────────────────────────────────────────────────────
 
+def sample_depth(depth_map: np.ndarray, u: np.ndarray, v: np.ndarray, window: int = 1) -> np.ndarray:
+    """Depth at (v, u). With window > 1, the MINIMUM finite depth in the
+    (window x window) neighbourhood: SfM features sit on corners and edges,
+    where a nearest-pixel lookup often lands on the *background* behind the
+    edge and biases the ratio high. Taking the local minimum picks the
+    foreground surface the feature actually belongs to."""
+    depth_map = np.asarray(depth_map, dtype=np.float64)
+    if window <= 1:
+        return depth_map[v, u]
+    r = window // 2
+    h, w = depth_map.shape
+    out = np.full(len(u), np.inf)
+    for dv in range(-r, r + 1):
+        for du in range(-r, r + 1):
+            vv = np.clip(v + dv, 0, h - 1)
+            uu = np.clip(u + du, 0, w - 1)
+            d = depth_map[vv, uu]
+            ok = np.isfinite(d) & (d > 0)
+            out = np.where(ok & (d < out), d, out)
+    out[~np.isfinite(out)] = np.nan
+    return out
+
+
 def frame_scale(metric_depth: np.ndarray, valid_mask: np.ndarray | None,
-                proj: dict[str, np.ndarray]) -> dict[str, Any]:
+                proj: dict[str, np.ndarray], window: int = 1) -> dict[str, Any]:
     """Robust ratio metric_depth / sparse_depth for one frame.
 
     Two passes: median of all finite ratios, then median of the ratios within
     ±INLIER_BAND of that. Reports how many points survived so the caller can
-    weight frames and refuse thin evidence.
+    weight frames and refuse thin evidence. `window` > 1 samples the local
+    minimum depth around each feature (see sample_depth).
     """
     depth_map = np.asarray(metric_depth, dtype=np.float64)
     u, v, sparse = proj["u"], proj["v"], proj["depth"]
     if len(sparse) == 0:
         return {"n_points": 0, "n_inliers": 0, "ratio": None, "mad_relative": None}
-    sampled = depth_map[v, u]
+    sampled = sample_depth(depth_map, u, v, window)
     good = np.isfinite(sampled) & (sampled > 0) & (sparse > 0)
     if valid_mask is not None:
         good &= np.asarray(valid_mask, dtype=bool)[v, u]
@@ -221,16 +245,29 @@ def aggregate(frame_results: list[dict[str, Any]]) -> dict[str, Any]:
 def build_proposal(agg: dict[str, Any], frame_results: list[dict[str, Any]], *,
                    model: str, source: str, job_id: str,
                    frame_check: dict[str, Any] | None = None,
-                   existing: dict[str, Any] | None = None) -> dict[str, Any]:
+                   existing: dict[str, Any] | None = None,
+                   dataparser_scale: float | None = None) -> dict[str, Any]:
     """A `scale_calibration`-shaped record flagged as a proposal, plus the
-    comparison against any existing calibration (never applied here)."""
-    factor = agg.get("meters_per_unit")
+    comparison against any existing calibration (never applied here).
+
+    MoGe depth is compared against COLMAP-frame sparse depth, so the raw ratio is
+    metres per COLMAP unit. The viewer PLY is in nerfstudio's normalised frame
+    (COLMAP units x dataparser_scale), which is where `meters_per_unit` is
+    measured and consumed — so when the scale is known the headline number is
+    converted into that frame and the COLMAP-frame value is kept alongside."""
+    colmap_factor = agg.get("meters_per_unit")
+    factor = colmap_factor
+    if colmap_factor and dataparser_scale:
+        factor = colmap_factor / dataparser_scale
     record: dict[str, Any] = {
         "schema": "dev.splatlab.scale-proposal/v1",
         "job_id": job_id,
         "proposed": True,
         "applied": False,
         "meters_per_unit": factor,
+        "frame": "viewer-normalized" if (colmap_factor and dataparser_scale) else "colmap",
+        "meters_per_unit_colmap_frame": colmap_factor,
+        "dataparser_scale": dataparser_scale,
         "method": METHOD_MOGE2,
         "source": source,
         "model": model,
@@ -253,6 +290,25 @@ def build_proposal(agg: dict[str, Any], frame_results: list[dict[str, Any]], *,
                               "relative_error": round(factor / have - 1.0, 6),
                               "within_5_percent": bool(abs(factor / have - 1.0) <= 0.05)}
     return record
+
+
+def find_dataparser_scale(job_dir: Path) -> dict[str, Any] | None:
+    """nerfstudio normalises poses (orient + centre + scale-to-unit-box) before
+    training, and `ns-export gaussian-splat` writes raw `model.means` — so the
+    viewer PLY, and every calibration measured in it, lives in that normalised
+    frame. dataparser_transforms.json under the checkpoint records the scale."""
+    cands = sorted(Path(job_dir).glob("processed/splatfacto/*/dataparser_transforms.json"),
+                   key=lambda p: p.stat().st_mtime)
+    if not cands:
+        return None
+    data = json.loads(cands[-1].read_text())
+    try:
+        scale = float(data["scale"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (scale > 0):
+        return None
+    return {"scale": scale, "transform": data.get("transform"), "path": str(cands[-1])}
 
 
 def fov_x_degrees(fx: float, w: int) -> float:
