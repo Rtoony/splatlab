@@ -48,6 +48,8 @@ import {
   SplatMesh,
 } from "@sparkjsdev/spark";
 import { buildPluckModifier, packChannelsRgba } from "./spark-heatmap";
+import { installMeshPortalClipping, installPortalClipping, validatePortals, type ArchitecturalPortal } from "./architectural-portals";
+import { findWalkingStart, inspectWalkingPose, walkingBodyError, type WalkingAdmission, type WalkingBody } from "./walking-admission";
 import {
   classTile,
   presetFor,
@@ -99,7 +101,9 @@ export interface WorldEntry {
    * Both shapes are supported; `files.glb` wins when present.
    */
   glb?: string | null;
-  files?: { glb?: string | null; atlas?: string | null; report?: string | null } | null;
+  files?: { glb?: string | null; splat?: string | null; atlas?: string | null; report?: string | null } | null;
+  gaussian_appearance?: { rows: number; frame: string; collision_source: string; render_vr_only: boolean };
+  material_lighting?: "authored-lit";
   faces?: number;
   extent?: [number, number, number];
   collision?: WorldCollisionBlock;
@@ -111,7 +115,16 @@ export interface WorldEntry {
   provenance?: string | null;
 }
 
+export function collisionScaleToWorld(manifest: WorldManifest): number {
+  const scale = manifest.collision_shell?.scale_to_world ?? 1;
+  if (!Number.isFinite(scale) || scale <= 0) {
+    throw new Error("Collision solid has an invalid capture-to-world scale.");
+  }
+  return scale;
+}
+
 export interface WorldManifest {
+  calibration?: { stale?: boolean };
   v?: number;
   job_id?: string;
   units?: string;
@@ -127,6 +140,7 @@ export interface WorldManifest {
    * watertight. Render the shell, collide against this.
    */
   collision_shell?: {
+    scale_to_world?: number;
     glb?: string | null;
     report?: string | null;
     gates?: Record<string, number | boolean> | null;
@@ -204,6 +218,7 @@ export function localWorldSource(dirUrl: string): WorldSource {
  * ------------------------------------------------------------------ */
 
 export interface WalkParams {
+  bodySizing?: "legacy-fit" | "fixed-metric";
   /** THE scale dial: how many scene units equal one real metre. */
   unitsPerMetre: number;
   eyeHeightM: number;
@@ -228,6 +243,7 @@ export interface WalkParams {
 }
 
 export const DEFAULT_WALK_PARAMS: WalkParams = {
+  bodySizing: "legacy-fit",
   unitsPerMetre: 1,
   eyeHeightM: 1.7,
   radiusM: 0.32,
@@ -276,6 +292,7 @@ export interface LoadedElement {
   collides: boolean;
   visible: boolean;
   object: THREE.Object3D;
+  gaussianAppearance?: SplatMesh;
   /** "authored" for placed assets — the collider merges authored static/
    *  environment geometry into the BVH; captured statics are already
    *  represented by the collision shell and must not double in. */
@@ -310,6 +327,8 @@ export interface LoadProgress {
   label: string;
 }
 
+type ColliderSource = "collision_shell" | "collision_shell+authored" | "collision_shell+elements" | "visual_shell";
+
 export interface WorldLoadResult {
   manifest: WorldManifest;
   elements: LoadedElement[];
@@ -320,7 +339,7 @@ export interface WorldLoadResult {
   /** Which geometry the BVH was built from — surfaced so a fallback to the
    *  fragmented visual shell is visible rather than silent, and so merged
    *  authored geometry (environment/static placements) is visible too. */
-  colliderSource: "collision_shell" | "collision_shell+authored" | "visual_shell";
+  colliderSource: ColliderSource;
   suggestedUnitsPerMetre: number;
 }
 
@@ -392,6 +411,7 @@ export class WorldWalker {
   /** Fired when the engine itself changes params (the [ ] scale hotkeys). */
   onParams: ((p: WalkParams) => void) | null = null;
   onLockChange: ((locked: boolean) => void) | null = null;
+  onControlsError: ((message: string) => void) | null = null;
   /** Fired ONLY when the crosshair target or its state changes — not per frame. */
   onTarget: ((target: TargetInfo | null) => void) | null = null;
   /** Fired when the player acts; the page persists it. */
@@ -404,6 +424,8 @@ export class WorldWalker {
   /** Fly (noclip) — for inspecting a world you cannot yet walk. */
   private flying = false;
   private spark: SparkRenderer | null = null;
+  private worldLoadEpoch = 0;
+  private generatedSplats = true;
   /** world_shell's PROVEN-interior point, Y-up. See respawn(). */
   private spawnSeed: THREE.Vector3 | null = null;
   /** Proven floor/ceiling of the solid, Y-up — the headroom the seed sits in. */
@@ -423,10 +445,13 @@ export class WorldWalker {
   private curtainSdf: SplatEditSdf | null = null;
   /** Eye-toggle intent per slug — outranks the computed visibility default. */
   private visibilityOverrides = new Map<string, boolean>();
+  private restorePortalClipping: (() => void) | null = null;
+  private architecturalPortals: ArchitecturalPortal[] = [];
   /** Captured slugs that an authored replacement stands in for. */
   private replacedSlugs = new Set<string>();
   /** Fired when fly mode toggles, so the HUD can say so. */
   onFlyChange: ((flying: boolean) => void) | null = null;
+  onWalkingAdmission: ((result: WalkingAdmission) => void) | null = null;
 
   private readonly canvas: HTMLCanvasElement;
   private readonly velocity = new THREE.Vector3();
@@ -444,7 +469,8 @@ export class WorldWalker {
 
   /** Geometry of the dedicated collision solid, when the manifest ships one. */
   private collisionShellGeom: THREE.BufferGeometry | null = null;
-  private colliderSource: "collision_shell" | "collision_shell+authored" | "visual_shell" = "visual_shell";
+  private colliderSource: ColliderSource = "visual_shell";
+  private staticPropCollision = false;
   private collider: THREE.Mesh | null = null;
   private colliderWire: THREE.LineSegments | null = null;
   private bvh: MeshBVH | null = null;
@@ -468,16 +494,18 @@ export class WorldWalker {
   private running = false;
   private disposed = false;
   private resizeObserver: ResizeObserver | null = null;
+  private captureInspectionMask: Uint8Array | null = null;
 
   private frameCount = 0;
   private statsClock = 0;
   private fps = 0;
   private spawn = new THREE.Vector3();
 
-  constructor(canvas: HTMLCanvasElement) {
+  constructor(canvas: HTMLCanvasElement, options: { antialias?: boolean } = {}) {
     this.canvas = canvas;
 
-    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: options.antialias ?? true,
+      powerPreference: "high-performance", logarithmicDepthBuffer: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     this.renderer.setClearColor(0x0b0b0e, 1);
 
@@ -543,6 +571,7 @@ export class WorldWalker {
     opts: { signal?: AbortSignal; onProgress?: (p: LoadProgress) => void } = {},
   ): Promise<WorldLoadResult> {
     this.clearWorld();
+    const loadEpoch = this.worldLoadEpoch;
 
     const entries: Array<{
       entry: WorldEntry; dir: string; role: WorldRole | "shell"; url: string;
@@ -563,6 +592,7 @@ export class WorldWalker {
         .filter((s): s is string => typeof s === "string" && s.length > 0));
 
     const loaded: LoadedElement[] = [];
+    this.elements = loaded;
     const warnings: string[] = [];
 
     for (let i = 0; i < entries.length; i++) {
@@ -571,11 +601,16 @@ export class WorldWalker {
       opts.onProgress?.({ loaded: i, total: entries.length, label: entry.label || entry.slug });
 
       const object = await this.loadGlb(source, url, dir);
+      if (this.disposed || opts.signal?.aborted || loadEpoch !== this.worldLoadEpoch) {
+        disposeObject(object);
+        throw new Error("World load was superseded or aborted.");
+      }
       const box = new THREE.Box3().setFromObject(object);
       let tris = 0;
       object.traverse((o) => {
         const mesh = o as THREE.Mesh;
         if (!mesh.isMesh) return;
+        mesh.userData.authoredLighting = entry.provenance === "authored" && entry.material_lighting === "authored-lit";
         const g = mesh.geometry as THREE.BufferGeometry;
         tris += g.index ? g.index.count / 3 : (g.getAttribute("position")?.count ?? 0) / 3;
       });
@@ -602,6 +637,10 @@ export class WorldWalker {
         provenance: entry.provenance ?? null,
         frameWarning: null,
       });
+      if (entry.files?.splat || entry.gaussian_appearance) {
+        if (manifest.units !== "meters") throw new Error("Generated Gaussian appearance requires a metre world.");
+        await this.loadGeneratedAppearance(entry, loaded[loaded.length - 1], loadEpoch, opts.signal);
+      }
     }
     opts.onProgress?.({ loaded: entries.length, total: entries.length, label: "assembling" });
 
@@ -631,6 +670,7 @@ export class WorldWalker {
     // through the lace visual shell, which is exactly what it exists to fix.
     const declaredCsUrl = manifest.collision_shell?.glb;
     const csUrl = declaredCsUrl ?? "collision_shell.glb";
+    const collisionScale = collisionScaleToWorld(manifest);
     if (csUrl) {
       opts.onProgress?.({ loaded: entries.length, total: entries.length, label: "collision solid" });
       try {
@@ -642,6 +682,7 @@ export class WorldWalker {
           if (!mesh.isMesh) return;
           const g = positionOnly(mesh.geometry as THREE.BufferGeometry);
           g.applyMatrix4(mesh.matrixWorld);
+          g.scale(collisionScale, collisionScale, collisionScale);
           parts.push(g);
         });
         if (parts.length) {
@@ -665,10 +706,10 @@ export class WorldWalker {
             const report = await rep.json();
             const seed = report?.params?.seed_yup;
             if (Array.isArray(seed) && seed.length === 3 && seed.every(Number.isFinite)) {
-              this.spawnSeed = new THREE.Vector3(seed[0], seed[1], seed[2]);
+              this.spawnSeed = new THREE.Vector3(seed[0], seed[1], seed[2]).multiplyScalar(collisionScale);
               const probe = report?.probe ?? {};
-              this.spawnFloorY = Number(probe.floor_level_y ?? seed[1]);
-              this.spawnTopY = Number(probe.top_level_y ?? seed[1]);
+              this.spawnFloorY = Number(probe.floor_level_y ?? seed[1]) * collisionScale;
+              this.spawnTopY = Number(probe.top_level_y ?? seed[1]) * collisionScale;
             }
           }
         } catch {
@@ -708,6 +749,7 @@ export class WorldWalker {
     }
 
     this.rebuildCollider();
+    this.refreshElementVisibility();
     this.respawn();
 
     // Far plane must comfortably clear the scene at any scale.
@@ -862,6 +904,7 @@ export class WorldWalker {
       // the room invisible from inside. DoubleSide everywhere is the safe read.
       const lit = new THREE.MeshStandardMaterial({
         map,
+        vertexColors: src?.vertexColors === true,
         color: src?.color?.clone() ?? new THREE.Color(0xffffff),
         roughness: src?.roughness ?? 0.85,
         metalness: 0,
@@ -869,6 +912,7 @@ export class WorldWalker {
       });
       const unlit = new THREE.MeshBasicMaterial({
         map,
+        vertexColors: src?.vertexColors === true,
         color: map ? new THREE.Color(0xffffff) : (src?.color?.clone() ?? new THREE.Color(0xffffff)),
         side: THREE.DoubleSide,
       });
@@ -891,6 +935,12 @@ export class WorldWalker {
    * (per the v1 brief — the manifest ships per-prop convex hulls we do not
    * need yet, because complex_as_simple shell collision is exact enough).
    */
+  setStaticPropCollision(enabled: boolean): void {
+    if (enabled && this.params.physicsProps) throw new Error("Static prop collision requires dynamic physics to be disabled.");
+    this.staticPropCollision = enabled;
+    this.rebuildCollider();
+  }
+
   rebuildCollider(): void {
     this.disposeCollider();
     if (!this.elements.length) return;
@@ -901,7 +951,8 @@ export class WorldWalker {
       // — either way collides=true is the truth. Props opt in only on the
       // fallback path (physics forces collideProps off when it engages).
       el.collides = el.role === "shell" || el.role === "static"
-        || el.role === "environment" || (!useShell && this.params.collideProps);
+        || el.role === "environment" || (!useShell && this.params.collideProps)
+        || (this.staticPropCollision === true && el.role === "prop");
     }
     const built = this.buildStaticColliderGeometry(this.params.collideProps);
     if (!built) return;
@@ -923,20 +974,24 @@ export class WorldWalker {
    */
   private buildStaticColliderGeometry(includeProps: boolean): {
     geom: THREE.BufferGeometry;
-    source: "collision_shell" | "collision_shell+authored" | "visual_shell";
+    source: ColliderSource;
   } | null {
     const useShell = !!this.collisionShellGeom && !includeProps;
     const geoms: THREE.BufferGeometry[] = [];
     if (useShell) geoms.push(this.collisionShellGeom!.clone());
     let authored = 0;
+    let props = 0;
     for (const el of this.elements) {
       const merge = useShell
-        ? el.provenance === "authored"
-          && (el.role === "static" || el.role === "environment")
+        ? ((el.provenance === "authored" || el.provenance === "generated")
+          && (el.role === "static" || el.role === "environment"))
+          || (this.staticPropCollision && el.role === "prop")
         : el.role === "shell" || el.role === "static"
-          || el.role === "environment" || includeProps;
+          || el.role === "environment" || includeProps
+          || (this.staticPropCollision && el.role === "prop");
       if (!merge) continue;
       if (useShell) authored += 1;
+      if (useShell && el.role === "prop") props += 1;
       el.object.updateWorldMatrix(true, true);
       el.object.traverse((o) => {
         const mesh = o as THREE.Mesh;
@@ -956,15 +1011,16 @@ export class WorldWalker {
       throw new Error("Collider merge failed — geometries had incompatible attributes.");
     }
     const source = useShell
-      ? (authored ? "collision_shell+authored" as const : "collision_shell" as const)
+      ? (props ? "collision_shell+elements" as const : authored ? "collision_shell+authored" as const : "collision_shell" as const)
       : "visual_shell" as const;
     return { geom: merged, source };
   }
 
   private installCollider(
     merged: THREE.BufferGeometry,
-    source: "collision_shell" | "collision_shell+authored" | "visual_shell",
+    source: ColliderSource,
   ): void {
+    if (this.params.bodySizing === "fixed-metric") this.setFlying(true);
     this.colliderSource = source;
     merged.computeBoundingBox();
     this.bvh = new MeshBVH(merged, { maxLeafTris: 8 });
@@ -1009,12 +1065,14 @@ export class WorldWalker {
   }
 
   private get capsuleRadius(): number {
+    if (this.params.bodySizing === "fixed-metric") return this.params.radiusM * this.params.unitsPerMetre;
     // A capsule needs radius < eye height; clamp instead of exploding when a
     // user dials the scale to something extreme.
     return Math.min(this.params.radiusM * this.params.unitsPerMetre, this.eyeHeight * 0.35);
   }
 
   private get capsuleHeight(): number {
+    if (this.params.bodySizing === "fixed-metric") return this.eyeHeight;
     // The physics capsule's height in units: the eye height, clamped so the
     // whole capsule FITS the headroom world_shell proved at the spawn seed —
     // capsule extent is height + radius, hence the radius-and-margin cap. On
@@ -1037,6 +1095,18 @@ export class WorldWalker {
 
   /** Drop the player onto the floor near the middle of the world. */
   respawn(): void {
+    if (this.params.bodySizing === "fixed-metric") {
+      this.setFlying(true);
+      const viewpoint = this.spawnSeed?.clone() || this.sceneBox.getCenter(new THREE.Vector3());
+      if (this.spawnSeed) viewpoint.y = this.spawnFloorY + this.eyeHeight + .1 * this.params.unitsPerMetre;
+      const result = findWalkingStart(this.bvh, this.collider, viewpoint, this.walkingBody);
+      this.camera.position.copy(result.position ? new THREE.Vector3(...result.position) : viewpoint);
+      this.spawn.copy(this.camera.position);
+      this.velocity.set(0, 0, 0);
+      this.grounded = false;
+      this.onWalkingAdmission?.({ ...result, message: result.ok ? "Supported full-size spawn found. Enable walking explicitly to begin." : result.message });
+      return;
+    }
     // Prefer the seed world_shell proved is inside the solid. Casting down from
     // the scene centre finds the first surface below, and on a watertight shell
     // that is the roof.
@@ -1093,7 +1163,8 @@ export class WorldWalker {
     this.camera.position.copy(this.findStandingPoint(target));
     this.velocity.set(0, 0, 0);
     this.grounded = false;
-    if (this.bvh) this.resolveCollisions(1 / 60);
+    if (this.params.bodySizing === "fixed-metric") this.setFlying(true);
+    else if (this.bvh) this.resolveCollisions(1 / 60);
     this.lookAt(center);
   }
 
@@ -1107,6 +1178,13 @@ export class WorldWalker {
     return this.bvh.raycast(_ray, THREE.DoubleSide)
       .map((h) => h.point.y)
       .sort((a, b) => a - b);
+  }
+
+  pickCollisionSurface(ray: THREE.Ray): { point: THREE.Vector3; normal: THREE.Vector3 } | null {
+    if (!this.bvh || ![...ray.origin.toArray(), ...ray.direction.toArray()].every(Number.isFinite)
+      || Math.abs(ray.direction.lengthSq() - 1) > 1e-6) return null;
+    const hit = this.bvh.raycastFirst(ray, THREE.DoubleSide, 0, 100);
+    return hit?.face ? { point: hit.point.clone(), normal: hit.face.normal.clone() } : null;
   }
 
   /**
@@ -1193,7 +1271,15 @@ export class WorldWalker {
 
   setParams(patch: Partial<WalkParams>): void {
     const before = this.params;
-    this.params = { ...before, ...patch };
+    const next = { ...before, ...patch };
+    if (next.bodySizing === "fixed-metric") {
+      const problem = walkingBodyError({ radiusM: next.radiusM, totalHeightM: next.eyeHeightM + next.radiusM, unitsPerMetre: next.unitsPerMetre });
+      if (problem) throw new Error(problem);
+    }
+    if ((before.bodySizing === "fixed-metric" || next.bodySizing === "fixed-metric") &&
+      (next.bodySizing !== before.bodySizing || next.radiusM !== before.radiusM || next.eyeHeightM !== before.eyeHeightM || next.unitsPerMetre !== before.unitsPerMetre))
+      this.setFlying(true);
+    this.params = next;
     if (patch.fovDeg !== undefined && patch.fovDeg !== before.fovDeg) {
       this.camera.fov = this.params.fovDeg;
       this.camera.updateProjectionMatrix();
@@ -1280,7 +1366,58 @@ export class WorldWalker {
     this.refreshElementVisibility();
   }
 
+  setArchitecturalPortals(portals: ArchitecturalPortal[]): void {
+    validatePortals(portals);
+    this.restorePortalClipping?.();
+    this.restorePortalClipping = null;
+    this.architecturalPortals = [];
+    if (!portals.length) return;
+    if (!this.collisionShellGeom) throw new Error("Architectural clipping requires its paired captured collision.");
+    const restores: (() => void)[] = [];
+    const materials = new Set<THREE.Material>();
+    try {
+      if (this.spark) restores.push(installPortalClipping(this.spark, portals));
+      for (const element of this.elements) {
+        if (element.provenance === "authored" || element.provenance === "generated") continue;
+        element.object.traverse(object => {
+          if (!(object as THREE.Mesh).isMesh) return;
+          const used = (object as THREE.Mesh).material;
+          for (const material of Array.isArray(used) ? used : [used]) {
+            if (materials.has(material)) continue;
+            materials.add(material);
+            restores.push(installMeshPortalClipping(material, portals));
+          }
+        });
+      }
+    } catch (error) {
+      for (const restore of restores.reverse()) restore();
+      throw error;
+    }
+    this.restorePortalClipping = () => { for (const restore of restores.reverse()) restore(); };
+    this.architecturalPortals = structuredClone(portals);
+  }
+
+  architecturalPortalState(): ArchitecturalPortal[] {
+    return structuredClone(this.architecturalPortals);
+  }
+
+  async applyCapturedVisibility(hiddenSlugs: string[]): Promise<void> {
+    if (!this.backdrop) {
+      if (hiddenSlugs.length) throw new Error("Captured visibility requires the revision's splat backdrop.");
+      return;
+    }
+    await this.backdrop.initialized;
+    for (const slug of hiddenSlugs) {
+      if (!this.pluckElement(slug)) throw new Error(`Cannot safely hide captured splats for ${slug}.`);
+    }
+    if (this.spark) await this.spark.update({ scene: this.scene, camera: this.camera });
+  }
+
   clearBackdrop(): void {
+    this.restorePortalClipping?.();
+    this.restorePortalClipping = null;
+    this.architecturalPortals = [];
+    this.captureInspectionMask = null;
     const had = this.backdrop !== null;
     if (this.backdrop) {
       this.scene.remove(this.backdrop);
@@ -1349,17 +1486,34 @@ export class WorldWalker {
   private refreshPluckModifier(numSplats: number): void {
     const splat = this.backdrop;
     if (!splat) return;
-    if (!this.pluckedSlugs.size || !this.pluckMask) {
+    const mask = this.captureInspectionMask ?? this.pluckMask;
+    if (!mask || (!this.captureInspectionMask && !this.pluckedSlugs.size)) {
       splat.worldModifier = undefined;
       splat.updateGenerator();
       return;
     }
     const maskArray = new RgbaArray({
-      array: packChannelsRgba([this.pluckMask], numSplats),
+      array: packChannelsRgba([mask], numSplats),
       count: numSplats,
     });
     splat.worldModifier = buildPluckModifier({ maskArray });
     splat.updateGenerator();
+  }
+
+  async inspectCapturedRows(rows: number[] | null, mode: "selected" | "remaining" = "selected"): Promise<void> {
+    if (!this.backdrop) throw new Error("Selection inspection requires captured appearance.");
+    await this.backdrop.initialized;
+    const count = this.pluckNumSplats();
+    if (!count || (rows && (!rows.length || rows.length > 200000 || rows.some(row => !Number.isInteger(row) || row < 0 || row >= count)))) {
+      throw new Error("Selection inspection rows do not match this backdrop.");
+    }
+    const mask = rows
+      ? mode === "remaining" ? this.pluckMask?.slice() ?? new Uint8Array(count) : new Uint8Array(count).fill(255)
+      : null;
+    if (mask && rows) for (const row of rows) mask[row] = mode === "remaining" ? 255 : 0;
+    this.captureInspectionMask = mask;
+    this.refreshPluckModifier(count);
+    if (this.spark) await this.spark.update({ scene: this.scene, camera: this.camera });
   }
 
   /** Remove a prop's splats from the photograph (idempotent, non-destructive
@@ -1513,7 +1667,46 @@ export class WorldWalker {
     // until the world reloads.
     this.visibilityOverrides.set(slug, visible);
     el.visible = visible;
-    el.object.visible = visible;
+    this.updateElementAppearance(el);
+  }
+
+  setGeneratedSplats(enabled: boolean): void {
+    this.generatedSplats = enabled;
+    this.refreshElementVisibility();
+  }
+
+  private async loadGeneratedAppearance(entry: WorldEntry, element: LoadedElement, epoch: number, signal?: AbortSignal): Promise<void> {
+    const appearance = entry.gaussian_appearance;
+    if (!entry.files?.splat || entry.provenance !== "generated" || entry.role !== "environment"
+      || appearance?.frame !== "world-y-up-metres" || appearance.collision_source !== "generated-delivery-mesh"
+      || appearance.render_vr_only !== true || !Number.isInteger(appearance.rows) || appearance.rows < 1 || appearance.rows > 2_000_000) {
+      throw new Error("Generated Gaussian appearance has no verified world-frame mesh pairing.");
+    }
+    const splat = new SplatMesh({ url: entry.files.splat, fileType: SplatFileType.PLY });
+    try {
+      await splat.initialized;
+      if (this.disposed || signal?.aborted || epoch !== this.worldLoadEpoch) throw new Error("Generated appearance load was superseded or aborted.");
+      if (splat.numSplats !== appearance.rows) throw new Error("Generated Gaussian row count differs from this revision.");
+      if (!this.spark) {
+        this.spark = new SparkRenderer({ renderer: this.renderer });
+        this.scene.add(this.spark);
+      }
+      splat.name = entry.slug + ":generated-appearance";
+      splat.userData.slug = entry.slug;
+      this.scene.add(splat);
+      element.gaussianAppearance = splat;
+      this.updateElementAppearance(element);
+    } catch (error) {
+      splat.dispose();
+      throw error;
+    }
+  }
+
+  private updateElementAppearance(element: LoadedElement): void {
+    const native = Boolean(element.gaussianAppearance) && this.generatedSplats !== false
+      && !this.restyleShowsMesh && !this.restyle?.elements?.[element.slug];
+    element.object.visible = element.visible && !native;
+    if (element.gaussianAppearance) element.gaussianAppearance.visible = element.visible && native;
   }
 
   /**
@@ -1534,7 +1727,7 @@ export class WorldWalker {
     if (this.replacedSlugs.has(el.slug)) return false; // stood in for
     if (!photographShowing) return true;
     if (el.role === "shell") return false; // the photograph IS the shell
-    if (el.provenance === "authored") return true;
+    if (el.provenance === "authored" || el.provenance === "generated") return true;
     if (this.pluckedSlugs.has(el.slug)) return true;
     if (this.restyle?.elements?.[el.slug]) return true;
     const record = this.interactions.get(el.slug);
@@ -1548,7 +1741,7 @@ export class WorldWalker {
       const visible = this.visibilityOverrides.get(el.slug)
         ?? this.defaultElementVisible(el);
       el.visible = visible;
-      el.object.visible = visible;
+      this.updateElementAppearance(el);
     }
   }
 
@@ -1805,6 +1998,14 @@ export class WorldWalker {
 
   /** Toggle noclip. Zeroes velocity so you do not inherit a fall on landing. */
   setFlying(flying: boolean): void {
+    if (!flying && this.params.bodySizing === "fixed-metric") {
+      const admission = inspectWalkingPose(this.bvh, this.collider, this.camera.position, this.walkingBody);
+      this.onWalkingAdmission?.(admission);
+      if (!admission.ok) {
+        if (!this.flying) this.setFlying(true);
+        return;
+      }
+    }
     if (this.flying === flying) return;
     this.flying = flying;
     this.velocity.set(0, 0, 0);
@@ -1814,6 +2015,27 @@ export class WorldWalker {
 
   get isFlying(): boolean {
     return this.flying;
+  }
+
+  get walkingBody(): WalkingBody {
+    return { radiusM: this.params.radiusM, totalHeightM: this.params.eyeHeightM + this.params.radiusM, unitsPerMetre: this.params.unitsPerMetre };
+  }
+
+  beginWalking(): WalkingAdmission {
+    const result = this.assessWalkingStart();
+    this.onWalkingAdmission?.(result);
+    if (result.ok && result.position) {
+      this.camera.position.fromArray(result.position);
+      this.keys.clear();
+      this.setFlying(false);
+    } else this.setFlying(true);
+    return result;
+  }
+
+  assessWalkingStart(viewpoint: THREE.Vector3 = this.camera.position): WalkingAdmission {
+    return this.params.bodySizing === "fixed-metric"
+      ? findWalkingStart(this.bvh, this.collider, viewpoint, this.walkingBody)
+      : { ok: false, message: "Configure an explicit fixed-metric body before requesting walking admission.", body: this.walkingBody };
   }
 
   /**
@@ -1847,6 +2069,7 @@ export class WorldWalker {
 
   private applyMaterialMode(): void {
     const unlit = this.params.unlit;
+    let needsLights = !unlit;
     this.worldGroup.traverse((o) => {
       const mesh = o as THREE.Mesh;
       if (!mesh.isMesh) return;
@@ -1854,18 +2077,35 @@ export class WorldWalker {
       // IS the surface now, and swapping it back would silently undo a
       // restyle every time the checkbox moved.
       if (mesh.userData.restyleMaterial) return;
-      const next = unlit ? mesh.userData.unlitMaterial : mesh.userData.litMaterial;
+      const authoredLighting = mesh.userData.authoredLighting === true;
+      needsLights ||= authoredLighting;
+      const next = unlit && !authoredLighting ? mesh.userData.unlitMaterial : mesh.userData.litMaterial;
       if (next) mesh.material = next as THREE.Material;
     });
-    this.lights.visible = !unlit;
+    this.lights.visible = needsLights;
+    if (this.architecturalPortals?.length) this.setArchitecturalPortals(this.architecturalPortals);
   }
 
   /* -------------------------------------------------------------- *
    * Input                                                           *
    * -------------------------------------------------------------- */
 
-  requestLock(): void {
-    if (!this.controls.isLocked) this.controls.lock();
+  async requestLock(): Promise<void> {
+    if (this.controls.isLocked || this.disposed) return;
+    try {
+      if (!this.controls.domElement?.isConnected) throw new Error("The scene canvas is no longer attached.");
+      await this.controls.domElement.requestPointerLock({ unadjustedMovement: false });
+    } catch (reason) {
+      this.keys.clear();
+      if (this.params.bodySizing === "fixed-metric") this.setFlying(true);
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      this.onControlsError?.(`Mouse look could not start. Focus this tab and click Explore again. ${detail}`);
+    }
+  }
+
+  releaseControls(): void {
+    this.keys.clear();
+    if (this.controls.isLocked) this.controls.unlock();
   }
 
   private handleLock = () => this.onLockChange?.(true);
@@ -1877,6 +2117,10 @@ export class WorldWalker {
 
   private handleKeyDown = (e: KeyboardEvent) => {
     if (!this.controls.isLocked) return;
+    if (e.code === "Escape") {
+      this.releaseControls();
+      return;
+    }
     if (!MOVE_KEYS.has(e.code)) return;
     if (e.code === "Space") e.preventDefault();
     if (e.repeat) return;
@@ -1900,6 +2144,10 @@ export class WorldWalker {
     // Live scale dialling without leaving pointer lock — the whole point of a
     // scale control on an uncalibrated capture.
     if (e.code === "BracketLeft" || e.code === "BracketRight") {
+      if (this.params.bodySizing === "fixed-metric") {
+        this.onWalkingAdmission?.({ ok: false, body: this.walkingBody, message: "Fixed-metric walking keeps the calibrated scale. Change calibration explicitly rather than resizing the world with shortcut keys." });
+        return;
+      }
       const factor = e.code === "BracketRight" ? 1.1 : 1 / 1.1;
       this.setParams({ unitsPerMetre: clamp(this.params.unitsPerMetre * factor, 0.01, 1000) });
       this.onParams?.(this.params);
@@ -2113,16 +2361,24 @@ export class WorldWalker {
   }
 
   private clearWorld(): void {
+    this.worldLoadEpoch = (this.worldLoadEpoch || 0) + 1;
     this.disposeCollider();
     this.physics?.dispose();
     this.physics = null;
     for (const el of this.elements) {
+      if (el.gaussianAppearance) {
+        this.scene.remove(el.gaussianAppearance);
+        el.gaussianAppearance.dispose();
+      }
       this.worldGroup.remove(el.object);
       disposeObject(el.object);
     }
     this.elements = [];
     this.sceneBox = new THREE.Box3();
     this.visibilityOverrides.clear();
+    this.restorePortalClipping?.();
+    this.restorePortalClipping = null;
+    this.architecturalPortals = [];
     this.replacedSlugs.clear();
     // The curtain belongs to the WORLD, not the walker: a new world's
     // curtain arrives from its own curtain.json, and the old one leaking
@@ -2153,6 +2409,11 @@ export class WorldWalker {
     // hundreds of MB of GPU buffers for a 1.2M-gaussian scene (review
     // finding, which the debug global made retainable).
     this.clearBackdrop();
+    if (this.spark) {
+      this.scene.remove(this.spark);
+      this.spark.dispose();
+      this.spark = null;
+    }
     for (const tile of this.classTiles.values()) tile.dispose();
     this.classTiles.clear();
     this.renderer.dispose();

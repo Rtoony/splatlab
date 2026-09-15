@@ -32,6 +32,7 @@ from typing import Any
 import numpy as np
 
 import artifact_manifest as manifests
+from artifact_dependencies import scale_revision
 from langfield_align import read_ply_xyz
 
 PLUCK_SCHEMA = "dev.splatlab.world-pluck/v1"
@@ -68,14 +69,11 @@ def _prop_slugs(world_dir: Path) -> list[str]:
 
 def _rows_via_map(indices: np.ndarray, index_map: np.ndarray
                   ) -> tuple[np.ndarray, int]:
-    n_ckpt = int(index_map.max()) + 1
-    inverse = np.full(n_ckpt, -1, dtype=np.int64)
-    inverse[index_map] = np.arange(len(index_map), dtype=np.int64)
-    in_range = indices[(indices >= 0) & (indices < n_ckpt)]
-    dropped = int(len(indices) - len(in_range))
-    rows = inverse[in_range]
-    dropped += int((rows < 0).sum())
-    return np.sort(rows[rows >= 0]), dropped
+    ordering = np.argsort(index_map)
+    positions = np.searchsorted(index_map[ordering], indices)
+    candidates = np.flatnonzero(positions < len(index_map))
+    matches = candidates[index_map[ordering[positions[candidates]]] == indices[candidates]]
+    return np.sort(ordering[positions[matches]]), int(len(indices) - len(matches))
 
 
 def _splat_xyz_keys(splat_ply: Path) -> dict[bytes, int]:
@@ -111,6 +109,9 @@ def build_pluck(job_dir: Path) -> dict[str, Any]:
     if not isolate_receipt.is_file():
         raise PluckError("no _scene/isolated/batch_isolate.json — run the "
                          "isolate stage first")
+    isolated = manifests.read_json(isolate_receipt) or {}
+    if isolated.get("scale_revision", {"scale_generation": 0, "meters_per_unit": None}) != scale_revision(job_dir):
+        raise PluckError("isolate claims predate the scale calibration; re-isolate before rebuilding pluck")
     if not (world_dir / "world.json").is_file():
         raise PluckError("no _world/world.json — solidify the world first")
     if not splat_ply.is_file():
@@ -131,7 +132,10 @@ def build_pluck(job_dir: Path) -> dict[str, Any]:
     index_map = None
     splat_keys: dict[bytes, int] | None = None
     if index_map_path.is_file():
-        index_map = np.load(index_map_path).astype(np.int64)
+        index_map = np.load(index_map_path, allow_pickle=False)
+        if (index_map.ndim != 1 or index_map.dtype.kind not in "iu" or len(index_map) != n_rows
+                or np.any(index_map < 0) or len(np.unique(index_map)) != n_rows):
+            raise PluckError("export index map must contain one unique nonnegative integer per splat row")
         method = "index-map"
     else:
         splat_keys = _splat_xyz_keys(splat_ply)
@@ -139,12 +143,16 @@ def build_pluck(job_dir: Path) -> dict[str, Any]:
 
     elements: dict[str, Any] = {}
     skipped: dict[str, str] = {}
+    coordinate_sources: dict[str, Any] = {}
+    served_xyz = None
     for slug in sorted(props):
         idx_path = job_dir / "_scene" / "isolated" / slug / "object_indices.npz"
         if not idx_path.is_file():
             skipped[slug] = "no-isolate-indices"
             continue
-        indices = np.load(idx_path)["indices"].astype(np.int64)
+        indices = np.load(idx_path, allow_pickle=False)["indices"]
+        if indices.ndim != 1 or indices.dtype.kind not in "iu" or np.any(indices < 0):
+            raise PluckError(f"{slug}: isolate indices must be nonnegative integers")
         if index_map is not None:
             rows, dropped = _rows_via_map(indices, index_map)
         else:
@@ -168,11 +176,32 @@ def build_pluck(job_dir: Path) -> dict[str, Any]:
         if not len(rows):
             skipped[slug] = "no rows survived the export mapping"
             continue
+        object_ply = idx_path.with_name("object.ply")
+        coordinate_verified = False
+        if index_map is not None and object_ply.is_file():
+            object_xyz = read_ply_xyz(object_ply)
+            if len(object_xyz) != len(indices) or len(np.unique(indices)) != len(indices):
+                raise PluckError(f"{slug}: object coordinates and checkpoint indices disagree")
+            if served_xyz is None:
+                served_xyz = read_ply_xyz(splat_ply)
+            ordering = np.argsort(indices)
+            locations = ordering[np.searchsorted(indices[ordering], index_map[rows])]
+            if not np.array_equal(object_xyz[locations], served_xyz[rows]):
+                raise PluckError(f"{slug}: index map addresses different coordinates; re-isolate and rebuild the export mapping")
+            coordinate_verified = True
+        elif index_map is None:
+            coordinate_verified = True
+        if coordinate_verified:
+            coordinate_sources[slug] = {
+                "object": manifests.file_identity(object_ply, include_sha256=False),
+                "indices": manifests.file_identity(idx_path, include_sha256=False),
+            }
         elements[slug] = {
             "rows": [int(r) for r in rows],
             "count": int(len(rows)),
             "ckpt_count": int(len(indices)),
             "dropped_by_export": int(dropped),
+            "coordinate_verified": coordinate_verified,
         }
 
     if not elements:
@@ -208,6 +237,8 @@ def build_pluck(job_dir: Path) -> dict[str, Any]:
         "elements": elements,
         "skipped": skipped,
         "built_from": built_from,
+        "coordinate_sources": coordinate_sources,
+        "scale_revision": scale_revision(job_dir),
     }
 
 
@@ -229,6 +260,13 @@ def validate_pluck(document: Any) -> dict[str, Any]:
             raise PluckError(f"{slug}: rows must be ints in [0, {n_rows})")
         if (entry.get("count") != len(rows)):
             raise PluckError(f"{slug}: count does not match rows")
+    coordinate_sources = document.get("coordinate_sources", {})
+    if not isinstance(coordinate_sources, dict) or len(coordinate_sources) > MAX_ELEMENTS:
+        raise PluckError("invalid coordinate evidence registry")
+    for slug, records in coordinate_sources.items():
+        if (not isinstance(records, dict) or not isinstance(records.get("object"), dict)
+                or not isinstance(records.get("indices"), dict) or slug not in elements):
+            raise PluckError("invalid coordinate evidence source")
     return document
 
 
@@ -253,6 +291,9 @@ def read_pluck(world_dir: Path, job_dir: Path
 
     job_dir = Path(job_dir)
     reasons: list[str] = []
+    revision = scale_revision(job_dir)
+    if doc.get("scale_revision", {"scale_generation": 0, "meters_per_unit": None}) != revision:
+        reasons.append("scale calibration changed since the pluck doc was built; re-isolate and rebuild pluck")
     sources = {
         "splat_ply": job_dir / "_preview" / "splat.ply",
         "batch_isolate": job_dir / "_scene" / "isolated" / "batch_isolate.json",
@@ -264,6 +305,13 @@ def read_pluck(world_dir: Path, job_dir: Path
             continue
         if not manifests.same_file_identity(source, record):
             reasons.append(f"{key} changed since the pluck doc was built")
+    for slug, records in (doc.get("coordinate_sources") or {}).items():
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", slug):
+            reasons.append("invalid coordinate evidence slug")
+            continue
+        for key, filename in (("object", "object.ply"), ("indices", "object_indices.npz")):
+            if not manifests.same_file_identity(job_dir / "_scene" / "isolated" / slug / filename, records.get(key)):
+                reasons.append(f"{slug} {key} coordinate evidence changed")
     if (job_dir / "_langfield" / "STALE").is_file():
         reasons.append("language field is STALE (splat edited)")
     return doc, bool(reasons), reasons

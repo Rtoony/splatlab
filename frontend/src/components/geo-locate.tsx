@@ -8,6 +8,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { apiRequest } from "@/lib/api";
+import GeoControlsPanel from "@/components/geo-controls-panel";
 import type { SplatGeoAnchor, SplatGeoFootprint, SplatGeoSuggestion, SplatJob } from "@/lib/contracts";
 import { Button, Card, Dialog, Input, SectionLabel } from "@/components/ui";
 import { Compass, Crosshair, Download, ExternalLink, Loader2, MapPin, Save, Search, Trash2, X } from "lucide-react";
@@ -48,6 +49,7 @@ export default function GeoLocateModal({ job, onClose }: { job: SplatJob; onClos
   const queryClient = useQueryClient();
   const mapDivRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
+  const controlMapPickRef = useRef<((latitude: number, longitude: number) => void) | null>(null);
   const markerRef = useRef<L.Marker | null>(null);
   const overlayRef = useRef<L.ImageOverlay | null>(null);
   const footprintImgRef = useRef<HTMLImageElement | null>(null);
@@ -58,6 +60,7 @@ export default function GeoLocateModal({ job, onClose }: { job: SplatJob; onClos
     job.geo ? { lat: job.geo.lat, lon: job.geo.lon } : null,
   );
   const [heading, setHeading] = useState<number>(job.geo?.heading_deg ?? 0);
+  const [anchorScene, setAnchorScene] = useState<[number, number] | null>(job.geo?.anchor_scene ?? null);
   const [altM, setAltM] = useState<string>(job.geo?.alt_m != null ? String(job.geo.alt_m) : "");
   // Working scale (meters per scene unit): starts from the survey calibration.
   const [mpu, setMpu] = useState<number>(job.meters_per_unit ?? 1);
@@ -120,8 +123,13 @@ export default function GeoLocateModal({ job, onClose }: { job: SplatJob; onClos
     });
     L.control.layers({ Satellite: sat, Streets: streets }, {}, { position: "topleft" }).addTo(map);
     map.on("click", (e: L.LeafletMouseEvent) => {
+      if (controlMapPickRef.current) {
+        controlMapPickRef.current(e.latlng.lat, e.latlng.lng);
+        return;
+      }
       setFromSuggestion(false);
       setAnchor({ lat: e.latlng.lat, lon: e.latlng.lng });
+      setAnchorScene(null);
     });
     mapRef.current = map;
     return () => {
@@ -172,9 +180,14 @@ export default function GeoLocateModal({ job, onClose }: { job: SplatJob; onClos
     const halfHm = (rot.h * mPerPx) / 2;
     const dLat = halfHm / M_PER_DEG_LAT;
     const dLon = halfWm / (M_PER_DEG_LAT * Math.cos((anchor.lat * Math.PI) / 180) || 1e-9);
+    const angle = heading * Math.PI / 180;
+    const offsetX = fp.center && anchorScene ? fp.center[0] - anchorScene[0] : 0;
+    const offsetY = fp.center && anchorScene ? fp.center[1] - anchorScene[1] : 0;
+    const centerLat = anchor.lat + mpu * (-offsetX * Math.sin(angle) + offsetY * Math.cos(angle)) / M_PER_DEG_LAT;
+    const centerLon = anchor.lon + mpu * (offsetX * Math.cos(angle) + offsetY * Math.sin(angle)) / (M_PER_DEG_LAT * Math.cos(anchor.lat * Math.PI / 180) || 1e-9);
     const bounds = L.latLngBounds(
-      [anchor.lat - dLat, anchor.lon - dLon],
-      [anchor.lat + dLat, anchor.lon + dLon],
+      [centerLat - dLat, centerLon - dLon],
+      [centerLat + dLat, centerLon + dLon],
     );
     if (!overlayRef.current) {
       overlayRef.current = L.imageOverlay(rot.url, bounds, { opacity, interactive: false }).addTo(map);
@@ -184,7 +197,7 @@ export default function GeoLocateModal({ job, onClose }: { job: SplatJob; onClos
       overlayRef.current.setOpacity(opacity);
     }
     markerRef.current?.setZIndexOffset(1000);
-  }, [anchor, heading, mpu, opacity, footprint]);
+  }, [anchor, anchorScene, heading, mpu, opacity, footprint]);
 
   // ── actions ────────────────────────────────────────────────────────────────
   const applySuggestion = useCallback(async () => {
@@ -198,6 +211,7 @@ export default function GeoLocateModal({ job, onClose }: { job: SplatJob; onClos
         return;
       }
       setAnchor({ lat: hit.lat, lon: hit.lon });
+      setAnchorScene(null);
       if (hit.alt_m != null) setAltM(String(Math.round(hit.alt_m * 10) / 10));
       setFromSuggestion(true);
       setSuggestNote(hit.detail);
@@ -248,7 +262,7 @@ export default function GeoLocateModal({ job, onClose }: { job: SplatJob; onClos
           lon: anchor.lon,
           alt_m: alt,
           heading_deg: heading,
-          anchor_scene: footprint?.center ?? null,
+          anchor_scene: anchorScene ?? footprint?.center ?? null,
           source: fromSuggestion ? "exif" : "map",
         },
       };
@@ -380,6 +394,11 @@ export default function GeoLocateModal({ job, onClose }: { job: SplatJob; onClos
               <p className="text-zinc-500">No anchor yet — click the map to place one.</p>
             )}
           </Card>
+
+          {footprint?.available && <GeoControlsPanel jobId={jobId} footprint={footprint} mapPickRef={controlMapPickRef} onApplied={() => {
+            queryClient.invalidateQueries({ queryKey: ["status"] });
+            onClose();
+          }} />}
 
           {/* heading */}
           <Card className="space-y-1.5 border-white/10 bg-white/5 p-2">

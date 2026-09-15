@@ -6,9 +6,10 @@
 // below its walkable top, plus canopy sheets overhead. Both naive picks —
 // first hit from the sky, lowest hit in the column — choose wrong here.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import * as THREE from "three";
 import { MeshBVH } from "three-mesh-bvh";
+import { GLTFLoader, type GLTF } from "three/addons/loaders/GLTFLoader.js";
 import {
   SplatEdit,
   SplatEditRgbaBlendMode,
@@ -16,7 +17,91 @@ import {
   SplatEditSdfType,
   SplatMesh,
 } from "@sparkjsdev/spark";
-import { WorldWalker, type CurtainParams } from "./world-walker";
+import { WorldWalker, DEFAULT_WALK_PARAMS, collisionScaleToWorld, type CurtainParams } from "./world-walker";
+
+describe("collision capture-to-world units", () => {
+  it("uses the explicit conversion, without guessing from player scale", () => {
+    expect(collisionScaleToWorld({ meters_per_unit: 1, collision_shell: { scale_to_world: 0.94975 } })).toBe(0.94975);
+    expect(collisionScaleToWorld({ meters_per_unit: 2 })).toBe(1);
+  });
+
+  it.each([0, -1, NaN, Infinity])("refuses an invalid collision scale %s", scale => {
+    expect(() => collisionScaleToWorld({ collision_shell: { scale_to_world: scale } })).toThrow("invalid");
+  });
+});
+
+describe("architectural threshold collider picking", () => {
+  it("returns the real nearest BVH face in world coordinates, never a hidden surface behind a wall", () => {
+    const floor = new THREE.BoxGeometry(4, 0.2, 4).translate(3, -1.1, 4);
+    const walker = Object.create(WorldWalker.prototype) as WorldWalker;
+    Object.assign(walker, { bvh: new MeshBVH(floor) });
+    const ray = new THREE.Ray(new THREE.Vector3(3, 2, 4), new THREE.Vector3(0, -1, 0));
+    const hit = walker.pickCollisionSurface(ray)!;
+    expect(hit.point.y).toBeCloseTo(-1);
+    expect(hit.normal.toArray()).toEqual([0, 1, 0]);
+    const side = walker.pickCollisionSurface(new THREE.Ray(new THREE.Vector3(0, -1.1, 4), new THREE.Vector3(1, 0, 0)))!;
+    expect(side.point.x).toBeCloseTo(1);
+    expect(side.normal.y).toBe(0);
+    hit.point.y = 123;
+    expect(walker.pickCollisionSurface(ray)!.point.y).toBeCloseTo(-1);
+    expect(ray.origin.toArray()).toEqual([3, 2, 4]);
+    floor.dispose();
+  });
+  it("refuses missing collision, malformed rays and hits beyond the bounded pick range", () => {
+    const walker = Object.create(WorldWalker.prototype) as WorldWalker;
+    const ray = new THREE.Ray(new THREE.Vector3(0, 200, 0), new THREE.Vector3(0, -1, 0));
+    Object.assign(walker, { bvh: null });
+    expect(walker.pickCollisionSurface(ray)).toBeNull();
+    const floor = new THREE.BoxGeometry(4, 0.2, 4);
+    Object.assign(walker, { bvh: new MeshBVH(floor) });
+    expect(walker.pickCollisionSurface(ray)).toBeNull();
+    ray.origin.y = 2;
+    ray.direction.y = -2;
+    expect(walker.pickCollisionSurface(ray)).toBeNull();
+    ray.direction.y = NaN;
+    expect(walker.pickCollisionSurface(ray)).toBeNull();
+    floor.dispose();
+  });
+});
+
+describe("revision-pinned captured visibility", () => {
+  it("waits for captured appearance before applying row selections", async () => {
+    const walker = Object.create(WorldWalker.prototype) as WorldWalker;
+    let ready!: () => void;
+    const initialized = new Promise<void>(resolve => { ready = resolve; });
+    const pluck = vi.fn(() => true);
+    Object.assign(walker, { backdrop: { initialized }, pluckElement: pluck });
+    const applied = walker.applyCapturedVisibility(["chair", "box"]);
+    expect(pluck).not.toHaveBeenCalled();
+    ready();
+    await applied;
+    expect(pluck.mock.calls).toEqual([["chair"], ["box"]]);
+  });
+
+  it("prepares the masked splat renderer before reporting readiness", async () => {
+    const walker = Object.create(WorldWalker.prototype) as WorldWalker;
+    const events: string[] = [];
+    Object.assign(walker, { backdrop: { initialized: Promise.resolve() },
+      pluckElement: () => { events.push("mask"); return true; },
+      spark: { update: async () => { events.push("renderer-ready"); } } });
+    await walker.applyCapturedVisibility(["box"]);
+    expect(events).toEqual(["mask", "renderer-ready"]);
+  });
+
+  it("reports a failed backdrop even when there are no hidden rows", async () => {
+    const walker = Object.create(WorldWalker.prototype) as WorldWalker;
+    Object.assign(walker, { backdrop: { initialized: Promise.reject(new Error("load failed")) } });
+    await expect(walker.applyCapturedVisibility([])).rejects.toThrow("load failed");
+  });
+
+  it("refuses missing backdrops and invalid row addressing", async () => {
+    const walker = Object.create(WorldWalker.prototype) as WorldWalker;
+    Object.assign(walker, { backdrop: null });
+    await expect(walker.applyCapturedVisibility(["chair"])).rejects.toThrow("backdrop");
+    Object.assign(walker, { backdrop: { initialized: Promise.resolve() }, pluckElement: () => false });
+    await expect(walker.applyCapturedVisibility(["chair"])).rejects.toThrow("Cannot safely hide");
+  });
+});
 
 /** A slab whose top is at `topY` and underside at `topY - thickness`. */
 function slab(topY: number, thickness: number, size = 20): THREE.BufferGeometry {
@@ -49,6 +134,63 @@ function probeRig(geoms: THREE.BufferGeometry[]) {
   });
   return walker;
 }
+
+describe("architectural capsule proof against actual walker physics", () => {
+  async function proofTools() {
+    const navigationModule = new URL("../../../tools/architectural-navigation-proof.mjs", import.meta.url).href;
+    const contractModule = new URL("../../../tools/architectural-proof-contract.mjs", import.meta.url).href;
+    return { ...await import(navigationModule), ...await import(contractModule) };
+  }
+  function doorway(open: boolean, headroom = 3) {
+    const geometries = [new THREE.BoxGeometry(8, 0.2, 8).translate(0, -0.1, 0),
+      new THREE.BoxGeometry(2, 3, 0.2).translate(-1.55, 1.5, 0),
+      new THREE.BoxGeometry(2, 3, 0.2).translate(1.55, 1.5, 0),
+      new THREE.BoxGeometry(1.1, 0.9, 0.2).translate(0, 2.55, 0)];
+    if (!open) geometries.push(new THREE.BoxGeometry(1.1, 2.1, 0.2).translate(0, 1.05, 0));
+    const walker = probeRig(geometries);
+    const geometry = (walker as unknown as { bvh: MeshBVH }).bvh.geometry;
+    Object.assign(walker, { collider: new THREE.Mesh(geometry), camera: new THREE.PerspectiveCamera(),
+      params: { ...DEFAULT_WALK_PARAMS, physicsProps: false }, controls: { isLocked: true },
+      keys: new Set(), velocity: new THREE.Vector3(), grounded: false, flying: true,
+      spawnFloorY: 0, spawnTopY: headroom, stop: vi.fn() });
+    const contract = { spec: { origin: [0, 0, 0], yaw_degrees: 0 }, radius: 0.22, height: 1.7,
+      lane: [[0, 0, -0.9], [0, 0, 2.8]], floor: [0, 0] };
+    return { walker, contract, dispose: () => { geometry.dispose(); geometries.forEach(item => item.dispose()); } };
+  }
+  it.each([false, true])("walks an actual open fixture continuously with reverse=%s and restores configuration", async reverse => {
+    const { traceArchitecturalLane, validateCapsuleTrace } = await proofTools();
+    const fixture = doorway(true);
+    vi.stubGlobal("window", { __sceneStudioWalker: fixture.walker });
+    try {
+      for (const profile of [{ radius: 0.22, height: 1.7 }, { radius: 0.32, height: 2.02 }]) {
+        const contract = { ...fixture.contract, ...profile };
+        const trace = traceArchitecturalLane({ ...contract, reverse });
+        expect(validateCapsuleTrace(trace, contract, reverse).grounded_fraction).toBeGreaterThan(0.95);
+        expect(fixture.walker.params.eyeHeightM).toBe(DEFAULT_WALK_PARAMS.eyeHeightM);
+        expect(fixture.walker.isFlying).toBe(true);
+      }
+    } finally { vi.unstubAllGlobals(); fixture.dispose(); }
+  });
+  it("cannot pass by driving the camera through an uncut wall", async () => {
+    const { traceArchitecturalLane, validateCapsuleTrace } = await proofTools();
+    const fixture = doorway(false);
+    vi.stubGlobal("window", { __sceneStudioWalker: fixture.walker });
+    try {
+      const trace = traceArchitecturalLane(fixture.contract);
+      expect(() => validateCapsuleTrace(trace, fixture.contract)).toThrow("did not reach");
+    } finally { vi.unstubAllGlobals(); fixture.dispose(); }
+  });
+  it("refuses auto-shortened capsules before traversal and restores their settings", async () => {
+    const { traceArchitecturalLane } = await proofTools();
+    const fixture = doorway(true, 1.5);
+    vi.stubGlobal("window", { __sceneStudioWalker: fixture.walker });
+    try {
+      expect(() => traceArchitecturalLane(fixture.contract)).toThrow("shortening");
+      expect(fixture.walker.params.eyeHeightM).toBe(DEFAULT_WALK_PARAMS.eyeHeightM);
+      expect(fixture.walker.isFlying).toBe(true);
+    } finally { vi.unstubAllGlobals(); fixture.dispose(); }
+  });
+});
 
 describe("ground probe (real BVH)", () => {
   // Turf top at 0, slab underside at -1, canopy at +4 — the Stump's shape.
@@ -208,6 +350,30 @@ describe("seeded respawn vs low headroom (real BVH + collisions)", () => {
   });
 });
 
+describe("generated vertex-color delivery", () => {
+  it.each([false, true])("preserves exported vertex colors when unlit is %s", async (unlit) => {
+    const geometry = new THREE.BoxGeometry();
+    geometry.setAttribute("color", new THREE.Float32BufferAttribute(new Float32Array(geometry.attributes.position.count * 3).fill(0.4), 3));
+    const material = new THREE.MeshStandardMaterial({ vertexColors: true });
+    const mesh = new THREE.Mesh(geometry, material);
+    const root = new THREE.Group();
+    root.add(mesh);
+    const loader = vi.spyOn(GLTFLoader.prototype, "loadAsync").mockResolvedValue({ scene: root } as GLTF);
+    try {
+      const walker = Object.create(WorldWalker.prototype) as WorldWalker;
+      Object.assign(walker, { params: { unlit } });
+      await (walker as unknown as { loadGlb(source: { fileUrl: (name: string) => string }, url: string, dir: string): Promise<THREE.Object3D> })
+        .loadGlb({ fileUrl: (name) => name }, "generated.glb", "");
+      expect(mesh.userData.litMaterial.vertexColors).toBe(true);
+      expect(mesh.userData.unlitMaterial.vertexColors).toBe(true);
+      expect(mesh.material).toBe(unlit ? mesh.userData.unlitMaterial : mesh.userData.litMaterial);
+      expect(mesh.geometry.getAttribute("color")).toBe(geometry.getAttribute("color"));
+    } finally {
+      loader.mockRestore();
+    }
+  });
+});
+
 describe("collider merge (environment role)", () => {
   // A BoxGeometry is 12 tris; positionOnly-style shells carry position+index
   // only, so the fixture shell mimics the load product's attribute shape.
@@ -248,9 +414,9 @@ describe("collider merge (environment role)", () => {
   const internals = (w: WorldWalker) =>
     w as unknown as { colliderTris: number; colliderSource: string };
 
-  it("fast path merges AUTHORED environment/static into the shell BVH", () => {
-    const env = mkEl("environment", "authored", 2);
-    const authoredStatic = mkEl("static", "authored", 4);
+  it.each(["authored", "generated"])("fast path merges %s environment/static into the shell BVH", (provenance) => {
+    const env = mkEl("environment", provenance, 2);
+    const authoredStatic = mkEl("static", provenance, 4);
     const w = colliderRig({ elements: [env, authoredStatic] });
     w.rebuildCollider();
     expect(internals(w).colliderTris).toBe(36); // shell 12 + 12 + 12
@@ -269,6 +435,21 @@ describe("collider merge (environment role)", () => {
     expect(captured.collides).toBe(true);
   });
 
+  it("studio retains the background solid while adding and removing prop collision", () => {
+    const chair = mkEl("prop", null, 1);
+    const table = mkEl("prop", null, 2);
+    const walker = colliderRig({ elements: [chair, table] });
+    walker.setStaticPropCollision(true);
+    expect(internals(walker).colliderTris).toBe(36);
+    expect(internals(walker).colliderSource).toBe("collision_shell+elements");
+    expect(chair.collides).toBe(true);
+    walker.elements.splice(0, 1);
+    walker.rebuildCollider();
+    expect(internals(walker).colliderTris).toBe(24);
+    walker.setStaticPropCollision(false);
+    expect(internals(walker).colliderTris).toBe(12);
+  });
+
   it("fallback path (no collision shell) merges shell+static+environment", () => {
     const els = [mkEl("shell", null, 0), mkEl("static", null, 1),
                  mkEl("environment", "authored", 2), mkEl("prop", null, 3)];
@@ -279,8 +460,8 @@ describe("collider merge (environment role)", () => {
     expect(els[3].collides).toBe(false);
   });
 
-  it("an authored platform becomes REAL floor the probes can stand on", () => {
-    const env = mkEl("environment", "authored", 2); // top face at y=2.1
+  it.each(["authored", "generated"])("a %s platform becomes REAL floor the probes can stand on", (provenance) => {
+    const env = mkEl("environment", provenance, 2);
     const w = colliderRig({ elements: [env] });
     w.rebuildCollider();
     // Off-centre probes (the box-centre ray grazes shared diagonals) and a
@@ -373,6 +554,75 @@ describe("pluck (per-prop backdrop-splat rows)", () => {
     expect(walker.pluckElement("bike")).toBe(false);
     expect(backdrop.worldModifier).toBeUndefined();
     expect(backdrop.generatorCalls).toBe(0);
+  });
+
+  it("isolates review rows without mutating removal state, then restores it", async () => {
+    const { walker, backdrop } = pluckRig();
+    walker.setPluckDoc({ n_rows: N, elements: { bike: { rows: [1, 4] } } });
+    walker.pluckElement("bike");
+    const state = walker.pluckState();
+    const internal = walker as unknown as { captureInspectionMask: Uint8Array | null; pluckMask: Uint8Array };
+    const original = [...internal.pluckMask];
+    const update = vi.fn().mockResolvedValue(undefined);
+    Object.assign(walker, { spark: { update } });
+    await walker.inspectCapturedRows([2, 3]);
+    expect([...internal.captureInspectionMask!]).toEqual([255, 255, 0, 0, 255, 255]);
+    expect([...internal.pluckMask]).toEqual(original);
+    expect(walker.pluckState()).toEqual(state);
+    await walker.inspectCapturedRows(null);
+    expect(internal.captureInspectionMask).toBeNull();
+    expect([...internal.pluckMask]).toEqual(original);
+    expect(backdrop.worldModifier).toBeDefined();
+    expect(update).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([[], [-1], [N], [1.5], [NaN]].map(rows => ({ rows })))("refuses invalid inspection rows $rows", async ({ rows }) => {
+    const { walker, backdrop } = pluckRig();
+    await expect(walker.inspectCapturedRows(rows)).rejects.toThrow("do not match");
+    expect(backdrop.generatorCalls).toBe(0);
+  });
+
+  it("inspects remaining capture without resurrecting existing removals or changing their masks", async () => {
+    const { walker, backdrop } = pluckRig();
+    walker.setPluckDoc({ n_rows: N, elements: { bike: { rows: [1, 4] } } });
+    walker.pluckElement("bike");
+    const state = walker.pluckState();
+    const internal = walker as unknown as { captureInspectionMask: Uint8Array | null; pluckMask: Uint8Array };
+    const original = [...internal.pluckMask];
+    await walker.inspectCapturedRows([2, 3], "remaining");
+    expect([...internal.captureInspectionMask!]).toEqual([0, 255, 255, 255, 255, 0]);
+    expect([...internal.pluckMask]).toEqual(original);
+    expect(walker.pluckState()).toEqual(state);
+    await walker.inspectCapturedRows(null);
+    expect(internal.captureInspectionMask).toBeNull();
+    expect([...internal.pluckMask]).toEqual(original);
+    expect(backdrop.worldModifier).toBeDefined();
+  });
+
+  it("can switch remaining capture back to selected rows without persisting either diagnostic", async () => {
+    const { walker, backdrop } = pluckRig();
+    const internal = walker as unknown as { captureInspectionMask: Uint8Array | null; pluckMask: Uint8Array | null };
+    await walker.inspectCapturedRows([2, 3], "remaining");
+    expect([...internal.captureInspectionMask!]).toEqual([0, 0, 255, 255, 0, 0]);
+    await walker.inspectCapturedRows([2, 3]);
+    expect([...internal.captureInspectionMask!]).toEqual([255, 255, 0, 0, 255, 255]);
+    await walker.inspectCapturedRows(null);
+    expect(internal.captureInspectionMask).toBeNull();
+    expect(internal.pluckMask).toBeNull();
+    expect(backdrop.worldModifier).toBeUndefined();
+  });
+
+  it("waits for the backdrop before installing an inspection mask", async () => {
+    const { walker, backdrop } = pluckRig();
+    let ready!: () => void;
+    Object.assign(backdrop, { initialized: new Promise<void>(resolve => { ready = resolve; }) });
+    const pending = walker.inspectCapturedRows([1]);
+    expect(backdrop.generatorCalls).toBe(0);
+    ready();
+    await pending;
+    expect(backdrop.generatorCalls).toBe(1);
+    await walker.inspectCapturedRows(null);
+    expect(backdrop.worldModifier).toBeUndefined();
   });
 
   it("physics-disturbed props get plucked; undisturbed ones keep their ghosts", () => {
@@ -495,6 +745,7 @@ describe("photograph-first visibility (triage lane)", () => {
       capturedProp: mk("bicycle", "prop", null),
       capturedStatic: mk("building", "static", null),
       authored: mk("torch", "environment", "authored"),
+      generated: mk("generated-box", "environment", "generated"),
       lamp: mk("lamp-post", "prop", null),
     };
     const walker = Object.create(WorldWalker.prototype) as WorldWalker;
@@ -513,6 +764,63 @@ describe("photograph-first visibility (triage lane)", () => {
     return { walker, els };
   }
 
+  it("switches native appearance and mesh without hiding semantics or rebuilding collision", () => {
+    const { walker, els } = visRig({});
+    const native = new THREE.Group();
+    Object.assign(els.generated, { gaussianAppearance: native });
+    const rebuild = vi.spyOn(walker, "rebuildCollider");
+    walker.refreshElementVisibility();
+    expect(native.visible).toBe(true);
+    expect(els.generated.visible).toBe(true);
+    expect(els.generated.object.visible).toBe(false);
+    walker.setGeneratedSplats(false);
+    expect(native.visible).toBe(false);
+    expect(els.generated.object.visible).toBe(true);
+    walker.setElementVisible(els.generated.slug, false);
+    walker.setGeneratedSplats(true);
+    expect(native.visible).toBe(false);
+    expect(els.generated.object.visible).toBe(false);
+    walker.setElementVisible(els.generated.slug, true);
+    expect(native.visible).toBe(true);
+    expect(els.generated.object.visible).toBe(false);
+    expect(rebuild).not.toHaveBeenCalled();
+    expect(native.matrix.equals(new THREE.Matrix4())).toBe(true);
+  });
+
+  it("uses the mesh for baked looks and restores the native layer when cleared", () => {
+    const { walker, els } = visRig({ backdrop: false });
+    const native = new THREE.Group();
+    Object.assign(els.generated, { gaussianAppearance: native });
+    walker.setBakedLook(true);
+    expect(native.visible).toBe(false);
+    expect(els.generated.object.visible).toBe(true);
+    walker.setBakedLook(false);
+    expect(native.visible).toBe(true);
+    expect(els.generated.object.visible).toBe(false);
+  });
+
+  it("disposes the native layer and invalidates unfinished loads when a revision clears", () => {
+    const { walker, els } = visRig({});
+    const native = new THREE.Group();
+    const dispose = vi.fn();
+    Object.assign(native, { dispose });
+    Object.assign(els.generated, { gaussianAppearance: native });
+    const scene = new THREE.Scene();
+    const worldGroup = new THREE.Group();
+    scene.add(native, worldGroup);
+    for (const element of Object.values(els)) worldGroup.add(element.object);
+    Object.assign(walker, { scene, worldGroup, disposeCollider: vi.fn(), worldLoadEpoch: 7 });
+    const internal = walker as unknown as { clearWorld(): void; worldLoadEpoch: number };
+    internal.clearWorld();
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(native.parent).toBeNull();
+    expect(worldGroup.children).toHaveLength(0);
+    expect(walker.elements).toHaveLength(0);
+    expect(internal.worldLoadEpoch).toBe(8);
+    internal.clearWorld();
+    expect(dispose).toHaveBeenCalledOnce();
+  });
+
   it("photograph showing: captured meshes hide; authored/interactive stay", () => {
     const { walker, els } = visRig({});
     walker.refreshElementVisibility();
@@ -520,6 +828,7 @@ describe("photograph-first visibility (triage lane)", () => {
     expect(els.capturedProp.visible).toBe(false);
     expect(els.capturedStatic.visible).toBe(false);
     expect(els.authored.visible).toBe(true);      // mesh is all it has
+    expect(els.generated.visible).toBe(true);
     expect(els.lamp.visible).toBe(true);          // a toggle earns its mesh
   });
 

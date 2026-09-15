@@ -266,7 +266,7 @@ def test_default_configuration_serves_without_auth_exactly_as_before(tmp_path):
     try:
         listed = _rpc(f"http://127.0.0.1:{port}/mcp",
                       {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
-        assert len(listed["result"]["tools"]) == 14
+        assert len(listed["result"]["tools"]) == 18
     finally:
         _stop(proc)
 
@@ -330,7 +330,8 @@ def test_mcp_protocol_handshake_list_tools_and_inspect_job(tmp_path):
                 "import_world_element", "import_asset", "list_asset_library",
                 "cleanup_mesh", "run_polish_recipe",
                 "export_blend_glb", "restore_blender_version",
-                "open_blender"} == names, "the 14 typed tools are the whole surface"
+                "open_blender", "create_wall", "cut_opening", "create_room",
+                "assign_material"} == names, "the 18 typed tools are the whole surface"
 
         called = _rpc(url, {
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",

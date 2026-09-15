@@ -13,12 +13,12 @@ export function AppShell({ children }: { children: ReactNode }) {
   return (
     <div className="min-h-screen">
       <nav className="sticky top-0 z-40 border-b border-white/10 bg-surface/85 backdrop-blur-md">
-        <div className="mx-auto flex h-14 max-w-[1880px] items-center gap-3 px-4 sm:px-6 xl:px-10">
+        <div className="mx-auto flex h-14 max-w-[1880px] items-center gap-2 px-4 sm:gap-3 sm:px-6 xl:px-10">
           <Link href="/" className="flex shrink-0 items-center gap-2.5">
             <img src="/favicon.svg" alt="" className="h-7 w-7 rounded-lg" />
             <span className="display text-lg font-black tracking-tight text-white">SplatLab</span>
           </Link>
-          <div className="ml-3 flex items-center gap-1">
+          <div className="flex items-center gap-1 sm:ml-3">
             <Link
               href="/"
               className={cn(
@@ -28,10 +28,12 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               Scenes
             </Link>
+            <Link href="/routes" aria-label="Explore routes" className={cn("whitespace-nowrap rounded-full px-3 py-1.5 text-xs font-bold transition", location.startsWith("/routes") ? "bg-white/10 text-zinc-100" : "text-zinc-400 hover:text-zinc-100")}><span className="hidden sm:inline">Explore </span>routes</Link>
           </div>
           <div className="ml-auto flex items-center gap-2">
             <Link
               href="/new"
+              aria-label="New capture"
               className={cn(
                 "inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold transition-colors",
                 location === "/new"
@@ -39,7 +41,7 @@ export function AppShell({ children }: { children: ReactNode }) {
                   : "bg-accent text-accent-ink hover:bg-accent-hover",
               )}
             >
-              <Plus className="h-3.5 w-3.5" /> New capture
+              <Plus className="h-3.5 w-3.5 shrink-0" /><span className="hidden whitespace-nowrap sm:inline">New capture</span>
             </Link>
             <DropdownMenu
               trigger={

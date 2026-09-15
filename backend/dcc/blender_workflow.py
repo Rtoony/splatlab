@@ -17,6 +17,7 @@ from typing import Any, Iterator
 
 import artifact_manifest as manifests
 import glb_check
+from dcc import architecture
 
 
 BLENDER_BIN = Path(
@@ -34,6 +35,10 @@ MUTATING_ACTIONS = {
     "import_world_element",
     "import_asset",
     "cleanup_mesh",
+    "create_wall",
+    "cut_opening",
+    "create_room",
+    "assign_material",
 }
 READ_ACTIONS = {"inspect"}
 # World-element slugs come from splat_route._object_slug output: lowercase
@@ -318,6 +323,36 @@ def _element_slug(value: Any) -> str:
 
 
 def _sanitize_params(action: str, params: dict[str, Any]) -> dict[str, Any]:
+    if action in {"create_wall", "create_room"}:
+        result = {"name": _element_slug(params.get("name")),
+                  "origin": _vec3(params.get("origin", [0, 0, 0]), "origin"),
+                  "rotation_degrees": _bounded_float(params.get("rotation_degrees", 0), "rotation_degrees", minimum=-360, maximum=360)}
+        for field, default in (("width", 4), ("height", 2.8), ("thickness", 0.15)):
+            result[field] = _bounded_float(params.get(field, default), field, minimum=0.01, maximum=100)
+        if action == "create_room":
+            for field, default in (("depth", 4), ("door_width", 0.9), ("door_height", 2.1)):
+                result[field] = _bounded_float(params.get(field, default), field, minimum=0.01, maximum=100)
+            if not isinstance(params.get("ceiling", False), bool):
+                raise BlenderWorkflowError("ceiling must be boolean")
+            result["ceiling"] = params.get("ceiling", False)
+            try:
+                architecture.room_boxes(**{key: result[key] for key in ("width", "depth", "height", "thickness", "door_width", "door_height", "ceiling")})
+            except ValueError as exc:
+                raise BlenderWorkflowError(str(exc)) from exc
+        return result
+    if action == "cut_opening":
+        result = {"object": _safe_name(str(params.get("object", "")), "object")}
+        for field, default, minimum in (("width", 0.9, 0.01), ("height", 2.1, 0.01), ("offset", 0, -100), ("sill", 0, 0)):
+            result[field] = _bounded_float(params.get(field, default), field, minimum=minimum, maximum=100)
+        return result
+    if action == "assign_material":
+        result = {"object": _safe_name(str(params.get("object", "")), "object"),
+                  "color": _vec3(params.get("color", [0.8, 0.8, 0.8]), "color")}
+        if not all(0 <= value <= 1 for value in result["color"]):
+            raise BlenderWorkflowError("color channels must be between 0 and 1")
+        for field, default in (("roughness", 0.7), ("metallic", 0)):
+            result[field] = _bounded_float(params.get(field, default), field, minimum=0, maximum=1)
+        return result
     if action == "inspect" or action == "snapshot":
         return {}
     if action == "import_world_element":
@@ -525,6 +560,8 @@ def run_action(
             ) from exc
 
     with _job_lock(job_dir):
+        if action in {"create_wall", "cut_opening", "create_room", "assign_material"} and base_version is not None and base_version != _latest_version(job_dir):
+            raise BlenderWorkflowError("Scene version changed; inspect the latest version before architectural editing")
         source, resolved_base = _source_blend(job_dir, base_version)
         version = None
         final_output = None
@@ -557,6 +594,8 @@ def run_action(
                 "--disable-autoexec",
                 "--background",
                 str(source),
+                "--threads",
+                "4",
                 "--python",
                 str(ACTION_SCRIPT),
                 "--",

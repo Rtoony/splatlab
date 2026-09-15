@@ -105,6 +105,10 @@ def main() -> int:
     ap.add_argument("--rel-floor", type=float, default=0.30)
     args = ap.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = args.out_dir.parent.parent / "meta.json"
+    metadata = json.loads(metadata_path.read_text()) if metadata_path.is_file() else {}
+    calibration_revision = {"scale_generation": int(metadata.get("scale_generation") or 0),
+                            "meters_per_unit": metadata.get("meters_per_unit")}
     if args.recall_expand and not (args.gauss_emb and args.gauss_emb.is_file()):
         print("FATAL: --recall-expand requires --gauss-emb pointing at a real file",
               file=sys.stderr)
@@ -274,6 +278,7 @@ def main() -> int:
 
     report = {"n_gaussians": N, "recall_expand": bool(args.recall_expand),
               "instances": results, "sanity": sanity}
+    report["scale_revision"] = calibration_revision
     (args.out_dir / "batch_isolate.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report))
     return 0

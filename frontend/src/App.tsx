@@ -10,6 +10,8 @@ const NewCapturePage = lazy(() => import("@/pages/new-capture"));
 const SplatViewPage = lazy(() => import("@/pages/splat-view"));
 const WorldViewPage = lazy(() => import("@/pages/world-view"));
 const FeedbackPage = lazy(() => import("@/pages/feedback"));
+const RoutesPage = lazy(() => import("@/pages/routes"));
+const SceneStudioPage = lazy(() => import("@/pages/scene-studio"));
 
 function Loading() {
   return (
@@ -54,6 +56,15 @@ export default function App() {
             <AppShell>
               <FeedbackPage />
             </AppShell>
+          </Route>
+          <Route path="/studio/:jobId">
+            <AppShell><SceneStudioPage /></AppShell>
+          </Route>
+          <Route path="/routes/:routeId">
+            <AppShell><RoutesPage /></AppShell>
+          </Route>
+          <Route path="/routes">
+            <AppShell><RoutesPage /></AppShell>
           </Route>
           <Route path="/new">
             <AppShell>

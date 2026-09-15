@@ -22,6 +22,7 @@ gates speak, a human promotes (or discards), and every step is reversible.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -30,9 +31,12 @@ import subprocess
 import uuid
 from pathlib import Path
 from typing import Any
+from artifact_dependencies import creative_dependencies
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, ConfigDict
 
 import artifact_manifest as manifests
 import glb_check
@@ -48,6 +52,14 @@ GENERATED_MARKER_SCHEMA = "dev.splatlab.generated-promotion/v1"
 # concurrent TRELLIS/proxy run from OOMing the card, not a precise budget.
 SAM3D_VRAM_MB = 22_000
 GENERATE_TIMEOUT_S = 1800
+
+
+class PromotionOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    quality: Literal["preview", "balanced", "detail"] = "preview"
+
+
+DELIVERY_PROFILES = {"preview": (8000, 1024), "balanced": (32000, 2048), "detail": (100000, 4096)}
 
 
 def _candidate_dir(job_dir: Path, slug: str) -> Path:
@@ -72,8 +84,12 @@ def _read_candidate(job_dir: Path, slug: str) -> dict[str, Any] | None:
     placed = bool(glb.is_file()
                   and placement.get("placement_resolved")
                   and placement.get("transform_4x4_generated_to_capture"))
-    return {"report": report, "placed": placed, "glb": glb.is_file(),
-            "dir": cdir}
+    lineage = manifests.read_json(cdir / "candidate-lineage.json") or {}
+    stale = (lineage.get("dependencies") != creative_dependencies(job_dir)
+             or not manifests.same_file_identity(glb, lineage.get("mesh"))
+             or not manifests.same_file_identity(report_path, lineage.get("report")))
+    return {"report": report, "placed": placed and not stale, "glb": glb.is_file(),
+            "dir": cdir, "stale": stale}
 
 
 def _require_job(job_id: str) -> tuple[dict[str, Any], Path]:
@@ -93,7 +109,8 @@ def _candidate_payload(job_id: str, slug: str,
                           f"?slug={slug}&fmt={fmt}")
     marker = None
     return {"job_id": job_id, "slug": slug, "placed": cand["placed"],
-            "report": cand["report"], "files": files, "marker": marker}
+            "report": cand["report"], "files": files, "marker": marker,
+            "stale": cand.get("stale", False)}
 
 
 @router.post("/jobs/{job_id}/objects/{slug}/generate/propose")
@@ -110,6 +127,8 @@ async def propose_generated(job_id: str, slug: str,
         raise HTTPException(status_code=409,
                             detail="No scene inventory — run the isolate/"
                                    "inventory stage before proposing")
+    base_dependencies = creative_dependencies(job_dir)
+    (_candidate_dir(job_dir, slug) / "candidate-lineage.json").unlink(missing_ok=True)
 
     def operation() -> tuple[int, str]:
         cmd = [str(splat_route.MESH_ENV_PYTHON),
@@ -140,6 +159,13 @@ async def propose_generated(job_id: str, slug: str,
         raise HTTPException(status_code=503,
                             detail=f"Generation blocked: {exc}") from exc
 
+    candidate_dir = _candidate_dir(job_dir, slug)
+    candidate_mesh = candidate_dir / "generated_mesh.glb"
+    candidate_report = candidate_dir / "generate_report.json"
+    if rc == 0 and candidate_mesh.is_file() and candidate_report.is_file():
+        manifests.atomic_write_json(candidate_dir / "candidate-lineage.json", {
+            "schema": "dev.splatlab.candidate-lineage/v1", "dependencies": base_dependencies,
+            "mesh": manifests.file_identity(candidate_mesh), "report": manifests.file_identity(candidate_report)})
     cand = _read_candidate(job_dir, slug)
     await audit_operator_event(
         request=request,
@@ -209,7 +235,7 @@ async def get_generate_file(job_id: str, slug: str, fmt: str) -> FileResponse:
 
 @router.post("/jobs/{job_id}/objects/{slug}/generate/promote")
 async def promote_generated(job_id: str, slug: str,
-                            request: Request) -> dict[str, Any]:
+                            request: Request, body: PromotionOptions | None = None) -> dict[str, Any]:
     """The HITL apply. place_generated (mesh env) transforms + decimates +
     bakes the candidate into a staged element, then the prior GLB+atlas pair
     is VERSIONED and replaced — the restyle-bake landing pattern, with the
@@ -238,6 +264,11 @@ async def promote_generated(job_id: str, slug: str,
     world = manifests.read_json(world_dir / "world.json") or {}
     mpu = world.get("meters_per_unit") or (meta.get("meters_per_unit") or None)
     staged = world_dir / f".building-promote-{uuid.uuid4().hex}.glb"
+    options = body or PromotionOptions()
+    base_dependencies = creative_dependencies(job_dir)
+    candidate_mesh_identity = manifests.file_identity(cand["dir"] / "generated_mesh.glb")
+    candidate_report_identity = manifests.file_identity(cand["dir"] / "generate_report.json")
+    delivery_faces, delivery_texture = DELIVERY_PROFILES[options.quality]
     snippet = f"""
 import json, sys
 sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
@@ -246,7 +277,7 @@ from mesh.scene_solidify import _generated_candidate, place_generated
 gen = _generated_candidate(Path({str(job_dir)!r}), {slug!r})
 assert gen is not None, "candidate vanished"
 res = place_generated(gen, __import__("pathlib").Path({str(staged)!r}),
-                      mpu={mpu!r}, faces=8000, tex=1024)
+                      mpu={mpu!r}, faces={delivery_faces!r}, tex={delivery_texture!r})
 print("PLACE " + json.dumps(res))
 """
     rc, out_b, err_b = await splat_route._run_capture_subprocess(
@@ -270,7 +301,34 @@ print("PLACE " + json.dumps(res))
         raise HTTPException(status_code=409,
                             detail="A mesh build or export is running — retry")
     async with lock:
+        if (creative_dependencies(job_dir) != base_dependencies
+                or not manifests.same_file_identity(cand["dir"] / "generated_mesh.glb", candidate_mesh_identity)
+                or not manifests.same_file_identity(cand["dir"] / "generate_report.json", candidate_report_identity)):
+            staged.unlink(missing_ok=True)
+            staged.with_name(staged.stem + "_atlas.png").unlink(missing_ok=True)
+            raise HTTPException(409, "Candidate or scene changed during placement; review a fresh proposal")
         versions = world_dir / "versions"
+        master_source = cand["dir"] / "generated_mesh.glb"
+        glb_check.validate_glb(master_source)
+        master_sha = manifests.sha256_file(master_source)
+        if master_sha != candidate_mesh_identity["sha256"]:
+            staged.unlink(missing_ok=True)
+            staged.with_name(staged.stem + "_atlas.png").unlink(missing_ok=True)
+            raise HTTPException(409, "Candidate changed while retaining its master; review a fresh proposal")
+        master_dir = versions / "masters" / (slug + "-" + master_sha[:16])
+        master_dir.mkdir(parents=True, exist_ok=True)
+        master_path = master_dir / "generated-mesh.glb"
+        if not master_path.is_file():
+            shutil.copy2(master_source, master_path)
+        if manifests.sha256_file(master_path) != master_sha:
+            raise HTTPException(409, "Retained master checksum mismatch")
+        report_sha = hashlib.sha256(json.dumps(cand["report"], sort_keys=True).encode()).hexdigest()
+        report_name = f"generation-report-{report_sha[:16]}.json"
+        if not (master_dir / report_name).is_file():
+            manifests.atomic_write_json(master_dir / report_name, cand["report"])
+        if manifests.read_json(master_dir / report_name) != cand["report"]:
+            raise HTTPException(409, "Retained master report mismatch")
+        report_sha = manifests.sha256_file(master_dir / report_name)
         prior_glb_version = polish_route._next_version_path(versions, slug)
         supersedes = manifests.file_identity(target)
         os.replace(target, prior_glb_version)
@@ -294,6 +352,10 @@ print("PLACE " + json.dumps(res))
             "candidate_iou": (cand["report"].get("mask_alignment_gate") or {})
                              .get("iou_vs_captured_object"),
             "faces": res.get("faces"),
+            "delivery_profile": options.quality,
+            "texture_size": delivery_texture,
+            "master": {"file": str(master_path.relative_to(world_dir)), "sha256": master_sha,
+                       "frame": "generated-native", "report": report_name, "report_sha256": report_sha},
             "provenance": "generative render-only (promoted by operator)",
             **manifests.file_identity(target),
         }

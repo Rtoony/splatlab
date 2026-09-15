@@ -297,6 +297,7 @@ export default function SplatViewPage() {
                 {job.geo ? "Located — open map" : "Locate in the world"}
               </DropdownItem>
               <DropdownItem onSelect={() => setSectionsOpen(true)}>Site sections</DropdownItem>
+              <DropdownItem onSelect={() => { window.location.href = `/studio/${jobId}`; }}>Creative scene studio</DropdownItem>
               <DropdownItem onSelect={() => setSceneRegenOpen(true)}>Scene panel (P6)</DropdownItem>
               <DropdownSeparator />
               <DropdownItem onSelect={resetToDefaultView}>Reset view</DropdownItem>

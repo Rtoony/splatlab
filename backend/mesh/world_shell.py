@@ -744,6 +744,11 @@ def main() -> int:
     source = Path(args.source) if args.source else job_dir / "_scene" / "isolated" / "background.ply"
     if not source.is_file():
         raise SystemExit(f"world_shell: source splat missing: {source}")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from artifact_dependencies import shell_dependencies
+    from artifact_manifest import file_identity
+
+    dependencies = shell_dependencies(job_dir)
 
     world = job_dir / "_world"
     world.mkdir(parents=True, exist_ok=True)
@@ -839,7 +844,7 @@ def main() -> int:
             "job_id": job_dir.name,
             "job_dir": str(job_dir),
             "source_splat": str(source),
-            "units": "scene units (UNCALIBRATED - meta.json meters_per_unit is null)",
+            "units": "scene-units; geometry is not metre-baked",
             "frame": {
                 "capture": "Z-up",
                 "output_glb": "Y-up (rotation_matrix(-pi/2,[1,0,0]), repo glTF convention)",
@@ -973,6 +978,14 @@ def main() -> int:
             report["verdict"] = "WALKABLE_NOT_WATERTIGHT" if not g["watertight"] else "WALKABLE"
         else:
             report["verdict"] = "NOT_WALKABLE"
+        report["dependencies"] = dependencies
+        report["geometry_frame"] = {"axis": "y-up", "units": "scene-units",
+                                    "meters_per_unit": dependencies["scale"]["meters_per_unit"]}
+        report["output"] = file_identity(out_glb, include_sha256=False)
+        report["source_override"] = bool(args.source)
+        if dependencies != shell_dependencies(job_dir):
+            report["verdict"] = "FAILED"
+            report["reason"] = "Source, surfaces or calibration changed during the build; rebuild required"
         report_path.write_text(json.dumps(report, indent=2))
 
         _log(

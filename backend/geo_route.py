@@ -40,9 +40,12 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 import geo_footprint
+import geo_controls
+import scale_calibration
+import artifact_manifest as manifests
 import splat_route
 
 router = APIRouter()
@@ -129,6 +132,53 @@ class GeoAnchorIn(BaseModel):
 
 class GeoBody(BaseModel):
     geo: GeoAnchorIn | None
+
+
+class GeoControl(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    scene: list[float] = Field(min_length=2, max_length=2)
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+
+
+class GeoControlsBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    controls: list[GeoControl] = Field(min_length=2, max_length=100)
+    expected_scale_generation: int = Field(default=0, ge=0)
+    force: bool = False
+
+
+@router.post("/jobs/{job_id}/geo/controls/propose")
+async def propose_geo_controls(job_id: str, body: GeoControlsBody):
+    metadata = _require_job_meta(job_id)
+    try:
+        result = geo_controls.fit_controls([control.model_dump() for control in body.controls])
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {**result, "base_scale_generation": int(metadata.get("scale_generation") or 0)}
+
+
+@router.post("/jobs/{job_id}/geo/controls/apply")
+async def apply_geo_controls(job_id: str, body: GeoControlsBody):
+    metadata = _require_job_meta(job_id)
+    if int(metadata.get("scale_generation") or 0) != body.expected_scale_generation:
+        raise HTTPException(409, "Calibration changed; propose the alignment again")
+    result = await propose_geo_controls(job_id, body)
+    record = scale_calibration.calibrate_manual(result["meters_per_unit"],
+                                                method=scale_calibration.METHOD_MAP,
+                                                source="multi-point map alignment")
+    prior = metadata.get("scale_calibration")
+    if not body.force and scale_calibration.downgrades_evidence(prior, record):
+        raise HTTPException(409, "Map controls would replace stronger scale evidence; force is required")
+    prior_geo = metadata.get("geo") or {}
+    anchor = _validated_geo(GeoAnchorIn(**result["geo"], alt_m=prior_geo.get("alt_m"), source="map"))
+    previous = {key: metadata.get(key) for key in ("geo", "meters_per_unit", "scale_calibration", "scale_generation")}
+    manifests.atomic_write_json(splat_route._job_dir(job_id) / "_geo" / f"alignment-before-{body.expected_scale_generation}.json", previous)
+    splat_route._patch_meta(job_id, geo=anchor, meters_per_unit=result["meters_per_unit"],
+                           scale_calibration=record, scale_generation=body.expected_scale_generation + 1,
+                           geo_controls=result)
+    splat_route._restamp_world_scale(splat_route._job_dir(job_id), result["meters_per_unit"])
+    return {**result, "geo": anchor, "scale_generation": body.expected_scale_generation + 1}
 
 
 def _validated_geo(g: GeoAnchorIn) -> dict[str, Any]:

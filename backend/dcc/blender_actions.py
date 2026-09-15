@@ -11,6 +11,9 @@ from pathlib import Path
 import bmesh
 import bpy
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import architecture
+
 
 ALLOWED_ACTIONS = {
     "inspect",
@@ -21,6 +24,10 @@ ALLOWED_ACTIONS = {
     "import_asset",
     "cleanup_mesh",
     "export_glb",
+    "create_wall",
+    "cut_opening",
+    "create_room",
+    "assign_material",
 }
 
 
@@ -85,8 +92,9 @@ def _inspect() -> dict:
                 "type": obj.type,
                 "location": list(obj.location),
                 "rotation_degrees": [
-                    math.degrees(value) for value in obj.rotation_euler
+                    math.degrees(value) for value in obj.matrix_basis.to_euler("XYZ")
                 ],
+                "rotation_mode": obj.rotation_mode,
                 "scale": list(obj.scale),
                 "visible_viewport": not obj.hide_viewport,
                 "visible_render": not obj.hide_render,
@@ -115,7 +123,68 @@ def _execute(request: dict) -> dict:
     if action not in ALLOWED_ACTIONS:
         raise ValueError(f"action is not allowed: {action!r}")
 
-    if action == "toggle_collection":
+    if action in {"create_wall", "create_room"}:
+        name = f"architecture_{params['name']}"
+        if bpy.data.objects.get(name) is not None:
+            raise ValueError(f"Architectural object already exists: {name}")
+        if abs(bpy.context.scene.unit_settings.scale_length - 1.0) > 1e-6:
+            raise ValueError("Architecture requires a metre-scaled Blender scene (scale_length=1)")
+        fields = ("width", "height", "thickness") if action == "create_wall" else ("width", "depth", "height", "thickness", "door_width", "door_height", "ceiling")
+        dimensions = {key: params[key] for key in fields}
+        boxes = architecture.wall_boxes(**dimensions) if action == "create_wall" else architecture.room_boxes(**dimensions)
+        vertices, faces = architecture.box_mesh(boxes)
+        mesh = bpy.data.meshes.new(name)
+        mesh.from_pydata(vertices, [], faces)
+        mesh.update()
+        obj = bpy.data.objects.new(name, mesh)
+        collection = bpy.data.collections.get("Architecture")
+        if collection is None:
+            collection = bpy.data.collections.new("Architecture")
+            bpy.context.scene.collection.children.link(collection)
+        collection.objects.link(obj)
+        obj.location = params["origin"]
+        obj.rotation_euler.z = math.radians(params["rotation_degrees"])
+        obj["splatlab_provenance"] = "authored"
+        obj["splatlab_architecture"] = json.dumps({"kind": action, **dimensions})
+        result = {"object": name, "dimensions_m": dimensions, "provenance": "authored", "frame": "blender-z-up-metres", "origin_contract": "front-wall bottom centre; room extends along local +Y"}
+    elif action == "cut_opening":
+        obj = bpy.data.objects.get(params["object"])
+        if obj is None or obj.type != "MESH" or not obj.get("splatlab_architecture"):
+            raise ValueError("Opening requires an authored structural wall; captured collision is not visible architecture")
+        structure = json.loads(obj["splatlab_architecture"])
+        if structure["kind"] != "create_wall":
+            raise ValueError("Select an authored wall, not a room or captured mesh")
+        if any(abs(value - 1) > 1e-6 for value in obj.scale):
+            raise ValueError("Opening dimensions require an unscaled structural wall")
+        opening = {key: params[key] for key in ("width", "height", "offset", "sill")}
+        boxes = architecture.wall_boxes(structure["width"], structure["height"], structure["thickness"], opening)
+        vertices, faces = architecture.box_mesh(boxes)
+        mesh = bpy.data.meshes.new(obj.name + "-opening")
+        mesh.from_pydata(vertices, [], faces)
+        mesh.update()
+        for material in obj.data.materials:
+            mesh.materials.append(material)
+        obj.data = mesh
+        obj["splatlab_architecture"] = json.dumps({**structure, "opening": opening})
+        result = {"object": obj.name, "opening_m": opening, "provenance": "authored"}
+    elif action == "assign_material":
+        obj = bpy.data.objects.get(params["object"])
+        if obj is None or obj.type != "MESH":
+            raise ValueError("Material assignment requires a mesh object")
+        material = bpy.data.materials.new(obj.name + "-material")
+        material.diffuse_color = (*params["color"], 1)
+        material.use_nodes = True
+        shader = material.node_tree.nodes.get("Principled BSDF")
+        shader.inputs["Base Color"].default_value = (*params["color"], 1)
+        shader.inputs["Roughness"].default_value = params["roughness"]
+        shader.inputs["Metallic"].default_value = params["metallic"]
+        obj.data = obj.data.copy()
+        obj.data.materials.clear()
+        obj.data.materials.append(material)
+        for polygon in obj.data.polygons:
+            polygon.material_index = 0
+        result = {"object": obj.name, "material": material.name, "appearance": "authored-pbr-not-relighting"}
+    elif action == "toggle_collection":
         collection = bpy.data.collections.get(params["collection"])
         if collection is None:
             raise ValueError(f"collection not found: {params['collection']!r}")
@@ -130,6 +199,7 @@ def _execute(request: dict) -> dict:
         if "location" in params:
             obj.location = params["location"]
         if "rotation_degrees" in params:
+            obj.rotation_mode = "XYZ"
             obj.rotation_euler = [
                 math.radians(value) for value in params["rotation_degrees"]
             ]

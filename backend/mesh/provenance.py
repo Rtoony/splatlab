@@ -13,6 +13,8 @@ which share third-party deps. The PLY header is parsed manually.
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import struct
 
 # In-file tag written into every generative PLY (header comment) and every
 # generative glTF node/asset (extras[GLTF_EXTRAS_KEY]). Greppable, versionless.
@@ -56,6 +58,34 @@ def ply_is_generative(path: str | Path) -> bool:
     return any(GENERATIVE_TAG in c for c in ply_header_comments(path))
 
 
+def glb_is_generative(path: str | Path) -> bool:
+    try:
+        with Path(path).open("rb") as handle:
+            header = handle.read(20)
+            if not header.startswith(b"glTF"):
+                return False
+            if len(header) != 20:
+                raise ValueError("truncated header")
+            _, version, total, json_bytes, chunk_type = struct.unpack("<4sIII4s", header)
+            if version != 2 or total != Path(path).stat().st_size or chunk_type != b"JSON" or json_bytes > 4 * 1024 ** 2:
+                raise ValueError("invalid or oversized GLB metadata")
+            document = json.loads(handle.read(json_bytes))
+            if not isinstance(document, dict):
+                raise ValueError("GLB metadata is not an object")
+    except OSError:
+        return False
+    except (ValueError, UnicodeError) as exc:
+        raise GenerativeInputRefused(f"REFUSED: cannot verify GLB provenance for {path}: {exc}") from exc
+    entries = [document, document.get("asset", {})]
+    for section in ("nodes", "meshes", "materials"):
+        entries.extend(document.get(section) or [])
+    for entry in entries:
+        extras = entry.get("extras") if isinstance(entry, dict) else None
+        if extras == GENERATIVE_TAG or isinstance(extras, dict) and extras.get(GLTF_EXTRAS_KEY) == GENERATIVE_TAG:
+            return True
+    return False
+
+
 def path_is_generative(path: str | Path) -> bool:
     """Quarantine-path rule: anything under a _regen/ dir, or a proxy artifact
     inside an _objects/ tree, is generative regardless of file content."""
@@ -78,4 +108,8 @@ def assert_not_generative(path: str | Path, lane: str) -> None:
     if ply_is_generative(path):
         raise GenerativeInputRefused(
             f"REFUSED: {path} carries the '{GENERATIVE_TAG}' tag — "
+            f"the {lane} lane never consumes generative geometry")
+    if glb_is_generative(path):
+        raise GenerativeInputRefused(
+            f"REFUSED: {path} carries the '{GENERATIVE_TAG}' GLB tag — "
             f"the {lane} lane never consumes generative geometry")

@@ -93,6 +93,39 @@ def test_build_maps_checkpoint_indices_through_the_inverse_map(tmp_path):
     assert "bench" not in doc["elements"] and "bench" not in doc["skipped"]
 
 
+def test_index_mapping_verifies_object_coordinates_and_tracks_changes(tmp_path):
+    job = _mk_job(tmp_path, crate_indices=(0, 2))
+    object_ply = job / "_scene/isolated/crate/object.ply"
+    _binary_ply(object_ply, SPLAT_XYZ[[1, 2]])
+    doc = wpk.build_pluck(job)
+    assert doc["elements"]["crate"]["coordinate_verified"]
+    wpk.write_pluck(job / "_world", doc)
+    assert not wpk.read_pluck(job / "_world", job)[1]
+    _binary_ply(object_ply, SPLAT_XYZ[[2, 1]])
+    assert wpk.read_pluck(job / "_world", job)[1]
+    with pytest.raises(wpk.PluckError, match="different coordinates"):
+        wpk.build_pluck(job)
+
+
+def test_missing_object_coordinates_does_not_claim_verified_mapping(tmp_path):
+    job = _mk_job(tmp_path)
+    assert not wpk.build_pluck(job)["elements"]["crate"]["coordinate_verified"]
+
+
+@pytest.mark.parametrize("index_map", ([0, 0, 2], [-1, 0, 2], [0, 1], [[0, 1, 2]], [0.0, 1.5, 2.0]))
+def test_malformed_export_map_is_refused(tmp_path, index_map):
+    job = _mk_job(tmp_path)
+    np.save(job / "_langfield/ply_index_map.npy", np.asarray(index_map))
+    with pytest.raises(wpk.PluckError, match="export index map"):
+        wpk.build_pluck(job)
+
+
+def test_sparse_checkpoint_ids_do_not_require_a_dense_inverse_allocation():
+    rows, dropped = wpk._rows_via_map(np.array([2, 10**12, 3]), np.array([10**12, 2]))
+    assert rows.tolist() == [0, 1]
+    assert dropped == 1
+
+
 def test_build_refuses_stale_langfield(tmp_path):
     job = _mk_job(tmp_path)
     (job / "_langfield" / "STALE").write_text("t\n")
@@ -169,6 +202,18 @@ def test_validate_rejects_malformed_docs(tmp_path):
         mutate(bad)
         with pytest.raises(wpk.PluckError):
             wpk.validate_pluck(bad)
+
+
+def test_pluck_invalidated_by_scale_change(tmp_path):
+    job = _mk_job(tmp_path)
+    document = wpk.build_pluck(job)
+    wpk.write_pluck(job / "_world", document)
+    metadata = json.loads((job / "meta.json").read_text())
+    metadata.update(scale_generation=1, meters_per_unit=2)
+    (job / "meta.json").write_text(json.dumps(metadata))
+    _, stale, reasons = wpk.read_pluck(job / "_world", job)
+    assert stale
+    assert any("scale calibration" in reason for reason in reasons)
 
 
 # ── routes ──────────────────────────────────────────────────────────────────────

@@ -581,7 +581,10 @@ def build_shell(job_dir: Path, args, instances, py: Path, script: Path, mpu) -> 
             # collision_shell.glb built by a DIFFERENT route silently ignores
             # the request — which is what happened the first time this was
             # wired: --shell-route voxel returned a splat-transform shell.
-            if not geom.is_file() or route != "auto":
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+            from artifact_dependencies import shell_is_current
+
+            if not shell_is_current(job_dir) or route != "auto":
                 _log(f"  building collision shell (route={route})")
                 shell_cmd = [str(py), str(Path(__file__).with_name("world_shell.py")),
                              str(job_dir)]

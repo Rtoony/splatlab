@@ -73,7 +73,7 @@ interface SceneInfo {
   shellHeightUnits: number;
   sceneSize: [number, number, number];
   colliderTris: number;
-  colliderSource: "collision_shell" | "collision_shell+authored" | "visual_shell";
+  colliderSource: "collision_shell" | "collision_shell+authored" | "collision_shell+elements" | "visual_shell";
   metersPerUnit: number | null;
 }
 
@@ -1453,7 +1453,7 @@ function ElementsPanel({
   hidden: Set<string>;
   upm: number;
   colliderTris: number;
-  colliderSource: "collision_shell" | "collision_shell+authored" | "visual_shell";
+  colliderSource: "collision_shell" | "collision_shell+authored" | "collision_shell+elements" | "visual_shell";
   jobId: string;
   library: string[];
   onToggle: (slug: string) => void;
@@ -1468,6 +1468,7 @@ function ElementsPanel({
   const [genSlug, setGenSlug] = useState<string | null>(null);
   const [genBusy, setGenBusy] = useState(false);
   const [genCandidate, setGenCandidate] = useState<GeneratedCandidate | null>(null);
+  const [genQuality, setGenQuality] = useState<"preview" | "balanced" | "detail">("preview");
   const [genNote, setGenNote] = useState<string>("");
   const openGenZone = (slug: string) => {
     if (genSlug === slug) { setGenSlug(null); return; }
@@ -1505,6 +1506,7 @@ function ElementsPanel({
           }}
         >
           [{colliderSource === "collision_shell+authored" ? "SOLID+AUTHORED"
+            : colliderSource === "collision_shell+elements" ? "SOLID+ELEMENTS"
             : colliderSource === "collision_shell" ? "SOLID" : "VISUAL — may fall through"}]
         </span>{" "}
         ·{" "}
@@ -1603,6 +1605,7 @@ function ElementsPanel({
                 <div className="mt-2 rounded-md border border-white/10 bg-black/40 p-2">
                   {genCandidate ? (
                     <>
+                      {genCandidate.stale && <p className="mb-2 text-[10px] text-amber-300">Scene, selection, scale or candidate lineage changed. Propose again before applying; the old preview remains reviewable.</p>}
                       <div className="mb-1 flex items-center gap-2 text-[10px]">
                         <Tag tone={genCandidate.placed ? "emerald" : "zinc"}>
                           {genCandidate.placed ? "PLACED candidate" : "not placeable"}
@@ -1625,8 +1628,13 @@ function ElementsPanel({
                           </button>
                         ) : (
                           <>
+                            <label className="text-[10px] text-zinc-300">Delivery quality
+                              <select value={genQuality} onChange={event => setGenQuality(event.target.value as typeof genQuality)} disabled={genBusy} className="ml-1 rounded border border-white/15 bg-zinc-950 p-1">
+                                <option value="preview">Preview · 8k / 1k</option><option value="balanced">Balanced · 32k / 2k</option><option value="detail">Detail · 100k / 4k</option>
+                              </select>
+                            </label>
                             <button type="button" disabled={genBusy || !genCandidate.placed}
-                              onClick={() => runGen(r.slug, () => promoteGenerated(jobId, r.slug).then(() => onPolished()), "Promoted — the generated mesh is the element now.")}
+                              onClick={() => runGen(r.slug, () => promoteGenerated(jobId, r.slug, genQuality).then(() => onPolished()), "Promoted — the generated master is retained and the delivery mesh is applied.")}
                               title={genCandidate.placed ? "Version the captured element and apply the candidate" : "The placement gate did not resolve — cannot promote"}
                               className="rounded-md border border-emerald-400/40 px-2 py-1 text-[10px] font-semibold text-emerald-200 hover:text-white disabled:opacity-40">
                               Promote

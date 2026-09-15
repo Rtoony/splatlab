@@ -40,6 +40,8 @@ import activity_route  # noqa: E402  (read-only busy-now snapshot: GPU holder + 
 import feedback  # noqa: E402  (small SQLite-backed in-app feedback loop)
 import world_interactions_route  # noqa: E402  (walkable-world affordances + player state)
 import opregistry  # noqa: E402  (persistent heavy-operation registry: pollable, restart-truthful)
+import capture_route
+import scene_studio_route
 import thumb as thumbgen  # noqa: E402  (scene thumbnail generator)
 
 # Nothing is proxied to the portal anymore; PORTAL_ORIGIN stays because /healthz
@@ -48,7 +50,7 @@ PORTAL_ORIGIN = os.environ.get("SPLATLAB_PORTAL_ORIGIN", "http://127.0.0.1:3300"
 PORTAL_TOKEN = os.environ.get("PORTAL_TOKEN", "")
 COOKIE = "splatlab_session"
 MAX_AGE = 60 * 60 * 24 * 14  # 14 days
-DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+DIST = Path(os.environ.get("SPLATLAB_FRONTEND_DIST", str(Path(__file__).resolve().parent.parent / "frontend" / "dist")))
 # Self-hosted SuperSplat editor build (index.html + hashed assets). The frontend
 # contract is the URL shape /supersplat/?load=<preview url>&filename=<name>.
 SUPERSPLAT_DIST = Path(os.environ.get("SUPERSPLAT_DIST", "/home/rtoony/projects/supersplat/dist"))
@@ -65,6 +67,7 @@ async def _lifespan(_app: FastAPI):
         await splat_route.resume_orphan_jobs()
     with contextlib.suppress(Exception):
         feedback.init_db()
+    capture_route.reconcile_routes()
     with contextlib.suppress(Exception):
         # Any operation still marked running belongs to the process that just
         # died. Say so plainly rather than leaving phantom work on /activity.
@@ -74,6 +77,7 @@ async def _lifespan(_app: FastAPI):
             print(f"[splatlab] marked {orphaned} interrupted operation(s) abandoned",
                   flush=True)
     yield
+    await capture_route.shutdown_tasks()
 
 
 app = FastAPI(title="SplatLab", lifespan=_lifespan)
@@ -216,6 +220,8 @@ def require_auth(request: Request) -> None:
 
 # /api/splat is now OWNED here (the ported pipeline), gated by splatlab auth.
 app.include_router(splat_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
+app.include_router(capture_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
+app.include_router(scene_studio_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
 
 # Scene editing (destructive ops are snapshot-versioned) — same auth gate as the pipeline.
 app.include_router(edit_ops.router, prefix="/api/splat", dependencies=[Depends(require_auth)])

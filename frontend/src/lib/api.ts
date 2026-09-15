@@ -591,6 +591,7 @@ export interface GeneratedCandidate {
   job_id: string;
   slug: string;
   placed: boolean;
+  stale?: boolean;
   report: { mask_alignment_gate?: { iou_vs_captured_object?: number };
             capture_frame_placement?: { mesh_glb?: { placement_resolved?: boolean; iou?: number } };
             [k: string]: unknown };
@@ -611,10 +612,10 @@ export function fetchGeneratedCandidate(jobId: string, slug: string): Promise<Ge
   );
 }
 
-export function promoteGenerated(jobId: string, slug: string): Promise<{ ok: boolean }> {
+export function promoteGenerated(jobId: string, slug: string, quality: "preview" | "balanced" | "detail" = "preview"): Promise<{ ok: boolean }> {
   return apiRequest(
     `/api/splat/jobs/${encodeURIComponent(jobId)}/objects/${encodeURIComponent(slug)}/generate/promote`,
-    { method: "POST" },
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ quality }) },
   );
 }
 

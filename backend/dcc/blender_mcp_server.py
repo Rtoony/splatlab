@@ -229,6 +229,42 @@ def run_polish_recipe(
     )
 
 
+@mcp.tool(title="Create structural wall", annotations=ADDITIVE)
+def create_wall(job_id: str, name: str, origin: list[float], width: float = 4,
+                height: float = 2.8, thickness: float = 0.15, rotation_degrees: float = 0,
+                base_version: int | None = None) -> dict[str, Any]:
+    """Create an authored metre-scaled wall in a new Blender version; local X width, Z height, origin at bottom centre. Does not publish to the walker."""
+    return workflow.run_action(job_id, "create_wall", {"name": name, "origin": origin,
+        "width": width, "height": height, "thickness": thickness, "rotation_degrees": rotation_degrees}, base_version=base_version)
+
+
+@mcp.tool(title="Cut dimensioned opening", annotations=ADDITIVE)
+def cut_opening(job_id: str, object_name: str, width: float = 0.9, height: float = 2.1,
+                offset: float = 0, sill: float = 0, base_version: int | None = None) -> dict[str, Any]:
+    """Cut or adjust one opening in an authored wall, retaining a lintel and jambs. Does not mistake captured collision for editable architecture."""
+    return workflow.run_action(job_id, "cut_opening", {"object": object_name,
+        "width": width, "height": height, "offset": offset, "sill": sill}, base_version=base_version)
+
+
+@mcp.tool(title="Create connected room candidate", annotations=ADDITIVE)
+def create_room(job_id: str, name: str, origin: list[float], width: float = 4, depth: float = 4,
+                height: float = 2.8, thickness: float = 0.15, door_width: float = 0.9,
+                door_height: float = 2.1, rotation_degrees: float = 0, ceiling: bool = False,
+                base_version: int | None = None) -> dict[str, Any]:
+    """Author a room extending local +Y from its front doorway. Origin is doorway bottom centre in Blender Z-up metres. Review alignment before separate publication."""
+    return workflow.run_action(job_id, "create_room", {"name": name, "origin": origin, "width": width,
+        "depth": depth, "height": height, "thickness": thickness, "door_width": door_width,
+        "door_height": door_height, "rotation_degrees": rotation_degrees, "ceiling": ceiling}, base_version=base_version)
+
+
+@mcp.tool(title="Assign architectural material", annotations=ADDITIVE)
+def assign_material(job_id: str, object_name: str, color: list[float], roughness: float = 0.7,
+                    metallic: float = 0, base_version: int | None = None) -> dict[str, Any]:
+    """Assign bounded PBR parameters to a mesh in a new version; this is material authoring, not captured-scene relighting."""
+    return workflow.run_action(job_id, "assign_material", {"object": object_name, "color": color,
+        "roughness": roughness, "metallic": metallic}, base_version=base_version)
+
+
 @mcp.tool(title="Restore Blender version", annotations=ADDITIVE)
 def restore_blender_version(
     job_id: str, version: int, note: str = ""

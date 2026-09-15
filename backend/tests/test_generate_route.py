@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import generate_route  # noqa: E402
 import splat_route  # noqa: E402
+import artifact_manifest as manifests
 
 JOB = "splat_dec0de"  # hex-only — a readable slug silently 404s every route
 
@@ -50,6 +51,11 @@ def _mk_candidate(job: Path, slug: str = "hydrant", *, placed: bool = True,
         "mask_alignment_gate": {"iou_vs_captured_object": 0.87},
         "capture_frame_placement": {"mesh_glb": placement},
     }))
+    if with_glb:
+        manifests.atomic_write_json(cdir / "candidate-lineage.json", {
+            "dependencies": generate_route.creative_dependencies(job),
+            "mesh": manifests.file_identity(cdir / "generated_mesh.glb"),
+            "report": manifests.file_identity(cdir / "generate_report.json")})
     return cdir
 
 
@@ -140,3 +146,54 @@ def test_revert_and_discard_refusals(client) -> None:
     assert http.delete(
         f"/api/splat/jobs/{JOB}/objects/hydrant/generate/candidate"
     ).status_code == 404
+
+
+def test_candidate_rejects_recalibration_and_unknown_lineage(client):
+    http, outputs = client
+    job = _mk_job(outputs)
+    candidate = _mk_candidate(job)
+    endpoint = f"/api/splat/jobs/{JOB}/objects/hydrant/generate/candidate"
+    assert http.get(endpoint).json()["placed"] is True
+    metadata = json.loads((job / "meta.json").read_text())
+    metadata["scale_generation"] = 1
+    (job / "meta.json").write_text(json.dumps(metadata))
+    assert http.get(endpoint).json()["stale"] is True
+    assert http.get(endpoint).json()["placed"] is False
+    (candidate / "candidate-lineage.json").unlink()
+    assert http.get(endpoint).json()["stale"] is True
+
+
+def test_promotion_retains_master_and_revert_keeps_it(client, monkeypatch):
+    from test_polish_route import _minimal_glb
+    import re
+
+    http, outputs = client
+    job = _mk_job(outputs)
+    world = job / "_world"
+    original = _minimal_glb(bin_bytes=4)
+    master = _minimal_glb(bin_bytes=8)
+    delivery = _minimal_glb(bin_bytes=12)
+    (world / "elements" / "hydrant.glb").write_bytes(original)
+    candidate = _mk_candidate(job)
+    (candidate / "generated_mesh.glb").write_bytes(master)
+    manifests.atomic_write_json(candidate / "candidate-lineage.json", {
+        "dependencies": generate_route.creative_dependencies(job),
+        "mesh": manifests.file_identity(candidate / "generated_mesh.glb"),
+        "report": manifests.file_identity(candidate / "generate_report.json")})
+
+    async def place(command):
+        destination = Path(re.search(r"Path\('([^']*\.building-promote-[^']+\.glb)'\)", command[-1]).group(1))
+        assert "faces=32000" in command[-1] and "tex=2048" in command[-1]
+        destination.write_bytes(delivery)
+        return 0, b'PLACE {"ok": true, "faces": 32000}', b""
+
+    monkeypatch.setattr(splat_route, "_run_capture_subprocess", place)
+    endpoint = f"/api/splat/jobs/{JOB}/objects/hydrant/generate"
+    response = http.post(endpoint + "/promote", json={"quality": "balanced"})
+    assert response.status_code == 200, response.text
+    retained = response.json()["marker"]["master"]
+    assert (world / retained["file"]).read_bytes() == master
+    assert (world / "elements" / "hydrant.glb").read_bytes() == delivery
+    assert http.post(endpoint + "/revert").status_code == 200
+    assert (world / "elements" / "hydrant.glb").read_bytes() == original
+    assert (world / retained["file"]).read_bytes() == master

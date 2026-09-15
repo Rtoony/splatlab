@@ -7209,8 +7209,11 @@ async def get_splat_world_manifest(job_id: str):
     # only the visual one is what makes a world look right and be unwalkable.
     collision_shell = None
     if (world_dir / "collision_shell.glb").is_file():
+        from artifact_dependencies import collision_scale_to_world
+
         gates = {}
         spawn = None
+        doc = {}
         report = world_dir / "collision_shell.json"
         if report.is_file():
             try:
@@ -7234,6 +7237,7 @@ async def get_splat_world_manifest(job_id: str):
             except (OSError, json.JSONDecodeError, TypeError, ValueError):
                 gates = gates or {}
         collision_shell = {
+            "scale_to_world": collision_scale_to_world(world, doc),
             "glb": _world_file_url(job_id, "collision_shell.glb"),
             "report": (_world_file_url(job_id, "collision_shell.json")
                        if report.is_file() else None),
