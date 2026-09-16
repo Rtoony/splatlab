@@ -211,7 +211,7 @@ def main() -> int:
     if a.output.exists():
         raise SystemExit(f"refusing to overwrite {a.output}")
     a.output.mkdir(parents=True); (a.output / "overlays").mkdir()
-    receipt_eval = json.loads((a.evaluation / "receipt.json").read_text())
+    receipt_eval = json.loads((a.evaluation / "receipt.json").read_text())      # a surfel evaluation, or the structure study itself (adapter jobs: no surfels)
     rec_struct, views = load_views(a.structure, a.evaluation, receipt_eval, a.mask_score)
     cams = np.array([v["c2w"][:3, 3] for v in views]); span = float(np.max(np.linalg.norm(cams[:, None] - cams[None], axis=-1)))
     tol = a.tol_frac * span
@@ -268,6 +268,8 @@ def main() -> int:
     for p in fac: p["ids"] = fac_ids[p["ids"]]
     for p in pav: p["ids"] = pav_ids[p["ids"]]
     up = sc.up_vector(pav[0], cams) if pav else None
+    if up is None:
+        print("[scaffold] no pavement plane: walls keep their SVD bases (not plumb), no up vector / Manhattan frame", flush=True)
     mem = np.load(a.structure / "membership.npz") if (a.structure / "membership.npz").is_file() else None
     walls, anchors = [], {}
     fit_tracks = mem["points"][mem["facade_supported"].astype(bool) & ~mem["plane_check_reserved"].astype(bool)] if mem is not None else np.zeros((0, 3))
@@ -282,7 +284,9 @@ def main() -> int:
     for i, p in enumerate(fac):
         p["name"] = f"facade-{i}"; p["tilt"] = sc.tilt_deg(p["normal"], up) if up is not None else None; p["kind"] = "facade-tilted"
         if up is None or p["tilt"] <= a.max_tilt:
-            p = sc.rebase_patch(p, points, sc.gravity_basis(p["normal"], up)); p["kind"] = "wall"       # plumb rectangles
+            if up is not None:
+                p = sc.rebase_patch(p, points, sc.gravity_basis(p["normal"], up))                     # plumb rectangles (needs a pavement plane)
+            p["kind"] = "wall"
             p, _ = anchor(p)                                                                           # position from the sparse SfM tracks, then merge
             walls.append(p)
         fac[i] = p
@@ -389,7 +393,7 @@ def main() -> int:
     manifests.atomic_write_json(a.output / "scaffold.json", scaffold)
     receipt = {"schema": SCHEMA, "started_at": manifests.utc_now(), "elapsed_seconds": round(time.time() - t0, 1), "status": "inferred-needs-review",
                "inputs": {"evaluation": str(a.evaluation), "structure": str(a.structure), "moge": str(a.moge) if a.moge else None, "alignment": str(a.alignment) if a.alignment else None, "building": str(a.building) if a.building else None},
-               "source_hashes": {"surfels.npz": manifests.sha256_file(a.evaluation / "surfels.npz"), "evaluation receipt": manifests.sha256_file(a.evaluation / "receipt.json"), "structure receipt": manifests.sha256_file(a.structure / "receipt.json")},
+               "source_hashes": {name: manifests.sha256_file(path) for name, path in (("surfels.npz", a.evaluation / "surfels.npz"), ("evaluation receipt", a.evaluation / "receipt.json"), ("structure receipt", a.structure / "receipt.json")) if path.is_file()},
                "parameters": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(a).items()},
                "summary": {"surfels_used": int(len(points)), "labels": counts, "wall_patches": [{"name": p["name"], "surfels": int(len(p["ids"])), "rms_units": float(p["rms"]), "tilt_deg": p["tilt"], "extent_units": p["extent"], "fragments": p.get("fragments", 1), "anchor": anchors.get(p["name"])} for p in walls],
                            "pavement_patches": [{"name": p["name"], "surfels": int(len(p["ids"])), "rms_units": float(p["rms"])} for p in pav],

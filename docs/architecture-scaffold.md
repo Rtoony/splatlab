@@ -8,13 +8,16 @@ rejects. Nothing in it promotes a reconstruction to accepted geometry.
 
 | Step | Tool (env) | In | Out |
 |---|---|---|---|
-| 1 Structure study | `tools/capture-structure.py prepare/masks/analyze` (app venv → SAM3 env via the compute gate, needs a lease JSON with `no_new_starts_after`) | fisheye reference package + frozen SfM (`sparse/0`; the reference pins the SfM package by hash) | 24 centre views with SAM3 masks per prompt (`--prompts` overrides the default list: building exterior wall, pavement, sky, vegetation, vehicle, window, garage door, door), tracks + reserved check points |
+| 1 Structure study | `tools/capture-structure.py prepare/masks/analyze` (app venv → SAM3 env via the compute gate, needs a lease JSON with `no_new_starts_after`) — or, for an ORDINARY job (phone video, DSLR stills), `tools/structure-study-from-job.py --job splat_xxx --output DIR` then the same `masks` / `analyze` | X5: fisheye reference package + frozen SfM (`sparse/0`; the reference pins the SfM package by hash). Job: `processed/transforms.json` + `processed/sparse/0/*.bin` (poses, one OPENCV camera, `applied_transform`); frames are undistorted + downsized to one pinhole intrinsics, COLMAP features rescaled to the frame resolution (COLMAP may have run at full size), support = error ≤ 2 px, track ≥ 3, reprojection ≤ 3 px | N views (24 X5 / `--views` job) with SAM3 masks per prompt (`--prompts` overrides the default list: building exterior wall, pavement, sky, vegetation, vehicle, window, garage door, door), tracks + reserved check points |
 | 2 Metric depth | `tools/moge-depth-views.py` (sam3d-body env, gated, ~10 s) | structure study | MoGe-2 depth per view scaled by that view's own SfM tracks; `global_meters_per_unit` = an independent metric scale for the SfM frame |
 | 3 Scaffold | `tools/architecture-scaffold.py --source moge` (splatops env, CPU, ~20 s) | 1 + 2 (+ registration + model, optional) | `scaffold.json` (planes, plumb wall bases anchored to sparse tracks, openings cast by rays onto walls with exclusive wall assignment, gaps, reserved-track checks, up + Manhattan frame), `scaffold.ply`, per-view overlays, `contact.png`, receipt |
 | 4 Registration | `tools/register-by-openings.py` (when no manual alignment exists) | scaffold + MoGe receipt + model + a wall/opening to anchor on | similarity file in the alignment-receipt shape (`cases[].fit.matrix`): planes → rotation, MoGe → scale, a door or the window pair → translation |
 | 5 Evidence | `tools/building-evidence.py` | scaffold + MoGe + registration + model + `--building-target kind:id` | `evidence.json` payloads; `--apply` posts to the review API (`--api`), `--resume` finishes a partial post |
 
 Core math lives in `backend/architecture/` (`scaffold_core.py`, `model_match.py`), numpy/scipy only, tested.
+Without a pavement plane the scaffold keeps SVD wall bases (not plumb) and skips the up vector; the step-3 receipt hashes
+whatever of `surfels.npz` / evaluation receipt exists, so a study directory can stand in for `--evaluation`.
+One-shot for a new exterior job: `bash ~/scripts/condo-exterior-job-2026-09-16.sh --job=splat_xxx --apply [--post]`.
 
 ## What the evidence contains
 

@@ -4222,3 +4222,16 @@ named datums (bay-window sill +4.36 m above the slab = +4.05 m above the studio 
   (largest wall vs its nearest model line, MoGe-2 vs registration scale, up vs +Z).
 - Guide: `docs/architecture-scaffold.md`. Re-checked on both condo clips: the same opening records as before, projections
   reduced to the meaningful pairs (bay 0.76 vs 0.81 m; garden recess 0.57 vs 0.46 m).
+
+## 2026-09-15 (evening) — structure-study adapter for ordinary jobs (phone video / DSLR stills)
+
+`tools/structure-study-from-job.py --job splat_xxx --output DIR` writes the same layout `capture_structure.prepare()` writes
+for X5 packages (frames/, tracks.npz, views.json, things.json, receipt.json with the same schema/status), so `capture-structure.py
+masks` / `analyze`, `moge-depth-views.py`, the scaffold and the evidence exporter run unchanged. Reads `processed/transforms.json`
+(one OPENCV camera, `applied_transform`) + `sparse/0/*.bin`; undistorts + downsizes to one pinhole intrinsics; rescales COLMAP
+features to the frame resolution (the bicycle job's COLMAP ran at 3118 px, frames are 1559 px — every support failed until
+that scale was applied, median residual 975 px → 0.3 px); support rule = error ≤ 2, track ≥ 3, reprojection ≤ 3 px. Smoke test on
+`splat_aea04ab3` (DSLR stills): 24 views, 124,942 supports, SAM3 27 s, analyze 21 s, MoGe 11 s, scaffold runs (no pavement →
+walls keep SVD bases; guarded). Pipeline for the incoming exterior capture: `~/scripts/condo-exterior-job-2026-09-16.sh --job=…`
+(study → masks → analyze → MoGe → scaffold → register by the garage door → evidence dry run; `--post` to file). Intake folder
+`~/projects/condo-2286-chanate/received/exterior-2026-09-16/` with a README for the iPhone / T3i sets and tape numbers.
