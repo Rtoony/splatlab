@@ -74,10 +74,13 @@ def main():
     parser.add_argument("--sfm", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--lease", type=Path)
+    parser.add_argument("--prompts", default=None, help="comma-separated SAM3 prompts for prepare (default: capture_structure.PROMPTS)")
     args = parser.parse_args()
     if args.action == "prepare":
         if args.reference is None or args.sfm is None:
             parser.error("Preparation needs --reference and --sfm")
+        if args.prompts:
+            structure.PROMPTS = tuple(p.strip() for p in args.prompts.split(",") if p.strip())
         result = structure.prepare(args.reference, args.sfm, args.output)
     else:
         if args.lease is None:

@@ -332,42 +332,36 @@ def main() -> int:
             chk_pts = mem["points"][mem["plane_check_reserved"].astype(bool) & mem[key].astype(bool)]
             rec["reserved_track_check"] = sc.reserved_track_check(p, chk_pts, wall_tol if p["kind"] == "wall" else tol, band=band)
         patch_recs.append(rec)
-    # measurements vs building.json
+    # measurements vs building.json (building-agnostic: scale checks + the largest wall against its nearest model wall line;
+    # opening-level comparisons live in tools/building-evidence.py)
     measurements = []
     if a.building and similarity is not None and walls and up is not None:
         b = json.loads(a.building.read_text()); R, s, _ = sc.similarity_parts(similarity)
-        lvl = b["levels"][0]; garage_wall = next((w for w in lvl["walls"] if any(o.get("kind") == "garage" for o in w.get("openings", []))), None)
-        if garage_wall:
-            length = float(np.linalg.norm(np.subtract(garage_wall["b"], garage_wall["a"])))
-            door = next(o for o in garage_wall["openings"] if o["kind"] == "garage")
-            w0 = patch_recs[0]
-            measurements.append({"item": "street wall plane extent (all coplanar units)", "model_m": length, "model_note": "model value = 2286 garage wall only", "model_source": garage_wall.get("source"), "model_confidence": garage_wall.get("confidence"),
-                                 "capture_m": w0["extent_m"][0], "circular": False, "note": "largest wall plane along its own axis; coplanar neighbouring units are included, so this is NOT the 2286 wall length"})
-            doors = w0["openings"]["garage_door"]
-            if doors:
-                measurements.append({"item": "garage door width", "model_m": door["width"], "model_confidence": door.get("confidence"), "capture_m": doors[0]["width_m"], "circular": True,
-                                     "n_views": doors[0]["n_views"], "spread_m": doors[0]["width_spread"] * s, "note": "the alignment scale was fitted to this very opening"})
-                measurements.append({"item": "garage door height", "model_m": door["height"], "model_confidence": door.get("confidence"), "capture_m": doors[0]["height_m"], "circular": True,
-                                     "n_views": doors[0]["n_views"], "spread_m": doors[0]["height_spread"] * s})
-            for k, g in enumerate(w0["openings"]["gap"][:3]):
-                measurements.append({"item": f"unobserved gap {k}", "model_m": None, "capture_m": [g["width_m"], g["height_m"]], "circular": False})
-            for k, g in enumerate(w0["openings"]["window"][:4]):
-                measurements.append({"item": f"window {k}", "model_m": None, "capture_m": [g["width_m"], g["height_m"]], "circular": False})
-            if a.moge and (a.moge / "receipt.json").is_file():
-                mr = json.loads((a.moge / "receipt.json").read_text()); mpu = mr.get("global_meters_per_unit")
-                if mpu:
-                    ratio = mpu / s
-                    measurements.append({"item": "SfM-frame scale: MoGe-2 (tracks) vs alignment (garage opening)", "model_m": s, "model_note": "alignment metres per unit, from the modelled 4.8768 x 2.1336 m opening",
-                                         "capture_m": mpu, "circular": False, "ratio": ratio, "n_views": mr.get("n_views_scaled"), "spread_m": mr.get("per_view_scale_mad_u_per_m"),
-                                         "note": "independent monocular metric depth scaled by each view's own sparse tracks; agreement means the modelled opening size is consistent with MoGe-2 to this ratio"})
-                    if doors:
-                        measurements.append({"item": "garage door width at MoGe-2 scale", "model_m": door["width"], "capture_m": doors[0]["width_m"] * ratio, "circular": False, "n_views": doors[0]["n_views"],
-                                             "note": "SAM3 door-leaf mask cast onto the anchored wall plane, metres from MoGe-2 (not from the door itself)"})
-                        measurements.append({"item": "garage door height at MoGe-2 scale", "model_m": door["height"], "capture_m": doors[0]["height_m"] * ratio, "circular": False, "n_views": doors[0]["n_views"]})
-                        measurements.append({"item": "garage door aspect (width / height), scale-free", "model_m": door["width"] / door["height"], "capture_m": doors[0]["width"] / doors[0]["height"], "circular": False})
-            measurements.append({"item": "wall normal vs model -Y (street side)", "model_m": None,
-                                 "capture_deg": float(math.degrees(math.acos(np.clip(-np.asarray(w0["normal_canonical"])[1], -1, 1)))), "circular": False})
-            measurements.append({"item": "up vector vs model +Z", "capture_deg": float(math.degrees(math.acos(np.clip((R @ np.asarray(up, dtype=np.float64))[2], -1, 1)))), "circular": False})
+        w0 = patch_recs[0]; cm = np.asarray(w0["corners_m"]); nc = np.asarray(w0["normal_canonical"])[:2]; nc = nc / max(np.linalg.norm(nc), 1e-9)
+        best = None
+        for L in b["levels"]:
+            for mw in L["walls"]:
+                if not mw.get("exterior"):
+                    continue
+                ma, mb = np.array(mw["a"], float), np.array(mw["b"], float); d = mb - ma; length = float(np.linalg.norm(d))
+                if length < 0.3:
+                    continue
+                d /= length; mn = np.array([d[1], -d[0]]); t = (cm[:, :2] - ma) @ d; overlap = min(float(t.max()), length) - max(float(t.min()), 0.0)
+                if overlap < 0.5:
+                    continue
+                ang = math.degrees(math.acos(min(1.0, abs(float(mn @ nc))))); off = abs(float(((cm.mean(axis=0)[:2] - ma) @ mn)))
+                if ang < 15 and off < 1.0 and (best is None or off < best[2]):
+                    best = (mw["id"], ang, off, L["id"])
+        if best:
+            measurements.append({"item": f"largest wall {w0['name']} vs model wall {best[0]} ({best[3]})", "capture_deg": round(best[1], 2), "offset_m": round(best[2], 3), "circular": False,
+                                 "note": "angle between the fitted wall normal and the nearest parallel model wall line; offset = capture face from the model line"})
+        if a.moge and (a.moge / "receipt.json").is_file():
+            mr = json.loads((a.moge / "receipt.json").read_text()); mpu = mr.get("global_meters_per_unit")
+            if mpu:
+                measurements.append({"item": "SfM-frame scale: MoGe-2 (tracks) vs the registration scale", "model_m": s, "capture_m": mpu, "circular": False, "ratio": mpu / s,
+                                     "n_views": mr.get("n_views_scaled"), "spread_m": mr.get("per_view_scale_mad_u_per_m"),
+                                     "note": "independent monocular metric depth scaled by each view's own sparse tracks vs the registration's scale"})
+        measurements.append({"item": "up vector vs model +Z", "capture_deg": float(math.degrees(math.acos(np.clip((R @ np.asarray(up, dtype=np.float64))[2], -1, 1)))), "circular": False})
     # overlays
     font = ImageFont.truetype(FONT, 18); tiles = []
     for view in views:

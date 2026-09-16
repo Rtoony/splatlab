@@ -4209,3 +4209,16 @@ evidence record `333b0674`, proposal `557b2c68` (Ready to Test), `Room.floorOffs
 `review/floor-offset-2026-09-15-01/candidate-v1` (364 app tests, browser proof), follow-on proposal generator staged.
 SplatLab side: `tools/condo-evidence.py --floor-datums "garage slab=0,studio FF=0.3048"` now writes every sill/head against
 named datums (bay-window sill +4.36 m above the slab = +4.05 m above the studio FF = ~1.0 m above the proposed level-2 floor).
+
+## 2026-09-15 — tools made building-agnostic (RToony: "improve these tools for future modeling tasks outside my condo")
+
+- `backend/architecture/model_match.py` (3 tests): openings/walls from any `building.json`, IoU matching with ghost
+  suppression, same-wall position shifts, wall-line offsets + angles (one model line per capture wall), parallel-wall
+  projections (one patch per model wall; cross-level only when a model `dimensions` entry documents the distance), footprint test.
+- `tools/building-evidence.py`: the exporter with `--building-target kind:id`, `--scale-check-target`, `--floor-datums`,
+  `--tags`, `--api`; `tools/condo-evidence.py` is now a wrapper that fills the condo defaults.
+- `tools/moge-depth-views.py` and `tools/register-by-openings.py` (renamed; `condo-*` wrappers kept for the staged scripts);
+  `tools/capture-structure.py prepare --prompts`; the scaffold's model measurements no longer assume a garage door
+  (largest wall vs its nearest model line, MoGe-2 vs registration scale, up vs +Z).
+- Guide: `docs/architecture-scaffold.md`. Re-checked on both condo clips: the same opening records as before, projections
+  reduced to the meaningful pairs (bay 0.76 vs 0.81 m; garden recess 0.57 vs 0.46 m).
