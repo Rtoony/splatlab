@@ -55,6 +55,11 @@ import {
 
 const DEV_SOURCE_KEY = "splatlab.world-view.devSource";
 
+/** Daylight behind a world only when no photographic backdrop is showing (a scan brings its own sky). */
+function applySky(walker: WorldWalker, on: boolean): void {
+  walker.setSky(on && !walker.hasBackdrop);
+}
+
 /** Snapshot of an engine element, safe to hold in React state. */
 interface ElementRow {
   slug: string;
@@ -132,6 +137,8 @@ export default function WorldViewPage() {
   const [target, setTarget] = useState<TargetInfo | null>(null);
   const [flying, setFlying] = useState(false);
   const [backdrop, setBackdrop] = useState(true);
+  const [sky, setSkyOn] = useState(true);
+  const skyRef = useRef(true);
   const [curtainDoc, setCurtainDoc] = useState<WorldCurtainDoc | null>(null);
   const [assetLibrary, setAssetLibrary] = useState<string[]>([]);
   const curtainSaveTimer = useRef<number | null>(null);
@@ -409,13 +416,19 @@ export default function WorldViewPage() {
                 m.meters_per_unit ?? null,
               );
             })
+            .then(() => {
+              if (!cancelled) applySky(walker, skyRef.current);
+            })
             .catch(() => {
-              if (!cancelled) setWarnings((w) => [...w, "Splat backdrop failed to load."]);
+              if (cancelled) return;
+              setWarnings((w) => [...w, "Splat backdrop failed to load."]);
+              applySky(walker, skyRef.current);
             });
         }
 
         setPhase("ready");
         walker.start();
+        applySky(walker, skyRef.current);
       } catch (err) {
         if (cancelled) return;
         setError((err as Error).message || String(err));
@@ -819,7 +832,7 @@ export default function WorldViewPage() {
                           ? `/api/splat/jobs/${encodeURIComponent(jobId)}/preview/file?fmt=web`
                           : null,
                         sceneInfo?.metersPerUnit ?? null,
-                      );
+                      ).then(() => applySky(w, skyRef.current));
                     }}
                     className="mt-0.5"
                   />
@@ -831,6 +844,28 @@ export default function WorldViewPage() {
                       is on, the shell is hidden — it is a blocky solid whose job
                       is collision, and drawing it just boxes you in. You still
                       cannot fall through it.
+                    </span>
+                  </span>
+                </label>
+                <label className="mt-2 flex items-start gap-2 text-[11px] text-zinc-300">
+                  <input
+                    type="checkbox"
+                    data-testid="world-sky"
+                    checked={sky}
+                    onChange={(e) => {
+                      skyRef.current = e.target.checked;
+                      setSkyOn(e.target.checked);
+                      const w = walkerRef.current;
+                      if (w) applySky(w, e.target.checked);
+                    }}
+                    className="mt-0.5"
+                  />
+                  <span>
+                    Sky outside
+                    <span className="block text-[10px] leading-snug text-zinc-500">
+                      A daylight sky behind rooms with no photograph, so a window
+                      looks out onto sky and ground instead of black. A scan brings
+                      its own sky, so this steps aside while the splat is showing.
                     </span>
                   </span>
                 </label>

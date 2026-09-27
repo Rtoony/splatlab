@@ -388,6 +388,48 @@ function gatherPoints(object: THREE.Object3D, offset: THREE.Vector3, maxPoints =
   return new Float32Array(out);
 }
 
+/**
+ * A daylight sky for worlds with no photographic backdrop (authored rooms, drawn sets): without it
+ * a window looks out onto black. Colour stops run bottom (straight down) to top (straight up); the
+ * horizon sits at the middle, so looking out of a window shows pale sky above ground tones below.
+ */
+const SKY_STOPS: Array<[number, [number, number, number]]> = [
+  [0.0, [74, 72, 60]], // ground, straight down
+  [0.44, [128, 124, 102]], // ground towards the horizon
+  [0.5, [214, 222, 226]], // horizon haze
+  [0.62, [168, 198, 226]], // low sky
+  [1.0, [86, 138, 196]], // zenith
+];
+
+/** The sky as `rows` RGB triples, bottom to top. Pure, so it can be tested without WebGL. */
+export function skyColumn(rows = 256): Array<[number, number, number]> {
+  const out: Array<[number, number, number]> = [];
+  for (let i = 0; i < rows; i++) {
+    const t = rows === 1 ? 0.5 : i / (rows - 1);
+    let k = 0;
+    while (k < SKY_STOPS.length - 2 && t > SKY_STOPS[k + 1][0]) k++;
+    const [t0, c0] = SKY_STOPS[k];
+    const [t1, c1] = SKY_STOPS[k + 1];
+    const f = t1 === t0 ? 0 : Math.min(1, Math.max(0, (t - t0) / (t1 - t0)));
+    out.push([0, 1, 2].map((j) => Math.round(c0[j] + (c1[j] - c0[j]) * f)) as [number, number, number]);
+  }
+  return out;
+}
+
+/** The sky column as an equirectangular background: row 0 (v=0) is straight down, the last row straight up. */
+export function makeSkyTexture(rows = 256): THREE.DataTexture {
+  const column = skyColumn(rows);
+  const data = new Uint8Array(rows * 4);
+  column.forEach(([r, g, b], i) => data.set([r, g, b, 255], i * 4));
+  const texture = new THREE.DataTexture(data, 1, rows, THREE.RGBAFormat);
+  texture.mapping = THREE.EquirectangularReflectionMapping;
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.magFilter = THREE.LinearFilter;
+  texture.minFilter = THREE.LinearFilter;
+  texture.needsUpdate = true;
+  return texture;
+}
+
 const MOVE_KEYS = new Set([
   "KeyW", "KeyA", "KeyS", "KeyD",
   "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
@@ -1432,6 +1474,22 @@ export class WorldWalker {
     return this.backdrop !== null;
   }
 
+  private skyTexture: THREE.DataTexture | null = null;
+
+  /** Daylight behind everything (the scene background), or the plain dark clear colour. */
+  setSky(on: boolean): void {
+    if (on) {
+      this.skyTexture ??= makeSkyTexture();
+      this.scene.background = this.skyTexture;
+    } else {
+      this.scene.background = null;
+    }
+  }
+
+  get hasSky(): boolean {
+    return this.scene.background !== null;
+  }
+
   /* -------------------------------------------------------------- *
    * Pluck — per-prop backdrop-splat rows                            *
    * -------------------------------------------------------------- */
@@ -2394,6 +2452,8 @@ export class WorldWalker {
     if (this.disposed) return;
     this.disposed = true;
     this.stop();
+    this.skyTexture?.dispose();
+    this.skyTexture = null;
     window.removeEventListener("keydown", this.handleKeyDown);
     window.removeEventListener("keyup", this.handleKeyUp);
     window.removeEventListener("blur", this.handleBlur);
