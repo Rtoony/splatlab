@@ -747,6 +747,13 @@ def _resolve_output_root(mode: Literal["3d", "4d"], raw_path: str | None) -> Pat
     return (OUTPUTS_DIR / mode).resolve()
 
 
+def _is_default_3d_root(root: Path) -> bool:
+    """`root` (already .resolve()d) is the one supported 3D output root. Compare RESOLVED paths:
+    outputs/ became a symlink to /mnt/storage on 2026-09-07, after which the unresolved comparison
+    refused every /train request ("Custom output roots are no longer supported"), UI included."""
+    return root.resolve() == DEFAULT_3D_ROOT.resolve()
+
+
 def _tool_path(binary: str, env_var: str) -> str | None:
     override = os.environ.get(env_var, "").strip()
     if override:
@@ -4379,7 +4386,7 @@ async def start_splat_training(request: Request, req: SplatTrainRequest):
             )
 
     output_root = _resolve_output_root(req.mode, req.output_dir)
-    if output_root != DEFAULT_3D_ROOT:
+    if not _is_default_3d_root(output_root):
         raise HTTPException(
             status_code=400,
             detail=f"Custom output roots are no longer supported — jobs persist under {DEFAULT_3D_ROOT}.",

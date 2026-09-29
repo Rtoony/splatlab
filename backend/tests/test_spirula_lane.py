@@ -230,3 +230,15 @@ def test_publish_refuses_an_unlevelled_model(tmp_path):
     with pytest.raises(ValueError, match="up axis is unknown"):
         sl.publish(tmp_path, tmp_path / "_preview" / "splat.ply")
     assert not (tmp_path / "_preview" / "splat.ply").exists()
+
+
+def test_default_output_root_survives_a_symlinked_outputs_dir(tmp_path, monkeypatch):
+    """Regression: outputs/ -> /mnt/storage/... (2026-09-07) made /train refuse every job."""
+    real = tmp_path / "raid" / "outputs"
+    (real / "3d").mkdir(parents=True)
+    link = tmp_path / "splatcli" / "outputs"
+    link.parent.mkdir()
+    link.symlink_to(real)
+    monkeypatch.setattr(splat_route, "DEFAULT_3D_ROOT", link / "3d")
+    assert splat_route._is_default_3d_root((link / "3d").resolve())
+    assert not splat_route._is_default_3d_root((tmp_path / "elsewhere").resolve())
