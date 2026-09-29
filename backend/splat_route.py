@@ -50,6 +50,7 @@ import gpu_arbiter
 import maintenance_gate
 import opregistry  # persistent heavy-operation registry (pollable, restart-truthful)
 import scale_calibration  # pure metric-scale math; imports nothing from this app
+import spirula_lane  # Spirula 360 lane (raw dual-fisheye .insv; GPL binary run as a subprocess)
 from train_preflight import train_preflight
 from health.precheck import precheck_input
 from health.probe import probe_capture
@@ -471,6 +472,12 @@ class SplatTrainRequest(BaseModel):
     # any other input type is rejected loudly rather than silently ignored.
     trim_start_s: float | None = Field(default=None, ge=0.0)
     trim_duration_s: float | None = Field(default=None, ge=5.0, le=600.0)
+    # Which trainer turns a raw .insv into a splat. "auto" (default) = the Spirula 360 lane
+    # (raw dual-fisheye -> Spirula SfM + 360-camera training; 2026-09-29 bake-off, owner decision)
+    # when the binary is installed and SPLAT_SPIRULA_LANE != 0, else the rig lane below.
+    # "splatfacto" forces the rig lane (langfield / mesh / isolate / world need its checkpoint).
+    # Non-.insv inputs always use splatfacto.
+    trainer: Literal["auto", "spirula", "splatfacto"] = "auto"
 
 
 @dataclass
@@ -620,6 +627,11 @@ def _new_meta(
         # stage), so a sparse request that didn't apply (equirect/dataset) isn't mis-badged.
         "capture_mode": "sparse" if (req.capture_mode == "sparse" and stages[:1] == ["mast3r_sfm"]) else "standard",
         "source_type": req.source_type,
+        "trainer": req.trainer,
+        # The trainer that actually runs (plan-time resolution of "auto").
+        "trainer_resolved": "spirula" if stages and stages[0] in spirula_lane.STAGES else (
+            "triposplat" if req.source_type == "generative-image" else "splatfacto"),
+        "spirula": _SPIRULA_PLANS.pop(str(job_dir), None),
         "command": [],
         "created_at": _utc_now(),
         "started_at": None,
@@ -958,6 +970,8 @@ def _engine_availability() -> dict:
         **_mast3r_availability(),
         # TripoSplat generative lane (opt-in): one image -> 3DGS .ply.
         **_triposplat_availability(),
+        # Spirula 360 lane (default for dual-fisheye .insv): spirula_available / spirula_path.
+        **spirula_lane.availability(),
         # Language Field (opt-in): SAM 2.1 + SigLIP 2 toolchain present?
         "langfield_available": _langfield_available(),
         # Splat→mesh export (opt-in): dn-splatter-probe env + gs-mesh present?
@@ -1218,6 +1232,9 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
         "pid": pid,
         "log_lines": log_lines,
         "preview_available": preview_file.is_file(),
+        # A nerfstudio checkpoint exists (langfield / mesh / isolate / world / condo-evidence need it).
+        # False for Spirula-lane jobs: those features 409 there until a checkpoint bridge exists.
+        "checkpoint_available": _find_latest_config(output_dir) is not None,
         # Raw .ply: in-page viewer, download, SuperSplat, engine interchange.
         "preview_file_url": f"/api/splat/jobs/{job_id}/preview/file" if preview_file.is_file() else None,
         # A .spz copy exists (10x smaller) for download / modern viewers, BUT
@@ -2309,6 +2326,58 @@ def _next_sfm_solver(tried: set[str], availability: dict, is_equirect: bool = Fa
     return None
 
 
+# Plan-time Spirula lane settings, handed to _new_meta (keyed by job dir) without making the job
+# escalation-eligible: a non-None sfm_context would arm the COLMAP reroute gate, which has no meaning here.
+_SPIRULA_PLANS: dict[str, dict[str, Any]] = {}
+
+
+def _plan_spirula_job(
+    req: SplatTrainRequest, availability: dict, job_dir: Path, input_path: Path
+) -> tuple[list[str], dict[str, list[str]], None] | None:
+    """The Spirula 360 plan, or None when this job belongs to another lane.
+
+    "auto" quietly falls back to the rig lane when the input is not a dual-fisheye .insv, the binary
+    is missing, or SPLAT_SPIRULA_LANE=0; an explicit trainer="spirula" that cannot run is a 400.
+    """
+    is_insv = input_path.suffix.lower() in INSV_EXTENSIONS
+    explicit = req.trainer == "spirula"
+    if req.trainer == "splatfacto" or req.source_type != "capture":
+        return None
+    if not is_insv:
+        if explicit:
+            raise HTTPException(status_code=400, detail="trainer=spirula needs a raw dual-fisheye .insv input.")
+        return None
+    if not (availability.get("spirula_available") and spirula_lane.lane_enabled()):
+        if explicit:
+            raise HTTPException(status_code=400, detail="The Spirula 360 lane is not available (binary missing "
+                                                        "or SPLAT_SPIRULA_LANE=0).")
+        return None
+    ffprobe = _tool_path("ffprobe", "SPLAT_FFPROBE_BIN")
+    info = spirula_lane.probe(ffprobe, input_path) if ffprobe else {"video_streams": 0}
+    if not spirula_lane.is_dual_fisheye(info):
+        if explicit:
+            raise HTTPException(status_code=400, detail="trainer=spirula needs a dual-fisheye .insv (two square "
+                                                        f"video tracks); probe found {info.get('video_streams', 0)}.")
+        return None
+    trim_start, trim_duration = req.trim_start_s, req.trim_duration_s
+    if trim_duration is not None and info.get("duration") and info["duration"] <= trim_duration:
+        trim_start = trim_duration = None                     # window >= clip: trim is a no-op
+    elif trim_duration is not None and trim_start is None and info.get("duration"):
+        trim_start = max(0.0, (info["duration"] - trim_duration) / 2)
+    if trim_start is not None and info.get("duration") and trim_start >= info["duration"]:
+        raise HTTPException(status_code=400, detail=f"trim_start_s ({trim_start:g}s) is beyond the end of the "
+                                                    f"clip ({info['duration']:.1f}s).")
+    s = spirula_lane.settings(info, trim_duration)
+    commands = spirula_lane.commands(
+        availability["spirula_path"], input_path, job_dir, s, ffmpeg=availability.get("ffmpeg_path"),
+        trim_start_s=trim_start, trim_duration_s=trim_duration)
+    stages = [st for st in spirula_lane.STAGES if st in commands] + ["spirula_publish"]
+    if _splat_transform_path():
+        stages += ["compress", "webopt"]
+    _SPIRULA_PLANS[str(job_dir)] = {**spirula_lane.settings_dict(s), "probe": info}
+    return stages, commands, None
+
+
 def _plan_3d_job(
     req: SplatTrainRequest, availability: dict, job_dir: Path, input_path: Path
 ) -> tuple[list[str], dict[str, list[str]], dict[str, Any] | None]:
@@ -2347,6 +2416,12 @@ def _plan_3d_job(
         if _splat_transform_path():
             stages += ["compress", "webopt"]  # .spz + decimated web.ply from splat.ply
         return stages, commands, None
+
+    # ── Spirula 360 lane: raw dual-fisheye .insv -> Spirula extract/mask/SfM/train -> Z-up .ply. No
+    #    stitch, no COLMAP, no nerfstudio (so no checkpoint: langfield/mesh/isolate/world 409 as today). ──
+    spirula_plan = _plan_spirula_job(req, availability, job_dir, input_path)
+    if spirula_plan is not None:
+        return spirula_plan
 
     missing = [
         name
@@ -3241,6 +3316,33 @@ async def _run_pipeline(job: SplatJob) -> None:
                 return_code = await _run_locked_stage(
                     job, stage, job.stage_commands[stage], SFM_VRAM_MB
                 )
+            elif stage in {"spirula_extract", "spirula_mask", "spirula_sfm", "spirula_train"}:
+                # Every Spirula step runs on the GPU (Vulkan decode / SAM / learned SfM / training), so each
+                # takes the shared lock — an unlisted stage would fall through to the UNLOCKED _run_stage.
+                vram = {"spirula_extract": spirula_lane.EXTRACT_VRAM_MB, "spirula_mask": spirula_lane.MASK_VRAM_MB,
+                        "spirula_sfm": spirula_lane.SFM_VRAM_MB, "spirula_train": spirula_lane.TRAIN_VRAM_MB}[stage]
+                return_code = await _run_locked_stage(job, stage, job.stage_commands[stage], vram)
+                if return_code == 0 and stage == "spirula_sfm" and not job.stop_requested:
+                    ok, msg = await asyncio.to_thread(spirula_lane.sfm_check, job_dir)
+                    job.log_lines.append(msg)
+                    if not ok:
+                        final_status = "failed"
+                        error_message = msg
+                        break
+            elif stage == "spirula_publish":
+                try:
+                    receipt = await asyncio.to_thread(
+                        spirula_lane.publish, job_dir, _preview_file_path(job_dir))
+                except Exception as exc:  # noqa: BLE001 — surfaced as the job's failure
+                    final_status = "failed"
+                    error_message = f"[spirula_publish] {exc}"
+                    job.log_lines.append(error_message)
+                    break
+                spirula_meta = {**((_read_meta(job.job_id) or {}).get("spirula") or {}), "published": receipt}
+                _patch_meta(job.job_id, spirula=spirula_meta)
+                job.log_lines.append(
+                    f"[spirula_publish] {receipt['splats']:,} splats, {receipt['cameras']} cameras -> preview.")
+                return_code = 0
             elif stage == "compress":
                 # Best-effort: compress the exported .ply into a viewer-native
                 # .spz. A missing tool or non-zero exit is logged and skipped —
@@ -3279,7 +3381,9 @@ async def _run_pipeline(job: SplatJob) -> None:
                         "--filter-harmonics",
                         "0",
                         "--decimate",
-                        str(WEB_DECIMATE_TARGET),
+                        str(spirula_lane.web_decimate_target()
+                            if job.stages_planned and job.stages_planned[0] in spirula_lane.STAGES
+                            else WEB_DECIMATE_TARGET),
                         str(_preview_web_path(job_dir)),
                     ]
                     rc = await _run_stage(job, stage, command)
@@ -3736,7 +3840,7 @@ def _req_from_meta(meta: dict[str, Any]) -> SplatTrainRequest | None:
     keys = ("mode", "input_path", "capture_format", "images_per_equirect",
             "crop_bottom", "num_frames_target", "max_num_iterations", "insv_fov",
             "sfm_backend", "language_field", "mesh_export", "capture_mode", "source_type",
-            "trim_start_s", "trim_duration_s")
+            "trim_start_s", "trim_duration_s", "trainer")
     fields = {k: meta[k] for k in keys if meta.get(k) is not None}
     try:
         return SplatTrainRequest(output_dir="outputs/3d", **fields)
@@ -3809,6 +3913,19 @@ def _stage_artifact_ok(job_dir: Path, stage: str) -> bool:
         return sparse.is_dir() and any(sparse.glob("*/cameras.bin"))
     if stage == "process":
         return (job_dir / "processed" / "transforms.json").is_file()
+    ws = spirula_lane.workdir(job_dir)
+    if stage == "spirula_trim":
+        return (ws / "trimmed.insv").is_file()
+    if stage == "spirula_extract":
+        return any((ws / "data" / "images" / "cam1").glob("*.jpg"))
+    if stage == "spirula_mask":
+        return any((ws / "data" / "masks").rglob("*.png"))
+    if stage == "spirula_sfm":
+        return (ws / "data" / "sparse" / "0" / "images.bin").is_file()
+    if stage == "spirula_train":
+        return spirula_lane.latest_splat(job_dir) is not None
+    if stage == "spirula_publish":
+        return _preview_file_path(job_dir).is_file() and (ws / "cameras" / "transforms.json").is_file()
     if stage == "train":
         # The canonical config finder knows the real nerfstudio layout
         # (processed/<experiment>/splatfacto/<ts>/) and already excludes the

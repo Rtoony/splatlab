@@ -1,0 +1,302 @@
+"""Spirula 360 lane: a raw dual-fisheye Insta360 .insv -> Spirula Studio -> a Z-up splat.
+
+Why (2026-09-29 bake-off, ~/reports/2026-09-29-spirula-bakeoff/): SplatLab's rig lane stitches the two
+lenses into an equirect, cuts 12 pinhole views and runs COLMAP + splatfacto; the stitch/resample softens
+the footage and splatfacto stops growing (181k splats on the storage room). Spirula trains on the RAW
+fisheye with its own rig-aware SfM (6.5 min vs ~60) and was visibly far sharper. Owner decision
+2026-09-29: default lane for .insv, view + walk first (no nerfstudio checkpoint, so langfield / mesh /
+isolate / world stay on rig-lane jobs), quality `high`.
+
+Spirula is GPL-3.0: it runs as a subprocess from ~/tools and is never vendored. Guards that are NOT
+optional (all measured): no `academic-baseline` preset (diverged on 360 views), no `--resume`
+(re-evaluation unfaithful / size-mismatch crash), `sfm auto` gets the IMAGE dir (the dataset dir also
+enumerates masks/), Vulkan pinned to the NVIDIA ICD (an Intel iGPU also enumerates), and production
+runs hold nothing out (`--eval-mode all`) so the eval-writer race cannot bite.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import shutil
+import struct
+import subprocess
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+SPIRULA_BIN = Path.home() / "tools" / "spirula" / "2026.9.24" / "spirula"
+NVIDIA_ICD = "/usr/share/vulkan/icd.d/nvidia_icd.json"
+WORKDIR = "_spirula"
+
+INSTANTS_PER_SECOND = 3.3          # the storage-room proof: 410 instants from 123 s (stride 9 at 29.97 fps)
+MAX_INSTANTS = 1400
+MIN_STRIDE = 3
+CPU_CACHE_BUDGET_BYTES = 40e9      # decoded RGB frames kept in RAM; the service cgroup is MemoryHigh 64G
+SCALES = (1.0, 0.75, 0.5)          # extraction scale ladder when the full-res frames would not fit
+FOCAL_PER_WIDTH = 0.27             # ~204° equidistant lens: f ≈ r/θmax (measured 518.7 px at 1920)
+MIN_REGISTERED_FRACTION = 0.8
+
+EXTRACT_VRAM_MB = 4_000
+MASK_VRAM_MB = 4_000
+SFM_VRAM_MB = 8_000
+TRAIN_VRAM_MB = 16_000
+
+STAGES = ("spirula_trim", "spirula_extract", "spirula_mask", "spirula_sfm", "spirula_train", "spirula_publish")
+
+
+def spirula_bin() -> str:
+    return os.environ.get("SPLAT_SPIRULA_BIN", "").strip() or str(SPIRULA_BIN)
+
+
+def availability() -> dict:
+    binary = spirula_bin()
+    ok = Path(binary).is_file() and os.access(binary, os.X_OK) and Path(NVIDIA_ICD).is_file()
+    return {"spirula_available": ok, "spirula_path": binary}
+
+
+def lane_enabled() -> bool:
+    """Kill-switch: SPLAT_SPIRULA_LANE=0 sends every .insv back to the rig lane."""
+    return os.environ.get("SPLAT_SPIRULA_LANE", "").strip() != "0"
+
+
+def quality() -> str:
+    q = os.environ.get("SPLAT_SPIRULA_QUALITY", "").strip() or "high"
+    return q if q in ("medium", "high", "ultra") else "high"
+
+
+def web_decimate_target() -> int:
+    """Spirula jobs carry 3M+ splats; the walker's default 1.2M decimation throws most of them away."""
+    try:
+        return max(100_000, int(os.environ.get("SPLAT_SPIRULA_WEB_DECIMATE", "") or 3_000_000))
+    except ValueError:
+        return 3_000_000
+
+
+# ---------------------------------------------------------------------------- probe + settings
+
+def probe(ffprobe: str, path: Path) -> dict:
+    """Video streams + duration of an .insv (dual-fisheye X4/X5 = two square HEVC streams)."""
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries",
+             "stream=codec_type,width,height,nb_frames,r_frame_rate:format=duration", "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=60, check=True).stdout
+        data = json.loads(out)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return {"video_streams": 0}
+    vids = [s for s in data.get("streams", []) if s.get("codec_type") == "video"]
+    if not vids:
+        return {"video_streams": 0}
+    num, _, den = str(vids[0].get("r_frame_rate", "30/1")).partition("/")
+    fps = float(num) / float(den or 1) if float(den or 1) else 30.0
+    duration = float(data.get("format", {}).get("duration") or 0.0)
+    frames = int(vids[0].get("nb_frames") or 0) or int(round(duration * fps))
+    return {"video_streams": len(vids), "width": int(vids[0].get("width") or 0),
+            "height": int(vids[0].get("height") or 0), "fps": fps, "duration": duration, "frames": frames,
+            "same_size": len({(v.get("width"), v.get("height")) for v in vids}) == 1}
+
+
+def is_dual_fisheye(info: dict) -> bool:
+    return (info.get("video_streams") == 2 and info.get("same_size")
+            and info.get("width") and info.get("width") == info.get("height"))
+
+
+@dataclass
+class LaneSettings:
+    stride: int
+    instants: int
+    scale: float
+    cache: str
+    focal: float
+    width: int
+    window_s: float
+    quality: str
+
+
+def settings(info: dict, trim_duration_s: float | None = None) -> LaneSettings:
+    """Frame stride, extraction scale and image cache for one clip.
+
+    ~3.3 instants per second (the proven storage-room density), at most MAX_INSTANTS, never denser than
+    every MIN_STRIDE-th frame. Full resolution when the decoded frames fit the RAM cache budget; otherwise
+    the largest scale that does, and only past the ladder a disk cache.
+    """
+    fps = info.get("fps") or 30.0
+    window = float(trim_duration_s) if trim_duration_s else float(info.get("duration") or 0.0)
+    frames = max(1, int(round(window * fps)) if window else int(info.get("frames") or 1))
+    target = max(1, min(math.ceil(INSTANTS_PER_SECOND * (frames / fps)), MAX_INSTANTS))
+    stride = max(MIN_STRIDE, frames // target)
+    instants = math.ceil(frames / stride)
+    w, h = int(info.get("width") or 3840), int(info.get("height") or 3840)
+    scale, cache = SCALES[-1], "disk"
+    for s in SCALES:
+        if instants * 2 * (w * s) * (h * s) * 3 <= CPU_CACHE_BUDGET_BYTES:
+            scale, cache = s, "cpu"
+            break
+    width = int(round(w * scale))
+    return LaneSettings(stride=stride, instants=instants, scale=scale, cache=cache,
+                        focal=round(FOCAL_PER_WIDTH * width, 1), width=width, window_s=round(window, 2),
+                        quality=quality())
+
+
+# ---------------------------------------------------------------------------- commands
+
+def workdir(job_dir: Path) -> Path:
+    return Path(job_dir) / WORKDIR
+
+
+def commands(binary: str, input_path: Path, job_dir: Path, s: LaneSettings, ffmpeg: str | None = None,
+             trim_start_s: float | None = None, trim_duration_s: float | None = None) -> dict[str, list[str]]:
+    ws = workdir(job_dir)
+    data, images = ws / "data", ws / "data" / "images"
+    run = ["env", f"VK_ICD_FILENAMES={NVIDIA_ICD}", binary]
+    cmds: dict[str, list[str]] = {}
+    source = Path(input_path)
+    if trim_start_s is not None or trim_duration_s is not None:
+        if not ffmpeg:
+            raise ValueError("a trimmed .insv needs ffmpeg")
+        source = ws / "trimmed.insv"
+        cut = []
+        if trim_start_s is not None:
+            cut += ["-ss", f"{trim_start_s:g}"]
+        if trim_duration_s is not None:
+            cut += ["-t", f"{trim_duration_s:g}"]
+        # Stream copy keeps both lens tracks; the cut lands on keyframes (fine for a test flight).
+        cmds["spirula_trim"] = ["bash", "-c", f'mkdir -p "{ws}" && "{ffmpeg}" -y -loglevel error '
+                                + " ".join(cut) + f' -i "{input_path}" -map 0:v -c copy "{source}"']
+    cmds["spirula_extract"] = [*run, "sam", "extract", str(source), "--sync", "--skip", str(s.stride),
+                               "--keep", "0", *(["--scale", f"{s.scale:g}"] if s.scale < 1 else []),
+                               "-o", str(images)]
+    cmds["spirula_mask"] = [*run, "sam", "mask", str(images)]
+    cmds["spirula_sfm"] = [*run, "sfm", "auto", str(images), "-o", str(data), "--data-type", "video",
+                           "--rig", "dual-fisheye=cam0,cam1", "--sequence", "cam0,cam1",
+                           "--camera-model", "opencv-fisheye", "--focal", f"{s.focal:g}"]
+    cmds["spirula_train"] = [*run, "train", "360-camera", "--data", str(data), "--data-format", "colmap",
+                             "--output-dir-prefix", str(ws), "--output-dir-name", "train",
+                             "--quality", s.quality, "--floater-suppression", "mild",
+                             "--cache-images", s.cache, "--eval-mode", "all", "--disable-viewer", "1"]
+    return cmds
+
+
+# ---------------------------------------------------------------------------- COLMAP binary readers
+
+def read_images_bin(path: Path) -> list[dict]:
+    """COLMAP images.bin -> [{id, qvec(wxyz), tvec, camera_id, name}] (2D points skipped)."""
+    out = []
+    with open(path, "rb") as fh:
+        (n,) = struct.unpack("<Q", fh.read(8))
+        for _ in range(n):
+            iid, qw, qx, qy, qz, tx, ty, tz, cid = struct.unpack("<I7dI", fh.read(64))
+            name = bytearray()
+            while (c := fh.read(1)) not in (b"\x00", b""):
+                name += c
+            (npts,) = struct.unpack("<Q", fh.read(8))
+            fh.seek(npts * 24, 1)
+            out.append({"id": iid, "qvec": (qw, qx, qy, qz), "tvec": (tx, ty, tz), "camera_id": cid,
+                        "name": name.decode()})
+    return out
+
+
+def _rotmat(q) -> list[list[float]]:
+    w, x, y, z = q
+    n = math.sqrt(w * w + x * x + y * y + z * z) or 1.0
+    w, x, y, z = w / n, x / n, y / n, z / n
+    return [[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]]
+
+
+def c2w_gl(qvec, tvec) -> list[list[float]]:
+    """COLMAP world->camera (OpenCV) → nerfstudio-style camera->world (OpenGL: x right, y up, z back)."""
+    r = _rotmat(qvec)
+    rt = [[r[j][i] for j in range(3)] for i in range(3)]                     # R^T = camera->world rotation
+    centre = [-sum(rt[i][k] * tvec[k] for k in range(3)) for i in range(3)]
+    return [[rt[i][0], -rt[i][1], -rt[i][2], centre[i]] for i in range(3)] + [[0.0, 0.0, 0.0, 1.0]]
+
+
+# ---------------------------------------------------------------------------- checks + publish
+
+def sfm_check(job_dir: Path) -> tuple[bool, str]:
+    """The run fails unless the main model registered MIN_REGISTERED_FRACTION of the extracted frames."""
+    data = workdir(job_dir) / "data"
+    images_bin = data / "sparse" / "0" / "images.bin"
+    extracted = sum(1 for p in (data / "images").rglob("*.jpg"))
+    if not images_bin.is_file():
+        return False, "[spirula_sfm] no model at sparse/0 — structure from motion failed."
+    with open(images_bin, "rb") as fh:
+        (registered,) = struct.unpack("<Q", fh.read(8))
+    frac = registered / extracted if extracted else 0.0
+    others = sorted(p.name for p in (data / "sparse").iterdir() if p.is_dir() and p.name != "0")
+    msg = (f"[spirula_sfm] registered {registered}/{extracted} fisheye images ({frac:.0%})"
+           + (f"; {len(others)} smaller disconnected model(s) ignored" if others else ""))
+    if frac < MIN_REGISTERED_FRACTION:
+        return False, msg + f" — below {MIN_REGISTERED_FRACTION:.0%}; the capture did not hold together."
+    return True, msg
+
+
+def latest_splat(job_dir: Path) -> Path | None:
+    plys = sorted((workdir(job_dir) / "train").glob("step-*.ckpt/splat.ply"),
+                  key=lambda p: int(re.sub(r"\D", "", p.parent.name) or 0))
+    return plys[-1] if plys else None
+
+
+def _copy_with_up_comment(src: Path, dst: Path) -> int:
+    """Copy a binary PLY, adding SplatLab's `Vertical Axis: z` comment; returns the vertex count."""
+    with open(src, "rb") as fin:
+        header = b""
+        while not header.endswith(b"end_header\n"):
+            line = fin.readline()
+            if not line:
+                raise ValueError(f"{src}: no end_header")
+            header += line
+        text = header.decode("ascii")
+        count = int(re.search(r"element vertex (\d+)", text).group(1))
+        if "Vertical Axis" not in text:
+            text = text.replace("\n", "\ncomment Vertical Axis: z\n", 1)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_suffix(".ply.tmp")
+        with open(tmp, "wb") as fout:
+            fout.write(text.encode("ascii"))
+            shutil.copyfileobj(fin, fout, 16 << 20)
+        os.replace(tmp, dst)
+    return count
+
+
+def publish(job_dir: Path, preview_ply: Path) -> dict:
+    """Spirula's splat → the job's preview + viewer cameras. Returns the receipt stored in meta["spirula"].
+
+    Spirula's SfM levels its model on the ground plane (gauge.txt `oriented 1 / up ground`): +Z up, floor
+    near z=0 — SplatLab's viewer frame already (measured on the storage room: floor plane z≈0, ceiling
+    plane z=1.34, every camera between). No rotation, so no SH rotation; a model NOT so oriented is refused
+    rather than shown sideways.
+    """
+    ws = workdir(job_dir)
+    sparse = ws / "data" / "sparse" / "0"
+    gauge = (sparse / "gauge.txt").read_text() if (sparse / "gauge.txt").is_file() else ""
+    if not re.search(r"^oriented\s+1", gauge, re.M) or not re.search(r"^up\s+ground", gauge, re.M):
+        raise ValueError(f"Spirula model is not ground-levelled (gauge.txt: {gauge.strip()!r}); refusing to "
+                         "publish a splat whose up axis is unknown.")
+    ply = latest_splat(job_dir)
+    if ply is None:
+        raise FileNotFoundError(f"no trained splat under {ws / 'train'}")
+    count = _copy_with_up_comment(ply, preview_ply)
+
+    images = read_images_bin(sparse / "images.bin")
+    frames = [{"file_path": f"images/{im['name']}", "transform_matrix": c2w_gl(im["qvec"], im["tvec"])}
+              for im in sorted(images, key=lambda i: i["name"])]
+    cams = ws / "cameras"
+    cams.mkdir(parents=True, exist_ok=True)
+    (cams / "transforms.json").write_text(json.dumps(
+        {"camera_model": "OPENCV_FISHEYE", "note": "Spirula SfM poses in the published splat's frame",
+         "frames": frames}))
+    # Identity: the cameras already live in the viewer frame (the /cameras route draws them solid).
+    (cams / "dataparser_transforms.json").write_text(json.dumps(
+        {"transform": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], "scale": 1.0}))
+    zs = sorted(f["transform_matrix"][2][3] for f in frames)
+    return {"splats": count, "source_ply": str(ply), "cameras": len(frames),
+            "camera_height_range": [round(zs[0], 4), round(zs[-1], 4)] if zs else None,
+            "gauge": gauge.strip().splitlines()[1:] if gauge else [], "binary": spirula_bin()}
+
+
+def settings_dict(s: LaneSettings) -> dict:
+    return asdict(s)

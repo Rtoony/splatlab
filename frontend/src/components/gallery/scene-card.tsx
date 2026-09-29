@@ -170,6 +170,13 @@ export function SceneCard({
             >
               <Wand2 className="h-3 w-3" /> Generated
             </span>
+          ) : job.trainer_resolved === "spirula" ? (
+            <span
+              title="Trained by Spirula from the raw 360 lenses (no stitch). View and explore with WASD; language field, mesh and walkable-world need a nerfstudio scene for now."
+              className="absolute left-1 top-1 flex items-center gap-1 rounded bg-emerald-400/20 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-200 backdrop-blur-sm"
+            >
+              <Camera className="h-3 w-3" /> Raw 360
+            </span>
           ) : job.capture_mode === "sparse" ? (
             <span
               title="Built from a few photos — camera poses + some geometry are AI-inferred, not measured."
@@ -211,9 +218,11 @@ export function SceneCard({
             size="sm"
             variant="outline"
             className="flex-1 border-cyan-300/40 text-cyan-200"
-            disabled={worldPrep || computeBlocked}
+            disabled={worldPrep || computeBlocked || job.checkpoint_available === false}
             onClick={startWorldPrep}
-            title="Build the walkable world right from here — mesh through scenario in one go; takes minutes, resumes after a failure"
+            title={job.checkpoint_available === false
+              ? "Needs a nerfstudio scene — not available yet for Raw 360 (Spirula) scenes. Open the scene and explore with WASD instead."
+              : "Build the walkable world right from here — mesh through scenario in one go; takes minutes, resumes after a failure"}
           >
             {worldPrep
               ? (<><Loader2 className="h-3.5 w-3.5 animate-spin" /> Preparing…</>)

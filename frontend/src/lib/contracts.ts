@@ -102,6 +102,19 @@ export interface SplatJob {
   // "generative-image" when built from a SINGLE image via TripoSplat ("Imagine a Splat")
   // — the whole object is generated; the card badges it "Generated".
   source_type?: "capture" | "generative-image";
+  // Trainer: "auto" (default) = the Spirula 360 lane for a raw dual-fisheye .insv, else splatfacto.
+  // trainer_resolved is what actually ran. Spirula scenes have no nerfstudio checkpoint, so
+  // checkpoint_available is false and langfield / mesh / isolate / walkable-world are unavailable.
+  trainer?: "auto" | "spirula" | "splatfacto";
+  trainer_resolved?: "spirula" | "splatfacto" | "triposplat";
+  checkpoint_available?: boolean;
+  spirula?: {
+    stride?: number;
+    instants?: number;
+    scale?: number;
+    quality?: string;
+    published?: { splats?: number; cameras?: number };
+  } | null;
   // Cheap per-scene stats for the gallery card (present once the scene is finished).
   stats?: {
     gaussians?: number;

@@ -361,9 +361,9 @@ export default function SplatViewPage() {
                       type="button"
                       variant="outline"
                       size="sm"
-                      disabled={worldPrep}
+                      disabled={worldPrep || job.checkpoint_available === false}
                       onClick={() => {
-                        if (worldPrep) return;
+                        if (worldPrep || job.checkpoint_available === false) return;
                         setWorldPrep(true);
                         pushToast("Preparing walkable world — heavy stages can take many minutes. Progress lives in Activity.", "info");
                         apiRequest(`/api/splat/jobs/${encodeURIComponent(job.job_id)}/world/prepare`, {
@@ -377,7 +377,9 @@ export default function SplatViewPage() {
                           pushToast(`World preparation failed: ${e instanceof Error ? e.message : String(e)}`, "error");
                         }).finally(() => setWorldPrep(false));
                       }}
-                      title="Run the whole ladder — mesh, inventory, isolate, ground, world, navmesh, affordances, scenario — in one go. Re-run resumes after a failure."
+                      title={job.checkpoint_available === false
+                        ? "Needs a nerfstudio scene — not available yet for Raw 360 (Spirula) scenes. Open the scene and explore with WASD instead."
+                        : "Run the whole ladder — mesh, inventory, isolate, ground, world, navmesh, affordances, scenario — in one go. Re-run resumes after a failure."}
                       className="border-cyan-300/40 text-cyan-200"
                     >
                       {worldPrep
