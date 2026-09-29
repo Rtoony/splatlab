@@ -252,7 +252,8 @@ def _copy_with_up_comment(src: Path, dst: Path) -> int:
         text = header.decode("ascii")
         count = int(re.search(r"element vertex (\d+)", text).group(1))
         if "Vertical Axis" not in text:
-            text = text.replace("\n", "\ncomment Vertical Axis: z\n", 1)
+            # After the `format` line: strict PLY readers require `format` to follow `ply` directly.
+            text = re.sub(r"(format [^\n]*\n)", r"\1comment Vertical Axis: z\n", text, count=1)
         dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = dst.with_suffix(".ply.tmp")
         with open(tmp, "wb") as fout:

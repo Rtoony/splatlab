@@ -219,6 +219,8 @@ def test_publish_writes_preview_and_viewer_cameras(tmp_path):
     raw = preview.read_bytes()
     head, _, data = raw.partition(b"end_header\n")
     assert b"comment Vertical Axis: z" in head and data == body and receipt["splats"] == 3
+    lines = head.decode().splitlines()
+    assert lines[:3] == ["ply", "format binary_little_endian 1.0", "comment Vertical Axis: z"]
     tf = json.loads((tmp_path / "_spirula" / "cameras" / "transforms.json").read_text())
     dp = json.loads((tmp_path / "_spirula" / "cameras" / "dataparser_transforms.json").read_text())
     assert len(tf["frames"]) == len(ims) == receipt["cameras"] and dp["scale"] == 1.0

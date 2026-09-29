@@ -3332,6 +3332,9 @@ async def _run_pipeline(job: SplatJob) -> None:
                 if return_code == 0 and stage == "spirula_sfm" and not job.stop_requested:
                     ok, msg = await asyncio.to_thread(spirula_lane.sfm_check, job_dir)
                     job.log_lines.append(msg)
+                    # Durable receipt: the job log keeps only its tail (MAX_LOG_LINES).
+                    _patch_meta(job.job_id, spirula={**((_read_meta(job.job_id) or {}).get("spirula") or {}),
+                                                     "sfm": msg.removeprefix("[spirula_sfm] ")})
                     if not ok:
                         final_status = "failed"
                         error_message = msg
