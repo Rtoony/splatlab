@@ -10,6 +10,8 @@ nerfstudio's own rather than re-implementations.
                               photos on disk (PSNR/SSIM/LPIPS, raw + colour-corrected)
   to-ns-frame PLY --dataparser-transforms F  move a PLY trained on transforms.json into the
                               nerfstudio viewer frame, SH0 (Spark comparison)
+  align / cross-render        score another SfM's model at SplatLab's held-out cameras
+  count   ARM_DIR             gaussian count of a trained arm
   summary SCENE_DIR           results table over every scored arm
   check-renders ARM_DIR       exit 0 iff every held-out photo has exactly one render
   sheet   OUT --mirror M --arms L=score.json..  photo | arm | arm contact sheet
@@ -28,6 +30,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "backend"))
+from bakeoff import cross  # noqa: E402
 from bakeoff import ply_frame  # noqa: E402
 from bakeoff import scoring  # noqa: E402
 from bakeoff import split as bsplit  # noqa: E402
@@ -62,7 +65,12 @@ def nerfstudio_eval_names(job: Path) -> list[str]:
 
 def cmd_split(args) -> int:
     job = job_dir(args.job)
-    names = nerfstudio_eval_names(job)
+    if args.rig_timestamps:
+        frames = json.loads((job / "processed" / "transforms.json").read_text())["frames"]
+        names = bsplit.rig_timestamp_eval_names([f["file_path"] for f in frames], args.rig_timestamps,
+                                                args.holdout_every)
+    else:
+        names = nerfstudio_eval_names(job)
     receipt = bsplit.build_mirror(job / "processed", names, Path(args.out))
     print(json.dumps({k: receipt[k] for k in ("source", "frames", "train", "eval")}, indent=2))
     print("first eval frames:", names[:3])
@@ -76,7 +84,7 @@ def load_split(mirror: Path) -> dict:
 def cmd_score(args) -> int:
     receipt = load_split(args.mirror)
     src = Path(receipt["source"])
-    photos = {n: scoring.load_rgb(src / n) for n in receipt["eval_names"]}
+    photos = {n: src / n for n in receipt["eval_names"]}   # paths: decoded one at a time
     pairs = scoring.ARM_LAYOUTS[args.layout](Path(args.renders))
     result = scoring.score(pairs, photos, scoring.Metrics(args.device))
     result.update({"layout": args.layout, "renders": str(Path(args.renders).resolve()),
@@ -96,7 +104,7 @@ def cmd_check_renders(args) -> int:
     another never; the runner re-evaluates from the full checkpoint until this passes."""
     receipt = load_split(args.mirror)
     src = Path(receipt["source"])
-    photos = {n: scoring.load_rgb(src / n) for n in receipt["eval_names"]}
+    photos = {n: src / n for n in receipt["eval_names"]}
     try:
         scoring.match_to_photos(scoring.ARM_LAYOUTS[args.layout](Path(args.renders)), photos)
     except ValueError as exc:
@@ -113,6 +121,11 @@ def cmd_to_ns_frame(args) -> int:
         r, t, s = np.eye(3), np.zeros(3), 1.0
     else:
         r, t, s = ply_frame.load_dataparser_transform(Path(args.dataparser_transforms))
+    if args.applied_transform_from:
+        # Spirula's nerfstudio parser UNDOES transforms.json's applied_transform: its splats are in the original
+        # COLMAP frame (measured 09-29: rendering them at transforms.json cameras = 10 dB; with it undone = 25+).
+        a = np.array(json.loads(Path(args.applied_transform_from).read_text())["applied_transform"], float)
+        r, t = r @ a[:3, :3], r @ a[:3, 3] + t
     xyz, f_dc, opacity, scale, rot = ply_frame.to_ns_frame(cols, r, t, s)
     n = write_splat_ply(Path(args.out), xyz, f_dc, opacity, scale, rot,
                         comment="trainer-bakeoff to-ns-frame SH0")
@@ -121,18 +134,25 @@ def cmd_to_ns_frame(args) -> int:
               "p1": np.percentile(xyz, 1, axis=0).round(4).tolist(),
               "p99": np.percentile(xyz, 99, axis=0).round(4).tolist(),
               "bbox": [lo.round(4).tolist(), hi.round(4).tolist()], "scale": s}
+    ok = True
     if args.reference:
+        # Overlap, not a bounding box: a box test passed a model rotated 90° about x (09-29). Two splat models of
+        # one scene in one frame put most gaussians within ~1% of the scene span of each other.
+        from scipy.spatial import cKDTree
         ref = ply_frame.read_vertex_ply(Path(args.reference))
         rxyz = np.stack([ref["x"], ref["y"], ref["z"]], axis=1)
-        rp1, rp99 = np.percentile(rxyz, 1, axis=0), np.percentile(rxyz, 99, axis=0)
-        span = rp99 - rp1
-        c = np.median(xyz, axis=0)
-        report["reference_p1_p99"] = [rp1.round(4).tolist(), rp99.round(4).tolist()]
-        report["median_inside_reference"] = bool(np.all((c >= rp1) & (c <= rp99)))
-        report["median_offset_over_span"] = (np.abs(c - np.median(rxyz, axis=0)) / span).round(4).tolist()
+        rng = np.random.default_rng(0)
+        a = xyz[rng.choice(len(xyz), min(50000, len(xyz)), replace=False)]
+        b = rxyz[rng.choice(len(rxyz), min(50000, len(rxyz)), replace=False)]
+        span = float(np.linalg.norm(np.percentile(rxyz, 99, 0) - np.percentile(rxyz, 1, 0)))
+        d = cKDTree(b).query(a)[0] / span
+        report["nn_to_reference_over_span"] = {"median": round(float(np.median(d)), 5),
+                                               "p75": round(float(np.percentile(d, 75)), 5)}
+        ok = report["nn_to_reference_over_span"]["median"] < args.max_nn
+        report["frame_check"] = "pass" if ok else "FAIL"
     print(json.dumps(report, indent=2))
-    if args.reference and not report["median_inside_reference"]:
-        print("FRAME CHECK FAILED: median splat is outside the reference's 1-99% box", file=sys.stderr)
+    if not ok:
+        print(f"FRAME CHECK FAILED: median NN distance to the reference > {args.max_nn} of its span", file=sys.stderr)
         return 3
     return 0
 
@@ -161,7 +181,7 @@ def cmd_sheet(args) -> int:
             r = next(v for v in res["per_view"] if v["photo"] == name)
             pairs = scoring.ARM_LAYOUTS[res["layout"]](Path(res["renders"]))
             pair = next(p for p in pairs if p.key == r["arm_key"])
-            row.append((f"{label}  {r['psnr']:.2f} dB  LPIPS {r['lpips']:.3f}", pair.pred))
+            row.append((f"{label}  {r['psnr']:.2f} dB  LPIPS {r['lpips']:.3f}", pair.load_pred()))
         tiles.append(row)
     h0, w0 = tiles[0][0][1].shape[:2]
     tile_h = int(round(tile_w * h0 / w0))
@@ -174,6 +194,103 @@ def cmd_sheet(args) -> int:
             draw.text((j * tile_w + 6, i * (tile_h + 22) + 5), label, fill="black")
     sheet.save(args.out)
     print(f"{args.out}: {len(tiles)} views x {len(tiles[0])} columns: {picks}")
+    return 0
+
+
+def _instant_of_rig_frame(rel: str, timestamps: int) -> int:
+    import re
+    return (int(re.fullmatch(r"frame_(\d+)", Path(rel).stem).group(1)) - 1) % timestamps
+
+
+def cmd_align(args) -> int:
+    """Sim(3) SplatLab transforms.json frame → another SfM's COLMAP frame, from centres paired by instant."""
+    from nerfstudio.data.utils import colmap_parsing_utils as cpu
+    import re
+    sparse = Path(args.colmap)
+    images = (cpu.read_images_binary(sparse / "images.bin") if (sparse / "images.bin").is_file()
+              else cpu.read_images_text(sparse / "images.txt"))
+    theirs: dict[int, list] = {}
+    for im in images.values():
+        m = re.match(r"(\d+)", Path(im.name).stem)
+        if m and int(m.group(1)) % args.stride == 0:
+            theirs.setdefault(int(m.group(1)) // args.stride, []).append(cross.colmap_centre(im.qvec, im.tvec))
+    frames = json.loads(Path(args.transforms).read_text())["frames"]
+    ours: dict[int, np.ndarray] = {}
+    for f in frames:
+        ours.setdefault(_instant_of_rig_frame(f["file_path"], args.rig_timestamps), np.array(f["transform_matrix"])[:3, 3])
+    common = sorted(set(theirs) & set(ours))
+    src = np.stack([ours[i] for i in common])
+    dst = np.stack([np.mean(theirs[i], axis=0) for i in common])
+    s, r, t = cross.umeyama(src, dst)
+    rep = cross.align_report(src, dst, s, r, t)
+    rep.update({"from": "splatlab transforms.json frame", "to": str(sparse), "s": s, "R": r.tolist(), "t": t.tolist(),
+                "instants_theirs": len(theirs), "instants_ours": len(ours),
+                "lens_spread_median": float(np.median([np.linalg.norm(np.ptp(np.stack(v), 0)) for v in theirs.values() if len(v) > 1] or [0]))})
+    Path(args.out).write_text(json.dumps(rep, indent=1))
+    print(json.dumps({k: rep[k] for k in ("pairs", "scale", "rmse", "p95", "extent", "rmse_over_extent",
+                                          "instants_theirs", "lens_spread_median")}, indent=1))
+    if rep["rmse_over_extent"] > args.max_rel_rmse:
+        print(f"ALIGN FAILED: rmse/extent {rep['rmse_over_extent']:.4f} > {args.max_rel_rmse}", file=sys.stderr)
+        return 3
+    return 0
+
+
+def _scene_transform(path: str | None):
+    if not path:
+        return 1.0, np.eye(3), np.zeros(3)
+    d = json.loads(Path(path).read_text())["train_from_world"]
+    return float(d["scale"]), np.array(d["rotation"]["matrix_3x3"], float), np.array(d["translation"], float)
+
+
+def cmd_cross_render(args) -> int:
+    """Render a 3DGS PLY (its own frame) at the mirror's held-out cameras; write Spirula-layout
+    eval-gt/eval-render PNG pairs so `score` / `check-renders` apply unchanged."""
+    import torch
+    from gsplat import rasterization
+    from PIL import Image
+    receipt = load_split(args.mirror)
+    src = Path(receipt["source"])
+    meta = json.loads((src / "transforms.json").read_text())
+    by_path = {f["file_path"]: f for f in meta["frames"]}
+    if args.align:
+        al = json.loads(Path(args.align).read_text())
+        s, r, t = float(al["s"]), np.array(al["R"]), np.array(al["t"])
+    else:
+        s, r, t = 1.0, np.eye(3), np.zeros(3)
+    if args.colmap_frame:   # model trained on this dataset by Spirula: it lives in the ORIGINAL COLMAP frame
+        a = np.array(meta["applied_transform"], float)
+        r = a[:3, :3].T @ r
+        t = a[:3, :3].T @ (t - a[:3, 3])
+    s2, r2, t2 = _scene_transform(args.scene_transform)          # their world → their training frame
+    s, r, t = s2 * s, r2 @ r, s2 * r2 @ t + t2
+    cols = ply_frame.read_vertex_ply(Path(args.ply))
+    dev = "cuda"
+    f32 = lambda a: torch.tensor(np.asarray(a), dtype=torch.float32, device=dev)  # noqa: E731
+    means = f32(np.stack([cols["x"], cols["y"], cols["z"]], 1))
+    quats = f32(np.stack([cols[f"rot_{i}"] for i in range(4)], 1))
+    scales = torch.exp(f32(np.stack([cols[f"scale_{i}"] for i in range(3)], 1)))
+    opac = torch.sigmoid(f32(cols["opacity"]))
+    dc = np.stack([cols[f"f_dc_{i}"] for i in range(3)], 1)[:, None, :]
+    n_rest = sum(1 for k in cols if k.startswith("f_rest_"))
+    rest = np.stack([cols[f"f_rest_{i}"] for i in range(n_rest)], 1).reshape(len(dc), 3, n_rest // 3).transpose(0, 2, 1)
+    sh = f32(np.concatenate([dc, rest], 1))
+    deg = int(round(np.sqrt(sh.shape[1]))) - 1
+    out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
+    for i, name in enumerate(receipt["eval_names"]):
+        f = by_path[name]
+        w, h = int(f.get("w", meta.get("w"))), int(f.get("h", meta.get("h")))
+        k = np.array([[f.get("fl_x", meta.get("fl_x")), 0, f.get("cx", meta.get("cx"))],
+                      [0, f.get("fl_y", meta.get("fl_y")), f.get("cy", meta.get("cy"))], [0, 0, 1]], float)
+        view = cross.c2w_gl_to_viewmat(np.array(f["transform_matrix"]), s, r, t)
+        with torch.no_grad():
+            img, _, _ = rasterization(means, quats, scales, opac, sh, f32(view)[None], f32(k)[None], w, h,
+                                      sh_degree=deg, rasterize_mode=args.mode)   # black background
+        arr = (img[0].clamp(0, 1).cpu().numpy() * 255).round().astype(np.uint8)
+        Image.fromarray(arr).save(out / f"eval-render-{i:05d}.png")
+        with Image.open(src / name) as ph:
+            ph.convert("RGB").save(out / f"eval-gt-{i:05d}.png")
+    print(f"{out}: {len(receipt['eval_names'])} views rendered (sh_degree {deg}, {args.mode}, "
+          f"{len(dc)} gaussians, camera map scale {s:.4f})")
     return 0
 
 
@@ -218,6 +335,9 @@ def main() -> int:
     p = sub.add_parser("split")
     p.add_argument("job")
     p.add_argument("out")
+    p.add_argument("--rig-timestamps", type=int, default=0,
+                   help="rig job: hold out whole timestamps instead of nerfstudio's split (value = timestamps per camera)")
+    p.add_argument("--holdout-every", type=int, default=8)
     p.set_defaults(fn=cmd_split)
     p = sub.add_parser("score")
     p.add_argument("renders", help="directory holding the arm's held-out renders")
@@ -237,7 +357,31 @@ def main() -> int:
                    help="the job's dataparser_transforms.json, or `identity` to only strip to SH0")
     p.add_argument("--out", required=True)
     p.add_argument("--reference", help="the job's own ns-export splat.ply, for the frame check")
+    p.add_argument("--applied-transform-from", help="transforms.json whose applied_transform to apply first "
+                   "(a PLY in the original COLMAP frame, e.g. Spirula trained on the mirror)")
+    p.add_argument("--max-nn", type=float, default=0.01)
     p.set_defaults(fn=cmd_to_ns_frame)
+    p = sub.add_parser("align")
+    p.add_argument("--colmap", required=True, help="the other SfM's sparse model dir")
+    p.add_argument("--transforms", required=True, help="SplatLab rig job transforms.json")
+    p.add_argument("--rig-timestamps", type=int, default=410)
+    p.add_argument("--stride", type=int, default=9, help="source frames per instant in the other model's names")
+    p.add_argument("--max-rel-rmse", type=float, default=0.02)
+    p.add_argument("--out", required=True)
+    p.set_defaults(fn=cmd_align)
+    p = sub.add_parser("cross-render")
+    p.add_argument("--ply", required=True)
+    p.add_argument("--mirror", required=True)
+    p.add_argument("--align", help="align.json (omit = same frame)")
+    p.add_argument("--scene-transform", help="the trainer's scene_transform.json, if not identity")
+    p.add_argument("--colmap-frame", action="store_true",
+                   help="the PLY was trained by Spirula on this same transforms.json (undo applied_transform)")
+    p.add_argument("--mode", default="classic", choices=["classic", "antialiased"])
+    p.add_argument("--out", required=True)
+    p.set_defaults(fn=cmd_cross_render)
+    p = sub.add_parser("count")
+    p.add_argument("arm_dir")
+    p.set_defaults(fn=lambda a: print(gaussian_count(Path(a.arm_dir))) or 0)
     p = sub.add_parser("summary")
     p.add_argument("scene_dir")
     p.set_defaults(fn=cmd_summary)

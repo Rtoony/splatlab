@@ -94,3 +94,21 @@ def build_mirror(processed: Path, eval_names: list[str], out: Path) -> dict:
     }
     (out / "split-receipt.json").write_text(json.dumps(receipt, indent=2))
     return receipt
+
+
+def rig_timestamp_eval_names(frame_paths: list[str], timestamps: int, every: int, offset: int = 0) -> list[str]:
+    """Held-out names for a SplatLab rig job: `frame_NNNNN` is virtual view
+    (N-1) // timestamps at timestamp (N-1) % timestamps, and every view of one
+    timestamp shares one camera centre. Holding out single views would leave
+    their siblings (same instant, overlapping content) in training, so whole
+    timestamps are held out: every `every`-th one, all its views together."""
+    import re
+    out = []
+    for rel in frame_paths:
+        m = re.fullmatch(r"frame_(\d+)", Path(rel).stem)
+        if not m:
+            raise ValueError(f"{rel}: not a rig frame_NNNNN name")
+        t = (int(m.group(1)) - 1) % timestamps
+        if t % every == offset:
+            out.append(rel)
+    return out

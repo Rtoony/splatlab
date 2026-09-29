@@ -34,8 +34,14 @@ MATCH_MEAN_ABS = 3.0 / 255  # full-res mean |diff| a GT must stay under to be "t
 @dataclass
 class Pair:
     key: str                 # the arm's own id for the view (file stem)
-    gt: np.ndarray           # the arm's GT, HxWx3 float32 in [0,1]
-    pred: np.ndarray         # the arm's render, HxWx3 float32 in [0,1]
+    gt: object               # the arm's GT: HxWx3 float32 array, or a zero-arg loader returning one
+    pred: object             # the arm's render: same
+
+    def load_gt(self) -> np.ndarray:
+        return self.gt() if callable(self.gt) else self.gt
+
+    def load_pred(self) -> np.ndarray:
+        return self.pred() if callable(self.pred) else self.pred
 
 
 def load_rgb(path: Path) -> np.ndarray:
@@ -44,15 +50,20 @@ def load_rgb(path: Path) -> np.ndarray:
         return np.asarray(im.convert("RGB"), dtype=np.float32) / 255.0
 
 
-def pairs_nerfstudio(render_dir: Path) -> list[Pair]:
-    out = []
-    for p in sorted(Path(render_dir).glob("eval_img_*.png")):
-        img = load_rgb(p)
+def _half(path: Path, right: bool):
+    def load():
+        img = load_rgb(path)
         w = img.shape[1]
         if w % 2:
-            raise ValueError(f"{p}: odd width {w}; not a GT|render concatenation")
-        out.append(Pair(p.stem, img[:, : w // 2], img[:, w // 2:]))
-    return out
+            raise ValueError(f"{path}: odd width {w}; not a GT|render concatenation")
+        return img[:, w // 2:] if right else img[:, : w // 2]
+    return load
+
+
+def pairs_nerfstudio(render_dir: Path) -> list[Pair]:
+    """Lazy: nothing is decoded until a pair's image is asked for (612-view rig sets)."""
+    return [Pair(p.stem, _half(p, False), _half(p, True))
+            for p in sorted(Path(render_dir).glob("eval_img_*.png"))]
 
 
 def pairs_spirula(render_dir: Path) -> list[Pair]:
@@ -62,11 +73,25 @@ def pairs_spirula(render_dir: Path) -> list[Pair]:
         pred_path = gt_path.with_name(f"eval-render-{idx}.png")
         if not pred_path.is_file():
             raise FileNotFoundError(pred_path)
-        out.append(Pair(gt_path.stem, load_rgb(gt_path), load_rgb(pred_path)))
+        out.append(Pair(gt_path.stem, lambda g=gt_path: load_rgb(g), lambda r=pred_path: load_rgb(r)))
     return out
 
 
 ARM_LAYOUTS = {"nerfstudio": pairs_nerfstudio, "spirula": pairs_spirula}
+
+
+def _photo(photos: dict, name: str) -> np.ndarray:
+    v = photos[name]
+    return load_rgb(v) if isinstance(v, (str, Path)) else v
+
+
+def _photo_shape(photos: dict, name: str) -> tuple:
+    v = photos[name]
+    if isinstance(v, (str, Path)):
+        from PIL import Image
+        with Image.open(v) as im:
+            return (im.size[1], im.size[0], 3)
+    return v.shape
 
 
 def fingerprint(img: np.ndarray, side: int = FINGERPRINT) -> np.ndarray:
@@ -78,21 +103,21 @@ def fingerprint(img: np.ndarray, side: int = FINGERPRINT) -> np.ndarray:
                       for j in range(side)] for i in range(side)], dtype=np.float32)
 
 
-def match_to_photos(pairs: list[Pair], photos: dict[str, np.ndarray]) -> dict[str, tuple[Pair, float]]:
-    """name -> (pair, full-res mean |GT - photo|). Raises on any ambiguity."""
+def match_to_photos(pairs: list[Pair], photos: dict) -> dict[str, tuple[Pair, float]]:
+    """name -> (pair, full-res mean |GT - photo|). Raises on any ambiguity.
+    `photos` values are arrays or paths; only fingerprints stay in memory."""
     names = list(photos)
-    prints = np.stack([fingerprint(photos[n]) for n in names])
+    shapes = [_photo_shape(photos, n) for n in names]
+    prints = np.stack([fingerprint(_photo(photos, n)) for n in names])
     matched: dict[str, tuple[Pair, float]] = {}
-    shapes = {photos[n].shape for n in names}
     for pair in pairs:
-        if pair.gt.shape not in shapes or pair.pred.shape != pair.gt.shape:
-            raise ValueError(f"{pair.key}: size gt {pair.gt.shape} / render {pair.pred.shape} "
-                             f"vs photo sizes {sorted(shapes)}")
-        d = np.abs(prints - fingerprint(pair.gt)[None]).mean(axis=(1, 2, 3))
-        d[[photos[n].shape != pair.gt.shape for n in names]] = np.inf
+        gt = pair.load_gt()
+        if gt.shape not in shapes:
+            raise ValueError(f"{pair.key}: size gt {gt.shape} vs photo sizes {sorted(set(shapes))}")
+        d = np.abs(prints - fingerprint(gt)[None]).mean(axis=(1, 2, 3))
+        d[[s != gt.shape for s in shapes]] = np.inf
         name = names[int(np.argmin(d))]
-        photo = photos[name]
-        err = float(np.abs(photo - pair.gt).mean())
+        err = float(np.abs(_photo(photos, name) - gt).mean())
         if err > MATCH_MEAN_ABS:
             raise ValueError(f"{pair.key}: nearest photo {name} differs by {err * 255:.2f}/255 mean; "
                              "this render's GT is not one of the held-out photos")
@@ -147,7 +172,10 @@ def score(pairs: list[Pair], photos: dict[str, np.ndarray], metrics) -> dict:
     for name in sorted(matched):
         pair, err = matched[name]
         row = {"photo": name, "arm_key": pair.key, "gt_match_mean_abs_255": round(err * 255, 3)}
-        row.update(metrics(photos[name], pair.pred))
+        pred = pair.load_pred()
+        if pred.shape != _photo_shape(photos, name):
+            raise ValueError(f"{pair.key}: render size {pred.shape} vs photo {name}")
+        row.update(metrics(_photo(photos, name), pred))
         per_view.append(row)
     keys = [k for k in per_view[0] if k not in ("photo", "arm_key", "gt_match_mean_abs_255")]
     mean = {k: float(np.mean([r[k] for r in per_view])) for k in keys}

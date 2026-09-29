@@ -58,6 +58,16 @@ def test_mirror_flattens_subfolders_without_collisions(tmp_path):
     assert got == ["eval_pano_camera1__f_0001.jpg", "train_pano_camera0__f_0001.jpg"]
 
 
+def test_rig_split_keeps_every_timestamp_whole():
+    t, cams = 10, 12
+    names = [f"images/frame_{n:05d}.jpg" for n in range(1, t * cams + 1)]
+    ev = split.rig_timestamp_eval_names(names, timestamps=t, every=4)
+    stamps = {(int(n[-9:-4]) - 1) % t for n in ev}
+    assert stamps == {0, 4, 8} and len(ev) == 3 * cams      # all 12 views of each held-out instant
+    with pytest.raises(ValueError, match="rig frame"):
+        split.rig_timestamp_eval_names(["images/DSC1.jpg"], timestamps=t, every=4)
+
+
 @pytest.mark.parametrize("bad", ["images/retrain_01.jpg", "images/Evaluation.jpg"])
 def test_mirror_refuses_names_filename_mode_would_misread(tmp_path, bad):
     proc = _dataset(tmp_path, ["images/a.jpg", bad])
@@ -130,8 +140,22 @@ def test_layout_readers(tmp_path):
     (ns,) = scoring.pairs_nerfstudio(tmp_path)
     (sp,) = scoring.pairs_spirula(tmp_path)
     for p in (ns, sp):
-        assert np.array_equal((p.gt * 255).round().astype(np.uint8), gt)
-        assert np.array_equal((p.pred * 255).round().astype(np.uint8), pr)
+        assert np.array_equal((p.load_gt() * 255).round().astype(np.uint8), gt)
+        assert np.array_equal((p.load_pred() * 255).round().astype(np.uint8), pr)
+
+
+def test_scorer_accepts_photo_paths_lazily(tmp_path):
+    from PIL import Image
+    photos = _photos(n=3)
+    paths = {}
+    for n, img in photos.items():
+        q = tmp_path / Path(n).name.replace(".jpg", ".png")
+        Image.fromarray((img * 255).round().astype(np.uint8)).save(q)
+        paths[n] = q
+    pairs = [scoring.Pair(n, (lambda q=paths[n]: scoring.load_rgb(q)), (lambda q=paths[n]: scoring.load_rgb(q)))
+             for n in photos]
+    res = scoring.score(pairs, paths, lambda gt, pred: {"mae": float(np.abs(gt - pred).mean())})
+    assert res["views"] == 3 and res["mean"]["mae"] == 0.0
 
 
 # ---------- frame move ----------
@@ -183,3 +207,42 @@ def test_dataparser_transform_must_be_a_rotation(tmp_path):
                                                   "scale": 1.0}))
     with pytest.raises(ValueError, match="proper rotation"):
         ply_frame.load_dataparser_transform(tmp_path / "dp.json")
+
+
+# ---------- cross-pipeline scoring ----------
+
+from bakeoff import cross  # noqa: E402
+
+
+def test_umeyama_recovers_a_similarity():
+    r, t, s = _rot([1, -0.3, 0.5], 140), np.array([3.0, -1.0, 0.25]), 1.3567
+    src = RNG.normal(size=(40, 3))
+    dst = s * src @ r.T + t + RNG.normal(scale=1e-4, size=(40, 3))
+    s2, r2, t2 = cross.umeyama(src, dst)
+    assert s2 == pytest.approx(s, rel=1e-4) and np.allclose(r2, r, atol=1e-4) and np.allclose(t2, t, atol=1e-3)
+    rep = cross.align_report(src, dst, s2, r2, t2)
+    assert rep["rmse"] < 1e-3 and rep["pairs"] == 40
+
+
+def _project(view, k, x):
+    xc = view[:3, :3] @ x + view[:3, 3]
+    return (k @ xc)[:2] / xc[2], xc[2]
+
+
+def test_moved_camera_sees_moved_points_at_the_same_pixels():
+    k = np.array([[720.0, 0, 720], [0, 720, 720], [0, 0, 1]])
+    c2w = np.eye(4); c2w[:3, :3] = _rot([0, 1, 0], 30); c2w[:3, 3] = [0.5, 0.2, 2.0]
+    pts = (c2w[:3, :3] @ np.array([[0.1, -0.2, -3.0], [-0.4, 0.3, -1.5]]).T).T + c2w[:3, 3]  # in front (GL -z)
+    r, t, s = _rot([0.2, 0.7, -1], 65), np.array([-2.0, 4.0, 1.0]), 0.37
+    v_f = cross.c2w_gl_to_viewmat(c2w)
+    v_g = cross.c2w_gl_to_viewmat(c2w, s, r, t)
+    for p in pts:
+        (uv_f, z_f), (uv_g, z_g) = _project(v_f, k, p), _project(v_g, k, s * r @ p + t)
+        assert z_f > 0 and np.allclose(uv_f, uv_g, atol=1e-8) and z_g == pytest.approx(s * z_f)
+
+
+def test_colmap_centre():
+    r = _rot([0, 0, 1], 90)
+    q = ply_frame.quat_from_matrix(r)
+    c = np.array([1.0, 2.0, 3.0])
+    assert np.allclose(cross.colmap_centre(q, -r @ c), c)
