@@ -1929,6 +1929,51 @@
         "no-code-found",
         "realsee-dataset-dependency"
       ]
+    },
+    {
+      "id": "spirula-studio",
+      "title": "Spirula Studio (formerly spirulae-splat)",
+      "kind": "cross-platform-trainer",
+      "source_url": "https://radiancefields.com/platforms/spirula-studio",
+      "repository_url": "https://github.com/harry7557558/spirula-studio",
+      "license": {
+        "spdx": "GPL-3.0",
+        "commercial_use": true,
+        "verified": true
+      },
+      "code_status": "available",
+      "maturity": "active-experimental-tool",
+      "relevance": "high",
+      "decision": "evaluate",
+      "integration_mode": "isolated-research",
+      "priority": "P1",
+      "techniques": [
+        "single-binary-C++-Vulkan-trainer-no-python",
+        "MCMC-IGS+-MRNF-densification",
+        "PPISP-and-bilateral-grid-per-photo-colour-correction",
+        "native-SfM-with-rig-constraints-and-insv-input",
+        "IMU-GPS-telemetry-metric-scale"
+      ],
+      "incorporation": {
+        "implemented": [
+          "trainer-bake-off-on-splatlab-datasets-2026-09-29 (tools/trainer-bakeoff.py; binary outside the repo at ~/tools/spirula)"
+        ],
+        "next": [
+          "decide-from-held-out-scores-whether-an-alternate-worker-lane-is-worth-building",
+          "end-to-end-raw-insv-SfM-vs-rig-lane-only-if-the-trainer-wins"
+        ]
+      },
+      "gates": [
+        "quality-parity-on-identical-poses-and-held-out-photos",
+        "viewer-fidelity-in-Spark",
+        "runtime-and-memory",
+        "deterministic-headless-operation"
+      ],
+      "risks": [
+        "GPL-3.0-binary-may-only-run-as-a-subprocess-never-vendored",
+        "v2026.9.24-eval-writer-race-writes-duplicate-and-missing-held-out-views",
+        "one-main-author-and-weekly-releases"
+      ]
     }
   ]
 }
