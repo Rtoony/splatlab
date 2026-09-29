@@ -103,9 +103,12 @@ def fingerprint(img: np.ndarray, side: int = FINGERPRINT) -> np.ndarray:
                       for j in range(side)] for i in range(side)], dtype=np.float32)
 
 
-def match_to_photos(pairs: list[Pair], photos: dict) -> dict[str, tuple[Pair, float]]:
+def match_to_photos(pairs: list[Pair], photos: dict, allow_missing: bool = False) -> dict[str, tuple[Pair, float]]:
     """name -> (pair, full-res mean |GT - photo|). Raises on any ambiguity.
-    `photos` values are arrays or paths; only fingerprints stay in memory."""
+    `photos` values are arrays or paths; only fingerprints stay in memory.
+    allow_missing (long runs only, where a retrain costs hours): a render that duplicates an already-matched
+    photo PIXEL-FOR-PIXEL is dropped and unrendered photos are allowed; the caller must compare arms on the
+    common photo set (summary does). Any other ambiguity still raises."""
     names = list(photos)
     shapes = [_photo_shape(photos, n) for n in names]
     prints = np.stack([fingerprint(_photo(photos, n)) for n in names])
@@ -122,10 +125,12 @@ def match_to_photos(pairs: list[Pair], photos: dict) -> dict[str, tuple[Pair, fl
             raise ValueError(f"{pair.key}: nearest photo {name} differs by {err * 255:.2f}/255 mean; "
                              "this render's GT is not one of the held-out photos")
         if name in matched:
+            if allow_missing and np.array_equal(pair.load_pred(), matched[name][0].load_pred()):
+                continue                               # Spirula's eval-writer race: an exact duplicate view
             raise ValueError(f"{pair.key} and {matched[name][0].key} both match photo {name}")
         matched[name] = (pair, err)
     unrendered = sorted(set(names) - set(matched))
-    if unrendered:
+    if unrendered and not allow_missing:
         raise ValueError(f"{len(unrendered)} held-out photos have no render, e.g. {unrendered[:3]}")
     return matched
 
@@ -166,8 +171,8 @@ class Metrics:
             return out
 
 
-def score(pairs: list[Pair], photos: dict[str, np.ndarray], metrics) -> dict:
-    matched = match_to_photos(pairs, photos)
+def score(pairs: list[Pair], photos: dict[str, np.ndarray], metrics, allow_missing: bool = False) -> dict:
+    matched = match_to_photos(pairs, photos, allow_missing)
     per_view = []
     for name in sorted(matched):
         pair, err = matched[name]
@@ -181,5 +186,6 @@ def score(pairs: list[Pair], photos: dict[str, np.ndarray], metrics) -> dict:
     mean = {k: float(np.mean([r[k] for r in per_view])) for k in keys}
     std = {k: float(np.std([r[k] for r in per_view])) for k in keys}
     return {"v": 1, "views": len(per_view), "mean": mean, "std": std,
+            "missing_photos": sorted(set(photos) - set(matched)),
             "max_gt_match_mean_abs_255": max(r["gt_match_mean_abs_255"] for r in per_view),
             "per_view": per_view}

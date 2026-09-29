@@ -11,6 +11,7 @@ nerfstudio's own rather than re-implementations.
   to-ns-frame PLY --dataparser-transforms F  move a PLY trained on transforms.json into the
                               nerfstudio viewer frame, SH0 (Spark comparison)
   align / cross-render        score another SfM's model at SplatLab's held-out cameras
+  xdataset                    their train images + SplatLab's held-out cameras, for their own renderer
   count   ARM_DIR             gaussian count of a trained arm
   summary SCENE_DIR           results table over every scored arm
   check-renders ARM_DIR       exit 0 iff every held-out photo has exactly one render
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -86,7 +88,7 @@ def cmd_score(args) -> int:
     src = Path(receipt["source"])
     photos = {n: src / n for n in receipt["eval_names"]}   # paths: decoded one at a time
     pairs = scoring.ARM_LAYOUTS[args.layout](Path(args.renders))
-    result = scoring.score(pairs, photos, scoring.Metrics(args.device))
+    result = scoring.score(pairs, photos, scoring.Metrics(args.device), allow_missing=args.allow_missing)
     result.update({"layout": args.layout, "renders": str(Path(args.renders).resolve()),
                    "mirror": str(Path(args.mirror).resolve())})
     out = Path(args.out)
@@ -121,11 +123,10 @@ def cmd_to_ns_frame(args) -> int:
         r, t, s = np.eye(3), np.zeros(3), 1.0
     else:
         r, t, s = ply_frame.load_dataparser_transform(Path(args.dataparser_transforms))
-    if args.applied_transform_from:
-        # Spirula's nerfstudio parser UNDOES transforms.json's applied_transform: its splats are in the original
-        # COLMAP frame (measured 09-29: rendering them at transforms.json cameras = 10 dB; with it undone = 25+).
-        a = np.array(json.loads(Path(args.applied_transform_from).read_text())["applied_transform"], float)
-        r, t = r @ a[:3, :3], r @ a[:3, 3] + t
+    # No applied_transform step: nerfstudio's saved dataparser transform already INCLUDES it (it maps the original
+    # COLMAP frame to the viewer frame), and Spirula trained on transforms.json keeps its splats in that original
+    # COLMAP frame — so the dataparser transform alone is exact (09-29: NN overlap with the arm's own ns-export
+    # 0.03 % of the span; applying applied_transform on top = 2.7 %, FAIL).
     xyz, f_dc, opacity, scale, rot = ply_frame.to_ns_frame(cols, r, t, s)
     n = write_splat_ply(Path(args.out), xyz, f_dc, opacity, scale, rot,
                         comment="trainer-bakeoff to-ns-frame SH0")
@@ -257,7 +258,7 @@ def cmd_cross_render(args) -> int:
         s, r, t = float(al["s"]), np.array(al["R"]), np.array(al["t"])
     else:
         s, r, t = 1.0, np.eye(3), np.zeros(3)
-    if args.colmap_frame:   # model trained on this dataset by Spirula: it lives in the ORIGINAL COLMAP frame
+    if args.colmap_frame:   # Spirula trained on this transforms.json keeps its splats in the ORIGINAL COLMAP frame
         a = np.array(meta["applied_transform"], float)
         r = a[:3, :3].T @ r
         t = a[:3, :3].T @ (t - a[:3, 3])
@@ -294,6 +295,80 @@ def cmd_cross_render(args) -> int:
     return 0
 
 
+def cmd_xdataset(args) -> int:
+    """COLMAP dataset = another SfM's TRAIN images (e.g. Spirula on the raw .insv) + SplatLab's held-out views
+    placed in that SfM's frame (via `align`), named *_eval. Spirula then renders SplatLab's own held-out cameras
+    with its OWN renderer, so the model can be scored against the exact photos splatfacto is scored on (a gsplat
+    replica of Spirula's renderer measured 2-5 dB off on 09-29, so it is not used for scores)."""
+    import re
+    from nerfstudio.data.utils import colmap_parsing_utils as cpu
+    sparse, img_root = Path(args.colmap), Path(args.images)
+    mask_root = Path(args.masks) if args.masks else None
+    out = Path(args.out)
+    (out / "sparse" / "0").mkdir(parents=True, exist_ok=True)
+    cams = cpu.read_cameras_binary(sparse / "cameras.bin")
+    ims = cpu.read_images_binary(sparse / "images.bin")
+    pts = cpu.read_points3D_binary(sparse / "points3D.bin")
+    al = json.loads(Path(args.align).read_text())
+    s_, r_, t_ = float(al["s"]), np.array(al["R"]), np.array(al["t"])
+    receipt = load_split(args.mirror)
+    src = Path(receipt["source"])
+    meta = json.loads((src / "transforms.json").read_text())
+    by_path = {f["file_path"]: f for f in meta["frames"]}
+
+    def link(dst: Path, target: Path):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.is_symlink() or dst.exists():
+            dst.unlink()
+        os.symlink(target, dst)
+
+    cam_lines, img_lines = [], []
+    k = args.camera_scale   # same poses, images k× the SfM's resolution: fx fy cx cy scale, fisheye k1..k4 do not
+    for cid, c in sorted(cams.items()):
+        if k != 1 and c.model not in ("OPENCV_FISHEYE", "OPENCV", "PINHOLE"):
+            raise SystemExit(f"--camera-scale: camera model {c.model} not handled")
+        params = [float(x) * (k if i < 4 else 1) for i, x in enumerate(c.params)]
+        cam_lines.append(f"{cid} {c.model} {round(c.width * k)} {round(c.height * k)} " + " ".join(repr(x) for x in params))
+    kept = 0
+    for iid, im in sorted(ims.items()):
+        if "_train" not in Path(im.name).stem:
+            continue                                   # their held-out / guard frames never train
+        link(out / "images" / im.name, img_root / im.name)
+        if mask_root is not None:
+            m = mask_root / Path(im.name).with_suffix(".png")
+            if m.is_file():
+                link(out / "masks" / Path(im.name).with_suffix(".png"), m)
+        img_lines += [f"{iid} " + " ".join(repr(float(x)) for x in im.qvec) + " "
+                      + " ".join(repr(float(x)) for x in im.tvec) + f" {im.camera_id} {im.name}", ""]
+        kept += 1
+    next_cam, next_img = max(cams) + 1, max(ims) + 1
+    pin_cams: dict[tuple, int] = {}
+    for name in receipt["eval_names"]:
+        f = by_path[name]
+        g = lambda k: f.get(k, meta.get(k))  # noqa: E731
+        key = (int(g("w")), int(g("h")), float(g("fl_x")), float(g("fl_y")), float(g("cx")), float(g("cy")))
+        if key not in pin_cams:
+            pin_cams[key] = next_cam
+            cam_lines.append(f"{next_cam} PINHOLE {key[0]} {key[1]} {key[2]!r} {key[3]!r} {key[4]!r} {key[5]!r}")
+            next_cam += 1
+        view = cross.c2w_gl_to_viewmat(np.array(f["transform_matrix"]), s_, r_, t_)   # OpenCV w2c = COLMAP
+        q = ply_frame.quat_from_matrix(view[:3, :3])
+        stem = re.sub(r"[^A-Za-z0-9_]", "_", Path(name).stem)
+        new = f"splatlab/{stem}_eval{Path(name).suffix}"
+        link(out / "images" / new, src / name)
+        img_lines += [f"{next_img} " + " ".join(repr(float(x)) for x in q) + " "
+                      + " ".join(repr(float(x)) for x in view[:3, 3]) + f" {pin_cams[key]} {new}", ""]
+        next_img += 1
+    (out / "sparse/0/cameras.txt").write_text("\n".join(cam_lines) + "\n")
+    (out / "sparse/0/images.txt").write_text("\n".join(img_lines) + "\n")
+    (out / "sparse/0/points3D.txt").write_text("".join(
+        f"{pid} {p.xyz[0]!r} {p.xyz[1]!r} {p.xyz[2]!r} {int(p.rgb[0])} {int(p.rgb[1])} {int(p.rgb[2])} {float(p.error)!r}\n"
+        for pid, p in pts.items()))
+    print(json.dumps({"train_images": kept, "splatlab_eval_views": len(receipt["eval_names"]),
+                      "pinhole_cameras": len(pin_cams), "points": len(pts), "out": str(out)}, indent=1))
+    return 0
+
+
 def gaussian_count(arm: Path) -> int | None:
     plys = sorted(arm.glob("step-*.ckpt/splat.ply"))
     if plys:
@@ -301,7 +376,7 @@ def gaussian_count(arm: Path) -> int | None:
         for line in head.splitlines():
             if line.startswith("element vertex"):
                 return int(line.split()[2])
-    ckpts = sorted(arm.glob("processed/splatfacto/*/nerfstudio_models/step-*.ckpt"))
+    ckpts = sorted(arm.glob("*/splatfacto/*/nerfstudio_models/step-*.ckpt"))
     if ckpts:
         import torch
         state = torch.load(ckpts[-1], map_location="cpu", weights_only=False)["pipeline"]
@@ -320,6 +395,15 @@ def cmd_summary(args) -> int:
                      "train_s": tm.get("train_s"), "peak_vram_mb": tm.get("peak_vram_mb"),
                      "gaussians": gaussian_count(arm), "renders": sc["renders"]})
     (scene / "summary.json").write_text(json.dumps(rows, indent=2))
+    per = {r["arm"]: {v["photo"]: v for v in json.loads((scene / r["arm"] / "score.json").read_text())["per_view"]}
+           for r in rows}
+    common = set.intersection(*(set(v) for v in per.values())) if per else set()
+    if per and any(len(v) != len(common) for v in per.values()):
+        print(f"\nOn the {len(common)} photos EVERY arm rendered (some arms have missing views):")
+        print("| arm | psnr | ssim | lpips | cc_psnr | cc_lpips |\n|---|---|---|---|---|---|")
+        for arm, v in per.items():
+            m = {k: np.mean([v[p][k] for p in common]) for k in ("psnr", "ssim", "lpips", "cc_psnr", "cc_lpips")}
+            print(f"| {arm} | {m['psnr']:.4f} | {m['ssim']:.4f} | {m['lpips']:.4f} | {m['cc_psnr']:.4f} | {m['cc_lpips']:.4f} |")
     cols = ["arm", "views", "psnr", "ssim", "lpips", "cc_psnr", "cc_ssim", "cc_lpips", "train_s", "peak_vram_mb",
             "gaussians"]
     print("| " + " | ".join(cols) + " |")
@@ -345,6 +429,9 @@ def main() -> int:
     p.add_argument("--mirror", required=True, help="split mirror (split-receipt.json names the photos)")
     p.add_argument("--out", required=True)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--allow-missing", action="store_true",
+                   help="long runs only: drop exact duplicate renders and allow unrendered photos (disclosed in "
+                        "the score; summary compares arms on the common photo set)")
     p.set_defaults(fn=cmd_score)
     p = sub.add_parser("check-renders")
     p.add_argument("renders")
@@ -357,8 +444,6 @@ def main() -> int:
                    help="the job's dataparser_transforms.json, or `identity` to only strip to SH0")
     p.add_argument("--out", required=True)
     p.add_argument("--reference", help="the job's own ns-export splat.ply, for the frame check")
-    p.add_argument("--applied-transform-from", help="transforms.json whose applied_transform to apply first "
-                   "(a PLY in the original COLMAP frame, e.g. Spirula trained on the mirror)")
     p.add_argument("--max-nn", type=float, default=0.01)
     p.set_defaults(fn=cmd_to_ns_frame)
     p = sub.add_parser("align")
@@ -379,6 +464,16 @@ def main() -> int:
     p.add_argument("--mode", default="classic", choices=["classic", "antialiased"])
     p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_cross_render)
+    p = sub.add_parser("xdataset")
+    p.add_argument("--colmap", required=True, help="the other SfM's sparse model (binary)")
+    p.add_argument("--images", required=True, help="image root its names are relative to")
+    p.add_argument("--masks", help="mask root (<name>.png), optional")
+    p.add_argument("--align", required=True, help="align.json: SplatLab transforms frame → that model's frame")
+    p.add_argument("--mirror", required=True, help="SplatLab split mirror whose eval views to add")
+    p.add_argument("--camera-scale", type=float, default=1.0,
+                   help="images are this many times the SfM's resolution (same instants, same names)")
+    p.add_argument("--out", required=True)
+    p.set_defaults(fn=cmd_xdataset)
     p = sub.add_parser("count")
     p.add_argument("arm_dir")
     p.set_defaults(fn=lambda a: print(gaussian_count(Path(a.arm_dir))) or 0)

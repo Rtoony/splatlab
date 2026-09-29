@@ -246,3 +246,17 @@ def test_colmap_centre():
     q = ply_frame.quat_from_matrix(r)
     c = np.array([1.0, 2.0, 3.0])
     assert np.allclose(cross.colmap_centre(q, -r @ c), c)
+
+
+def test_allow_missing_drops_only_exact_duplicates():
+    photos = _photos(n=4)
+    names = list(photos)
+    pairs = [scoring.Pair(n, photos[n], photos[n] * 0.9) for n in names[:3]]
+    dup = scoring.Pair("dup", photos[names[0]], photos[names[0]] * 0.9)          # identical to pair 0
+    res = scoring.score(pairs + [dup], photos, _fake_metrics, allow_missing=True)
+    assert res["views"] == 3 and res["missing_photos"] == [names[3]]
+    with pytest.raises(ValueError, match="both match"):                          # a different render is not a dup
+        scoring.score(pairs + [scoring.Pair("x", photos[names[0]], photos[names[0]] * 0.5)], photos, _fake_metrics,
+                      allow_missing=True)
+    with pytest.raises(ValueError, match="no render"):                           # default stays strict
+        scoring.score(pairs, photos, _fake_metrics)
