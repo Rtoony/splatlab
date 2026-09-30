@@ -403,12 +403,28 @@ def walk_seed_yup(job_dir: Path) -> list[float] | None:
     return [round(med[0], 4), round(med[2], 4), round(-med[1], 4)]
 
 
-def walk_shell_command(python: str, script: Path, job_dir: Path, seed: list[float] | None) -> list[str]:
+# world_shell.py ranks candidates BEFORE its crumb drop re-grades the winner, so the auto pick can land just under
+# the floor gate (office, splat_b30d3965e8: voxel 0.9524 -> 0.9496 after the drop) while the splat-transform
+# candidate scored 1.0. The walk retries that route once rather than refusing a walkable room.
+WALK_FALLBACK_ROUTE = "splat-transform"
+
+
+def walk_shell_command(python: str, script: Path, job_dir: Path, seed: list[float] | None,
+                       route: str = "auto") -> list[str]:
     cmd = [python, str(script), str(job_dir), "--source", str(job_dir / "_preview" / "splat.ply"),
-           "--player-height", str(WALK_PLAYER_HEIGHT_M), "--player-radius", str(WALK_PLAYER_RADIUS_M), "--json"]
+           "--player-height", str(WALK_PLAYER_HEIGHT_M), "--player-radius", str(WALK_PLAYER_RADIUS_M),
+           "--route", route, "--json"]
     if seed:
-        cmd += ["--seed", ",".join(f"{v:.6g}" for v in seed)]
+        # `--seed=`: a seed starting with "-" would otherwise parse as an option (argparse exit 2).
+        cmd.append("--seed=" + ",".join(f"{v:.6g}" for v in seed))
     return cmd
+
+
+def walk_verdict(job_dir: Path) -> str | None:
+    try:
+        return json.loads((job_dir / "_world" / "collision_shell.json").read_text()).get("verdict")
+    except (OSError, ValueError):
+        return None
 
 
 def write_walk_world(job_dir: Path, job_id: str, meters_per_unit: float | None) -> dict:

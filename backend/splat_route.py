@@ -7016,16 +7016,19 @@ async def _world_prepare_spirula(
         _WORLD_PREPARE_OPS[job_id] = op_id
         try:
             world_dir.mkdir(exist_ok=True)
-            cmd = spirula_lane.walk_shell_command(
-                str(MESH_ENV_PYTHON), MESH_DIR / "world_shell.py", job_dir,
-                spirula_lane.walk_seed_yup(job_dir))
+            seed = spirula_lane.walk_seed_yup(job_dir)
             try:
-                proc = await asyncio.to_thread(
-                    subprocess.run, cmd, capture_output=True, text=True,
-                    cwd=str(MESH_DIR.parent), timeout=1800)
-                if proc.returncode != 0:
-                    tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-4:])
-                    raise ValueError(f"world_shell.py exited {proc.returncode}: {tail[:300]}")
+                for route in ("auto", spirula_lane.WALK_FALLBACK_ROUTE):
+                    cmd = spirula_lane.walk_shell_command(
+                        str(MESH_ENV_PYTHON), MESH_DIR / "world_shell.py", job_dir, seed, route)
+                    proc = await asyncio.to_thread(
+                        subprocess.run, cmd, capture_output=True, text=True,
+                        cwd=str(MESH_DIR.parent), timeout=1800)
+                    if proc.returncode != 0:
+                        tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-4:])
+                        raise ValueError(f"world_shell.py exited {proc.returncode}: {tail[:300]}")
+                    if spirula_lane.walk_verdict(job_dir) in spirula_lane.WALK_OK_VERDICTS:
+                        break
                 walk = spirula_lane.write_walk_world(
                     job_dir, job_id, meta.get("meters_per_unit"))
             except (OSError, ValueError, subprocess.TimeoutExpired) as exc:

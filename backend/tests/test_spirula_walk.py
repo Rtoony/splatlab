@@ -27,14 +27,17 @@ def _shell_report(verdict: str = "PASS") -> dict:
             "geometry_frame": {"axis": "y-up", "units": "scene-units", "meters_per_unit": None}}
 
 
-def _fake_world_shell(job: Path, verdict: str = "PASS"):
+def _fake_world_shell(job: Path, verdict: str = "PASS", by_route: dict | None = None):
     def run(cmd, **kw):
         w = job / "_world"
+        route = cmd[cmd.index("--route") + 1]
         (w / "collision_shell.glb").write_bytes(b"glTF")
-        (w / "collision_shell.json").write_text(json.dumps(_shell_report(verdict)))
+        (w / "collision_shell.json").write_text(json.dumps(_shell_report((by_route or {}).get(route, verdict))))
         (w / "navmesh.json").write_text("{}")
         run.cmd = cmd
+        run.routes.append(route)
         return subprocess.CompletedProcess(cmd, 0, "", "")
+    run.routes = []
     return run
 
 
@@ -76,9 +79,19 @@ def test_seed_is_the_median_camera_in_y_up(tmp_path):
 def test_shell_command_uses_metric_player_and_seed(tmp_path):
     cmd = spirula_lane.walk_shell_command("py", Path("world_shell.py"), tmp_path, [1.0, 1.4, -2.0])
     assert cmd[cmd.index("--player-height") + 1] == "1.7"
-    assert cmd[cmd.index("--seed") + 1] == "1,1.4,-2"
+    assert "--seed=1,1.4,-2" in cmd and cmd[cmd.index("--route") + 1] == "auto"
     assert cmd[cmd.index("--source") + 1] == str(tmp_path / "_preview" / "splat.ply")
-    assert "--seed" not in spirula_lane.walk_shell_command("py", Path("w.py"), tmp_path, None)
+    assert not any(a.startswith("--seed") for a in spirula_lane.walk_shell_command("py", Path("w.py"), tmp_path, None))
+
+
+def test_negative_seed_parses_as_a_value_not_an_option(tmp_path):
+    """Condo frontage etc. failed with argparse exit 2: `--seed -1.2,...` reads as an option."""
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--seed")
+    cmd = spirula_lane.walk_shell_command("py", Path("w.py"), tmp_path, [-1.2, 0.5, -3.0])
+    seed_arg = next(a for a in cmd if a.startswith("--seed"))
+    assert ap.parse_args([seed_arg]).seed == "-1.2,0.5,-3"
 
 
 def test_prepare_builds_a_metric_walk_the_manifest_route_serves(client, monkeypatch):
@@ -90,7 +103,7 @@ def test_prepare_builds_a_metric_walk_the_manifest_route_serves(client, monkeypa
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["stages"] == {"walk": "done"} and body["walk"]["verdict"] == "PASS"
-    assert fake.cmd[fake.cmd.index("--seed") + 1] == "1,1.4,-2"
+    assert "--seed=1,1.4,-2" in fake.cmd and fake.routes == ["auto"]
     world = json.loads((job / "_world" / "world.json").read_text())
     assert world["units"] == "meters" and world["meters_per_unit"] == 1.0
     assert (job / "_world" / "shell.glb").read_bytes() == b"glTF"
@@ -107,6 +120,17 @@ def test_prepare_builds_a_metric_walk_the_manifest_route_serves(client, monkeypa
     assert fake.cmd is None
     assert tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={"force": ["walk"]}).status_code == 200
     assert tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={"force": ["mesh"]}).status_code == 400
+
+
+def test_auto_pick_under_the_floor_gate_retries_the_splat_transform_route(client, monkeypatch):
+    tc, outputs = client
+    job = _mk_job(outputs)
+    fake = _fake_world_shell(job, by_route={"auto": "NOT_WALKABLE", "splat-transform": "WALKABLE_NOT_WATERTIGHT"})
+    monkeypatch.setattr(splat_route.subprocess, "run", fake)
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={})
+    assert r.status_code == 200, r.text
+    assert fake.routes == ["auto", "splat-transform"]
+    assert r.json()["walk"]["verdict"] == "WALKABLE_NOT_WATERTIGHT"
 
 
 def test_unwalkable_shell_fails_loudly_and_writes_no_world(client, monkeypatch):
