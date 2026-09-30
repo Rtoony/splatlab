@@ -104,7 +104,8 @@ export interface SplatJob {
   source_type?: "capture" | "generative-image";
   // Trainer: "auto" (default) = the Spirula 360 lane for a raw dual-fisheye .insv, else splatfacto.
   // trainer_resolved is what actually ran. Spirula scenes have no nerfstudio checkpoint, so
-  // checkpoint_available is false and langfield / mesh / isolate / walkable-world are unavailable.
+  // checkpoint_available is false and langfield / mesh / isolate are unavailable; a WALK is built
+  // straight from the splat (see walkBuildable).
   trainer?: "auto" | "spirula" | "splatfacto";
   trainer_resolved?: "spirula" | "splatfacto" | "triposplat";
   checkpoint_available?: boolean;
@@ -1018,4 +1019,10 @@ export interface SplatTransferEntry {
 export interface SplatTransfersResponse {
   dir: string;
   entries: SplatTransferEntry[];
+}
+
+// "Make walkable" can run: rig-lane scenes need their nerfstudio checkpoint (the full world ladder);
+// Raw 360 (Spirula) scenes build a checkpoint-free walk from the splat alone.
+export function walkBuildable(job: Pick<SplatJob, "checkpoint_available" | "trainer_resolved">): boolean {
+  return job.trainer_resolved === "spirula" || job.checkpoint_available !== false;
 }

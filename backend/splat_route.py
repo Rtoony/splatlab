@@ -6761,6 +6761,8 @@ async def world_prepare(request: Request, job_id: str, body: WorldPrepareBody):
             detail=f"World prepare requires a completed job "
                    f"(status: {meta.get('status')})")
     job_dir = Path(meta["output_dir"])
+    if spirula_lane.is_spirula_job(meta):
+        return await _world_prepare_spirula(request, job_id, body, meta, job_dir)
     if not (job_dir / LANGFIELD_DIRNAME / "gauss_emb.npz").is_file():
         raise HTTPException(
             status_code=409,
@@ -6973,6 +6975,80 @@ async def _world_prepare_run(
     )
     return {"ok": True, "op_id": op_id, "stages": outcome,
             "warnings": warnings, "gate": gate}
+
+
+async def _world_prepare_spirula(
+    request: Request,
+    job_id: str,
+    body: WorldPrepareBody,
+    meta: dict[str, Any],
+    job_dir: Path,
+) -> dict[str, Any]:
+    """Raw 360 (Spirula) scenes have no checkpoint and no language field, so the
+    ladder above cannot run. A walk needs neither: one CPU stage (world_shell.py
+    on the splat PLY) gives the collision solid + navmesh, and the walker looks
+    at the splat itself. A built walk is a no-op unless `force` names "walk"."""
+    unknown = [s for s in body.force if s != "walk"]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown stage(s) in force: {', '.join(sorted(unknown))} "
+                   "— a Raw 360 scene has one stage: walk")
+    world_dir = job_dir / WORLD_DIRNAME
+    if (world_dir / "world.json").is_file() and "walk" not in body.force:
+        return {"ok": True, "op_id": None, "stages": {"walk": "skipped"},
+                "warnings": [], "gate": None}
+    if not (job_dir / PREVIEW_DIRNAME / "splat.ply").is_file():
+        raise HTTPException(status_code=409, detail="This scene has no splat to walk yet")
+    if not MESH_ENV_PYTHON.is_file():
+        raise HTTPException(status_code=503,
+                            detail="The world-shell toolchain (dn-splatter-probe env) is not available")
+
+    prepare_lock = _world_prepare_lock(job_id)
+    if prepare_lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail=f"A world prepare is already running for this job "
+                   f"(op {_WORLD_PREPARE_OPS.get(job_id, '?')}) — watch it in "
+                   f"Activity rather than starting a second one")
+    async with prepare_lock:
+        op_id = opregistry.start("world_prepare", job_id, step="walk")
+        _WORLD_PREPARE_OPS[job_id] = op_id
+        try:
+            world_dir.mkdir(exist_ok=True)
+            cmd = spirula_lane.walk_shell_command(
+                str(MESH_ENV_PYTHON), MESH_DIR / "world_shell.py", job_dir,
+                spirula_lane.walk_seed_yup(job_dir))
+            try:
+                proc = await asyncio.to_thread(
+                    subprocess.run, cmd, capture_output=True, text=True,
+                    cwd=str(MESH_DIR.parent), timeout=1800)
+                if proc.returncode != 0:
+                    tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-4:])
+                    raise ValueError(f"world_shell.py exited {proc.returncode}: {tail[:300]}")
+                walk = spirula_lane.write_walk_world(
+                    job_dir, job_id, meta.get("meters_per_unit"))
+            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                opregistry.finish(op_id, status=opregistry.FAILED,
+                                  result={"stage": "walk", "detail": str(exc)},
+                                  error=str(exc)[:500])
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"stage 'walk' failed: {exc}") from exc
+            opregistry.finish(op_id, result={"stages": {"walk": "done"}, "walk": walk})
+            await audit_operator_event(
+                request=request,
+                title="World prepared",
+                description=f"{job_id}: Raw 360 walk ({walk['verdict']}, {walk['route']})",
+                variant="success",
+                action="splat.world_prepare",
+                target=meta.get("mode", "3d"),
+                metadata={"job_id": job_id, "stages": {"walk": "done"}, "walk": walk},
+            )
+            return {"ok": True, "op_id": op_id, "stages": {"walk": "done"},
+                    "warnings": [], "gate": walk.get("gates"), "walk": walk}
+        finally:
+            _WORLD_PREPARE_OPS.pop(job_id, None)
 
 
 class WorldRegradeBody(BaseModel):

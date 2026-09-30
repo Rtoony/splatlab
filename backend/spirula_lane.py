@@ -372,3 +372,73 @@ def publish(job_dir: Path, preview_ply: Path) -> dict:
 
 def settings_dict(s: LaneSettings) -> dict:
     return asdict(s)
+
+
+# --- Walk (owner 2026-09-30 "Yes build next!"): a first-person world with no nerfstudio checkpoint ---------
+# The rig lane's world ladder (mesh -> inventory -> isolate -> ground -> solidify) needs a language field and
+# a checkpoint. A walk needs neither: the walker LOOKS at the splat (setBackdrop) and COLLIDES with
+# world_shell.py's voxel solid, which it builds from the splat PLY alone. Measured on the storage room
+# (splat_e5b31df394): voxel route, PASS, 1 component, watertight, floor continuity 0.987, 42 s on CPU.
+# The shell entry points at the collision solid too; the walker hides every shell while the photograph shows.
+WALK_PLAYER_HEIGHT_M = 1.7
+WALK_PLAYER_RADIUS_M = 0.32
+WALK_OK_VERDICTS = ("PASS", "WALKABLE", "WALKABLE_NOT_WATERTIGHT")
+
+
+def is_spirula_job(meta: dict) -> bool:
+    return meta.get("trainer_resolved") == "spirula" or bool((meta.get("spirula") or {}).get("published"))
+
+
+def walk_seed_yup(job_dir: Path) -> list[float] | None:
+    """Median capture-camera position, mapped Z-up (x,y,z) -> Y-up (x, z, -y). The operator walked there,
+    so it is free space — a better flood-fill seed than the cloud-median probe in a narrow room."""
+    try:
+        frames = json.loads((workdir(job_dir) / "cameras" / "transforms.json").read_text())["frames"]
+        pos = [[float(f["transform_matrix"][r][3]) for r in range(3)] for f in frames]
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return None
+    if not pos:
+        return None
+    med = [sorted(p[i] for p in pos)[len(pos) // 2] for i in range(3)]
+    return [round(med[0], 4), round(med[2], 4), round(-med[1], 4)]
+
+
+def walk_shell_command(python: str, script: Path, job_dir: Path, seed: list[float] | None) -> list[str]:
+    cmd = [python, str(script), str(job_dir), "--source", str(job_dir / "_preview" / "splat.ply"),
+           "--player-height", str(WALK_PLAYER_HEIGHT_M), "--player-radius", str(WALK_PLAYER_RADIUS_M), "--json"]
+    if seed:
+        cmd += ["--seed", ",".join(f"{v:.6g}" for v in seed)]
+    return cmd
+
+
+def write_walk_world(job_dir: Path, job_id: str, meters_per_unit: float | None) -> dict:
+    """world.json + world_manifest.json + shell.glb around world_shell.py's output. Refuses a shell whose
+    verdict is not walkable — a world you fall through is worse than no world."""
+    world = job_dir / "_world"
+    report = json.loads((world / "collision_shell.json").read_text())
+    verdict = report.get("verdict")
+    if verdict not in WALK_OK_VERDICTS:
+        raise ValueError(f"collision shell verdict {verdict!r} is not walkable")
+    if not (world / "navmesh.json").is_file():
+        raise ValueError("world_shell.py wrote no navmesh.json")
+    shutil.copyfile(world / "collision_shell.glb", world / "shell.glb")
+    probe = report.get("probe") or {}
+    mpu = float(meters_per_unit) if meters_per_unit else None
+    shell = {"built": True, "glb": "shell.glb", "source": "collision_shell", "texture": None,
+             "faces": (report.get("artifact") or {}).get("triangles_written")}
+    (world / "world.json").write_text(json.dumps({
+        "v": 1, "job_id": job_id, "kind": "spirula-walk",
+        # Metric only when the IMU measured it; otherwise the walker keeps its scene-unit dial.
+        "units": "meters" if mpu else "scene-units",
+        "meters_per_unit": 1.0 if mpu else None,
+        "calibrated_from_meters_per_unit": mpu,
+        "up_axis": "Y", "shell": shell, "elements": [],
+        "note": "Raw 360 walk: look at the splat, collide with the voxel solid (no checkpoint, no elements)"},
+        indent=2))
+    (world / "world_manifest.json").write_text(json.dumps({
+        "v": 1, "units": "meters" if mpu else "scene-units", "meters_per_unit": 1.0 if mpu else None,
+        "shell": {"slug": "shell", "role": "static", "glb": "shell.glb"}, "elements": [],
+        "counts": {"elements": 0}}, indent=2))
+    return {"verdict": verdict, "gates": report.get("gates"), "route": report.get("route_used"),
+            "floor_y": probe.get("floor_level_y"), "top_y": probe.get("top_level_y"),
+            "seed_yup": (report.get("params") or {}).get("seed_yup"), "seconds": report.get("seconds")}

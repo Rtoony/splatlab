@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useLocation } from "wouter";
-import type { SplatJob } from "@/lib/contracts";
+import { walkBuildable, type SplatJob } from "@/lib/contracts";
 import { apiRequest } from "@/lib/api";
 import { Badge, Button, Card, useToast } from "@/components/ui";
 import { DownloadMenu } from "@/components/gallery/download-menu";
@@ -218,9 +218,11 @@ export function SceneCard({
             size="sm"
             variant="outline"
             className="flex-1 border-cyan-300/40 text-cyan-200"
-            disabled={worldPrep || computeBlocked || job.checkpoint_available === false}
+            disabled={worldPrep || computeBlocked || !walkBuildable(job)}
             onClick={startWorldPrep}
-            title={job.checkpoint_available === false
+            title={job.trainer_resolved === "spirula"
+                ? "Walk this Raw 360 scene: builds a collision floor from the splat in about a minute, then you walk inside the photograph."
+                : !walkBuildable(job)
               ? "Needs a nerfstudio scene — not available yet for Raw 360 (Spirula) scenes. Open the scene and explore with WASD instead."
               : "Build the walkable world right from here — mesh through scenario in one go; takes minutes, resumes after a failure"}
           >

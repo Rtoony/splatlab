@@ -10,6 +10,7 @@ import type {
   SplatJob,
   SplatStatusResponse,
 } from "@/lib/contracts";
+import { walkBuildable } from "@/lib/contracts";
 import type { ViewerCameraNodeTarget, ViewerCameraPose, ViewerCameraViewTarget, ViewerHighlight, ViewerOverlay } from "@/components/viewer-types";
 import { Button, Card, DropdownItem, DropdownMenu, DropdownSeparator, Input, SectionLabel, Tabs, TabsList, TabsTrigger, useToast } from "@/components/ui";
 import { EditProgress } from "@/components/edit-progress";
@@ -361,9 +362,9 @@ export default function SplatViewPage() {
                       type="button"
                       variant="outline"
                       size="sm"
-                      disabled={worldPrep || job.checkpoint_available === false}
+                      disabled={worldPrep || !walkBuildable(job)}
                       onClick={() => {
-                        if (worldPrep || job.checkpoint_available === false) return;
+                        if (worldPrep || !walkBuildable(job)) return;
                         setWorldPrep(true);
                         pushToast("Preparing walkable world — heavy stages can take many minutes. Progress lives in Activity.", "info");
                         apiRequest(`/api/splat/jobs/${encodeURIComponent(job.job_id)}/world/prepare`, {
@@ -377,7 +378,9 @@ export default function SplatViewPage() {
                           pushToast(`World preparation failed: ${e instanceof Error ? e.message : String(e)}`, "error");
                         }).finally(() => setWorldPrep(false));
                       }}
-                      title={job.checkpoint_available === false
+                      title={job.trainer_resolved === "spirula"
+                        ? "Walk this Raw 360 scene: builds a collision floor from the splat in about a minute, then you walk inside the photograph."
+                        : !walkBuildable(job)
                         ? "Needs a nerfstudio scene — not available yet for Raw 360 (Spirula) scenes. Open the scene and explore with WASD instead."
                         : "Run the whole ladder — mesh, inventory, isolate, ground, world, navmesh, affordances, scenario — in one go. Re-run resumes after a failure."}
                       className="border-cyan-300/40 text-cyan-200"
