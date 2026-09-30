@@ -3349,7 +3349,13 @@ async def _run_pipeline(job: SplatJob) -> None:
                     job.log_lines.append(error_message)
                     break
                 spirula_meta = {**((_read_meta(job.job_id) or {}).get("spirula") or {}), "published": receipt}
-                _patch_meta(job.job_id, spirula=spirula_meta)
+                patch: dict[str, Any] = {"spirula": spirula_meta}
+                if receipt.get("metric"):
+                    # The camera's IMU (+GPS) made the model metric: one scene unit is one metre.
+                    patch["meters_per_unit"] = 1.0
+                _patch_meta(job.job_id, **patch)
+                if receipt.get("orientation_warning"):
+                    job.log_lines.append(f"[spirula_publish] WARNING: {receipt['orientation_warning']}")
                 job.log_lines.append(
                     f"[spirula_publish] {receipt['splats']:,} splats, {receipt['cameras']} cameras -> preview.")
                 return_code = 0

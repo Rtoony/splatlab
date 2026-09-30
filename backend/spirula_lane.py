@@ -168,9 +168,14 @@ def commands(binary: str, input_path: Path, job_dir: Path, s: LaneSettings, ffmp
                                "--keep", "0", *(["--scale", f"{s.scale:g}"] if s.scale < 1 else []),
                                "-o", str(images)]
     cmds["spirula_mask"] = [*run, "sam", "mask", str(images)]
+    # Up (and metric scale) from the camera's own IMU: the .insv trailer carries a 1 kHz gyro+accelerometer log.
+    # Without it Spirula GUESSES up from the largest level-looking plane, and in a shelf-lined aisle it picked a wall
+    # (storage room 2026-09-29, published sideways). A trimmed copy has no trailer (ffmpeg drops it), so a test
+    # flight falls back to the guess and publish flags it.
+    telemetry = [] if source != Path(input_path) else ["--telemetry", str(input_path)]
     cmds["spirula_sfm"] = [*run, "sfm", "auto", str(images), "-o", str(data), "--data-type", "video",
                            "--rig", "dual-fisheye=cam0,cam1", "--sequence", "cam0,cam1",
-                           "--camera-model", "opencv-fisheye", "--focal", f"{s.focal:g}"]
+                           "--camera-model", "opencv-fisheye", "--focal", f"{s.focal:g}", *telemetry]
     cmds["spirula_train"] = [*run, "train", "360-camera", "--data", str(data), "--data-format", "colmap",
                              "--output-dir-prefix", str(ws), "--output-dir-name", "train",
                              "--quality", s.quality, "--floater-suppression", "mild",
@@ -263,20 +268,31 @@ def _copy_with_up_comment(src: Path, dst: Path) -> int:
     return count
 
 
+def read_gauge(path: Path) -> dict[str, str]:
+    """sparse/N/gauge.txt -> {oriented, metric, up, scale}: whether +Z-up / metre units were MEASURED, and by what."""
+    out: dict[str, str] = {}
+    if path.is_file():
+        for line in path.read_text().splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2 and not line.startswith("#"):
+                out[parts[0]] = parts[1].strip()
+    return out
+
+
 def publish(job_dir: Path, preview_ply: Path) -> dict:
     """Spirula's splat → the job's preview + viewer cameras. Returns the receipt stored in meta["spirula"].
 
-    Spirula's SfM levels its model on the ground plane (gauge.txt `oriented 1 / up ground`): +Z up, floor
-    near z=0 — SplatLab's viewer frame already (measured on the storage room: floor plane z≈0, ceiling
-    plane z=1.34, every camera between). No rotation, so no SH rotation; a model NOT so oriented is refused
-    rather than shown sideways.
+    Spirula writes an oriented model (+Z up, ground at z=0: SplatLab's viewer frame), so no rotation and no SH
+    rotation. `up` in gauge.txt says what set it: the camera's IMU (measured, via --telemetry) or `ground`
+    (a GUESS — in a shelf-lined aisle it levelled on a wall, 2026-09-29). A guessed up is published but flagged;
+    a model that is not oriented at all is refused rather than shown at an arbitrary tilt.
     """
     ws = workdir(job_dir)
     sparse = ws / "data" / "sparse" / "0"
-    gauge = (sparse / "gauge.txt").read_text() if (sparse / "gauge.txt").is_file() else ""
-    if not re.search(r"^oriented\s+1", gauge, re.M) or not re.search(r"^up\s+ground", gauge, re.M):
-        raise ValueError(f"Spirula model is not ground-levelled (gauge.txt: {gauge.strip()!r}); refusing to "
-                         "publish a splat whose up axis is unknown.")
+    g = read_gauge(sparse / "gauge.txt")
+    if g.get("oriented") != "1":
+        raise ValueError(f"Spirula model is not oriented (gauge.txt: {g!r}); refusing to publish a splat whose up "
+                         "axis is unknown.")
     ply = latest_splat(job_dir)
     if ply is None:
         raise FileNotFoundError(f"no trained splat under {ws / 'train'}")
@@ -294,9 +310,14 @@ def publish(job_dir: Path, preview_ply: Path) -> dict:
     (cams / "dataparser_transforms.json").write_text(json.dumps(
         {"transform": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]], "scale": 1.0}))
     zs = sorted(f["transform_matrix"][2][3] for f in frames)
+    up_source = g.get("up", "unknown")
     return {"splats": count, "source_ply": str(ply), "cameras": len(frames),
             "camera_height_range": [round(zs[0], 4), round(zs[-1], 4)] if zs else None,
-            "gauge": gauge.strip().splitlines()[1:] if gauge else [], "binary": spirula_bin()}
+            "gauge": g, "up_source": up_source, "metric": g.get("metric") == "1",
+            "orientation_warning": (None if up_source not in ("ground", "cameras", "unknown") else
+                                    f"up was guessed ({up_source}), not measured by the camera's IMU — the scene may "
+                                    "be tilted or on its side"),
+            "binary": spirula_bin()}
 
 
 def settings_dict(s: LaneSettings) -> dict:

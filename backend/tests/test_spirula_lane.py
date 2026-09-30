@@ -69,6 +69,8 @@ def test_commands_carry_the_measured_guards(tmp_path):
     assert train[train.index("--eval-mode") + 1] == "all" and "--save-eval-images" not in train
     assert train[train.index("--quality") + 1] == "high"
     assert train[train.index("--floater-suppression") + 1] == "mild"
+    sfm = cmds["spirula_sfm"]
+    assert sfm[sfm.index("--telemetry") + 1] == "/in/VID_x.insv"          # up + scale from the camera's IMU
 
 
 def test_trim_prepends_a_stream_copy(tmp_path):
@@ -77,6 +79,7 @@ def test_trim_prepends_a_stream_copy(tmp_path):
     assert list(cmds)[0] == "spirula_trim"
     assert "-ss 40 -t 20" in cmds["spirula_trim"][2] and "-map 0:v -c copy" in cmds["spirula_trim"][2]
     assert cmds["spirula_extract"][5] == str(tmp_path / "_spirula" / "trimmed.insv")
+    assert "--telemetry" not in cmds["spirula_sfm"]                          # a re-muxed trim has no IMU trailer
 
 
 # ---------------------------------------------------------------- plan routing
@@ -244,3 +247,13 @@ def test_default_output_root_survives_a_symlinked_outputs_dir(tmp_path, monkeypa
     monkeypatch.setattr(splat_route, "DEFAULT_3D_ROOT", link / "3d")
     assert splat_route._is_default_3d_root((link / "3d").resolve())
     assert not splat_route._is_default_3d_root((tmp_path / "elsewhere").resolve())
+
+
+def test_publish_reports_measured_vs_guessed_up(tmp_path):
+    _job(tmp_path, gauge="oriented 1\nmetric 1\nup telemetry\nscale telemetry\n")
+    r = sl.publish(tmp_path, tmp_path / "_preview" / "splat.ply")
+    assert r["metric"] and r["up_source"] == "telemetry" and r["orientation_warning"] is None
+    other = tmp_path / "g"
+    _job(other)                                                              # oriented 1 / up ground (a guess)
+    r = sl.publish(other, other / "_preview" / "splat.ply")
+    assert not r["metric"] and r["up_source"] == "ground" and "guessed" in r["orientation_warning"]
