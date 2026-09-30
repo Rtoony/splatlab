@@ -448,7 +448,22 @@ def walk_coarser_voxel(job_dir: Path, voxel: float = WALK_BASE_VOXEL) -> float |
     return round(voxel * math.sqrt(tris / WALK_TARGET_COLLIDE_TRIS), 3)
 
 
-def walk_spawn_check_command(python: str, script: Path, job_dir: Path) -> list[str]:
+def walk_spawn_check_command(python: str, script: Path, job_dir: Path, sweep: int = 0) -> list[str]:
+    return [python, str(script), str(job_dir)] + (["--sweep", str(sweep)] if sweep else [])
+
+
+# Indoor vs outdoor (owner 2026-09-30: "indoor and outdoor want different processes"). walk_ground.py --classify:
+# a ceiling of solid splats above most of the capture path = indoor -> world_shell.py's voxel room (proven on the
+# storage rooms / office / conference room); otherwise the path-anchored ground (walk_ground.py).
+WALK_SWEEP_EVERY = 10              # test every 10th capture camera along the path
+WALK_SWEEP_MIN_PASS = 0.98         # outdoor: ground under >= 98 % of the path, never buried in solid
+
+
+def walk_classify_command(python: str, script: Path, job_dir: Path) -> list[str]:
+    return [python, str(script), str(job_dir), "--classify"]
+
+
+def walk_ground_command(python: str, script: Path, job_dir: Path) -> list[str]:
     return [python, str(script), str(job_dir)]
 
 

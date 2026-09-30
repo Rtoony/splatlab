@@ -5,6 +5,9 @@ import { MeshBVH } from "three-mesh-bvh";
 import { findWalkingStart, inspectWalkingPose, walkingBodyError, type WalkingBody } from "./walking-admission";
 import { DEFAULT_WALK_PARAMS, WorldWalker } from "./world-walker";
 
+// The default body (eye 1.68 m per the owner's 5.5 ft, radius 0.32 m) — read, never re-typed.
+const DEFAULT_TOTAL_M = DEFAULT_WALK_PARAMS.eyeHeightM + DEFAULT_WALK_PARAMS.radiusM;
+
 const body = (): WalkingBody => ({ radiusM: 0.32, totalHeightM: 2.02, unitsPerMetre: 1 });
 
 function room(ceilingY = 3, wall = false, units = 1) {
@@ -125,7 +128,7 @@ describe("fixed-metric walking admission", () => {
       const result = findWalkingStart(fixture.bvh, fixture.collider, fixture.walker.camera.position, body());
       expect(result.ok).toBe(false);
       expect(result.message).toContain("not shortened");
-      expect(result.body.totalHeightM).toBe(2.02);
+      expect(result.body.totalHeightM).toBe(2.02);   // the body passed in, unchanged
     } finally {
       fixture.dispose();
     }
@@ -170,12 +173,12 @@ describe("fixed-metric walking admission", () => {
         stepPlayer: (seconds: number) => void;
         keys: Set<string>;
       };
-      expect(internals.capsuleHeight + internals.capsuleRadius).toBe(2.02);
+      expect(internals.capsuleHeight + internals.capsuleRadius).toBeCloseTo(DEFAULT_TOTAL_M, 9);
       internals.keys.add("KeyW");
       for (let step = 0; step < 30; step++) internals.stepPlayer(1 / 120);
       expect(walker.camera.position.z).toBeLessThan(-0.8);
-      expect(walker.camera.position.y).toBeCloseTo(1.7, 3);
-      expect(internals.capsuleHeight + internals.capsuleRadius).toBe(2.02);
+      expect(walker.camera.position.y).toBeCloseTo(DEFAULT_WALK_PARAMS.eyeHeightM, 3);
+      expect(internals.capsuleHeight + internals.capsuleRadius).toBeCloseTo(DEFAULT_TOTAL_M, 9);
     } finally {
       fixture.dispose();
     }
@@ -194,7 +197,7 @@ describe("fixed-metric walking admission", () => {
       walker.setParams({ radiusM: 0.3 });
       expect(walker.isFlying).toBe(true);
       expect(() => walker.setParams({ eyeHeightM: 5 })).toThrow("total height");
-      expect(walker.params.eyeHeightM).toBe(1.7);
+      expect(walker.params.eyeHeightM).toBe(DEFAULT_WALK_PARAMS.eyeHeightM);
       walker.beginWalking();
       walker.setParams({ unitsPerMetre: 2 });
       expect(walker.isFlying).toBe(true);
@@ -214,8 +217,8 @@ describe("fixed-metric walking admission", () => {
       walker.setParams({ bodySizing: "fixed-metric" });
       walker.respawn();
       expect(walker.isFlying).toBe(true);
-      expect(walker.walkingBody.totalHeightM).toBe(2.02);
-      expect(walker.camera.position.y).toBeCloseTo(1.8);
+      expect(walker.walkingBody.totalHeightM).toBeCloseTo(DEFAULT_TOTAL_M, 9);
+      expect(walker.camera.position.y).toBeCloseTo(DEFAULT_WALK_PARAMS.eyeHeightM + 0.1);   // respawn: eye + 0.1 m
       expect(walker.beginWalking().ok).toBe(false);
     } finally {
       fixture.dispose();

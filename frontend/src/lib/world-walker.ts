@@ -248,7 +248,7 @@ export interface WalkParams {
 export const DEFAULT_WALK_PARAMS: WalkParams = {
   bodySizing: "legacy-fit",
   unitsPerMetre: 1,
-  eyeHeightM: 1.7,
+  eyeHeightM: 1.68,                 // owner 2026-09-30: "approximately 5.5' eye height"
   radiusM: 0.32,
   walkSpeedMps: 3.4,
   sprintMultiplier: 2.4,

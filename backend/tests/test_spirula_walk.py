@@ -33,6 +33,14 @@ def _fake_world_shell(job: Path, verdict: str = "PASS", by_route: dict | None = 
         w = job / "_world"
         if cmd[1].endswith("walk_spawn_check.py"):
             return subprocess.CompletedProcess(cmd, 0, json.dumps(run.spawn), "")
+        if cmd[1].endswith("walk_ground.py") and "--classify" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, json.dumps({"indoor": run.indoor, "ceiling_frac": 0.2}), "")
+        if cmd[1].endswith("walk_ground.py"):
+            run.routes.append("path-ground")
+            (w / "collision_shell.glb").write_bytes(b"glTF")
+            (w / "collision_shell.json").write_text(json.dumps(_shell_report(verdict)))
+            (w / "navmesh.json").write_text("{}")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
         if cmd[1].endswith("walk_visual_shell.py"):
             run.visual.append(cmd[cmd.index("--max-faces") + 1])
             (w / "shell.glb").write_bytes(b"glTF-light")
@@ -50,7 +58,8 @@ def _fake_world_shell(job: Path, verdict: str = "PASS", by_route: dict | None = 
     run.routes = []
     run.visual = []
     run.voxels = []
-    run.spawn = {"ok": True, "ground_below_m": 1.3}
+    run.spawn = {"ok": True, "ground_below_m": 1.3, "sweep": {"cameras": 40, "pass_frac": 1.0}}
+    run.indoor = True
     return run
 
 
@@ -184,6 +193,40 @@ def test_a_capture_path_buried_in_the_solid_is_refused_and_an_old_world_retired(
     assert r.status_code == 422 and "inside the collision solid" in r.json()["detail"]
     assert not (job / "_world" / "world.json").exists() and (job / "_world" / "world.json.refused").is_file()
     assert tc.get(f"/api/splat/jobs/{JOB}/world/manifest").status_code == 404
+
+
+def test_outdoor_scenes_build_ground_from_the_path_not_the_exterior_skin(client, monkeypatch):
+    """Owner 2026-09-30: indoor and outdoor are different processes; outdoor = walk_ground.py."""
+    tc, outputs = client
+    job = _mk_job(outputs)
+    fake = _fake_world_shell(job)
+    fake.indoor = False
+    monkeypatch.setattr(splat_route.subprocess, "run", fake)
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={})
+    assert r.status_code == 200, r.text
+    assert fake.routes == ["path-ground"] and fake.voxels == []          # world_shell.py never ran
+    assert r.json()["walk"]["mode"] == "outdoor" and r.json()["walk"]["path_sweep"]["pass_frac"] == 1.0
+
+
+def test_outdoor_walk_without_ground_under_the_whole_path_is_refused(client, monkeypatch):
+    tc, outputs = client
+    job = _mk_job(outputs)
+    fake = _fake_world_shell(job)
+    fake.indoor = False
+    fake.spawn = {"ok": True, "sweep": {"cameras": 40, "pass_frac": 0.9}}
+    monkeypatch.setattr(splat_route.subprocess, "run", fake)
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={})
+    assert r.status_code == 422 and "ground under only 0.9" in r.json()["detail"]
+    assert not (job / "_world" / "world.json").exists()
+
+
+def test_indoor_scenes_keep_the_voxel_room(client, monkeypatch):
+    tc, outputs = client
+    job = _mk_job(outputs)
+    fake = _fake_world_shell(job)
+    monkeypatch.setattr(splat_route.subprocess, "run", fake)
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={})
+    assert r.status_code == 200 and r.json()["walk"]["mode"] == "indoor" and fake.routes == ["auto"]
 
 
 def test_unwalkable_shell_fails_loudly_and_writes_no_world(client, monkeypatch):

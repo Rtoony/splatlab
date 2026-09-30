@@ -7047,39 +7047,49 @@ async def _world_prepare_spirula(
         try:
             world_dir.mkdir(exist_ok=True)
             seed = spirula_lane.walk_seed_yup(job_dir)
+
+            async def mesh_tool(cmd: list[str], what: str, timeout: int = 1800) -> str:
+                proc = await asyncio.to_thread(
+                    subprocess.run, cmd, capture_output=True, text=True,
+                    cwd=str(MESH_DIR.parent), timeout=timeout)
+                if proc.returncode != 0:
+                    tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-4:])
+                    raise ValueError(f"{what} exited {proc.returncode}: {tail[:300]}")
+                return proc.stdout or ""
+
             try:
-                for route in ("auto", spirula_lane.WALK_FALLBACK_ROUTE):
-                    cmd = spirula_lane.walk_shell_command(
-                        str(MESH_ENV_PYTHON), MESH_DIR / "world_shell.py", job_dir, seed, route)
-                    proc = await asyncio.to_thread(
-                        subprocess.run, cmd, capture_output=True, text=True,
-                        cwd=str(MESH_DIR.parent), timeout=1800)
-                    if proc.returncode != 0:
-                        tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-4:])
-                        raise ValueError(f"world_shell.py exited {proc.returncode}: {tail[:300]}")
-                    if spirula_lane.walk_verdict(job_dir) in spirula_lane.WALK_OK_VERDICTS:
-                        break
-                coarser = (spirula_lane.walk_coarser_voxel(job_dir)
-                           if spirula_lane.walk_verdict(job_dir) in spirula_lane.WALK_OK_VERDICTS else None)
-                if coarser:
-                    # Too heavy for the browser's collider: rebuild once, coarser. If THAT is not walkable,
-                    # the verdict below refuses it rather than shipping a world nobody can load.
-                    proc = await asyncio.to_thread(
-                        subprocess.run,
-                        spirula_lane.walk_shell_command(
-                            str(MESH_ENV_PYTHON), MESH_DIR / "world_shell.py", job_dir, seed,
-                            "auto", coarser),
-                        capture_output=True, text=True, cwd=str(MESH_DIR.parent), timeout=1800)
-                    if proc.returncode != 0:
-                        tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-4:])
-                        raise ValueError(f"world_shell.py (voxel {coarser}) exited {proc.returncode}: {tail[:300]}")
+                ground_py = MESH_DIR / "walk_ground.py"
+                cls = json.loads((await mesh_tool(spirula_lane.walk_classify_command(
+                    str(MESH_ENV_PYTHON), ground_py, job_dir), "walk_ground.py --classify", 900)
+                                  ).strip().splitlines()[-1])
+                mode = "indoor" if cls.get("indoor") else "outdoor"
+                if mode == "outdoor":
+                    # Ground from where you walked (walk_ground.py): the exterior skin buries outdoor paths.
+                    await mesh_tool(spirula_lane.walk_ground_command(str(MESH_ENV_PYTHON), ground_py, job_dir),
+                                    "walk_ground.py")
+                else:
+                    for route in ("auto", spirula_lane.WALK_FALLBACK_ROUTE):
+                        await mesh_tool(spirula_lane.walk_shell_command(
+                            str(MESH_ENV_PYTHON), MESH_DIR / "world_shell.py", job_dir, seed, route),
+                            "world_shell.py")
+                        if spirula_lane.walk_verdict(job_dir) in spirula_lane.WALK_OK_VERDICTS:
+                            break
+                    coarser = (spirula_lane.walk_coarser_voxel(job_dir)
+                               if spirula_lane.walk_verdict(job_dir) in spirula_lane.WALK_OK_VERDICTS else None)
+                    if coarser:
+                        # Too heavy for the browser's collider: rebuild once, coarser. If THAT is not walkable,
+                        # the verdict below refuses it rather than shipping a world nobody can load.
+                        await mesh_tool(spirula_lane.walk_shell_command(
+                            str(MESH_ENV_PYTHON), MESH_DIR / "world_shell.py", job_dir, seed, "auto", coarser),
+                            f"world_shell.py (voxel {coarser})")
+                spawn = None
                 if spirula_lane.walk_verdict(job_dir) in spirula_lane.WALK_OK_VERDICTS:
-                    # world_shell's gates look DOWN FROM ABOVE; outdoors the skin also wraps the sky floaters,
-                    # the gates pass, and the capture path sits INSIDE the solid. Ask from the path itself.
+                    # Gates look DOWN FROM ABOVE; ask from the capture path itself: ground below, not buried.
                     chk = await asyncio.to_thread(
                         subprocess.run,
                         spirula_lane.walk_spawn_check_command(
-                            str(MESH_ENV_PYTHON), MESH_DIR / "walk_spawn_check.py", job_dir),
+                            str(MESH_ENV_PYTHON), MESH_DIR / "walk_spawn_check.py", job_dir,
+                            spirula_lane.WALK_SWEEP_EVERY),
                         capture_output=True, text=True, cwd=str(MESH_DIR.parent), timeout=900)
                     try:
                         spawn = json.loads((chk.stdout or "").strip().splitlines()[-1])
@@ -7087,6 +7097,10 @@ async def _world_prepare_spirula(
                         spawn = {"ok": False, "reason": f"spawn check failed: {(chk.stderr or '')[-200:]}"}
                     if not spawn.get("ok"):
                         raise ValueError(f"not walkable yet: {spawn.get('reason')}")
+                    sweep = spawn.get("sweep") or {}
+                    if mode == "outdoor" and (sweep.get("pass_frac") or 0.0) < spirula_lane.WALK_SWEEP_MIN_PASS:
+                        raise ValueError(f"not walkable yet: ground under only {sweep.get('pass_frac')} of the "
+                                         f"capture path")
                 (world_dir / "shell.glb").unlink(missing_ok=True)
                 if spirula_lane.walk_verdict(job_dir) in spirula_lane.WALK_OK_VERDICTS:
                     vis = await asyncio.to_thread(
@@ -7099,6 +7113,8 @@ async def _world_prepare_spirula(
                                        (vis.stderr or "")[-300:])
                 walk = spirula_lane.write_walk_world(
                     job_dir, job_id, meta.get("meters_per_unit"))
+                walk.update(mode=mode, ceiling_frac=cls.get("ceiling_frac"),
+                            path_sweep=(spawn or {}).get("sweep"))
             except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
                 # world_shell.py already overwrote the collision files: an older world.json no longer describes
                 # them, so it must stop advertising a walk.
@@ -7113,7 +7129,7 @@ async def _world_prepare_spirula(
             await audit_operator_event(
                 request=request,
                 title="World prepared",
-                description=f"{job_id}: Raw 360 walk ({walk['verdict']}, {walk['route']})",
+                description=f"{job_id}: Raw 360 walk ({walk['mode']}, {walk['verdict']}, {walk['route']})",
                 variant="success",
                 action="splat.world_prepare",
                 target=meta.get("mode", "3d"),

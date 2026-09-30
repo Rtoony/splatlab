@@ -23,6 +23,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("job_dir")
     ap.add_argument("--max-drop", type=float, default=4.0)
+    ap.add_argument("--sweep", type=int, default=0,
+                    help="also test every Nth capture camera (Y-up) the same way; reports the pass fraction")
     args = ap.parse_args()
     world = Path(args.job_dir) / "_world"
     report = json.loads((world / "collision_shell.json").read_text())
@@ -42,8 +44,28 @@ def main() -> int:
         i = int(np.argmin(np.abs(locs[:, 1] - seed[1])))
         return float(locs[i, 1]), float(mesh.face_normals[tri[i]][1])
 
+    def verdict_at(p):
+        nonlocal seed
+        seed = p
+        dn, upp = first_hit(-1.0), first_hit(1.0)
+        return (dn is not None and dn[1] > 0.0 and p[1] - dn[0] <= args.max_drop
+                and not (upp is not None and upp[1] > 0.0)), dn
+
+    sweep = None
+    if args.sweep > 0:
+        frames = json.loads((Path(args.job_dir) / "_spirula" / "cameras" / "transforms.json").read_text())["frames"]
+        cams = [[float(f["transform_matrix"][r][3]) for r in range(3)] for f in frames][:: args.sweep]
+        seed0, ok, drops = seed, 0, []
+        for c in cams:
+            good, dn = verdict_at([c[0], c[2], -c[1]])
+            ok += good
+            if dn is not None:
+                drops.append(c[2] - dn[0])
+        seed = seed0
+        sweep = {"cameras": len(cams), "pass_frac": round(ok / max(1, len(cams)), 4),
+                 "ground_below_median_m": round(float(np.median(drops)), 3) if drops else None}
     down, up = first_hit(-1.0), first_hit(1.0)
-    out = {"seed_yup": seed, "down": down, "up": up}
+    out = {"seed_yup": seed, "down": down, "up": up, "sweep": sweep}
     if down is None:
         out.update(ok=False, reason="nothing under the capture path")
     elif down[1] <= 0.0:
