@@ -165,9 +165,13 @@ for v in range(n_frames):
         continue
     g = gid[valid]
     w = op_g[valid].unsqueeze(-1)
-    emb = embeds[lab[valid]]
-    # (F) opacity-weighted scatter-accumulate (index_add_ sums duplicate gaussians)
-    Facc.index_add_(0, g, w * emb)
+    lab_v = lab[valid]
+    # (F) opacity-weighted scatter-accumulate (index_add_ sums duplicate gaussians), in CHUNKS: a view with ~1M
+    # hits made a [hits, 1152] fp32 temporary of 4.5 GB on top of the 3M-row Facc and OOM'd the conference room
+    # (09-30) whenever anything else held GPU memory. 256k rows = ~1.2 GB peak, whatever the view.
+    for _c in range(0, g.numel(), 262_144):
+        gc, wc = g[_c:_c + 262_144], w[_c:_c + 262_144]
+        Facc.index_add_(0, gc, wc * embeds[lab_v[_c:_c + 262_144]])
     Wsum.index_add_(0, g, w)
     seen[g] = True
     if (v + 1) % 20 == 0 or v == 0:
