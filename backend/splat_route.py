@@ -7056,7 +7056,6 @@ async def _world_prepare_spirula(
                     except (IndexError, ValueError):
                         spawn = {"ok": False, "reason": f"spawn check failed: {(chk.stderr or '')[-200:]}"}
                     if not spawn.get("ok"):
-                        spirula_lane.retire_walk_world(job_dir)
                         raise ValueError(f"not walkable yet: {spawn.get('reason')}")
                 (world_dir / "shell.glb").unlink(missing_ok=True)
                 if spirula_lane.walk_verdict(job_dir) in spirula_lane.WALK_OK_VERDICTS:
@@ -7071,6 +7070,9 @@ async def _world_prepare_spirula(
                 walk = spirula_lane.write_walk_world(
                     job_dir, job_id, meta.get("meters_per_unit"))
             except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                # world_shell.py already overwrote the collision files: an older world.json no longer describes
+                # them, so it must stop advertising a walk.
+                spirula_lane.retire_walk_world(job_dir)
                 opregistry.finish(op_id, status=opregistry.FAILED,
                                   result={"stage": "walk", "detail": str(exc)},
                                   error=str(exc)[:500])

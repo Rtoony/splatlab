@@ -189,10 +189,12 @@ def test_a_capture_path_buried_in_the_solid_is_refused_and_an_old_world_retired(
 def test_unwalkable_shell_fails_loudly_and_writes_no_world(client, monkeypatch):
     tc, outputs = client
     job = _mk_job(outputs)
+    (job / "_world").mkdir()
+    (job / "_world" / "world.json").write_text("{}")          # an older walk, now stale
     monkeypatch.setattr(splat_route.subprocess, "run", _fake_world_shell(job, verdict="FAIL"))
-    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={})
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={"force": ["walk"]})
     assert r.status_code == 422 and "not walkable" in r.json()["detail"]
-    assert not (job / "_world" / "world.json").exists()
+    assert not (job / "_world" / "world.json").exists() and (job / "_world" / "world.json.refused").is_file()
     import opregistry
     op = opregistry.list_ops(job_id=JOB, kind="world_prepare", limit=5)[0]
     assert op["status"] == opregistry.FAILED
