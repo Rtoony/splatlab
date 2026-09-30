@@ -158,6 +158,11 @@ for v in range(n_frames):
     lab = label_map[py, px]
     valid = occ_ok & (lab >= 0)
 
+    if not bool(valid.any()):
+        # A view where no splat passes the gates (all masked — e.g. mostly the camera operator — or nothing in
+        # front): a zero-length index_add_ is an invalid CUDA launch on this torch ("invalid configuration
+        # argument", conference room 09-30), so skip it rather than crash the whole lift.
+        continue
     g = gid[valid]
     w = op_g[valid].unsqueeze(-1)
     emb = embeds[lab[valid]]

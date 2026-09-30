@@ -102,6 +102,7 @@ def plan(monkeypatch):
     monkeypatch.setattr(splat_route, "_splat_transform_path", lambda: "/bin/splat-transform")
     monkeypatch.setattr(splat_route, "_health_available", lambda: False)
     monkeypatch.setattr(splat_route, "_eval_available", lambda: False)
+    monkeypatch.setattr(splat_route, "_langfield_available", lambda: False)   # tests opt in explicitly
     monkeypatch.setattr(splat_route, "_tool_path", lambda binary, env: f"/bin/{binary}")
     monkeypatch.setattr(splat_route, "_probe_video_streams",
                         lambda f, p: {"streams": 2, "width": 3840, "height": 3840, "dims": [(3840, 3840)] * 2})
@@ -123,6 +124,20 @@ def test_auto_routes_dual_fisheye_insv_to_spirula(plan):
                                  Path("/in/VID_x.insv"), Path("/jobs/splat_t"), stages, ctx)
     assert meta["trainer_resolved"] == "spirula" and meta["spirula"]["stride"] == 9
     assert meta["trainer"] == "auto"
+
+
+def test_language_search_is_on_by_default_for_raw_360_and_can_be_switched_off(plan, monkeypatch):
+    """Owner 2026-09-30: default once proven (storage room + conference room). An explicit false always wins."""
+    monkeypatch.setattr(splat_route, "_langfield_available", lambda: True)
+    stages, _, ctx = plan()
+    assert stages[-3:] == ["compress", "webopt", "langfield"]
+    meta = splat_route._new_meta("splat_t", splat_route.SplatTrainRequest(mode="3d", input_path="/in/VID_x.insv"),
+                                 Path("/in/VID_x.insv"), Path("/jobs/splat_t"), stages, ctx)
+    assert meta["language_field"] is True                     # resolved, so a re-run keeps it
+    off, _, _ = plan(language_field=False)
+    assert "langfield" not in off
+    rig, _, _ = plan(input_path="/in/photos.mp4")               # the rig/splatfacto lane keeps its opt-in default
+    assert "langfield" not in rig
 
 
 def test_fallbacks_keep_the_rig_lane(plan, monkeypatch):

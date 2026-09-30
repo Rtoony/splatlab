@@ -455,7 +455,9 @@ class SplatTrainRequest(BaseModel):
     # OPT-IN: build a text-searchable language field after training (SAM 2.1 +
     # SigLIP 2, training-free lift). Default off → the pipeline is byte-identical.
     # Best-effort: a build failure never fails the splat job.
-    language_field: bool = False
+    # None = the lane's default: ON for Raw 360 (Spirula) scenes (owner 2026-09-30: default once proven on two
+    # scenes), off for the rig/splatfacto lane. An explicit false always wins.
+    language_field: bool | None = None
     # OPT-IN: export a triangle mesh after training (Open3D TSDF champion recipe,
     # the Digital Twin kernel — Blender/CAD/STL downstream). Default off → the
     # pipeline is byte-identical. Best-effort: a mesh failure never fails the job.
@@ -626,7 +628,8 @@ def _new_meta(
         "sfm_tried": sorted(_seed_sfm_tried(sfm_context, stages)),
         "reroute_count": 0,
         "sfm_reroutes": [],
-        "language_field": req.language_field,
+        # RESOLVED: was a language stage planned (the Raw 360 default is on). A re-run reads this back.
+        "language_field": "langfield" in stages,
         "mesh_export": req.mesh_export,
         "trim_start_s": req.trim_start_s,
         "trim_duration_s": req.trim_duration_s,
@@ -2403,6 +2406,9 @@ def _plan_spirula_job(
     stages = [st for st in spirula_lane.STAGES if st in commands] + ["spirula_publish"]
     if _splat_transform_path():
         stages += ["compress", "webopt"]
+        # Language search is built on web.ply, so it needs webopt; on by default for Raw 360 scenes.
+        if req.language_field is not False and _langfield_available():
+            stages.append("langfield")
     _SPIRULA_PLANS[str(job_dir)] = {**spirula_lane.settings_dict(s), "probe": info}
     return stages, commands, None
 

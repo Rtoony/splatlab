@@ -53,8 +53,8 @@ export default function NewCapturePage() {
   }, [uploaded]);
   const [iters, setIters] = useState<number>(QUALITY.standard.iterations);
   const [showCustom, setShowCustom] = useState(false);
-  // Opt-in: build a text-searchable Language Field alongside the scene.
-  const [languageField, setLanguageField] = useState(false);
+  // Build a text-searchable Language Field alongside the scene. ON by default (owner 2026-09-30); untick to skip.
+  const [languageField, setLanguageField] = useState(true);
   // Opt-in: export a triangle mesh (Digital Twin kernel — Blender/CAD/print).
   const [meshExport, setMeshExport] = useState(false);
   // Safe default: raw .insv evaluations start as a bounded Test Flight. A full
@@ -320,8 +320,8 @@ export default function NewCapturePage() {
                 <Sparkles className="h-3.5 w-3.5 text-cyan-200" /> Language search (text-searchable)
               </span>
               <span className="mt-0.5 block text-xs text-zinc-400">
-                Build a language field so you can search the finished scene by typing what you're looking for. Adds
-                some build time.
+                Build a language field so you can search the finished scene by typing what you're looking for. On by
+                default; adds about 10 minutes of build time and ~1 GB.
               </span>
             </span>
           </button>
