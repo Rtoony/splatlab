@@ -86,6 +86,19 @@ def test_seed_is_the_median_camera_in_y_up(tmp_path):
     assert spirula_lane.walk_seed_yup(tmp_path / "nothing") is None
 
 
+def test_seed_on_a_loop_is_a_real_camera_not_the_empty_middle(tmp_path):
+    """A loop around a pool: the median of x and y is the middle of the water."""
+    import math
+    job = tmp_path / "loop"
+    cams = job / "_spirula" / "cameras"
+    cams.mkdir(parents=True)
+    frames = [{"transform_matrix": [[1, 0, 0, 10 * math.cos(a)], [0, 1, 0, 10 * math.sin(a)], [0, 0, 1, 1.5],
+                                    [0, 0, 0, 1]]} for a in [i * 2 * math.pi / 36 for i in range(36)]]
+    (cams / "transforms.json").write_text(json.dumps({"frames": frames}))
+    x, y, z = spirula_lane.walk_seed_yup(job)
+    assert abs(math.hypot(x, -z) - 10) < 1e-3 and y == 1.5
+
+
 def test_shell_command_uses_metric_player_and_seed(tmp_path):
     cmd = spirula_lane.walk_shell_command("py", Path("world_shell.py"), tmp_path, [1.0, 1.4, -2.0])
     assert cmd[cmd.index("--player-height") + 1] == "1.7"

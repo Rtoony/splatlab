@@ -399,8 +399,11 @@ def is_spirula_job(meta: dict) -> bool:
 
 
 def walk_seed_yup(job_dir: Path) -> list[float] | None:
-    """Median capture-camera position, mapped Z-up (x,y,z) -> Y-up (x, z, -y). The operator walked there,
-    so it is free space — a better flood-fill seed than the cloud-median probe in a narrow room."""
+    """The capture camera nearest the median camera position, mapped Z-up (x,y,z) -> Y-up (x, z, -y).
+
+    The operator stood there, so it is free space with ground under it — a better flood-fill seed than the
+    cloud-median probe in a narrow room. It must be a REAL camera: the component-wise median of a loop around a
+    pool (pool long take, splat_aab7a913bc) sits over the water, and the walker dropped into the basin."""
     try:
         frames = json.loads((workdir(job_dir) / "cameras" / "transforms.json").read_text())["frames"]
         pos = [[float(f["transform_matrix"][r][3]) for r in range(3)] for f in frames]
@@ -409,7 +412,8 @@ def walk_seed_yup(job_dir: Path) -> list[float] | None:
     if not pos:
         return None
     med = [sorted(p[i] for p in pos)[len(pos) // 2] for i in range(3)]
-    return [round(med[0], 4), round(med[2], 4), round(-med[1], 4)]
+    near = min(pos, key=lambda p: sum((p[i] - med[i]) ** 2 for i in range(3)))
+    return [round(near[0], 4), round(near[2], 4), round(-near[1], 4)]
 
 
 # world_shell.py ranks candidates BEFORE its crumb drop re-grades the winner, so the auto pick can land just under
