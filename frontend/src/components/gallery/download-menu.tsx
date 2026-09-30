@@ -6,6 +6,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "wouter";
 import { buildPortableExports, buildUnrealBundle, fetchPortableExports } from "@/lib/api";
 import type { SplatJob } from "@/lib/contracts";
+import { formatBytes, formatSplats } from "@/lib/quality";
 import { Button } from "@/components/ui";
 import { Box, ChevronDown, Download, Layers, Loader2 } from "lucide-react";
 
@@ -72,10 +73,27 @@ export function DownloadMenu({ job }: { job: SplatJob }) {
       hint: "bounds · scale · provenance · SHA-256",
     },
   ];
+  // Viewing tiers (lib/quality.ts): every tier downloads from anywhere, even where the viewer won't show full.
+  const tiers = job.quality_tiers ?? [];
+  const tierHint: Record<string, string> = {
+    full: "every splat · for editing · shown in the viewer on the Nexus PC only",
+    web: "compressed · the copy browsers off the PC see",
+    lite: "compressed · phones",
+  };
+  const tierOpts = tiers.map((t) => ({
+    url: t.url,
+    label: `${t.label} · ${formatSplats(t.splats)} · ${formatBytes(t.bytes)}`,
+    ext: t.compressed ? `${t.id}.compressed.ply` : `${t.id}.ply`,
+    hint: tierHint[t.id],
+  }));
   const opts = [
-    { url: job.preview_web_url, label: "Web .ply", ext: "ply", hint: "small · for sharing/viewing" },
+    ...(tierOpts.length
+      ? tierOpts
+      : [
+        { url: job.preview_web_url, label: "Web .ply", ext: "ply", hint: "small · for sharing/viewing" },
+        { url: job.preview_file_url, label: "Full .ply", ext: "ply", hint: "full quality · for editing" },
+      ]),
     { url: job.preview_spz_url, label: "Compressed .spz", ext: "spz", hint: "smallest · modern viewers" },
-    { url: job.preview_file_url, label: "Full .ply", ext: "ply", hint: "full quality · for editing" },
     { url: job.mesh_file_url, label: "Mesh .ply", ext: "ply", hint: "triangle mesh · Blender/CAD" },
     { url: job.mesh_glb_url, label: "Mesh .glb", ext: "glb", hint: "triangle mesh · drag into Blender" },
     { url: job.twin_glb_url, label: "Twin .glb", ext: "glb", hint: "splat-colored · real meters · Blender-ready" },

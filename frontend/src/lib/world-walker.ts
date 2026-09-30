@@ -47,6 +47,7 @@ import {
   SplatFileType,
   SplatMesh,
 } from "@sparkjsdev/spark";
+import type { QualityTier } from "./contracts";
 import { buildPluckModifier, packChannelsRgba } from "./spark-heatmap";
 import { installMeshPortalClipping, installPortalClipping, validatePortals, type ArchitecturalPortal } from "./architectural-portals";
 import { findWalkingStart, inspectWalkingPose, walkingBodyError, type WalkingAdmission, type WalkingBody } from "./walking-admission";
@@ -125,6 +126,8 @@ export function collisionScaleToWorld(manifest: WorldManifest): number {
 
 export interface WorldManifest {
   calibration?: { stale?: boolean };
+  /** Viewing tiers for the splat backdrop (full only on the Nexus PC — lib/quality.ts). */
+  quality_tiers?: QualityTier[];
   v?: number;
   job_id?: string;
   units?: string;

@@ -20,7 +20,7 @@ document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene(); scene.background = new THREE.Color(0xffffff);
 const camera = new THREE.PerspectiveCamera(50, W / H, 0.01, 1000);
 const spark = new SparkRenderer({ renderer }); scene.add(spark);
-const mesh = new SplatMesh({ url: q.get("ply"), fileType: SplatFileType.PLY });
+const mesh = new SplatMesh({ url: q.get("ply"), fileType: q.get("ply").endsWith(".spz") ? SplatFileType.SPZ : SplatFileType.PLY });
 scene.add(mesh);
 let frames = 0;
 function loop() { renderer.render(scene, camera); frames++; requestAnimationFrame(loop); }

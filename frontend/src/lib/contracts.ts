@@ -11,6 +11,17 @@ export interface SfmReroute {
   at: string;
 }
 
+export type QualityTierId = "full" | "web" | "lite";
+
+export interface QualityTier {
+  id: QualityTierId;
+  label: string;
+  splats: number | null;
+  bytes: number;
+  compressed: boolean;
+  url: string;
+}
+
 export interface SplatJob {
   job_id: string;
   mode: "3d" | "4d";
@@ -109,6 +120,8 @@ export interface SplatJob {
   trainer?: "auto" | "spirula" | "splatfacto";
   trainer_resolved?: "spirula" | "splatfacto" | "triposplat";
   checkpoint_available?: boolean;
+  // Viewing tiers on disk (full / web / lite). Full is shown only on the Nexus PC; see lib/quality.ts.
+  quality_tiers?: QualityTier[];
   spirula_quality?: "high" | "ultra" | null;
   spirula?: {
     stride?: number;

@@ -21,6 +21,9 @@ import { LIGHT_PRESETS, emptyRestyle, type RestyleDoc, type RestyleEntry, type R
 import { WorldGame, type GameHudState, type Scenario } from "@/lib/world-game";
 import type { parseNavmesh } from "@/lib/world-navmesh";
 import { PolishUploadZone } from "@/components/workspace/polish-upload";
+import type { QualityTier } from "@/lib/contracts";
+import { defaultTier, fetchViewerContext, formatBytes, formatSplats, isPhoneLike, readQualityPref, viewableTiers,
+  writeQualityPref } from "@/lib/quality";
 import {
   DEFAULT_WALK_PARAMS,
   WorldWalker,
@@ -137,6 +140,12 @@ export default function WorldViewPage() {
   const [target, setTarget] = useState<TargetInfo | null>(null);
   const [flying, setFlying] = useState(false);
   const [backdrop, setBackdrop] = useState(true);
+  // Backdrop viewing tier (lib/quality.ts): full quality only on the Nexus PC. A fresh pluck doc pins the
+  // backdrop to the row-identical langweb copy, so the picker steps aside then.
+  const [backdropTiers, setBackdropTiers] = useState<QualityTier[]>([]);
+  const [backdropTier, setBackdropTier] = useState<QualityTier | null>(null);
+  const [backdropLocal, setBackdropLocal] = useState(false);
+  const [pluckPinned, setPluckPinned] = useState(false);
   const [sky, setSkyOn] = useState(true);
   const skyRef = useRef(true);
   const [curtainDoc, setCurtainDoc] = useState<WorldCurtainDoc | null>(null);
@@ -401,18 +410,25 @@ export default function WorldViewPage() {
           // the server falls back to the raw ply) only when a FRESH pluck doc
           // exists. A stale doc never chooses rows: wrong rows would pluck the
           // wrong gaussians, and wrong is worse than none.
-          void fetchWorldPluck(jobId)
-            .catch(() => null)
-            .then((pluckRes) => {
+          void Promise.all([fetchWorldPluck(jobId).catch(() => null), fetchViewerContext()])
+            .then(([pluckRes, ctx]) => {
               if (cancelled) return undefined;
               const fresh = pluckRes && pluckRes.ok && !pluckRes.stale ? pluckRes.pluck : null;
               if (fresh) walker.setPluckDoc(fresh);
+              const viewable = viewableTiers(m.quality_tiers, ctx.local);
+              const tier = defaultTier(viewable, ctx.local, isPhoneLike(), readQualityPref());
+              setBackdropTiers(viewable);
+              setBackdropTier(tier);
+              setBackdropLocal(ctx.local);
+              setPluckPinned(Boolean(fresh));
               if (pluckRes?.stale) {
                 setWarnings((w) => [...w,
                   "Pluck data is stale — moved props keep their splat ghosts (rebuild via POST /world/pluck)."]);
               }
               return walker.setBackdrop(
-                `/api/splat/jobs/${encodeURIComponent(jobId)}/preview/file?fmt=${fresh ? "langweb" : "web"}`,
+                fresh
+                  ? `/api/splat/jobs/${encodeURIComponent(jobId)}/preview/file?fmt=langweb`
+                  : tier?.url ?? `/api/splat/jobs/${encodeURIComponent(jobId)}/preview/file?fmt=web`,
                 m.meters_per_unit ?? null,
               );
             })
@@ -829,7 +845,9 @@ export default function WorldViewPage() {
                       if (!w) return;
                       void w.setBackdrop(
                         e.target.checked
-                          ? `/api/splat/jobs/${encodeURIComponent(jobId)}/preview/file?fmt=web`
+                          ? (pluckPinned
+                            ? `/api/splat/jobs/${encodeURIComponent(jobId)}/preview/file?fmt=langweb`
+                            : backdropTier?.url ?? `/api/splat/jobs/${encodeURIComponent(jobId)}/preview/file?fmt=web`)
                           : null,
                         sceneInfo?.metersPerUnit ?? null,
                       ).then(() => applySky(w, skyRef.current));
@@ -847,6 +865,34 @@ export default function WorldViewPage() {
                     </span>
                   </span>
                 </label>
+                {backdropTier && !pluckPinned && (
+                  <label className="mt-2 flex items-center gap-2 text-[11px] text-zinc-300"
+                    title={backdropLocal ? "On the Nexus PC: full quality is available."
+                      : "Full quality is shown on the Nexus PC only — download it from the scene's download menu."}>
+                    <span>Quality</span>
+                    <select
+                      aria-label="Splat quality"
+                      value={backdropTier.id}
+                      disabled={!backdrop || backdropTiers.length < 2}
+                      onChange={(e) => {
+                        const next = backdropTiers.find((t) => t.id === e.target.value);
+                        const w = walkerRef.current;
+                        if (!next || !w) return;
+                        writeQualityPref(next.id);
+                        setBackdropTier(next);
+                        void w.setBackdrop(next.url, sceneInfo?.metersPerUnit ?? null)
+                          .then(() => applySky(w, skyRef.current));
+                      }}
+                      className="rounded border border-white/15 bg-black/60 px-1 py-0.5 text-[10px] text-zinc-100"
+                    >
+                      {backdropTiers.map((t) => (
+                        <option key={t.id} value={t.id}>
+                          {t.label} · {formatSplats(t.splats)} · {formatBytes(t.bytes)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
                 <label className="mt-2 flex items-start gap-2 text-[11px] text-zinc-300">
                   <input
                     type="checkbox"

@@ -28,6 +28,7 @@ import {
   type OverlayMode,
 } from "@/lib/spark-heatmap";
 import type { SplatJob } from "@/lib/contracts";
+import { formatBytes, formatSplats, useQualityTier } from "@/lib/quality";
 import type {
   ViewerCameraNodeTarget,
   ViewerCameraOverlay,
@@ -237,7 +238,14 @@ export function SparkSceneViewer({
   const [reloadNonce, setReloadNonce] = useState(0);
   // Langfield scenes MUST load langweb: relevancy rows are exported-ply order
   // and langweb preserves it; web.ply is decimated + reordered.
-  const url = `/api/splat/jobs/${job.job_id}/preview/file?fmt=${job.langfield_available ? "langweb" : "web"}&v=${reloadNonce}`;
+  // Viewing tier (lib/quality.ts): full quality only on the Nexus PC, compressed web / lite elsewhere. Null until
+  // the server has said where we are, so a remote browser never starts a multi-GB download by accident.
+  const quality = useQualityTier(job.quality_tiers);
+  const url = job.langfield_available
+    ? `/api/splat/jobs/${job.job_id}/preview/file?fmt=langweb&v=${reloadNonce}`
+    : !quality.ready
+      ? null
+      : `${quality.current?.url ?? `/api/splat/jobs/${job.job_id}/preview/file?fmt=web`}&v=${reloadNonce}`;
   const dimsStorageKey = `splatlab.dims.${job.job_id}`;
 
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -1747,7 +1755,7 @@ export function SparkSceneViewer({
   // ---- three.js scene ------------------------------------------------------
   useEffect(() => {
     const container = containerRef.current;
-    if (!container) return;
+    if (!container || !url) return;
 
     let disposed = false;
     setError(null);
@@ -2748,6 +2756,9 @@ export function SparkSceneViewer({
           These are DOM/SVG siblings ABOVE the canvas — clicks on the marker
           buttons never reach the renderer's own pointer handlers, so they
           cannot double-fire crop/paint/measure picking. */}
+      {!chromeHidden && !job.langfield_available && quality.current && (
+        <QualityPicker quality={quality} />
+      )}
       {showShortcutLegend && !chromeHidden && <ShortcutLegend />}
       {!chromeHidden && (
         <ToolHud
@@ -3992,6 +4003,37 @@ function ShortcutLegend() {
       <p className="mt-2 text-[10px] leading-snug text-zinc-600">
         Keys are ignored while you're typing in a field.
       </p>
+    </div>
+  );
+}
+
+
+/** Bottom-left quality chip: which copy of the splat is showing, and the others this browser may switch to. */
+function QualityPicker({ quality }: { quality: ReturnType<typeof useQualityTier> }) {
+  const current = quality.current;
+  if (!current) return null;
+  const describe = (t: typeof current) =>
+    `${t.label} · ${formatSplats(t.splats)}${t.splats ? " · " : ""}${formatBytes(t.bytes)}`;
+  const note = quality.local
+    ? "On the Nexus PC: full quality is available."
+    : "Full quality is shown on the Nexus PC only — download it from the download menu.";
+  return (
+    <div className="absolute bottom-2 left-2 z-20 flex items-center gap-1.5 rounded-lg border border-white/10 bg-black/70 px-2 py-1 text-[10px] text-zinc-300 backdrop-blur-sm" title={note}>
+      <span className="font-semibold uppercase tracking-[0.14em] text-cyan-300/80">Quality</span>
+      {quality.viewable.length > 1 ? (
+        <select
+          aria-label="Splat quality"
+          value={current.id}
+          onChange={(e) => quality.choose(e.target.value as typeof current.id)}
+          className="rounded border border-white/15 bg-black/60 px-1 py-0.5 text-[10px] text-zinc-100"
+        >
+          {quality.viewable.map((t) => (
+            <option key={t.id} value={t.id}>{describe(t)}</option>
+          ))}
+        </select>
+      ) : (
+        <span>{describe(current)}</span>
+      )}
     </div>
   );
 }

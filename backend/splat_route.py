@@ -50,6 +50,7 @@ import gpu_arbiter
 import maintenance_gate
 import opregistry  # persistent heavy-operation registry (pollable, restart-truthful)
 import scale_calibration  # pure metric-scale math; imports nothing from this app
+import quality_tiers  # viewing-quality tiers (full on the Nexus PC only; web/lite elsewhere)
 import spirula_lane  # Spirula 360 lane (raw dual-fisheye .insv; GPL binary run as a subprocess)
 from train_preflight import train_preflight
 from health.precheck import precheck_input
@@ -1259,6 +1260,9 @@ def _job_payload(meta: dict[str, Any], live: SplatJob | None = None) -> dict:
         # Lightweight copy for the shareable /splat/view page; fmt=web falls back
         # to the raw .ply server-side, so this is offered whenever a preview exists.
         "preview_web_url": f"/api/splat/jobs/{job_id}/preview/file?fmt=web" if preview_file.is_file() else None,
+        # Viewing tiers (full / web / lite) that exist on disk, with splat counts and sizes. Which one a viewer
+        # shows depends on where it is opened from: GET /viewer-context says whether this is the Nexus PC.
+        "quality_tiers": quality_tiers.tiers(_preview_dir_path(output_dir), job_id),
         # Opt-in language field: a built per-gaussian feature sidecar exists -> the
         # scene is text-searchable (the viewer shows the query UI when this is true).
         "langfield_available": langfield_built,
@@ -3418,6 +3422,14 @@ async def _run_pipeline(job: SplatJob) -> None:
                         job.log_lines.append("[webopt] web-optimized .ply failed; viewer falls back to the raw .ply.")
                         _record_stage_failure(job.job_id, stage, f"exit code {rc}")
                         stage_ok = False
+                    else:
+                        # Viewing tiers for browsers off the Nexus PC (quality_tiers.py): compressed web + lite,
+                        # both from web.ply. Best-effort — a missing tier only means a viewer offers fewer choices.
+                        for label, tier_cmd in quality_tiers.build_commands(transform, _preview_dir_path(job_dir)):
+                            trc = await _run_stage(job, label, tier_cmd)
+                            if trc != 0:
+                                job.log_lines.append(f"[webopt] {label} failed; that viewing tier is unavailable.")
+                                _record_stage_failure(job.job_id, label, f"exit code {trc}")
                     # langweb: full-count SH-stripped copy for the CLIENT-SIDE language
                     # heatmap. No --decimate, so its row order matches gauss_emb.npz
                     # (probe-verified — see _langweb_command). Built only for jobs that
@@ -4178,6 +4190,13 @@ def migrate_legacy_metas() -> int:
 # ---------------------------------------------------------------------------
 
 
+@router.get("/viewer-context")
+async def viewer_context(request: Request):
+    """Is this browser on the Nexus PC itself? Only then may a viewer show the full-quality splat."""
+    return {"local": quality_tiers.is_local_request(request.client.host if request.client else None,
+                                                     request.headers)}
+
+
 @router.get("/status")
 async def get_splat_status():
     availability = _engine_availability()
@@ -4641,10 +4660,21 @@ async def get_splat_cameras(job_id: str, limit: int = 500):
 
 
 @router.get("/jobs/{job_id}/preview/file")
-async def get_splat_preview_file(job_id: str, fmt: Literal["ply", "spz", "web", "langweb"] = "ply"):
+async def get_splat_preview_file(
+    job_id: str, fmt: Literal["ply", "spz", "web", "langweb", "full", "webc", "lite"] = "ply"
+):
     # Resolved purely from disk so preview URLs survive portal restarts.
     if not _safe_job_id(job_id):
         raise HTTPException(status_code=404, detail="Splat job not found")
+    if fmt in quality_tiers.TIER_OF_FMT:
+        # Viewing tiers (quality_tiers.py). fmt=web keeps its historical meaning (web.ply) for older links.
+        tier = quality_tiers.TIER_OF_FMT[fmt]
+        tier_file = quality_tiers.tier_path(_preview_dir_path(_job_dir(job_id)), tier)
+        if tier_file is None:
+            raise HTTPException(status_code=404, detail=f"No {tier} copy of this splat yet")
+        suffix = ".compressed.ply" if tier_file.name.endswith(".compressed.ply") else ".ply"
+        return FileResponse(str(tier_file), media_type="application/octet-stream",
+                            filename=f"{job_id}-{tier}{suffix}", headers={"Cache-Control": "no-cache"})
     if fmt == "spz":
         preview_file = _preview_spz_path(_job_dir(job_id))
         suffix = "spz"
@@ -7709,6 +7739,8 @@ async def get_splat_world_manifest(job_id: str):
         "thresholds": manifest.get("thresholds"),
         "shell": shell,
         "collision_shell": collision_shell,
+        # Viewing tiers for the splat backdrop (full only on the Nexus PC; lib/quality.ts picks).
+        "quality_tiers": quality_tiers.tiers(_preview_dir_path(Path(meta["output_dir"])), job_id),
         "elements": elements,
         "reports": {
             key: _world_file_url(job_id, name)
