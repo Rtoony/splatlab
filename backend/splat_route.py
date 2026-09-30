@@ -7043,6 +7043,21 @@ async def _world_prepare_spirula(
                     if proc.returncode != 0:
                         tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-4:])
                         raise ValueError(f"world_shell.py (voxel {coarser}) exited {proc.returncode}: {tail[:300]}")
+                if spirula_lane.walk_verdict(job_dir) in spirula_lane.WALK_OK_VERDICTS:
+                    # world_shell's gates look DOWN FROM ABOVE; outdoors the skin also wraps the sky floaters,
+                    # the gates pass, and the capture path sits INSIDE the solid. Ask from the path itself.
+                    chk = await asyncio.to_thread(
+                        subprocess.run,
+                        spirula_lane.walk_spawn_check_command(
+                            str(MESH_ENV_PYTHON), MESH_DIR / "walk_spawn_check.py", job_dir),
+                        capture_output=True, text=True, cwd=str(MESH_DIR.parent), timeout=900)
+                    try:
+                        spawn = json.loads((chk.stdout or "").strip().splitlines()[-1])
+                    except (IndexError, ValueError):
+                        spawn = {"ok": False, "reason": f"spawn check failed: {(chk.stderr or '')[-200:]}"}
+                    if not spawn.get("ok"):
+                        spirula_lane.retire_walk_world(job_dir)
+                        raise ValueError(f"not walkable yet: {spawn.get('reason')}")
                 (world_dir / "shell.glb").unlink(missing_ok=True)
                 if spirula_lane.walk_verdict(job_dir) in spirula_lane.WALK_OK_VERDICTS:
                     vis = await asyncio.to_thread(

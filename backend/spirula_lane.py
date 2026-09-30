@@ -448,6 +448,18 @@ def walk_coarser_voxel(job_dir: Path, voxel: float = WALK_BASE_VOXEL) -> float |
     return round(voxel * math.sqrt(tris / WALK_TARGET_COLLIDE_TRIS), 3)
 
 
+def walk_spawn_check_command(python: str, script: Path, job_dir: Path) -> list[str]:
+    return [python, str(script), str(job_dir)]
+
+
+def retire_walk_world(job_dir: Path) -> None:
+    """A refused walk must not leave an older world.json advertising world_available (kept aside, not deleted)."""
+    world = job_dir / "_world"
+    for name in ("world.json", "world_manifest.json"):
+        if (world / name).is_file():
+            (world / name).replace(world / f"{name}.refused")
+
+
 def walk_verdict(job_dir: Path) -> str | None:
     try:
         return json.loads((job_dir / "_world" / "collision_shell.json").read_text()).get("verdict")

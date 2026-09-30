@@ -31,6 +31,8 @@ def _fake_world_shell(job: Path, verdict: str = "PASS", by_route: dict | None = 
                       tris_by_voxel: dict | None = None):
     def run(cmd, **kw):
         w = job / "_world"
+        if cmd[1].endswith("walk_spawn_check.py"):
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(run.spawn), "")
         if cmd[1].endswith("walk_visual_shell.py"):
             run.visual.append(cmd[cmd.index("--max-faces") + 1])
             (w / "shell.glb").write_bytes(b"glTF-light")
@@ -48,6 +50,7 @@ def _fake_world_shell(job: Path, verdict: str = "PASS", by_route: dict | None = 
     run.routes = []
     run.visual = []
     run.voxels = []
+    run.spawn = {"ok": True, "ground_below_m": 1.3}
     return run
 
 
@@ -166,6 +169,21 @@ def test_a_solid_too_heavy_for_the_browser_is_rebuilt_once_coarser(client, monke
     assert tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={}).status_code == 200
     assert fake.voxels == ["0.07", "0.165"]
     assert json.loads((job / "_world" / "collision_shell.json").read_text())["artifact"]["triangles_written"] == 3_050_000
+
+
+def test_a_capture_path_buried_in_the_solid_is_refused_and_an_old_world_retired(client, monkeypatch):
+    """Street walk: gates PASS (they look down from above the sky floaters) but the path is inside the solid."""
+    tc, outputs = client
+    job = _mk_job(outputs)
+    fake = _fake_world_shell(job)
+    monkeypatch.setattr(splat_route.subprocess, "run", fake)
+    assert tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={}).status_code == 200
+    assert (job / "_world" / "world.json").is_file()
+    fake.spawn = {"ok": False, "reason": "the capture path is inside the collision solid"}
+    r = tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={"force": ["walk"]})
+    assert r.status_code == 422 and "inside the collision solid" in r.json()["detail"]
+    assert not (job / "_world" / "world.json").exists() and (job / "_world" / "world.json.refused").is_file()
+    assert tc.get(f"/api/splat/jobs/{JOB}/world/manifest").status_code == 404
 
 
 def test_unwalkable_shell_fails_loudly_and_writes_no_world(client, monkeypatch):
