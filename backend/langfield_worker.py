@@ -190,6 +190,10 @@ def _make_render(means, quats, scales, opac, cams, fullW, fullH):
 
 
 # ── scene cache ──────────────────────────────────────────────────────────────────
+class _IdentityRows(Exception):
+    """Raw 360 scenes: field rows ARE the served ply's rows."""
+
+
 class Scene:
     """One lifted scene resident on the GPU, keyed by config_path."""
 
@@ -204,23 +208,42 @@ class Scene:
         config_p = Path(config_path)
         lf_p = Path(lfdir)
 
-        # geometry (KEEP the spike load — same as query_render_v2.py)
-        config, pipeline, _, _ = eval_setup(config_p, test_mode="test")
-        m = pipeline.model.to(DEV)
-        self.means = m.means.detach()
-        self.quats = m.quats.detach()
-        self.scales = torch.exp(m.scales.detach())
-        self.opac = torch.sigmoid(m.opacities.detach()).squeeze(-1)
-        self.sh = torch.cat(
-            [m.features_dc.detach()[:, None, :], m.features_rest.detach()], dim=1)
-        self.cams = pipeline.datamanager.train_dataset.cameras.to(DEV)
+        # Raw 360 (Spirula) scenes have no checkpoint: the build leaves <lfdir>/scene.json naming the published
+        # web.ply (whose row order IS the field's) and the upright pinhole cameras the lift used.
+        self.spirula = config_p.name == "scene.json"
+        if self.spirula:
+            doc = json.loads(config_p.read_text())
+            _ld = str(Path(__file__).resolve().parent / "langfield")
+            if _ld not in sys.path:
+                sys.path.insert(0, _ld)
+            from spirula_source import PinholeCameras, load_splat
+            self.means, self.quats, self.scales, self.opac, self.sh = load_splat(
+                Path(doc["ply"]), DEV, with_colors=True)
+            self.cams = PinholeCameras(Path(doc["cameras"]), DEV)
+            pipeline = m = None
+        else:
+            # geometry (KEEP the spike load — same as query_render_v2.py)
+            config, pipeline, _, _ = eval_setup(config_p, test_mode="test")
+            m = pipeline.model.to(DEV)
+            self.means = m.means.detach()
+            self.quats = m.quats.detach()
+            self.scales = torch.exp(m.scales.detach())
+            self.opac = torch.sigmoid(m.opacities.detach()).squeeze(-1)
+            self.sh = torch.cat(
+                [m.features_dc.detach()[:, None, :], m.features_rest.detach()], dim=1)
+            self.cams = pipeline.datamanager.train_dataset.cameras.to(DEV)
         self.fullW = int(self.cams.width[0])
         self.fullH = int(self.cams.height[0])
         self.n_cams = int(self.cams.camera_to_worlds.shape[0])
+        # web.ply carries only the DC colour; checkpoint scenes carry all 3 SH bands
+        self.sh_degree = int(round(self.sh.shape[1] ** 0.5)) - 1
 
         # per-gaussian lifted SigLIP features (already L2-normed; zeros for unseen)
         d = np.load(lf_p / "gauss_emb.npz")
         self.feat_n = torch.tensor(d["gauss_emb"], device=DEV).float()
+        # A PCA-reduced field (langfield_v2 LANGFIELD_PCA_DIM) ships its basis: text must be projected the same way.
+        self.proj = (torch.tensor(d["proj"], device=DEV).float()
+                     if "proj" in getattr(d, "files", []) else None)
 
         # Which gaussians the lift actually observed. Written by langfield_v2
         # since the lift was first built, but only mesh/object_isolate.py ever
@@ -239,6 +262,9 @@ class Scene:
         # CPU as numpy; None -> /relevancy serves ckpt order and the client's
         # row-count guard fails loud instead of mistinting.
         try:
+            if self.spirula:
+                # the field was lifted onto web.ply itself, and the client renders web.ply (langweb): identity
+                raise _IdentityRows
             # lazy import: keeps the no-heavy-deps import path clean; sys.path
             # insert because the worker isn't launched with backend/ as a root
             import sys as _sys
@@ -248,6 +274,8 @@ class Scene:
             import langfield_align
             self.ply_map = langfield_align.load_or_build_map(
                 lf_p, self.means.detach().cpu().numpy())
+        except _IdentityRows:
+            self.ply_map = np.arange(int(self.feat_n.shape[0]), dtype=np.int64)
         except Exception:
             log.exception("ply->ckpt align errored; relevancy stays in ckpt order")
             self.ply_map = None
@@ -258,6 +286,12 @@ class Scene:
 
         # keep the model only via tensors we pulled; drop pipeline ref
         del pipeline, m
+
+    def project(self, emb):
+        """Text embeddings [.., 1152] into this scene's feature space (identity for a full-width field)."""
+        if self.proj is None:
+            return emb
+        return F.normalize(emb.float() @ self.proj, dim=-1)
 
     def touch(self) -> None:
         self.last_used = time.monotonic()
@@ -336,8 +370,8 @@ STATE = WorkerState()
 def _compute_relevancy(state: WorkerState, sc: Scene, text: str):
     """LOCKLESS: query text embed + per-gaussian LERF relevancy. Cheap, no gsplat,
     ~no extra VRAM beyond the resident text encoder. Returns rel3 = [N,3]."""
-    q = state._text_emb([text])[0]
-    rel = relevancy_vec(sc.feat_n, q, state.neg_p, seen=sc.seen)
+    q = sc.project(state._text_emb([text]))[0]
+    rel = relevancy_vec(sc.feat_n, q, sc.project(state.neg_p), seen=sc.seen)
     return rel[:, None].repeat(1, 3)
 
 
@@ -424,8 +458,8 @@ def _scene_inventory(state: "WorkerState", sc: Scene, topn: int = 20) -> list[di
     import numpy as np
     feat_n = sc.feat_n                                  # [N,1152] L2-normed
     n = int(feat_n.shape[0])
-    emb = state._text_emb(VOCAB)                        # [V,1152]
-    neg = state.neg_p                                   # [K,1152]
+    emb = sc.project(state._text_emb(VOCAB))            # [V,D] (D = 1152, or the PCA width)
+    neg = sc.project(state.neg_p)                       # [K,D]
     sim_neg = feat_n @ neg.T                            # [N,K] — same for every word
 
     # Scene solid-core center + radius (opacity-weighted). The sharp, well-reconstructed
@@ -505,7 +539,7 @@ def _render_view_overlay(sc: Scene, rel3, ci: int):
     Returns an HxWx3 uint8 array."""
     turbo = cm.get_cmap("turbo")
     white = torch.ones(3, device=DEV)
-    out, alpha = sc.render(sc.sh, 3, ci, QW, QH)
+    out, alpha = sc.render(sc.sh, sc.sh_degree, ci, QW, QH)
     rgb = (out[0, ..., :3] + (1 - alpha[0]) * white).clamp(0, 1)
     relmap, alpha = sc.render(rel3, None, ci, QW, QH)
     a = alpha[0, ..., 0]
@@ -531,7 +565,7 @@ def _render_hero_locked(sc: Scene, out_path: Path, long_side: int = 512) -> None
     w_px = long_side
     h_px = max(1, int(round(long_side * sc.fullH / max(sc.fullW, 1))))
     white = torch.ones(3, device=DEV)
-    out, alpha = sc.render(sc.sh, 3, ci, w_px, h_px)
+    out, alpha = sc.render(sc.sh, sc.sh_degree, ci, w_px, h_px)
     rgb = (out[0, ..., :3] + (1 - alpha[0]) * white).clamp(0, 1)
     Image.fromarray((rgb.cpu().numpy() * 255).astype(np.uint8)).save(out_path, "WEBP", quality=88)
 
@@ -1276,7 +1310,7 @@ def _apply_paint_overrides(state: "WorkerState", sc: Scene, lfdir: str) -> None:
             continue
         rows = mp_t[torch.from_numpy(idx).to(sc.feat_n.device)]
         prompts = [rec["label"], *rec.get("aliases", [])]
-        emb = F.normalize(state._text_emb(prompts).mean(0), dim=-1).to(sc.feat_n.dtype)
+        emb = F.normalize(sc.project(state._text_emb(prompts)).mean(0), dim=-1).to(sc.feat_n.dtype)
         a = float(rec.get("alpha", 0.9))
         if rec.get("op") in ("assign", "boost"):
             blended = a * emb[None, :] + (1.0 - a) * sc.feat_n[rows]

@@ -155,6 +155,9 @@ MAST3R_VRAM_MB = 6_000
 # splat job. Pinned scripts live in backend/langfield/ (not the scratch ~/tools dir).
 LANGFIELD_DIR = Path(__file__).resolve().parent / "langfield"
 LANGFIELD_RUNNER = LANGFIELD_DIR / "run_langfield.sh"
+# Raw 360 (Spirula) scenes: no checkpoint — views are cut from the fisheye frames and the field lands on web.ply.
+LANGFIELD_SPIRULA_RUNNER = LANGFIELD_DIR / "run_langfield_spirula.sh"
+LANGFIELD_SPIRULA_VRAM_MB = 24_000        # lift accumulates [3M, 1152] fp32 on the card (~14 GB) + SAM/SigLIP
 LANGFIELD_QUERY_RUNNER = LANGFIELD_DIR / "run_query.sh"
 LANGFIELD_QUERY_SCRIPT = LANGFIELD_DIR / "query_render_v2.py"
 LANGFIELD_ENV_PYTHON = Path.home() / "miniconda3" / "envs" / "langfield-spike" / "bin" / "python"
@@ -1354,6 +1357,16 @@ def _find_latest_config(output_dir: Path) -> Path | None:
         return None
     candidates = sorted(root.rglob("config.yml"), key=lambda path: path.stat().st_mtime, reverse=True)
     return candidates[0] if candidates else None
+
+
+def _langfield_config(job_dir: Path) -> Path | None:
+    """What the language worker loads a scene from: the training checkpoint's config, or — for a Raw 360
+    (Spirula) scene, which has none — the scene.json its language build wrote (web.ply + pinhole cameras)."""
+    config = _find_latest_config(job_dir)
+    if config is not None:
+        return config
+    scene = job_dir / LANGFIELD_DIRNAME / "scene.json"
+    return scene if scene.is_file() else None
 
 
 def _read_mesh_report(output_dir: Path) -> dict[str, Any] | None:
@@ -3566,13 +3579,16 @@ async def _run_pipeline(job: SplatJob) -> None:
                 stage_ok = True
                 try:
                     config_path = _find_latest_config(job_dir)
-                    if config_path is None or not _langfield_available():
+                    spirula_job = config_path is None and (job_dir / spirula_lane.WORKDIR).is_dir()
+                    if (config_path is None and not spirula_job) or not _langfield_available():
                         job.log_lines.append("[langfield] skipped (no config or toolchain unavailable).")
                     else:
                         lfdir = job_dir / LANGFIELD_DIRNAME
                         lfdir.mkdir(parents=True, exist_ok=True)
-                        command = ["bash", str(LANGFIELD_RUNNER), str(config_path), str(lfdir)]
-                        rc = await _run_locked_stage(job, stage, command, LANGFIELD_VRAM_MB)
+                        command = (["bash", str(LANGFIELD_SPIRULA_RUNNER), str(job_dir), str(lfdir)] if spirula_job
+                                   else ["bash", str(LANGFIELD_RUNNER), str(config_path), str(lfdir)])
+                        rc = await _run_locked_stage(job, stage, command,
+                                                     LANGFIELD_SPIRULA_VRAM_MB if spirula_job else LANGFIELD_VRAM_MB)
                         if rc != 0:
                             job.log_lines.append(
                                 "[langfield] build failed; the splat is unaffected (no language search for this scene)."
@@ -7815,6 +7831,64 @@ def _langfield_stale_guard(lfdir: Path) -> None:
         )
 
 
+_LANGFIELD_BUILDS: dict[str, str] = {}
+
+
+@router.post("/jobs/{job_id}/langfield/build")
+async def langfield_build(request: Request, job_id: str, payload: dict[str, Any] | None = None):
+    """Add language search to a finished Raw 360 (Spirula) scene: fisheye -> upright pinhole views -> SAM 2.1 ->
+    SigLIP lift onto web.ply (PCA 256). ~10-15 min of GPU, so it runs in the BACKGROUND under the GPU arbiter and
+    this returns an op id at once (a request that long would die in the Cloudflare tunnel). Progress: Activity;
+    done: the job's langfield_available flips. `{"force": true}` rebuilds an existing field."""
+    require_heavy_work_admitted()
+    if not _safe_job_id(job_id):
+        raise HTTPException(status_code=404, detail="Splat job not found")
+    meta = _read_meta(job_id)
+    if not meta or meta.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Language search needs a completed scene")
+    job_dir = Path(meta["output_dir"])
+    if not spirula_lane.is_spirula_job(meta):
+        raise HTTPException(status_code=409, detail="This builds language search for Raw 360 scenes; "
+                                                    "checkpoint scenes get it with 'Language search' at upload")
+    if not (job_dir / PREVIEW_DIRNAME / "web.ply").is_file():
+        raise HTTPException(status_code=409, detail="No web copy of this splat to search yet")
+    if not _langfield_available() or not LANGFIELD_SPIRULA_RUNNER.is_file():
+        raise HTTPException(status_code=503, detail="Language-field toolchain unavailable")
+    lfdir = job_dir / LANGFIELD_DIRNAME
+    force = bool((payload or {}).get("force"))
+    if (lfdir / "gauss_emb.npz").is_file() and not force:
+        return {"ok": True, "op_id": None, "status": "already built"}
+    if job_id in _LANGFIELD_BUILDS:
+        raise HTTPException(status_code=409, detail=f"A language build is already running (op {_LANGFIELD_BUILDS[job_id]})")
+    op_id = opregistry.start("langfield_build", job_id, step="views")
+    _LANGFIELD_BUILDS[job_id] = op_id
+
+    async def build() -> None:
+        try:
+            lfdir.mkdir(parents=True, exist_ok=True)
+            command = ["bash", str(LANGFIELD_SPIRULA_RUNNER), str(job_dir), str(lfdir)]
+            rc, _out, err = await gpu_arbiter.run_gpu_operation(
+                lane="splat-langfield", operation_id=job_id, vram_mb=LANGFIELD_SPIRULA_VRAM_MB,
+                operation=lambda: _run_capture_subprocess(command))
+            if rc != 0 or not (lfdir / "scene.json").is_file():
+                tail = "\n".join(err.decode("utf-8", errors="replace").splitlines()[-6:])
+                opregistry.finish(op_id, status=opregistry.FAILED, error=f"exit {rc}: {tail}"[:2000])
+                return
+            opregistry.finish(op_id, result={"lfdir": str(lfdir)})
+            await audit_operator_event(
+                request=request, title="Language search built", description=f"{job_id}: Raw 360 language field",
+                variant="success", action="splat.langfield_build", target=meta.get("mode", "3d"),
+                metadata={"job_id": job_id})
+        except Exception as exc:  # noqa: BLE001 — background: record, never raise into the loop
+            with contextlib.suppress(Exception):
+                opregistry.finish(op_id, status=opregistry.FAILED, error=str(exc)[:2000])
+        finally:
+            _LANGFIELD_BUILDS.pop(job_id, None)
+
+    asyncio.create_task(build())
+    return {"ok": True, "op_id": op_id, "status": "started"}
+
+
 @router.post("/jobs/{job_id}/langfield/query")
 async def langfield_query(job_id: str, payload: dict[str, Any]):
     """Text-search a built language field -> a server-rendered relevancy heatmap.
@@ -7832,7 +7906,7 @@ async def langfield_query(job_id: str, payload: dict[str, Any]):
     if not (lfdir / "gauss_emb.npz").is_file():
         raise HTTPException(status_code=404, detail="Language field not built for this scene")
     _langfield_stale_guard(lfdir)
-    config_path = _find_latest_config(job_dir)
+    config_path = _langfield_config(job_dir)
     if config_path is None:
         raise HTTPException(status_code=409, detail="Scene checkpoint missing")
     name = _langfield_heatmap_name(clean)
@@ -7844,6 +7918,9 @@ async def langfield_query(job_id: str, payload: dict[str, Any]):
         # (worker path only). `matches` = distinct clustered instances; each carries a
         # `thumb` filename the UI turns into a served heatmap URL (same job, same route).
         focus = {k: worker_result[k] for k in ("focus", "radius", "matches") if k in worker_result}
+    elif config_path.name == "scene.json":
+        # the cold subprocess (query_render_v2) loads checkpoints only; Raw 360 scenes need the warm worker
+        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield :3417)")
     else:
         rendered = await _langfield_query_cold(job_id, str(config_path), str(lfdir), clean)
     if not rendered or not (lfdir / name).is_file():
@@ -7877,7 +7954,7 @@ async def langfield_relevancy(job_id: str, payload: dict[str, Any]):
     if not (lfdir / "gauss_emb.npz").is_file():
         raise HTTPException(status_code=404, detail="Language field not built for this scene")
     _langfield_stale_guard(lfdir)
-    config_path = _find_latest_config(job_dir)
+    config_path = _langfield_config(job_dir)
     if config_path is None:
         raise HTTPException(status_code=409, detail="Scene checkpoint missing")
     resp = await _langfield_worker_relevancy(str(config_path), str(lfdir), clean)
@@ -7905,7 +7982,7 @@ def _langfield_paint_context(job_id: str) -> tuple[str, str]:
     if not (lfdir / "gauss_emb.npz").is_file():
         raise HTTPException(status_code=404, detail="Language field not built for this scene")
     _langfield_stale_guard(lfdir)
-    config_path = _find_latest_config(job_dir)
+    config_path = _langfield_config(job_dir)
     if config_path is None:
         raise HTTPException(status_code=409, detail="Scene checkpoint missing")
     return str(config_path), str(lfdir)
@@ -8254,7 +8331,7 @@ async def langfield_inventory(job_id: str, refresh: bool = False):
     if not (lfdir / "gauss_emb.npz").is_file():
         raise HTTPException(status_code=404, detail="Language field not built for this scene")
     _langfield_stale_guard(lfdir)
-    config_path = _find_latest_config(job_dir)
+    config_path = _langfield_config(job_dir)
     if config_path is None:
         raise HTTPException(status_code=409, detail="Scene checkpoint missing")
     result = await _langfield_worker_inventory(str(config_path), str(lfdir), refresh=refresh)

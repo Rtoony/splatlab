@@ -39,13 +39,24 @@ OUT = Path(sys.argv[3]) if len(sys.argv) > 3 else Path("/home/rtoony/tools/langf
 OUT.mkdir(parents=True, exist_ok=True)
 
 # ── geometry + cameras (KEEP the spike's pose-correct load) ──────────────────────
-config, pipeline, _, _ = eval_setup(CONFIG, test_mode="test")
-m = pipeline.model.to(DEV)
-means, quats = m.means.detach(), m.quats.detach()
-scales = torch.exp(m.scales.detach())
-opac = torch.sigmoid(m.opacities.detach()).squeeze(-1)
+# Raw 360 (Spirula) scenes have no checkpoint: CONFIG is then the job dir, geometry is the published web.ply (its
+# row order IS the field's row order) and the cameras are spirula_views.py's upright pinhole cuts (cameras.json).
+SPIRULA = (CONFIG / "_spirula").is_dir()
+if SPIRULA:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from spirula_source import load_splat, PinholeCameras
+    means, quats, scales, opac = load_splat(CONFIG / "_preview" / "web.ply", DEV)
+    cams = PinholeCameras(FEAT / "cameras.json", DEV)
+else:
+    config, pipeline, _, _ = eval_setup(CONFIG, test_mode="test")
+    m = pipeline.model.to(DEV)
+    means, quats = m.means.detach(), m.quats.detach()
+    scales = torch.exp(m.scales.detach())
+    opac = torch.sigmoid(m.opacities.detach()).squeeze(-1)
+    cams = pipeline.datamanager.train_dataset.cameras.to(DEV)
 N = means.shape[0]
-cams = pipeline.datamanager.train_dataset.cameras.to(DEV)
+# Reduce the 1152-D SigLIP rows to PCA_DIM (owner 2026-09-30: ~4x smaller fields). 0 = keep full width.
+PCA_DIM = int(os.environ.get("LANGFIELD_PCA_DIM", "256" if SPIRULA else "0"))
 
 meta = json.load(open(FEAT / "frames_meta.json"))
 n_frames, LIFT_W, LIFT_H = meta["n"], meta["W"], meta["H"]
@@ -113,6 +124,10 @@ zeros3 = means.new_zeros(N, 3)
 for v in range(n_frames):
     label_np = np.load(FEAT / "masks" / f"view_{v:03d}.npz")["label"]
     assert label_np.shape == (LIFT_H, LIFT_W), f"mask res {label_np.shape} != {(LIFT_H, LIFT_W)}"
+    valid_png = FEAT / "valid" / f"view_{v:03d}.png"
+    if valid_png.is_file():
+        # outside the fisheye, or the camera operator (SAM 3 person mask): never a feature source
+        label_np = np.where(np.array(Image.open(valid_png)) >= 128, label_np, -1)
     label_map = torch.from_numpy(label_np.astype(np.int64)).to(DEV)
     embeds = view_region_embeds(v, label_np)             # [maxlabel+1, 1152]
 
@@ -174,8 +189,26 @@ _SEEN_MIN = float(os.environ.get("LANGFIELD_SEEN_MIN", "0.5"))
 assert frac_seen > _SEEN_MIN, f"only {frac_seen:.1%} gaussians seen — occlusion gate too tight (raise DEPTH_TOL)"
 assert frac_w > _SEEN_MIN, f"only {frac_w:.1%} gaussians got a mask — PASS A handoff / res mismatch"
 
+extra = {}
+if PCA_DIM and PCA_DIM < D:
+    # Uncentred PCA of the observed rows: basis P [1152, k]. A text query projects the same way (q @ P, then
+    # L2-normalise), so cosine relevancy survives in the subspace. Fit on a sample: the top-k directions of 3M
+    # unit vectors are stable from a few hundred thousand.
+    rows = torch.nonzero(seen).squeeze(-1)
+    samp = rows[torch.randperm(rows.numel(), device=DEV)[:300_000]]
+    _, _, Vh = torch.linalg.svd(gauss_emb[samp].float(), full_matrices=False)
+    P = Vh[:PCA_DIM].T.contiguous()                      # [1152, k]
+    red = torch.empty(N, PCA_DIM, device=DEV)
+    for _s in range(0, N, _NORM_CHUNK):
+        _e = min(_s + _NORM_CHUNK, N)
+        red[_s:_e] = F.normalize(gauss_emb[_s:_e] @ P, dim=-1)
+    red[~seen] = 0.0
+    kept = float((torch.linalg.norm(gauss_emb[samp] @ P, dim=-1) ** 2).mean())
+    print(f"[lift] PCA {D}->{PCA_DIM}: keeps {kept:.1%} of the feature energy", flush=True)
+    gauss_emb = red
+    extra = {"proj": P.cpu().numpy().astype(np.float32), "pca_energy": np.float32(kept)}
 np.savez_compressed(OUT / "gauss_emb.npz",
          gauss_emb=gauss_emb.half().cpu().numpy(),
          seen=seen.cpu().numpy(),
-         model_id=SIGLIP_CKPT, lift_res=np.array([LIFT_W, LIFT_H]))
+         model_id=SIGLIP_CKPT, lift_res=np.array([LIFT_W, LIFT_H]), **extra)
 print(f"LIFT_DONE -> {OUT/'gauss_emb.npz'}", flush=True)

@@ -241,7 +241,12 @@ export function SparkSceneViewer({
   // Viewing tier (lib/quality.ts): full quality only on the Nexus PC, compressed web / lite elsewhere. Null until
   // the server has said where we are, so a remote browser never starts a multi-GB download by accident.
   const quality = useQualityTier(job.quality_tiers);
-  const url = job.langfield_available
+  // Raw 360 language fields are lifted onto web.ply (langweb.ply is the same file), so search / paint / class
+  // colours work while the WEB tier is showing; Full (PC only) and Lite are view-only. Checkpoint scenes keep
+  // loading their full-count langweb whatever the tier.
+  const tierAwareLangfield = Boolean(job.langfield_available && job.trainer_resolved === "spirula");
+  const searchReady = Boolean(job.langfield_available && (!tierAwareLangfield || quality.current?.id === "web"));
+  const url = searchReady
     ? `/api/splat/jobs/${job.job_id}/preview/file?fmt=langweb&v=${reloadNonce}`
     : !quality.ready
       ? null
@@ -798,7 +803,7 @@ export function SparkSceneViewer({
   // The paint section also unmounts on its own gate (safe mode, or a stale
   // language field) without the tab changing — the section vanishes, so the
   // mode flag has to go with it.
-  const paintSectionAvailable = job.langfield_available && !safeMode && !job.langfield_stale;
+  const paintSectionAvailable = searchReady && !safeMode && !job.langfield_stale;
   useEffect(() => {
     if (!paintSectionAvailable) setPaintMode(false);
   }, [paintSectionAvailable]);
@@ -1355,7 +1360,7 @@ export function SparkSceneViewer({
   }
 
   useEffect(() => {
-    if (job.langfield_available) void loadOverridesList();
+    if (searchReady) void loadOverridesList();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [job.job_id]);
 
@@ -1369,12 +1374,12 @@ export function SparkSceneViewer({
       const numSplats = mesh.packedSplats?.numSplats ?? mesh.numSplats ?? 0;
       let result: RelevancyResult;
       try {
-        result = job.langfield_available && !safeMode
+        result = searchReady && !safeMode
           ? await fetchRelevancy(job.job_id, text)
           : buildTestRelevancy(
               numSplats,
               text,
-              job.langfield_available ? "hardware gate active; using safe test search" : "no language field on this scene",
+              searchReady ? "hardware gate active; using safe test search" : "no language field on this scene",
             );
       } catch (cause) {
         if (!shouldUseTestRelevancy(cause)) throw cause;
@@ -2756,7 +2761,7 @@ export function SparkSceneViewer({
           These are DOM/SVG siblings ABOVE the canvas — clicks on the marker
           buttons never reach the renderer's own pointer handlers, so they
           cannot double-fire crop/paint/measure picking. */}
-      {!chromeHidden && !job.langfield_available && quality.current && (
+      {!chromeHidden && quality.current && (!job.langfield_available || tierAwareLangfield) && (
         <QualityPicker quality={quality} />
       )}
       {showShortcutLegend && !chromeHidden && <ShortcutLegend />}
@@ -2906,7 +2911,7 @@ export function SparkSceneViewer({
         {panelSections === "measure" && (
         <>
         <>
-            <SectionLabel>{job.langfield_available ? "Language overlay" : "Test search overlay"}</SectionLabel>
+            <SectionLabel>{searchReady ? "Language overlay" : "Test search overlay"}</SectionLabel>
             {safeMode && (
               <p className="rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5 text-[10px] leading-snug text-amber-100/85">
                 Real language search is blocked by the current hardware gate. Spark search will use a deterministic
@@ -2918,9 +2923,19 @@ export function SparkSceneViewer({
                 This scene has no language field, so searches use a test pattern to verify overlay controls.
               </p>
             )}
+            {job.langfield_available && !searchReady && (
+              <div className="space-y-1.5 rounded-lg border border-cyan-300/25 bg-cyan-300/10 px-2 py-1.5">
+                <p className="text-[10px] leading-snug text-cyan-100/85">
+                  Language search runs on the Web copy of this scene (it is showing {quality.current?.label ?? "another copy"}).
+                </p>
+                <Button type="button" size="sm" variant="outline" onClick={() => quality.choose("web")}>
+                  Switch to the searchable Web copy
+                </Button>
+              </div>
+            )}
             {/* Stale field: strokes/searches would 409 server-side — say so
                 and offer the one-click cure instead of harvesting errors. */}
-            {job.langfield_available && job.langfield_stale && (
+            {searchReady && job.langfield_stale && (
               <div className="space-y-1.5 rounded-lg border border-amber-300/25 bg-amber-300/10 px-2 py-1.5">
                 <p className="text-[10px] leading-snug text-amber-100/85">
                   The language field no longer matches this scene's geometry — it was edited after the field
@@ -2958,7 +2973,7 @@ export function SparkSceneViewer({
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder={channels.length >= 4 ? "4 query limit reached" : "Add a search…"}
-                disabled={channels.length >= 4 || Boolean(job.langfield_available && job.langfield_stale)}
+                disabled={channels.length >= 4 || Boolean(searchReady && job.langfield_stale)}
                 size="xs"
                 className="disabled:opacity-50"
               />
@@ -2967,7 +2982,7 @@ export function SparkSceneViewer({
                 size="sm"
                 disabled={
                   queryBusy || !query.trim() || channels.length >= 4 ||
-                  Boolean(job.langfield_available && job.langfield_stale)
+                  Boolean(searchReady && job.langfield_stale)
                 }
               >
                 {queryBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
@@ -3054,7 +3069,7 @@ export function SparkSceneViewer({
             )}
         </>
 
-        {job.langfield_available && !safeMode && !job.langfield_stale && (
+        {searchReady && !safeMode && !job.langfield_stale && (
           <>
             <div className="h-px bg-white/10" />
             <SectionLabel>
@@ -3424,7 +3439,7 @@ export function SparkSceneViewer({
             )}
           </>
         )}
-        {job.langfield_available && safeMode && (
+        {searchReady && safeMode && (
           <>
             <div className="h-px bg-white/10" />
             <p className="rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5 text-[10px] leading-snug text-amber-100/85">
@@ -3574,10 +3589,10 @@ export function SparkSceneViewer({
                   <>
                     <p className="text-[10px] leading-snug text-zinc-400">
                       {cropRemovedCount !== null
-                        ? `${job.langfield_available ? "" : "≈"}${cropRemovedCount.toLocaleString()} of ${(splatCount ?? 0).toLocaleString()} loaded splats would be removed (${splatCount ? Math.round((cropRemovedCount / splatCount) * 100) : 0}%).${job.langfield_available ? "" : " Preview estimate — the full scene has more splats than this decimated preview."}`
+                        ? `${searchReady ? "" : "≈"}${cropRemovedCount.toLocaleString()} of ${(splatCount ?? 0).toLocaleString()} loaded splats would be removed (${splatCount ? Math.round((cropRemovedCount / splatCount) * 100) : 0}%).${searchReady ? "" : " Preview estimate — the full scene has more splats than this decimated preview."}`
                         : "Counting…"}
                     </p>
-                    {job.langfield_available && (
+                    {searchReady && (
                       <p className="rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5 text-[10px] leading-snug text-amber-100/85">
                         This scene has a language field. Cropping changes the gaussian count, so search and paint
                         pause until the field is rebuilt — one click afterwards, painted labels carry across.
@@ -3651,10 +3666,10 @@ export function SparkSceneViewer({
                   <>
                     <p className="text-[10px] leading-snug text-zinc-400">
                       {boxRemovedCount !== null
-                        ? `${job.langfield_available ? "" : "≈"}${boxRemovedCount.toLocaleString()} of ${(splatCount ?? 0).toLocaleString()} loaded splats would be removed (${splatCount ? Math.round((boxRemovedCount / splatCount) * 100) : 0}%).${job.langfield_available ? "" : " Preview estimate — the full scene has more splats than this decimated preview."}`
+                        ? `${searchReady ? "" : "≈"}${boxRemovedCount.toLocaleString()} of ${(splatCount ?? 0).toLocaleString()} loaded splats would be removed (${splatCount ? Math.round((boxRemovedCount / splatCount) * 100) : 0}%).${searchReady ? "" : " Preview estimate — the full scene has more splats than this decimated preview."}`
                         : "Counting…"}
                     </p>
-                    {job.langfield_available && (
+                    {searchReady && (
                       <p className="rounded-lg border border-amber-300/20 bg-amber-300/10 px-2 py-1.5 text-[10px] leading-snug text-amber-100/85">
                         This scene has a language field. Cropping changes the gaussian count, so search and paint
                         pause until the field is rebuilt — one click afterwards, painted labels carry across.
