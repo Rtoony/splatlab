@@ -212,7 +212,8 @@ CDT_VENV_PYTHON = Path.home() / "projects" / "civil-design-tools" / ".venv" / "b
 RIG_LANE_DIR = Path(__file__).resolve().parent / "rig"
 RIG_RENDER_SCRIPT = RIG_LANE_DIR / "render_rig.py"
 COLMAP4_ENV_PYTHON = Path.home() / "miniconda3" / "envs" / "colmap4" / "bin" / "python"
-KEEP_UNPINNED_COMPLETED = 10
+# Completed splats are NEVER auto-deleted (owner decision 2026-09-30: a 16-job re-run made this cap rm -rf every
+# older unpinned scene, incl. the storage room's walkable world). Deleting a scene is a deliberate user action only.
 FAILED_RETENTION_HOURS = 24
 PREVIEW_DIRNAME = "_preview"
 STOP_GRACE_SECONDS = 10
@@ -3754,7 +3755,7 @@ async def _run_pipeline(job: SplatJob) -> None:
         try:
             pruned = _prune_old_jobs()
             if pruned:
-                job.log_lines.append(f"Pruned {pruned} old unpinned job(s).")
+                job.log_lines.append(f"Cleaned up {pruned} stale failed job(s) that had no splat.")
                 _flush_log(job)
         except Exception:
             pass
@@ -3814,10 +3815,10 @@ def _iso_to_epoch(iso: str | None) -> float | None:
 
 
 def _prune_old_jobs() -> int:
-    """Delete unpinned completed jobs beyond the cap, plus stale failures.
+    """Delete stale failed/stopped jobs that never produced a splat. Nothing else.
 
-    Splat job dirs are multi-GB (processed images + checkpoints + preview),
-    so the unpinned cap is deliberately low. Pin anything worth keeping.
+    Completed jobs are never auto-deleted, pinned or not (owner decision 2026-09-30). A failed or stopped job
+    that has a preview splat (e.g. a finished train that failed in a late optional stage) is kept too.
     """
     metas = _all_metas()
     pruned = 0
@@ -3826,18 +3827,10 @@ def _prune_old_jobs() -> int:
     for m in metas:
         if m.get("status") in ("failed", "stopped") and not m.get("pinned"):
             ts = _iso_to_epoch(m.get("created_at"))
-            if ts and ts < cutoff_failed and m["job_id"] not in JOBS:
+            has_splat = _preview_file_path(Path(m.get("output_dir") or _job_dir(m["job_id"]))).is_file()
+            if ts and ts < cutoff_failed and m["job_id"] not in JOBS and not has_splat:
                 _delete_job_files(m["job_id"])
                 pruned += 1
-
-    completed_unpinned = [
-        m for m in metas
-        if m.get("status") == "completed" and not m.get("pinned") and m["job_id"] not in JOBS
-    ]
-    completed_unpinned.sort(key=lambda m: m.get("created_at", ""), reverse=True)
-    for m in completed_unpinned[KEEP_UNPINNED_COMPLETED:]:
-        _delete_job_files(m["job_id"])
-        pruned += 1
 
     return pruned
 
@@ -4203,7 +4196,7 @@ async def get_splat_status():
             "Raw .insv stitches with ffmpeg v360 (seams visible). For seamless output, export an equirectangular MP4 from the Insta360 app/Studio and feed that in 360 mode.",
             "360 capture: orbit slowly, keep the camera moving for parallax, and use crop-bottom to drop the operator/nadir.",
             "Training shares the RTX 5090 with TRELLIS through a single GPU lock — queued jobs wait their turn.",
-            f"Unpinned completed jobs beyond the newest {KEEP_UNPINNED_COMPLETED} are pruned (job dirs are multi-GB). Pin anything worth keeping.",
+            "Finished scenes are never deleted automatically; only stale failed jobs that produced no splat are cleaned up. Delete a scene yourself when you no longer want it.",
             "4D training is deferred until the 3D path is validated.",
         ],
     }
