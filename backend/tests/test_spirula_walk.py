@@ -19,25 +19,35 @@ import splat_route  # noqa: E402
 JOB = "splat_5e0001"
 
 
-def _shell_report(verdict: str = "PASS") -> dict:
+def _shell_report(verdict: str = "PASS", tris: int = 1234) -> dict:
     return {"verdict": verdict, "route_used": "voxel",
             "gates": {"components": 1, "watertight": True, "floor_continuity": 0.987},
             "probe": {"floor_level_y": -1.72, "top_level_y": 1.13},
-            "params": {"seed_yup": [0.1, -0.3, 0.0]}, "artifact": {"triangles_written": 1234},
+            "params": {"seed_yup": [0.1, -0.3, 0.0]}, "artifact": {"triangles_written": tris},
             "geometry_frame": {"axis": "y-up", "units": "scene-units", "meters_per_unit": None}}
 
 
-def _fake_world_shell(job: Path, verdict: str = "PASS", by_route: dict | None = None):
+def _fake_world_shell(job: Path, verdict: str = "PASS", by_route: dict | None = None,
+                      tris_by_voxel: dict | None = None):
     def run(cmd, **kw):
         w = job / "_world"
+        if cmd[1].endswith("walk_visual_shell.py"):
+            run.visual.append(cmd[cmd.index("--max-faces") + 1])
+            (w / "shell.glb").write_bytes(b"glTF-light")
+            return subprocess.CompletedProcess(cmd, 0, "{}", "")
         route = cmd[cmd.index("--route") + 1]
+        voxel = cmd[cmd.index("--voxel-size") + 1]
+        run.voxels.append(voxel)
         (w / "collision_shell.glb").write_bytes(b"glTF")
-        (w / "collision_shell.json").write_text(json.dumps(_shell_report((by_route or {}).get(route, verdict))))
+        (w / "collision_shell.json").write_text(json.dumps(_shell_report(
+            (by_route or {}).get(route, verdict), (tris_by_voxel or {}).get(voxel, 1234))))
         (w / "navmesh.json").write_text("{}")
         run.cmd = cmd
         run.routes.append(route)
         return subprocess.CompletedProcess(cmd, 0, "", "")
     run.routes = []
+    run.visual = []
+    run.voxels = []
     return run
 
 
@@ -106,7 +116,8 @@ def test_prepare_builds_a_metric_walk_the_manifest_route_serves(client, monkeypa
     assert "--seed=1,1.4,-2" in fake.cmd and fake.routes == ["auto"]
     world = json.loads((job / "_world" / "world.json").read_text())
     assert world["units"] == "meters" and world["meters_per_unit"] == 1.0
-    assert (job / "_world" / "shell.glb").read_bytes() == b"glTF"
+    # The visual stand-in is the decimated one, never a second full-size download of the collision solid.
+    assert fake.visual == ["200000"] and (job / "_world" / "shell.glb").read_bytes() == b"glTF-light"
 
     m = tc.get(f"/api/splat/jobs/{JOB}/world/manifest").json()
     assert m["shell"]["files"]["glb"].endswith("shell.glb")
@@ -131,6 +142,17 @@ def test_auto_pick_under_the_floor_gate_retries_the_splat_transform_route(client
     assert r.status_code == 200, r.text
     assert fake.routes == ["auto", "splat-transform"]
     assert r.json()["walk"]["verdict"] == "WALKABLE_NOT_WATERTIGHT"
+
+
+def test_a_solid_too_heavy_for_the_browser_is_rebuilt_once_coarser(client, monkeypatch):
+    """Pool long take: 16.6M triangles at the 0.07 voxel never loaded in the walker."""
+    tc, outputs = client
+    job = _mk_job(outputs)
+    fake = _fake_world_shell(job, tris_by_voxel={"0.07": 16_581_712, "0.165": 3_050_000})
+    monkeypatch.setattr(splat_route.subprocess, "run", fake)
+    assert tc.post(f"/api/splat/jobs/{JOB}/world/prepare", json={}).status_code == 200
+    assert fake.voxels == ["0.07", "0.165"]
+    assert json.loads((job / "_world" / "collision_shell.json").read_text())["artifact"]["triangles_written"] == 3_050_000
 
 
 def test_unwalkable_shell_fails_loudly_and_writes_no_world(client, monkeypatch):

@@ -383,6 +383,15 @@ def settings_dict(s: LaneSettings) -> dict:
 WALK_PLAYER_HEIGHT_M = 1.7
 WALK_PLAYER_RADIUS_M = 0.32
 WALK_OK_VERDICTS = ("PASS", "WALKABLE", "WALKABLE_NOT_WATERTIGHT")
+# The walker downloads the visual shell AND the collision solid; a plain copy doubled a 298 MB download on the
+# pool long take and it never loaded. The stand-in is hidden while the splat shows, so it only needs to be light.
+WALK_VISUAL_MAX_FACES = 200_000
+# The browser must build a BVH over the collision solid. 2.9M triangles (condo frontage, 37 x 40 m) loads at 60 fps;
+# 16.6M (pool long take, 104 x 128 m at the 0.07 voxel) never finished loading in 240 s. Triangles scale ~1/voxel^2,
+# so an oversized solid is rebuilt once at the voxel that lands near WALK_TARGET_COLLIDE_TRIS.
+WALK_BASE_VOXEL = 0.07
+WALK_MAX_COLLIDE_TRIS = 4_000_000
+WALK_TARGET_COLLIDE_TRIS = 3_000_000
 
 
 def is_spirula_job(meta: dict) -> bool:
@@ -410,14 +419,29 @@ WALK_FALLBACK_ROUTE = "splat-transform"
 
 
 def walk_shell_command(python: str, script: Path, job_dir: Path, seed: list[float] | None,
-                       route: str = "auto") -> list[str]:
+                       route: str = "auto", voxel: float = WALK_BASE_VOXEL) -> list[str]:
     cmd = [python, str(script), str(job_dir), "--source", str(job_dir / "_preview" / "splat.ply"),
            "--player-height", str(WALK_PLAYER_HEIGHT_M), "--player-radius", str(WALK_PLAYER_RADIUS_M),
-           "--route", route, "--json"]
+           "--route", route, "--voxel-size", f"{voxel:.4g}", "--json"]
     if seed:
         # `--seed=`: a seed starting with "-" would otherwise parse as an option (argparse exit 2).
         cmd.append("--seed=" + ",".join(f"{v:.6g}" for v in seed))
     return cmd
+
+
+def walk_visual_shell_command(python: str, script: Path, job_dir: Path) -> list[str]:
+    return [python, str(script), str(job_dir), "--max-faces", str(WALK_VISUAL_MAX_FACES)]
+
+
+def walk_coarser_voxel(job_dir: Path, voxel: float = WALK_BASE_VOXEL) -> float | None:
+    """The voxel to rebuild at when the collision solid is too heavy for the browser, else None."""
+    try:
+        tris = json.loads((job_dir / "_world" / "collision_shell.json").read_text())["artifact"]["triangles_written"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not tris or tris <= WALK_MAX_COLLIDE_TRIS:
+        return None
+    return round(voxel * math.sqrt(tris / WALK_TARGET_COLLIDE_TRIS), 3)
 
 
 def walk_verdict(job_dir: Path) -> str | None:
@@ -437,7 +461,8 @@ def write_walk_world(job_dir: Path, job_id: str, meters_per_unit: float | None) 
         raise ValueError(f"collision shell verdict {verdict!r} is not walkable")
     if not (world / "navmesh.json").is_file():
         raise ValueError("world_shell.py wrote no navmesh.json")
-    shutil.copyfile(world / "collision_shell.glb", world / "shell.glb")
+    if not (world / "shell.glb").is_file():  # walk_visual_shell.py normally wrote a decimated stand-in
+        shutil.copyfile(world / "collision_shell.glb", world / "shell.glb")
     probe = report.get("probe") or {}
     mpu = float(meters_per_unit) if meters_per_unit else None
     shell = {"built": True, "glb": "shell.glb", "source": "collision_shell", "texture": None,

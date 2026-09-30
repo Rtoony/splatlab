@@ -7029,6 +7029,30 @@ async def _world_prepare_spirula(
                         raise ValueError(f"world_shell.py exited {proc.returncode}: {tail[:300]}")
                     if spirula_lane.walk_verdict(job_dir) in spirula_lane.WALK_OK_VERDICTS:
                         break
+                coarser = (spirula_lane.walk_coarser_voxel(job_dir)
+                           if spirula_lane.walk_verdict(job_dir) in spirula_lane.WALK_OK_VERDICTS else None)
+                if coarser:
+                    # Too heavy for the browser's collider: rebuild once, coarser. If THAT is not walkable,
+                    # the verdict below refuses it rather than shipping a world nobody can load.
+                    proc = await asyncio.to_thread(
+                        subprocess.run,
+                        spirula_lane.walk_shell_command(
+                            str(MESH_ENV_PYTHON), MESH_DIR / "world_shell.py", job_dir, seed,
+                            "auto", coarser),
+                        capture_output=True, text=True, cwd=str(MESH_DIR.parent), timeout=1800)
+                    if proc.returncode != 0:
+                        tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-4:])
+                        raise ValueError(f"world_shell.py (voxel {coarser}) exited {proc.returncode}: {tail[:300]}")
+                (world_dir / "shell.glb").unlink(missing_ok=True)
+                if spirula_lane.walk_verdict(job_dir) in spirula_lane.WALK_OK_VERDICTS:
+                    vis = await asyncio.to_thread(
+                        subprocess.run,
+                        spirula_lane.walk_visual_shell_command(
+                            str(MESH_ENV_PYTHON), MESH_DIR / "walk_visual_shell.py", job_dir),
+                        capture_output=True, text=True, cwd=str(MESH_DIR.parent), timeout=1800)
+                    if vis.returncode != 0:  # the full-size copy still walks; it is only heavier to load
+                        log.warning("walk visual shell failed for %s: %s", job_id,
+                                       (vis.stderr or "")[-300:])
                 walk = spirula_lane.write_walk_world(
                     job_dir, job_id, meta.get("meters_per_unit"))
             except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
