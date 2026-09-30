@@ -165,12 +165,11 @@ SAM2_ENV_PYTHON = Path.home() / "miniconda3" / "envs" / "sam2" / "bin" / "python
 LANGFIELD_DIRNAME = "_langfield"          # per-job artifact dir (sibling of _preview)
 LANGFIELD_VRAM_MB = 10_000                # SAM2.1 ~5GB + SigLIP2 ~2.3GB + gsplat render
 QUERY_VRAM_MB = 4_000                     # per-query render reserve (lock held ~ms)
-# 3425 is where the worker actually listens (see deploy/systemd/user/
-# splatlab-langfield.service.d/). The default used to be 3417, which nothing
-# has bound for a long time: if the drop-in supplying this variable ever went
-# missing, every language query would fail against a dead port instead of
-# falling back to the right one.
-LANGFIELD_WORKER_URL = os.environ.get("SPLAT_LANGFIELD_WORKER_URL", "http://127.0.0.1:3425")
+# 3443 is where the worker listens (deploy/systemd/user/splatlab-langfield.service.d/90-worker-port-3443.conf).
+# It was 3425 until 2026-09-30 — but Panel Studio has owned 3425 since 2026-08-27 (nexus-manifest), so every
+# language query was answered by Panel Studio with a non-200, never woke the worker, and 503'd. Keep this default
+# equal to the drop-in so a missing drop-in still lands on the right port.
+LANGFIELD_WORKER_URL = os.environ.get("SPLAT_LANGFIELD_WORKER_URL", "http://127.0.0.1:3443")
 # ── Capture-health fog gate (report-only, Capture Coach Phase 0.5) ───────────────
 # Post-train reconstruction-health verdict (backend/health/fog_gate.py, calibrated
 # 2026-07-11 vs RToony-graded scenes — tools/gates/gate_p0_fog_calibration.sh).
@@ -7926,7 +7925,7 @@ async def langfield_query(job_id: str, payload: dict[str, Any]):
         focus = {k: worker_result[k] for k in ("focus", "radius", "matches") if k in worker_result}
     elif config_path.name == "scene.json":
         # the cold subprocess (query_render_v2) loads checkpoints only; Raw 360 scenes need the warm worker
-        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield :3417)")
+        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield on :3443)")
     else:
         rendered = await _langfield_query_cold(job_id, str(config_path), str(lfdir), clean)
     if not rendered or not (lfdir / name).is_file():
@@ -7969,7 +7968,7 @@ async def langfield_relevancy(job_id: str, payload: dict[str, Any]):
             status_code=503,
             detail=(
                 "Language-field worker is not running; the client-side heatmap needs "
-                "the warm worker (systemd unit splatlab-langfield on :3417)."
+                "the warm worker (systemd unit splatlab-langfield on :3443)."
             ),
         )
     headers = {k: v for k, v in resp.headers.items() if k.lower() in RELEVANCY_FORWARD_HEADERS}
@@ -8008,7 +8007,7 @@ async def langfield_select_sphere(job_id: str, payload: dict[str, Any]):
         "/select_sphere", {"config": config_path, "lfdir": lfdir, "center": center, "radius": radius}
     )
     if resp is None:
-        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield on :3417).")
+        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield on :3443).")
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=resp.json().get("detail", "worker error"))
     return Response(
@@ -8053,7 +8052,7 @@ async def langfield_overrides_add(job_id: str, payload: dict[str, Any]):
     }
     resp = await _langfield_worker_json("/overrides_add", body)
     if resp is None:
-        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield on :3417).")
+        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield on :3443).")
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=resp.json().get("detail", "worker error"))
     return resp.json()
@@ -8068,7 +8067,7 @@ async def langfield_overrides_delete(job_id: str, override_id: str):
         "/overrides_delete", {"config": config_path, "lfdir": lfdir, "override_id": override_id}
     )
     if resp is None:
-        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield on :3417).")
+        raise HTTPException(status_code=503, detail="Language-field worker is not running (splatlab-langfield on :3443).")
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=resp.json().get("detail", "worker error"))
     return resp.json()

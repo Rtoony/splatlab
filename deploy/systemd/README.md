@@ -24,35 +24,20 @@ the zero-disk policy.
 | `user/*.service.d/70-shared-slice.conf` | Puts the unit in `splatlab.slice`. |
 | `user/*.service.d/80-compute-gate.conf` | `ExecCondition` on `tools/splatlab-compute-gate.sh`. |
 | `user/splatlab.service.d/90-langfield-worker-url.conf` | Points the app at the worker. |
-| `user/splatlab-langfield.service.d/90-supervised-port-3418.conf` | Sets the worker's listen port. |
+| `user/splatlab-langfield.service.d/90-worker-port-3443.conf` | Sets the worker's listen port (3443). |
 
-## Two known discrepancies
+## Worker port (moved 2026-09-30)
 
-**1. The `90-supervised-port-3418.conf` filename is wrong.** Its contents set
-`--port 3425`, which is where the worker actually listens and what
-`90-langfield-worker-url.conf` points the app at. There is no 3418. The
-investigation that surfaced this read it as a three-way port conflict
-(3417/3418/3425); it is really one live port plus a misleading filename plus a
-stale code default.
+The worker listens on **3443**. It used to listen on 3425 — but Panel Studio has owned 3425 since 2026-08-27
+(registered in the Nexus manifest), so SplatLab's language queries were answered by Panel Studio with a non-200:
+the app never woke its own worker and every search 503'd. The drop-in is renamed to what it does
+(`90-worker-port-3443.conf`, was the misleading `90-supervised-port-3418.conf`), the app's
+`90-langfield-worker-url.conf` points at 3443, and both code defaults (`splat_route.LANGFIELD_WORKER_URL`,
+`langfield_worker.PORT`) match, so a missing drop-in still lands on the right port.
 
-The code defaults were the actionable half and are now fixed —
-`splat_route.LANGFIELD_WORKER_URL` and `langfield_worker.PORT` both default to
-3425, so if these drop-ins ever go missing the app fails over to the right port
-instead of a dead one.
-
-Renaming the file is a live systemd mutation and is deliberately left to the
-operator. To do it:
-
-```bash
-cd ~/.config/systemd/user/splatlab-langfield.service.d
-git -C ~/projects/splatlab show HEAD:deploy/systemd/user/splatlab-langfield.service.d/90-supervised-port-3418.conf > 90-worker-port-3425.conf
-rm 90-supervised-port-3418.conf
-systemctl --user daemon-reload
-systemctl --user restart splatlab-langfield.service
-systemctl --user show splatlab-langfield.service -p ExecStart | grep -o 'port 3425'   # receipt
-```
-
-Then rename the copy in this directory to match.
+Installing the drop-ins is a live systemd change, so it is a script the operator runs:
+`bash ~/scripts/splatlab-langfield-port-3443-2026-09-30.sh --apply` (dry-run by default; backs up, verifies,
+prints the rollback).
 
 **2. Flight A units are historical.** `splatlab-flight-a@.service`,
 `splatlab-flight-a-boot-recovery.service` and
