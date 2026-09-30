@@ -26,6 +26,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 SPIRULA_BIN = Path.home() / "tools" / "spirula" / "2026.9.24" / "spirula"
+# Spirula's own SAM 3 (sam3.cpp GGML conversion of Meta's SAM 3, 1.84 GB) — the same cache path its app uses.
+SAM3_MODEL = Path.home() / ".cache" / "spirula-studio" / "models" / "sam3-f16.ggml"
 NVIDIA_ICD = "/usr/share/vulkan/icd.d/nvidia_icd.json"
 WORKDIR = "_spirula"
 
@@ -38,11 +40,13 @@ FOCAL_PER_WIDTH = 0.27             # ~204° equidistant lens: f ≈ r/θmax (mea
 MIN_REGISTERED_FRACTION = 0.8
 
 EXTRACT_VRAM_MB = 4_000
+PERSON_VRAM_MB = 8_000
 MASK_VRAM_MB = 4_000
 SFM_VRAM_MB = 8_000
 TRAIN_VRAM_MB = 16_000
 
-STAGES = ("spirula_trim", "spirula_extract", "spirula_mask", "spirula_sfm", "spirula_train", "spirula_publish")
+STAGES = ("spirula_trim", "spirula_extract", "spirula_mask", "spirula_person", "spirula_sfm", "spirula_train",
+          "spirula_publish")
 
 
 def spirula_bin() -> str:
@@ -53,6 +57,17 @@ def availability() -> dict:
     binary = spirula_bin()
     ok = Path(binary).is_file() and os.access(binary, os.X_OK) and Path(NVIDIA_ICD).is_file()
     return {"spirula_available": ok, "spirula_path": binary}
+
+
+def sam3_model() -> str | None:
+    """The SAM 3 checkpoint for operator masking, or None (then the person stage is skipped)."""
+    path = os.environ.get("SPLAT_SPIRULA_SAM3", "").strip() or str(SAM3_MODEL)
+    return path if Path(path).is_file() else None
+
+
+def person_mask_enabled() -> bool:
+    """Kill-switch: SPLAT_SPIRULA_PERSON_MASK=0 trains without masking the camera operator."""
+    return os.environ.get("SPLAT_SPIRULA_PERSON_MASK", "").strip() != "0"
 
 
 def lane_enabled() -> bool:
@@ -114,7 +129,7 @@ class LaneSettings:
     quality: str
 
 
-def settings(info: dict, trim_duration_s: float | None = None) -> LaneSettings:
+def settings(info: dict, trim_duration_s: float | None = None, quality_override: str | None = None) -> LaneSettings:
     """Frame stride, extraction scale and image cache for one clip.
 
     ~3.3 instants per second (the proven storage-room density), at most MAX_INSTANTS, never denser than
@@ -136,7 +151,7 @@ def settings(info: dict, trim_duration_s: float | None = None) -> LaneSettings:
     width = int(round(w * scale))
     return LaneSettings(stride=stride, instants=instants, scale=scale, cache=cache,
                         focal=round(FOCAL_PER_WIDTH * width, 1), width=width, window_s=round(window, 2),
-                        quality=quality())
+                        quality=quality_override if quality_override in ("high", "ultra") else quality())
 
 
 # ---------------------------------------------------------------------------- commands
@@ -168,6 +183,15 @@ def commands(binary: str, input_path: Path, job_dir: Path, s: LaneSettings, ffmp
                                "--keep", "0", *(["--scale", f"{s.scale:g}"] if s.scale < 1 else []),
                                "-o", str(images)]
     cmds["spirula_mask"] = [*run, "sam", "mask", str(images)]
+    model = sam3_model()
+    if model and person_mask_enabled():
+        # The camera operator (on the stick) moves WITH the camera, so robust losses cannot drop them and they train
+        # into a smoky ghost (office A/B 09-30: --distraction-robustness mild/strong left it untouched). SAM 3 masks
+        # "person" per lens; combine_person_masks() then ANDs them into masks/ so SfM and training both ignore them.
+        person = ws / "data" / "person"
+        cmds["spirula_person"] = ["bash", "-c", " && ".join(
+            f'env VK_ICD_FILENAMES={NVIDIA_ICD} "{binary}" sam track --model "{model}" --frames "{images}/{cam}" '
+            f'--text person --out "{person}/{cam}"' for cam in ("cam0", "cam1"))]
     # Up (and metric scale) from the camera's own IMU: the .insv trailer carries a 1 kHz gyro+accelerometer log.
     # Without it Spirula GUESSES up from the largest level-looking plane, and in a shelf-lined aisle it picked a wall
     # (storage room 2026-09-29, published sideways). A trimmed copy has no trailer (ffmpeg drops it), so a test
@@ -237,6 +261,32 @@ def sfm_check(job_dir: Path) -> tuple[bool, str]:
     if frac < MIN_REGISTERED_FRACTION:
         return False, msg + f" — below {MIN_REGISTERED_FRACTION:.0%}; the capture did not hold together."
     return True, msg
+
+
+def combine_person_masks(job_dir: Path) -> str:
+    """AND SAM 3's per-frame person masks (frame_NNNNN.png = the Nth image in sorted order, white = keep) into the
+    lens-border masks in data/masks/. Idempotent. Returns a one-line receipt."""
+    import numpy as np
+    from PIL import Image
+    data = workdir(job_dir) / "data"
+    pristine = data / "masks-border"            # the lens-border masks as `sam mask` wrote them, kept for re-runs
+    if not pristine.is_dir():
+        shutil.copytree(data / "masks", pristine)
+    total = kept = frames = 0
+    for cam in ("cam0", "cam1"):
+        for i, img in enumerate(sorted((data / "images" / cam).glob("*.jpg"))):
+            border_path = data / "masks" / cam / f"{img.stem}.png"
+            source_path = pristine / cam / f"{img.stem}.png"
+            person_path = data / "person" / cam / f"frame_{i:05d}.png"
+            if not source_path.is_file() or not person_path.is_file():
+                continue
+            b = np.asarray(Image.open(source_path).convert("L")) >= 128
+            p = np.asarray(Image.open(person_path).convert("L").resize(b.shape[::-1])) >= 128
+            m = b & p
+            Image.fromarray((m * 255).astype(np.uint8)).save(border_path)
+            total += int(b.sum()); kept += int(m.sum()); frames += 1
+    share = 100.0 * (1 - kept / total) if total else 0.0
+    return f"[spirula_person] masked the camera operator in {frames} frames ({share:.2f} % of in-lens pixels)"
 
 
 def latest_splat(job_dir: Path) -> Path | None:

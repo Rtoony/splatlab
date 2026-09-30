@@ -17,6 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import spirula_lane as sl  # noqa: E402
 import splat_route  # noqa: E402
 
+@pytest.fixture(autouse=True)
+def _no_sam3_by_default(monkeypatch):
+    monkeypatch.setattr(sl, "sam3_model", lambda: None)
+
+
 DUAL_4K = {"video_streams": 2, "width": 3840, "height": 3840, "fps": 29.97, "duration": 123.09, "frames": 3689,
            "same_size": True}
 
@@ -257,3 +262,38 @@ def test_publish_reports_measured_vs_guessed_up(tmp_path):
     _job(other)                                                              # oriented 1 / up ground (a guess)
     r = sl.publish(other, other / "_preview" / "splat.ply")
     assert not r["metric"] and r["up_source"] == "ground" and "guessed" in r["orientation_warning"]
+
+
+def test_person_stage_runs_sam3_on_both_lenses(tmp_path, monkeypatch):
+    monkeypatch.setattr(sl, "sam3_model", lambda: "/m/sam3-f16.ggml")
+    cmds = sl.commands("/bin/spirula", Path("/in/v.insv"), tmp_path, sl.settings(DUAL_4K))
+    assert list(cmds) == ["spirula_extract", "spirula_mask", "spirula_person", "spirula_sfm", "spirula_train"]
+    script = cmds["spirula_person"][2]
+    assert script.count("sam track") == 2 and '--text person' in script and "/cam0" in script and "/cam1" in script
+    monkeypatch.setenv("SPLAT_SPIRULA_PERSON_MASK", "0")
+    assert "spirula_person" not in sl.commands("/bin/spirula", Path("/in/v.insv"), tmp_path, sl.settings(DUAL_4K))
+
+
+def test_combine_person_masks_ands_into_border_masks(tmp_path):
+    from PIL import Image
+    data = tmp_path / "_spirula" / "data"
+    for cam in ("cam0", "cam1"):
+        (data / "images" / cam).mkdir(parents=True); (data / "masks" / cam).mkdir(parents=True)
+        (data / "person" / cam).mkdir(parents=True)
+        for i, stem in enumerate(("00000", "00009")):
+            (data / "images" / cam / f"{stem}.jpg").write_bytes(b"x")
+            border = np.full((8, 8), 255, np.uint8); border[:, :2] = 0            # lens border: left 2 columns out
+            person = np.full((4, 4), 255, np.uint8); person[0, :] = 0             # person: top row (half-res mask)
+            Image.fromarray(border).save(data / "masks" / cam / f"{stem}.png")
+            Image.fromarray(person).save(data / "person" / cam / f"frame_{i:05d}.png")
+    msg = sl.combine_person_masks(tmp_path)
+    m = np.asarray(Image.open(data / "masks" / "cam1" / "00009.png"))
+    assert (m[:, :2] == 0).all() and (m[:2, :] == 0).all() and (m[2:, 2:] == 255).all()
+    assert "in 4 frames" in msg
+    assert sl.combine_person_masks(tmp_path) == msg                               # idempotent
+
+
+def test_quality_override_per_job():
+    assert sl.settings(DUAL_4K, quality_override="ultra").quality == "ultra"
+    assert sl.settings(DUAL_4K, quality_override=None).quality == "high"
+    assert sl.settings(DUAL_4K, quality_override="academic-baseline").quality == "high"

@@ -108,6 +108,7 @@ export interface SplatJob {
   trainer?: "auto" | "spirula" | "splatfacto";
   trainer_resolved?: "spirula" | "splatfacto" | "triposplat";
   checkpoint_available?: boolean;
+  spirula_quality?: "high" | "ultra" | null;
   spirula?: {
     stride?: number;
     instants?: number;

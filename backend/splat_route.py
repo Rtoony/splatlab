@@ -479,6 +479,9 @@ class SplatTrainRequest(BaseModel):
     # "splatfacto" forces the rig lane (langfield / mesh / isolate / world need its checkpoint).
     # Non-.insv inputs always use splatfacto.
     trainer: Literal["auto", "spirula", "splatfacto"] = "auto"
+    # Spirula lane only: None = the service default (SPLAT_SPIRULA_QUALITY, "high": 3M splats / 50k steps);
+    # "ultra" = 10M splats / 80k steps, roughly 4x the GPU time, for favourite scenes.
+    spirula_quality: Literal["high", "ultra"] | None = None
 
 
 @dataclass
@@ -629,6 +632,7 @@ def _new_meta(
         "capture_mode": "sparse" if (req.capture_mode == "sparse" and stages[:1] == ["mast3r_sfm"]) else "standard",
         "source_type": req.source_type,
         "trainer": req.trainer,
+        "spirula_quality": req.spirula_quality,
         # The trainer that actually runs (plan-time resolution of "auto").
         "trainer_resolved": "spirula" if stages and stages[0] in spirula_lane.STAGES else (
             "triposplat" if req.source_type == "generative-image" else "splatfacto"),
@@ -2375,7 +2379,7 @@ def _plan_spirula_job(
     if trim_start is not None and info.get("duration") and trim_start >= info["duration"]:
         raise HTTPException(status_code=400, detail=f"trim_start_s ({trim_start:g}s) is beyond the end of the "
                                                     f"clip ({info['duration']:.1f}s).")
-    s = spirula_lane.settings(info, trim_duration)
+    s = spirula_lane.settings(info, trim_duration, quality_override=req.spirula_quality)
     commands = spirula_lane.commands(
         availability["spirula_path"], input_path, job_dir, s, ffmpeg=availability.get("ffmpeg_path"),
         trim_start_s=trim_start, trim_duration_s=trim_duration)
@@ -3324,12 +3328,18 @@ async def _run_pipeline(job: SplatJob) -> None:
                 return_code = await _run_locked_stage(
                     job, stage, job.stage_commands[stage], SFM_VRAM_MB
                 )
-            elif stage in {"spirula_extract", "spirula_mask", "spirula_sfm", "spirula_train"}:
+            elif stage in {"spirula_extract", "spirula_mask", "spirula_person", "spirula_sfm", "spirula_train"}:
                 # Every Spirula step runs on the GPU (Vulkan decode / SAM / learned SfM / training), so each
                 # takes the shared lock — an unlisted stage would fall through to the UNLOCKED _run_stage.
                 vram = {"spirula_extract": spirula_lane.EXTRACT_VRAM_MB, "spirula_mask": spirula_lane.MASK_VRAM_MB,
+                        "spirula_person": spirula_lane.PERSON_VRAM_MB,
                         "spirula_sfm": spirula_lane.SFM_VRAM_MB, "spirula_train": spirula_lane.TRAIN_VRAM_MB}[stage]
                 return_code = await _run_locked_stage(job, stage, job.stage_commands[stage], vram)
+                if return_code == 0 and stage == "spirula_person" and not job.stop_requested:
+                    msg = await asyncio.to_thread(spirula_lane.combine_person_masks, job_dir)
+                    job.log_lines.append(msg)
+                    _patch_meta(job.job_id, spirula={**((_read_meta(job.job_id) or {}).get("spirula") or {}),
+                                                     "person_mask": msg.removeprefix("[spirula_person] ")})
                 if return_code == 0 and stage == "spirula_sfm" and not job.stop_requested:
                     ok, msg = await asyncio.to_thread(spirula_lane.sfm_check, job_dir)
                     job.log_lines.append(msg)
@@ -3849,7 +3859,7 @@ def _req_from_meta(meta: dict[str, Any]) -> SplatTrainRequest | None:
     keys = ("mode", "input_path", "capture_format", "images_per_equirect",
             "crop_bottom", "num_frames_target", "max_num_iterations", "insv_fov",
             "sfm_backend", "language_field", "mesh_export", "capture_mode", "source_type",
-            "trim_start_s", "trim_duration_s", "trainer")
+            "trim_start_s", "trim_duration_s", "trainer", "spirula_quality")
     fields = {k: meta[k] for k in keys if meta.get(k) is not None}
     try:
         return SplatTrainRequest(output_dir="outputs/3d", **fields)
@@ -3929,6 +3939,8 @@ def _stage_artifact_ok(job_dir: Path, stage: str) -> bool:
         return any((ws / "data" / "images" / "cam1").glob("*.jpg"))
     if stage == "spirula_mask":
         return any((ws / "data" / "masks").rglob("*.png"))
+    if stage == "spirula_person":
+        return any((ws / "data" / "person" / "cam1").glob("*.png"))
     if stage == "spirula_sfm":
         return (ws / "data" / "sparse" / "0" / "images.bin").is_file()
     if stage == "spirula_train":

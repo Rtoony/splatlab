@@ -1,11 +1,12 @@
 import type { SplatJob } from "@/lib/contracts";
 
 // ── pipeline metadata ────────────────────────────────────────────────────────
-export const STAGE_ORDER = ["spirula_trim", "spirula_extract", "spirula_mask", "spirula_sfm", "spirula_train", "spirula_publish", "stitch", "process", "train", "langfield", "export", "health", "compress", "webopt", "mesh"];
+export const STAGE_ORDER = ["spirula_trim", "spirula_extract", "spirula_mask", "spirula_person", "spirula_sfm", "spirula_train", "spirula_publish", "stitch", "process", "train", "langfield", "export", "health", "compress", "webopt", "mesh"];
 export const STAGE_HUMAN: Record<string, string> = {
   spirula_trim: "Cutting the test-flight window",
   spirula_extract: "Pulling frames from both lenses",
   spirula_mask: "Masking the lens borders",
+  spirula_person: "Masking out the camera operator",
   spirula_sfm: "Solving the 360 camera path",
   spirula_train: "Building the 3D scene (Spirula)",
   spirula_publish: "Publishing the scene",
@@ -26,6 +27,7 @@ export const STAGE_SHORT: Record<string, string> = {
   spirula_trim: "Trim",
   spirula_extract: "Frames",
   spirula_mask: "Mask",
+  spirula_person: "Operator",
   spirula_sfm: "360 path",
   spirula_train: "Train",
   spirula_publish: "Publish",
