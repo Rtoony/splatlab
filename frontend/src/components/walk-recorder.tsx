@@ -40,7 +40,11 @@ export function WalkRecorderButton({ jobId, getCanvas, onStart, className = "" }
 
   const stop = useCallback(() => {
     if (timer.current !== null) { window.clearInterval(timer.current); timer.current = null; }
-    if (rec.current && rec.current.state !== "inactive") rec.current.stop();
+    if (rec.current && rec.current.state !== "inactive") {
+      rec.current.stop();
+      // Stopping with V mid-walk leaves the mouse captured: release it so the pop-up can be clicked straight away.
+      if (document.pointerLockElement) document.exitPointerLock();
+    }
   }, []);
 
   const start = useCallback(() => {
