@@ -741,3 +741,27 @@ export function revertWorldRestyleBake(jobId: string): Promise<RestyleBakeResult
     { method: "POST" },
   );
 }
+
+
+// Enhance this view (enhance_route.py): a viewer frame + camera pose in the splat frame -> an AI-enhanced still.
+export interface EnhanceResult {
+  job_id: string;
+  shot_id: string;
+  label: "AI-enhanced";
+  note: string;
+  model: string | null;
+  model_ms: number | null;
+  seconds: number;
+  before_url: string;
+  after_url: string;
+  ref_url: string | null;
+  reference: { used: boolean; view?: number | null; distance_m?: number; facing?: number; source?: string | null; why_not?: string };
+}
+
+export function enhanceView(
+  jobId: string,
+  image: string,
+  camera: { position: number[]; forward: number[] } | null,
+): Promise<EnhanceResult> {
+  return postJSON(`/api/splat/jobs/${encodeURIComponent(jobId)}/enhance`, { image, camera });
+}

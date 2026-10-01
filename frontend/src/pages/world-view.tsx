@@ -21,6 +21,7 @@ import { LIGHT_PRESETS, emptyRestyle, type RestyleDoc, type RestyleEntry, type R
 import { WorldGame, type GameHudState, type Scenario } from "@/lib/world-game";
 import type { parseNavmesh } from "@/lib/world-navmesh";
 import { PolishUploadZone } from "@/components/workspace/polish-upload";
+import { EnhanceViewButton } from "@/components/enhance-view";
 import type { QualityTier } from "@/lib/contracts";
 import { defaultTier, fetchViewerContext, formatBytes, formatSplats, isPhoneLike, readQualityPref, viewableTiers,
   writeQualityPref } from "@/lib/quality";
@@ -797,6 +798,11 @@ export default function WorldViewPage() {
             <Settings2 className="h-3.5 w-3.5" />
             {panelsOpen ? "Hide panels" : "Show panels"}
           </button>
+          {jobId && backdrop && (
+            // Press Esc to release the mouse, then click: an AI-enhanced still of exactly what you see.
+            <EnhanceViewButton jobId={jobId} capture={() => walkerRef.current?.captureForEnhance() ?? null}
+              className="pointer-events-auto absolute bottom-4 left-44 z-20" />
+          )}
 
           {panelsOpen && (
             <div

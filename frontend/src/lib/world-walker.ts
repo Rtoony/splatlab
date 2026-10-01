@@ -1473,6 +1473,21 @@ export class WorldWalker {
     if (had) this.refreshElementVisibility();
   }
 
+  /** "Enhance this view": the frame as shown + the camera pose in the SPLAT backdrop's own frame (the server matches
+   *  it against the real capture cameras). Null when no photographic backdrop is loaded. */
+  captureForEnhance(): { image: string; camera: { position: number[]; forward: number[] } } | null {
+    const splat = this.backdrop;
+    if (!splat) return null;
+    // Render and read back in the same task: the drawing buffer isn't preserved between frames.
+    this.renderer.render(this.scene, this.camera);
+    const image = this.renderer.domElement.toDataURL("image/png");
+    splat.updateMatrixWorld();
+    const inv = splat.matrixWorld.clone().invert();
+    const position = this.camera.position.clone().applyMatrix4(inv);
+    const forward = this.camera.getWorldDirection(new THREE.Vector3()).transformDirection(inv);
+    return { image, camera: { position: position.toArray(), forward: forward.toArray() } };
+  }
+
   get hasBackdrop(): boolean {
     return this.backdrop !== null;
   }

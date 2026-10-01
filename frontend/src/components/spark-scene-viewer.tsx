@@ -29,6 +29,7 @@ import {
 } from "@/lib/spark-heatmap";
 import type { SplatJob } from "@/lib/contracts";
 import { formatBytes, formatSplats, useQualityTier } from "@/lib/quality";
+import { EnhanceViewButton, type EnhanceCapture } from "@/components/enhance-view";
 import type {
   ViewerCameraNodeTarget,
   ViewerCameraOverlay,
@@ -258,6 +259,8 @@ export function SparkSceneViewer({
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
   const meshRef = useRef<SplatMesh | null>(null);
+  // "Enhance this view": set inside the render effect (needs renderer/scene/camera/mesh); null until the scene runs.
+  const captureRef = useRef<(() => EnhanceCapture | null) | null>(null);
   // Default FOV to restore on reset (viewCamera can override cam.fov).
   const defaultFovRef = useRef<number | null>(null);
 
@@ -2090,6 +2093,17 @@ export function SparkSceneViewer({
     const mesh = new SplatMesh({ url, fileType: SplatFileType.PLY, raycastable: true, minRaycastOpacity: 0.1 });
     scene.add(mesh);
     meshRef.current = mesh;
+    captureRef.current = () => {
+      // Render and read back in the same task: the drawing buffer isn't preserved between frames.
+      renderer.render(scene, camera);
+      const image = renderer.domElement.toDataURL("image/png");
+      // Pose in the SPLAT's own frame (the server matches it against the real capture cameras).
+      mesh.updateMatrixWorld();
+      const inv = mesh.matrixWorld.clone().invert();
+      const position = camera.position.clone().applyMatrix4(inv);
+      const forward = camera.getWorldDirection(new THREE.Vector3()).transformDirection(inv);
+      return { image, camera: { position: position.toArray(), forward: forward.toArray() } };
+    };
 
     // floating dimension labels: DOM nodes moved imperatively every frame
     const proj = new THREE.Vector3();
@@ -2490,6 +2504,7 @@ export function SparkSceneViewer({
       renderer.dispose();
       if (renderer.domElement.parentElement === container) container.removeChild(renderer.domElement);
       cameraRef.current = null;
+      captureRef.current = null;
       controlsRef.current = null;
       meshRef.current = null;
       dimGroupRef.current = null;
@@ -2761,6 +2776,10 @@ export function SparkSceneViewer({
           These are DOM/SVG siblings ABOVE the canvas — clicks on the marker
           buttons never reach the renderer's own pointer handlers, so they
           cannot double-fire crop/paint/measure picking. */}
+      {!chromeHidden && !safeMode && job.status === "completed" && (
+        <EnhanceViewButton jobId={job.job_id} capture={() => captureRef.current?.() ?? null}
+          disabled={!ready} className="absolute bottom-12 left-2 z-20" />
+      )}
       {!chromeHidden && quality.current && (!job.langfield_available || tierAwareLangfield) && (
         <QualityPicker quality={quality} />
       )}
