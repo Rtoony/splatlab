@@ -765,3 +765,43 @@ export function enhanceView(
 ): Promise<EnhanceResult> {
   return postJSON(`/api/splat/jobs/${encodeURIComponent(jobId)}/enhance`, { image, camera });
 }
+
+// Record walk (walk_record_route.py): the walker canvas as a WebM -> a plain MP4 kept beside the scene, plus an
+// optional background "realism finish" (nexus-film SeedVR2).
+export type WalkFinishStatus = "none" | "running" | "done" | "failed" | "interrupted";
+export interface WalkRecord {
+  job_id: string;
+  walk_id: string;
+  width: number;
+  height: number;
+  frames: number;
+  seconds: number;
+  fps: number;
+  finish_available: boolean;
+  finish_estimate_s: number;
+  finish: { status: WalkFinishStatus; error?: string; seconds?: number; estimate_s?: number; started?: number };
+  video_url: string;
+  realism_url: string | null;
+}
+
+export async function uploadWalk(jobId: string, recording: Blob): Promise<WalkRecord> {
+  const resp = await fetch(`/api/splat/jobs/${encodeURIComponent(jobId)}/walks`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "video/webm" },
+    body: recording,
+  });
+  if (!resp.ok) {
+    const payload = (await resp.json().catch(() => null)) as { detail?: unknown } | null;
+    throw new Error(typeof payload?.detail === "string" ? payload.detail : `HTTP ${resp.status}`);
+  }
+  return (await resp.json()) as WalkRecord;
+}
+
+export function finishWalk(jobId: string, walkId: string): Promise<WalkRecord> {
+  return postJSON(`/api/splat/jobs/${encodeURIComponent(jobId)}/walks/${walkId}/finish`, {});
+}
+
+export function getWalk(jobId: string, walkId: string): Promise<WalkRecord> {
+  return apiRequest<WalkRecord>(`/api/splat/jobs/${encodeURIComponent(jobId)}/walks/${walkId}`);
+}

@@ -22,6 +22,7 @@ import { WorldGame, type GameHudState, type Scenario } from "@/lib/world-game";
 import type { parseNavmesh } from "@/lib/world-navmesh";
 import { PolishUploadZone } from "@/components/workspace/polish-upload";
 import { EnhanceViewButton } from "@/components/enhance-view";
+import { WalkRecorderButton } from "@/components/walk-recorder";
 import type { QualityTier } from "@/lib/contracts";
 import { defaultTier, fetchViewerContext, formatBytes, formatSplats, isPhoneLike, readQualityPref, viewableTiers,
   writeQualityPref } from "@/lib/quality";
@@ -799,9 +800,13 @@ export default function WorldViewPage() {
             {panelsOpen ? "Hide panels" : "Show panels"}
           </button>
           {jobId && backdrop && (
-            // Press Esc to release the mouse, then click: an AI-enhanced still of exactly what you see.
-            <EnhanceViewButton jobId={jobId} capture={() => walkerRef.current?.captureForEnhance() ?? null}
-              className="pointer-events-auto absolute bottom-4 left-44 z-20" />
+            <div className="pointer-events-auto absolute bottom-4 left-44 z-20 flex items-start gap-2">
+              {/* Press Esc to release the mouse, then click: an AI-enhanced still of exactly what you see. */}
+              <EnhanceViewButton jobId={jobId} capture={() => walkerRef.current?.captureForEnhance() ?? null} />
+              {/* Record walk: V starts/stops even while walking; the clip is the 3D canvas only. */}
+              <WalkRecorderButton jobId={jobId} getCanvas={() => walkerRef.current?.renderer.domElement ?? null}
+                onStart={() => walkerRef.current?.requestLock()} />
+            </div>
           )}
 
           {panelsOpen && (
@@ -1035,7 +1040,7 @@ export default function WorldViewPage() {
           <Key k="F" v="fly / noclip" />
           <Key k="Space / C" v="fly up / down" />
             <Key k="Esc" v="release mouse" />
-            <Key k="" v="" />
+            <Key k="V" v="record walk" />
           </div>
         </button>
       )}

@@ -43,6 +43,7 @@ import opregistry  # noqa: E402  (persistent heavy-operation registry: pollable,
 import capture_route
 import scene_studio_route
 import enhance_route  # noqa: E402  (Enhance this view: AI-enhanced still from a viewer frame, NVIDIA Difix)
+import walk_record_route  # noqa: E402  (Record walk: walker canvas -> MP4, optional realism finish)
 import thumb as thumbgen  # noqa: E402  (scene thumbnail generator)
 
 # Nothing is proxied to the portal anymore; PORTAL_ORIGIN stays because /healthz
@@ -224,6 +225,7 @@ app.include_router(splat_route.router, prefix="/api/splat", dependencies=[Depend
 app.include_router(capture_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
 app.include_router(scene_studio_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
 app.include_router(enhance_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
+app.include_router(walk_record_route.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
 
 # Scene editing (destructive ops are snapshot-versioned) — same auth gate as the pipeline.
 app.include_router(edit_ops.router, prefix="/api/splat", dependencies=[Depends(require_auth)])
